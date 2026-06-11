@@ -4,3 +4,9 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Local media/research cache (rebuild with scripts/fetch-videos.sh)
+/cache/
+
+# Local env/config (may reference private data paths)
+.env
