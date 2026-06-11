@@ -1,0 +1,33 @@
+{
+ "fixture": "001-star-photo",
+ "note": "Star a photo from the photo-edit view: opened folder '2010-12-25 Winter Holiday', double-clicked the 2nd thumbnail in the grid (which is photo02.jpg, not photo01 - grid order != filename order), pressed spacebar (add star), clicked Back to Library. Immediate artifacts: .picasa.ini [photo02.jpg] star=yes, db3/starlist.txt gains full Z:\\ path line. NO .pmp change within 3+ min (lazy flush - to be tested at session-end Picasa exit).",
+ "captured": "2026-06-11T15:28:51+00:00",
+ "baseline": {
+  "label": "pre-session-clean",
+  "created": "2026-06-11T15:21:13+00:00"
+ },
+ "files": {
+  "db3/starlist.txt": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0
+   },
+   "after": {
+    "sha256": "8d3430d3d1d3671af75698a9832077e4100a95e103d1b64bc2817356678ebdb6",
+    "size": 93
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "d48c17f0473e3dc3f317eb81e1f805e6f4a308d681cee978fe93f3b9c4c13042",
+    "size": 25
+   }
+  }
+ }
+}
