@@ -1,0 +1,219 @@
+{
+ "fixture": "013-face-tag-manual",
+ "note": "Manual face tag: View->People, typed 'Synthetic Person' in right panel, 'add manually', drew box on photo04.jpg in '2009-07-04 Beach Day' (image is synthetic gradient - manual tagging works without a detectable face). Synchronous phase: person name written into JPEG XMP as dc:subject keyword (+ ModifyDate bump, +102 bytes); ini backuphash 3224->14043. NO face geometry in the JPEG (no mwg-rs RegionInfo); rect/template/contacts expected db-side on lazy flush. Thumbnail caches churned.",
+ "captured": "2026-06-11T19:03:45+00:00",
+ "baseline": {
+  "label": "after 012-rename-album-db-flush",
+  "created": "2026-06-11T18:34:35+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "b2e662fc34cb30def5e40fe9dbbf5fc2d39d4b06fc63d147e64e780535dc1dd3",
+    "size": 108
+   },
+   "after": {
+    "sha256": "38e485274122ba8ee8666a9dc7ec2f0be040af943d5bf55fd787bccf94feddbc",
+    "size": 108
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7f04e5c58a9d51214d988f9365ed2364b21831fc85613cc44de5117552a337f7",
+    "size": 108
+   },
+   "after": {
+    "sha256": "66b1b50e62fec4a065214ffdb54ee329cfa8bff7ea5699aab6d9d877b3329d5c",
+    "size": 108
+   }
+  },
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "a745d146a82dcfab3986cad3e0e63c8f6e6692418cfe58f9f6283113efc96ac2",
+    "size": 127652
+   },
+   "after": {
+    "sha256": "bcc61a139bae6f61d73748c68c95ed010960862e5f031695f654dde214b336b3",
+    "size": 138121
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "0b36cbb6ecca464def1b0f92d0ac8e00d529836de49d981e9006641904bf37ea",
+    "size": 356
+   },
+   "after": {
+    "sha256": "6206b069a08f793ca036dfe5fe1d6f12d3c8487e4ffd13a38af6ca26aa06c983",
+    "size": 356
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "4590abd63ef8e90d204dd80e22b5fa4c0c8a9a05cc87dfe9d106889fd1c65d4b",
+    "size": 70
+   },
+   "after": {
+    "sha256": "48342ec61fe68efd978b2bc3e9444308d1c86e49c2d8c1cef80a1e751301cce2",
+    "size": 70
+   }
+  },
+  "db3/imagedata_tags.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "5c1f3215c66eb97c67c70525ffd097f4639e894277ad0f2505f96ada8b9ebedd",
+    "size": 31
+   },
+   "after": {
+    "sha256": "838ef0ac14a3880865ab1bbae94eefb66f95fb77b8f73f03922e9945c16ad5e7",
+    "size": 69
+   }
+  },
+  "db3/previews_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "b0a73110846bdbd9943f37d0da16c3945c6d7011e09df639a45d8589eae2bc68",
+    "size": 394955
+   },
+   "after": {
+    "sha256": "024868acdaf0cd830d1bcff86d44c88f66f4b075c27b5dbe8d8a0c983adeadad",
+    "size": 410319
+   }
+  },
+  "db3/previews_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "fc1ab90677808e6ab5c9413f89ed1697e2520aab4b4b8dfa5fec6f4bf4c910de",
+    "size": 356
+   },
+   "after": {
+    "sha256": "844103ee2fc117ae408d8ab17c48937fbce348a88a7d51c92af6384164f86023",
+    "size": 356
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "551961f341b9d85b9a0b274d60319af10d89347c117ae884e1440d88a99b4e1f",
+    "size": 1429
+   },
+   "after": {
+    "sha256": "e11e892056e57b39b2b294919c7046df06c39d0472a9607c347821b027d35e06",
+    "size": 1429
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "b8e14e8e5459beac4593e0b4faeea56c2e872e7af1cd7927deb2ac3fdc32a84c",
+    "size": 30506
+   },
+   "after": {
+    "sha256": "1e02628040872ed24767bd8f03055771d30dc8e05756ffbc876c5265349c2194",
+    "size": 31446
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a0e67db8722f46f811be6f1999760ab900ea30857b112fbbd372c4d414c68a48",
+    "size": 356
+   },
+   "after": {
+    "sha256": "cf01953bb7f624c55a446e23cbdc778a2e7f1488981cd8a303976ba206a769ab",
+    "size": 356
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "1d4013abba4cffe46aa38917fa6bd16618874478f0b3a79fa4496f1f0098ef63",
+    "size": 82289
+   },
+   "after": {
+    "sha256": "07f52898aa088ca2a8a73d53d6d63b9d173bb2d6283b83b4df5f59a0a16052dd",
+    "size": 87277
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "62e8d7a2b35abcdf66bd3cb28c04aca4da44acc4d46dea61c187e6f21d5aaa7f",
+    "size": 356
+   },
+   "after": {
+    "sha256": "0bb3ace24989bc5161979a3d78983c30bcede183d39c41af7d7ba4a9134ffcaa",
+    "size": 356
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "1a56fcb674b209d50c1af79980888a357f867e10332c2cb321645121f599f01a",
+    "size": 67256
+   },
+   "after": {
+    "sha256": "9e4304a5c27be902d53a489036fad8d5fa371fd12e5e69ddbf8966abea72b211",
+    "size": 67280
+   }
+  },
+  "library/2009-07-04 Beach Day/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "29a780e76b863dca027cfcb92c2f058b4f3b95ba231742c6db8795442a8ab6f0",
+    "size": 65
+   },
+   "after": {
+    "sha256": "ecc2af3f12197b47168a641a284a0cc4e17220401d1381c1d1b3b9d6bd907957",
+    "size": 66
+   }
+  },
+  "library/2009-07-04 Beach Day/photo04.jpg": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "eb5a5e3511b49977c3fa2f22569b3558c802dba48edb20a906246e7e643bc6b3",
+    "size": 78063
+   },
+   "after": {
+    "sha256": "642dc104de22d0b092f51cb7edaecb298b4627532bea8d3340d2d618a0d52a68",
+    "size": 78165
+   }
+  }
+ }
+}
