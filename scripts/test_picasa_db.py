@@ -154,6 +154,16 @@ def test_pmp_truncated_string_strict_vs_lax(tmp_path):
     assert col.values == ["one"]
 
 
+def test_pmp_fixed_width_trailing_garbage_strict(tmp_path):
+    # Chromium requires payload length to EXACTLY equal count*width
+    p = write_pmp(tmp_path, "t_c.pmp", 0x1, struct.pack("<II", 1, 2) + b"xx", 2)
+    with pytest.raises(pdb.PmpError, match="trailing"):
+        pdb.read_pmp(p)
+    col = pdb.read_pmp(p, strict=False)
+    assert col.values == [1, 2]
+    assert col.trailing_bytes == 2
+
+
 def test_pmp_string_trailing_garbage_strict(tmp_path):
     p = write_pmp(tmp_path, "t_s.pmp", 0x0, b"one\x00extra\x00", 1)
     with pytest.raises(pdb.PmpError, match="unconsumed"):
@@ -185,26 +195,28 @@ def test_read_table_variable_length_columns(tmp_path):
 
 
 def test_ole_epoch_and_positive():
-    assert pdb.ole_to_datetime(0.0) == datetime(1899, 12, 30, tzinfo=timezone.utc)
+    # naive datetimes: VARIANT time is local wall-clock per the MS DATE docs
+    assert pdb.ole_to_datetime(0.0) == datetime(1899, 12, 30)
     # sbktech's example: 3.25 is 6:00 AM on January 2, 1900
-    assert pdb.ole_to_datetime(3.25) == datetime(1900, 1, 2, 6, 0, tzinfo=timezone.utc)
+    assert pdb.ole_to_datetime(3.25) == datetime(1900, 1, 2, 6, 0)
 
 
 def test_ole_negative_fraction_is_time_of_day():
-    # MS DATE semantics: -1.25 is 1899-12-29 06:00 (time always runs forward)
-    assert pdb.ole_to_datetime(-1.25) == datetime(
-        1899, 12, 29, 6, 0, tzinfo=timezone.utc
-    )
+    # MS DATE semantics: -1.25 is 1899-12-29 06:00 (time always runs forward);
+    # MS's own table: -0.25 = 30 Dec 1899 6 A.M., -2.5 = 28 Dec 1899 noon
+    assert pdb.ole_to_datetime(-1.25) == datetime(1899, 12, 29, 6, 0)
+    assert pdb.ole_to_datetime(-0.25) == datetime(1899, 12, 30, 6, 0)
+    assert pdb.ole_to_datetime(-2.5) == datetime(1899, 12, 28, 12, 0)
 
 
 @pytest.mark.parametrize(
     "dt",
     [
-        datetime(1899, 12, 30, tzinfo=timezone.utc),
-        datetime(1900, 1, 2, 6, 0, tzinfo=timezone.utc),
-        datetime(1899, 12, 29, 6, 0, tzinfo=timezone.utc),
-        datetime(2009, 7, 4, 10, 0, tzinfo=timezone.utc),
-        datetime(1903, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+        datetime(1899, 12, 30),
+        datetime(1900, 1, 2, 6, 0),
+        datetime(1899, 12, 29, 6, 0),
+        datetime(2009, 7, 4, 10, 0),
+        datetime(1903, 12, 31, 23, 59, 59),
     ],
 )
 def test_ole_roundtrip(dt):
@@ -250,12 +262,42 @@ def test_parse_faces():
     assert faces[1][0][3] == pytest.approx(0xFFFF / 65536)
 
 
+def test_parse_faces_short_contact_id_zero_padded():
+    # contact ids are %llx-printed (leading zeros stripped in the wild)
+    faces = pdb.parse_faces("rect64(ffff),632e71e2ffd6c6d")
+    assert faces[0][1] == "0632e71e2ffd6c6d"
+
+
 def test_parse_filters():
     v = "crop64=1,3f845bcb59418507;enhance=1;finetune2=1,0.0,0.0,0.3,0.0,0.0;"
     ops = pdb.parse_filters(v)
     assert [name for name, _ in ops] == ["crop64", "enhance", "finetune2"]
     assert ops[0][1] == ["1", "3f845bcb59418507"]
     assert ops[2][1][3] == "0.3"
+
+
+def test_parse_filters_real_world_crop():
+    # real crop from the fbuchinger-gist survey: 10000000f1ddff49
+    ops = pdb.parse_filters("crop64=1,10000000f1ddff49;")
+    rect = pdb.parse_rect64(ops[0][1][1])
+    assert rect == pytest.approx(
+        (0x1000 / 65536, 0.0, 0xF1DD / 65536, 0xFF49 / 65536)
+    )
+
+
+def test_parse_rotate():
+    assert pdb.parse_rotate("rotate(1)") == 1
+    assert pdb.parse_rotate("rotate(3)") == 3
+    with pytest.raises(ValueError):
+        pdb.parse_rotate("1")
+
+
+def test_parse_moddate_le_filetime():
+    # worked example from the format research (inferred LE FILETIME dump)
+    dt = pdb.parse_moddate("8094e2826277cd01")
+    assert dt == datetime(2012, 8, 11, 1, 42, 5, tzinfo=timezone.utc)
+    with pytest.raises(ValueError):
+        pdb.parse_moddate("xyz")
 
 
 # --------------------------------------------------------------------------
@@ -329,24 +371,38 @@ def test_ini_key_before_section(tmp_path):
     assert any("before any section" in a for a in ini.anomalies)
 
 
+def test_cli_ini_redact_hides_strings_and_unknown_keys(tmp_path, capsys):
+    p = tmp_path / ".picasa.ini"
+    p.write_text(
+        "[holiday.jpg]\ncaption=secret words\nIIDLIST_joedoe_lh=4dfe636c9cf4c302\n"
+        "star=yes\n",
+        encoding="utf-8",
+    )
+    assert pdb.main(["ini", str(p), "--redact"]) == 0
+    out = capsys.readouterr().out
+    # values, section (filename), and dynamic key names must not appear
+    assert "secret" not in out and "holiday" not in out and "joedoe" not in out
+    assert "star" in out  # known-structural keys stay readable
+
+
 # --------------------------------------------------------------------------
 # thumbindex.db
 # --------------------------------------------------------------------------
 
 
-def make_thumbindex(entries: list[tuple[str, int, int, int, int, int, int]]) -> bytes:
+def make_thumbindex(entries: list[tuple]) -> bytes:
     out = struct.pack("<II", pdb.THUMBINDEX_MAGIC, len(entries))
-    for name, ft1, ft2, n1, n2, n3, parent in entries:
+    for name, taken, mtime, size, ftype, flags, valid, parent in entries:
         out += name.encode("utf-8") + b"\x00"
-        out += struct.pack("<QQIIHI", ft1, ft2, n1, n2, n3, parent)
+        out += struct.pack("<QQIBIBI", taken, mtime, size, ftype, flags, valid, parent)
     return out
 
 
 SAMPLE_TI = [
-    ("C:\\pics\\", 10, 20, 0, 1, 256, 0xFFFFFFFF),
-    ("C:\\pics\\2009\\", 11, 21, 0, 1, 256, 0xFFFFFFFF),
-    ("a.jpg", 12, 22, 999, 2, 256, 1),
-    ("b.jpg", 13, 23, 888, 2, 256, 1),
+    ("C:\\pics\\", 10, 20, 0, 0x01, 0, 1, 0xFFFFFFFF),
+    ("C:\\pics\\2009\\", 11, 21, 0, 0x01, 0, 1, 0xFFFFFFFF),
+    ("a.jpg", 12, 22, 999, 0x02, 0, 1, 1),
+    ("b.jpg", 13, 23, 888, 0x02, 0, 1, 1),
 ]
 
 
@@ -357,10 +413,22 @@ def test_thumbindex_roundtrip(tmp_path):
     assert len(entries) == 4
     assert entries[0].is_folder and entries[0].parent is None
     assert entries[2].name == "a.jpg" and entries[2].parent == 1
-    assert entries[2].num1 == 999 and entries[2].num2 == 2
+    assert entries[2].size == 999 and entries[2].ftype == 0x02
+    assert entries[2].ftype_name == "jpeg" and entries[0].ftype_name == "directory"
+    assert entries[2].valid == 1 and entries[2].flags == 0
     paths = pdb.thumbindex_full_paths(entries)
     assert paths[2] == "C:\\pics\\2009\\a.jpg"
     assert paths[0] == "C:\\pics\\"
+
+
+def test_thumbindex_deleted_entry(tmp_path):
+    p = tmp_path / "thumbindex.db"
+    rows = SAMPLE_TI + [("", 0, 0, 0, 0x00, 0, 0, 0xFFFFFFFF)]
+    p.write_bytes(make_thumbindex(rows))
+    entries = pdb.read_thumbindex(p)
+    assert entries[4].is_deleted
+    assert not entries[4].is_folder  # deleted, not a folder, despite no parent
+    assert pdb.thumbindex_full_paths(entries)[4] == ""
 
 
 def test_thumbindex_bad_magic(tmp_path):
@@ -387,7 +455,7 @@ def test_thumbindex_trailing_bytes(tmp_path):
 
 def test_thumbindex_bad_parent_does_not_crash(tmp_path):
     p = tmp_path / "thumbindex.db"
-    p.write_bytes(make_thumbindex([("x.jpg", 0, 0, 1, 2, 256, 7)]))
+    p.write_bytes(make_thumbindex([("x.jpg", 0, 0, 1, 0x02, 0, 1, 7)]))
     entries = pdb.read_thumbindex(p)
     paths = pdb.thumbindex_full_paths(entries)
     assert "bad-parent" in paths[0]
@@ -444,9 +512,10 @@ def test_oracle_thumbindex_matches_imagedata():
     filetype = pdb.read_pmp(ORACLE_DB3 / "imagedata_filetype.pmp")
     assert len(entries) == filetype.count
     for e in entries:
-        # thumbindex num2 mirrors imagedata.filetype (1=folder, 2=image)
-        assert e.num2 == filetype.values[e.index]
-        assert e.is_folder == (e.num2 == 1)
+        # the thumbindex ftype byte mirrors imagedata.filetype (1=dir, 2=jpeg)
+        assert e.ftype == filetype.values[e.index]
+        assert e.is_folder == (e.ftype == 1)
+        assert e.valid == 1 and e.flags == 0  # invariant in the oracle data
 
 
 def _oracle_path_to_local(win_path: str) -> Path | None:
@@ -475,7 +544,7 @@ def test_oracle_join_dimensions_and_sizes():
             assert img.size == (width.get(e.index), height.get(e.index)), paths[
                 e.index
             ]
-        assert e.num1 == local.stat().st_size  # thumbindex u32 is the byte size
+        assert e.size == local.stat().st_size  # thumbindex u32 is the byte size
         checked += 1
     assert checked >= 20  # the synthetic library has 24 photos
 

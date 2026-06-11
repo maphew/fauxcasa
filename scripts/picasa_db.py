@@ -65,7 +65,10 @@ PMP_CONST1 = 0x1332
 PMP_CONST2 = 0x00000002
 PMP_HEADER_SIZE = 20
 
-# field-type code -> (name, struct width in bytes; None = null-terminated string)
+# field-type code -> (name, struct width in bytes; None = null-terminated
+# string). 0x0-0x4 are confirmed by Chromium's pmp_constants.h; 0x5/0x6/0x7
+# come from sbktech/picasa3meta (Chromium never handled them). The oracle
+# uses 0x7 for imagedata edit_width/edit_height; 0x5/0x6 are so far unseen.
 PMP_FIELD_TYPES: dict[int, tuple[str, int | None]] = {
     0x0: ("string", None),
     0x1: ("uint32", 4),
@@ -79,7 +82,15 @@ PMP_FIELD_TYPES: dict[int, tuple[str, int | None]] = {
 
 _PMP_STRUCT_FMT = {1: "<B", 2: "<H", 4: "<I", 8: "<Q"}
 
-OLE_EPOCH = datetime(1899, 12, 30, tzinfo=timezone.utc)
+OLE_EPOCH = datetime(1899, 12, 30)  # naive: VARIANT time is local wall-clock
+
+# albumdata.category semantics (re-derived from Chromium picasa_types.cc,
+# BSD-3): 0 = album, 2 = folder-on-disk; albums carry a "]album:<32hex>"
+# token, folders carry a filesystem path in albumdata.filename.
+ALBUM_CATEGORY_ALBUM = 0
+ALBUM_CATEGORY_FOLDER = 2
+ALBUM_CATEGORY_INVALID = 0xFFFF
+ALBUM_TOKEN_PREFIX = "]album:"
 
 
 class PmpError(ValueError):
@@ -91,13 +102,16 @@ class PmpError(ValueError):
 
 
 def ole_to_datetime(value: float) -> datetime:
-    """Convert an OLE/VARIANT automation date to a UTC datetime.
+    """Convert an OLE/VARIANT automation date to a naive datetime.
 
-    The value is days since 1899-12-30 00:00. Per Microsoft's DATE semantics
-    the fractional part is the (always positive) time of day, even for
-    negative values: -1.25 is 1899-12-29 06:00, not 18:00. Some prior art
-    (picasa3meta) instead nudged negative fractions with ``t = 1.0 + t``;
-    we follow the Microsoft definition.
+    The value is days since 1899-12-30 00:00 in *local wall-clock time*
+    (per Microsoft's DATE docs), hence the naive result. The fractional
+    part is the absolute time of day even for negative values: -1.25 is
+    1899-12-29 06:00, not 18:00. Prior art diverges here — Chromium
+    converts linearly (wrong for negative fractions), picasa3meta applies
+    ``t = 1.0 + t`` to negative fractions (also wrong except at .0/.5);
+    we follow the Microsoft definition. Negatives never occur in healthy
+    Picasa data (the UI floor is 1903), so flag them as suspect upstream.
     """
     days = math.trunc(value)
     frac = abs(value - days)
@@ -109,10 +123,10 @@ def datetime_to_ole(dt: datetime) -> float:
 
     MS semantics: the whole part counts days (signed) from the epoch to the
     value's midnight; the fractional part is the time of day, applied away
-    from zero — so 1899-12-29 06:00 encodes as -1.25, not -0.75.
+    from zero — so 1899-12-29 06:00 encodes as -1.25, not -0.75. Aware
+    datetimes are taken at face value as wall-clock (tzinfo ignored).
     """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.replace(tzinfo=None)
     day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
     days = (day_start - OLE_EPOCH) / timedelta(days=1)
     time_of_day = (dt - day_start) / timedelta(days=1)
@@ -172,10 +186,13 @@ def read_pmp(path: Path | str, *, strict: bool = True) -> PmpColumn:
         u32 magic 0x3fcccccd | u16 field-type | u16 0x1332 | u32 0x00000002
         | u16 field-type (repeat) | u16 0x1332 | u32 entry-count
 
-    With strict=True any structural deviation raises PmpError. With
-    strict=False, short fixed-width payloads yield the entries that fit and
-    short string payloads yield the strings present; `count` still reports
-    the declared count.
+    With strict=True any structural deviation raises PmpError — including
+    trailing bytes after the declared entries, mirroring Chromium's
+    pmp_column_reader, which requires the payload length to EXACTLY equal
+    the entries' size (Chromium also caps files at 50 MB; we don't, being
+    a research tool on trusted data). With strict=False, short payloads
+    yield the entries/strings that fit and trailing bytes are recorded in
+    `trailing_bytes`; `count` still reports the declared count.
     """
     path = Path(path)
     data = path.read_bytes()
@@ -210,6 +227,11 @@ def read_pmp(path: Path | str, *, strict: bool = True) -> PmpColumn:
         else:
             count_avail = count
             trailing = len(payload) - need
+            if trailing and strict:
+                raise PmpError(
+                    f"{path.name}: payload {len(payload)} bytes != "
+                    f"{count} x {width} = {need} ({trailing} trailing)"
+                )
         if ftype == 0x2:
             values = list(
                 struct.unpack_from(f"<{count_avail}d", payload, 0) if count_avail else ()
@@ -239,9 +261,8 @@ def read_pmp(path: Path | str, *, strict: bool = True) -> PmpColumn:
         else:
             trailing = len(raw) - pos
     if trailing and strict and width is None:
-        # Fixed-width trailing bytes are tolerated (observed 0 in oracle files,
-        # but Chromium tolerates length >= needed); string columns must
-        # consume the payload exactly to prove the scan stayed in sync.
+        # Like Chromium, the payload must be consumed exactly; for string
+        # columns this also proves the NUL scan stayed in sync.
         raise PmpError(f"{path.name}: {trailing} unconsumed bytes after last string")
 
     table, column = split_pmp_name(path)
@@ -295,6 +316,26 @@ THUMBINDEX_MAGIC = 0x40466666
 THUMBINDEX_NO_PARENT = 0xFFFFFFFF
 FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 
+# File-type codes for ThumbIndexEntry.ftype, re-derived from xkikeg/PicasaDB
+# (Data/PicasaDB.hs; layout facts only). '?' = that project's own uncertainty.
+THUMBINDEX_FILE_TYPES = {
+    0x00: "empty",
+    0x01: "directory",
+    0x02: "jpeg",
+    0x03: "gif",
+    0x05: "directory",
+    0x06: "wbmp",
+    0x07: "photoshop",
+    0x08: "avi",
+    0x09: "mpeg4?",
+    0x0A: "h264?",
+    0x0D: "tiff",
+    0x0E: "png",
+    0x12: "nikon-raw",
+    0x1E: "xml",
+    0xE9: "empty",
+}
+
 
 class ThumbIndexError(ValueError):
     """Raised when thumbindex.db fails structural validation."""
@@ -313,28 +354,52 @@ class ThumbIndexEntry:
 
     Folder entries store a full path (e.g. ``C:\\photos\\2009\\``) and have
     ``parent == None``; file entries store a bare name and join to their
-    folder through ``parent`` (an index into the same entry list). The
-    record number here equals the record number in the ``imagedata`` table —
-    this file is the join key between pmp rows and paths on disk.
+    folder through ``parent`` (an index into the same entry list — one level
+    of indirection, folders always carry absolute paths). The record number
+    here equals the record number in the ``imagedata`` table — this file is
+    the join key between pmp rows and paths on disk.
 
-    The 26 bytes between name and parent decode as below; semantics are
-    our oracle-verified best guess (prior art skipped them as unknown):
-    two FILETIMEs that track the file's timestamps, then what looks like a
-    size/hash u32, a type u32 (1=folder, 2=image), and a u16.
+    The 26 bytes between name and parent follow xkikeg/PicasaDB's
+    decomposition (u64 + u64 + u32 + u8 + u32 + u8), with semantics
+    refined against the Wine oracle (all 28 entries cross-checked against
+    the synthetic library):
+
+    - ``taken_filetime``: NOT the filesystem creation time (prior art's
+      guess) — for photos with EXIF it matches DateTimeOriginal exactly,
+      converted local->UTC; without EXIF it falls back to file mtime.
+    - ``modified_filetime``: file mtime (matched on-disk mtime 28/28).
+    - ``size``: byte size of the file (exact match 28/28; folders 0).
+      xkikeg treats these 4 bytes as opaque; size fits our oracle.
+    - ``ftype``: see THUMBINDEX_FILE_TYPES (1/5=directory, 2=jpeg, ...).
+    - ``flags``: opaque u32, observed 0.
+    - ``valid``: 0 = invalidated entry (xkikeg enforces that such entries
+      carry no parent index); observed 1 everywhere in the oracle.
+
+    An empty ``name`` marks a deleted record (per picasa3meta); record
+    numbers are never reused, so deleted rows keep their slot.
     """
 
     index: int
     name: str
-    filetime1: int  # observed: file creation time as Windows FILETIME
-    filetime2: int  # observed: file modification time as Windows FILETIME
-    num1: int  # u32; observed values correlate with file size (folders: 0)
-    num2: int  # u32; observed: 1 for folders, 2 for images
-    num3: int  # u16; observed: 0x0100 everywhere in oracle data
+    taken_filetime: int
+    modified_filetime: int
+    size: int
+    ftype: int
+    flags: int
+    valid: int
     parent: int | None  # entry index of containing folder; None for folders
 
     @property
     def is_folder(self) -> bool:
-        return self.parent is None
+        return self.parent is None and not self.is_deleted
+
+    @property
+    def is_deleted(self) -> bool:
+        return self.name == ""
+
+    @property
+    def ftype_name(self) -> str:
+        return THUMBINDEX_FILE_TYPES.get(self.ftype, f"unknown-0x{self.ftype:x}")
 
 
 def read_thumbindex(path: Path | str, *, strict: bool = True) -> list[ThumbIndexEntry]:
@@ -345,10 +410,12 @@ def read_thumbindex(path: Path | str, *, strict: bool = True) -> list[ThumbIndex
 
         u32 magic 0x40466666 | u32 entry-count
         then per entry:
-        null-terminated path/name | 26 bytes | u32 parent-index
+        null-terminated path/name | u64 taken | u64 mtime | u32 size
+        | u8 ftype | u32 flags | u8 valid | u32 parent-index
 
-    The 26 bytes are split as u64 + u64 + u32 + u32 + u16 (see
-    ThumbIndexEntry). 0xffffffff as parent-index means "no parent".
+    0xffffffff as parent-index means "no parent" (folder or deleted).
+    picasa3meta also accepted 0xff as a name terminator; we have never
+    observed that and require NUL.
     """
     path = Path(path)
     data = path.read_bytes()
@@ -366,18 +433,19 @@ def read_thumbindex(path: Path | str, *, strict: bool = True) -> list[ThumbIndex
                 f"{path.name}: truncated in entry {i} of {count} at offset {pos}"
             )
         name = data[pos:end].decode("utf-8", "surrogateescape")
-        ft1, ft2, num1, num2, num3, parent = struct.unpack_from(
-            "<QQIIHI", data, end + 1
+        taken, mtime, size, ftype, flags, valid, parent = struct.unpack_from(
+            "<QQIBIBI", data, end + 1
         )
         entries.append(
             ThumbIndexEntry(
                 index=i,
                 name=name,
-                filetime1=ft1,
-                filetime2=ft2,
-                num1=num1,
-                num2=num2,
-                num3=num3,
+                taken_filetime=taken,
+                modified_filetime=mtime,
+                size=size,
+                ftype=ftype,
+                flags=flags,
+                valid=valid,
                 parent=None if parent == THUMBINDEX_NO_PARENT else parent,
             )
         )
@@ -390,9 +458,17 @@ def read_thumbindex(path: Path | str, *, strict: bool = True) -> list[ThumbIndex
 
 
 def thumbindex_full_paths(entries: list[ThumbIndexEntry]) -> list[str]:
-    """Resolve each entry to its full path (folder entries already are one)."""
+    """Resolve each entry to its full path.
+
+    Folder entries already store one; deleted entries resolve to "".
+    Parent chains are followed defensively even though Picasa only ever
+    writes a single level (files -> folder with absolute path).
+    """
     paths: list[str] = []
     for e in entries:
+        if e.is_deleted:
+            paths.append("")
+            continue
         parts = [e.name]
         seen = {e.index}
         cur = e
@@ -443,14 +519,22 @@ def read_picasa_ini(path: Path | str) -> PicasaIni:
     """Parse a .picasa.ini (or legacy Picasa.ini / picasa.ini) file.
 
     Deliberately not configparser: real-world files contain duplicate
-    sections/keys, unescaped values, and occasional junk lines after
-    crashes (per picasa2digikam's field experience). We preserve order,
-    duplicates, and unparseable lines (recorded as anomalies by line
-    number — never by content, so output stays redaction-safe).
+    sections AND duplicate keys (configparser merges or throws), dynamic
+    key names with spaces/hyphens (`BKTag All Pictures-backuphash`),
+    `[(null)]` garbage sections, even byte-reversed lines after crashes
+    (per picasa2digikam's field experience and the fbuchinger-gist survey
+    of ~800 real files). We preserve order, duplicates, and unknown
+    sections verbatim; unparseable lines are recorded as anomalies by line
+    number — never by content, so output stays redaction-safe. Section
+    order is arbitrary in the wild; never assume [Picasa] comes first.
+    `;` and `#` are NOT comment markers in Picasa files (`;` is data in
+    faces/filters/Contacts2 values) — only whole junk lines are skipped.
 
-    Picasa 3.9 writes UTF-8 (the `[encoding]` section was used by some
-    versions); older versions may have written the system codepage. We
-    decode UTF-8 with surrogateescape so nothing is lost either way.
+    Encoding: Picasa 3.x writes UTF-8 and marks it with an `[encoding]`
+    section (`utf8=1`, may appear anywhere); older versions wrote the
+    system codepage, and mixed-encoding files exist in the wild (sections
+    appended by different Picasa versions). We decode UTF-8 with
+    surrogateescape so every byte survives a round trip either way.
     """
     path = Path(path)
     raw = path.read_bytes()
@@ -463,7 +547,7 @@ def read_picasa_ini(path: Path | str) -> PicasaIni:
     current: IniSection | None = None
     for lineno, line in enumerate(text.split("\n"), 1):
         line = line.rstrip("\r").strip()
-        if not line or line.startswith((";", "#")):
+        if not line:
             continue
         if line.startswith("[") and line.endswith("]"):
             current = IniSection(name=line[1:-1])
@@ -515,14 +599,19 @@ def parse_rect64(value: str | int) -> tuple[float, float, float, float]:
     return (left / 65536.0, top / 65536.0, right / 65536.0, bottom / 65536.0)
 
 
-UNKNOWN_CONTACT = "ffffffffffffffff"  # faces= contact id for "unnamed person"
+# faces= contact id meaning "face detected, name suggestion unconfirmed"
+UNKNOWN_CONTACT = "ffffffffffffffff"
 
 
 def parse_faces(value: str) -> list[tuple[tuple[float, float, float, float], str]]:
     """Decode a `faces=` value: `rect64(...),<16-hex contact id>;...`.
 
-    Returns [(rect, contact_id), ...]; contact ids join to contacts.xml /
-    the contacts pmp tables. UNKNOWN_CONTACT marks an unnamed region.
+    Returns [(rect, contact_id), ...]; contact ids join to [Contacts2]
+    sections / contacts.xml. Ids are %llx-printed by Picasa (leading zeros
+    stripped), so they are zero-padded back to 16 chars here — the
+    [Contacts2] keys are stored padded. UNKNOWN_CONTACT marks a face whose
+    suggested name was never confirmed; faces with no suggestion at all are
+    simply absent from the ini.
     """
     out = []
     for part in value.split(";"):
@@ -530,8 +619,41 @@ def parse_faces(value: str) -> list[tuple[tuple[float, float, float, float], str
         if not part:
             continue
         rect_s, _, contact = part.partition(",")
-        out.append((parse_rect64(rect_s), contact.strip().lower()))
+        contact = contact.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{1,16}", contact):
+            contact = contact.zfill(16)
+        out.append((parse_rect64(rect_s), contact))
     return out
+
+
+_ROTATE_RE = re.compile(r"^rotate\((\d+)\)$")
+
+
+def parse_rotate(value: str) -> int:
+    """Decode `rotate=rotate(N)` -> N quarter-turns clockwise (0-3)."""
+    m = _ROTATE_RE.match(value.strip())
+    if not m:
+        raise ValueError("not a rotate(N) value")
+    return int(m.group(1))
+
+
+def parse_moddate(value: str) -> datetime:
+    """Decode a `moddate=` value (16 hex chars) to a UTC datetime.
+
+    Inferred format (validated by plausibility only — the community never
+    cracked this key): the hex is a byte-for-byte little-endian dump of a
+    Windows FILETIME, e.g. `8094e2826277cd01` -> 0x01cd776282e29480 ->
+    2012-08-11 01:42:05 UTC. Verify against the oracle before treating as
+    normative.
+    """
+    s = value.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{16}", s):
+        raise ValueError("not a moddate value")
+    ticks = int.from_bytes(bytes.fromhex(s), "little")
+    dt = filetime_to_datetime(ticks)
+    if dt is None:
+        raise ValueError("moddate is zero")
+    return dt
 
 
 def parse_filters(value: str) -> list[tuple[str, list[str]]]:
@@ -633,12 +755,14 @@ def cmd_thumbindex(args: argparse.Namespace) -> int:
             "index": e.index,
             "path" if args.paths else "name": _render(shown, args.redact),
             "folder": e.is_folder,
+            "deleted": e.is_deleted,
             "parent": e.parent,
-            "ft1": str(filetime_to_datetime(e.filetime1)),
-            "ft2": str(filetime_to_datetime(e.filetime2)),
-            "num1": e.num1,
-            "num2": e.num2,
-            "num3": e.num3,
+            "taken": str(filetime_to_datetime(e.taken_filetime)),
+            "modified": str(filetime_to_datetime(e.modified_filetime)),
+            "size": e.size,
+            "ftype": e.ftype_name,
+            "flags": e.flags,
+            "valid": e.valid,
         }
         out.append(rec)
         if not args.json:
@@ -648,22 +772,47 @@ def cmd_thumbindex(args: argparse.Namespace) -> int:
     return 0
 
 
+# Known-structural ini key vocabulary: safe to print under --redact. Keys
+# outside this set are redacted too, because Picasa generates dynamic key
+# names embedding account names (IIDLIST_<user>_lh, <user>_lh) and backup
+# set names (<set name>-backuphash).
+_INI_KNOWN_KEYS = frozenset(
+    """star caption keywords rotate flipped crop crop64 filters redo faces
+    albums backuphash moddate originhash width height textactive text geotag
+    screensaver name token date description location link category p2category
+    utf8 album""".split()
+)
+
+
 def cmd_ini(args: argparse.Namespace) -> int:
     ini = read_picasa_ini(args.file)
     out: list[dict[str, Any]] = []
     for s in ini.sections:
         sec: dict[str, Any] = {"section": _render(s.name, args.redact), "items": []}
         for k, v in s.items:
-            item: dict[str, Any] = {"key": k, "value": _render(v, args.redact)}
+            redact_key = args.redact and k.lower() not in _INI_KNOWN_KEYS
+            item: dict[str, Any] = {
+                "key": _redact_str(k) if redact_key else k,
+                "value": _render(v, args.redact),
+            }
             try:
-                if k.lower() in ("crop", "crop64") or v.startswith("rect64("):
-                    item["decoded"] = parse_rect64(v)
-                elif k.lower() == "faces":
+                kl = k.lower()
+                if kl == "faces":
                     item["decoded"] = [
                         {"rect": r, "contact": c} for r, c in parse_faces(v)
                     ]
-                elif k.lower() == "filters":
+                elif kl in ("filters", "redo"):
                     item["decoded"] = parse_filters(v)
+                elif kl == "rotate":
+                    item["decoded"] = parse_rotate(v)
+                elif kl == "moddate":
+                    item["decoded"] = str(parse_moddate(v))
+                elif kl == "date" and s.name.lower() == "picasa":
+                    # [Picasa] date= is an OLE double; [.album:*] date= is
+                    # ISO 8601 text and needs no decoding.
+                    item["decoded"] = str(ole_to_datetime(float(v)))
+                elif kl in ("crop", "crop64") or v.startswith("rect64("):
+                    item["decoded"] = parse_rect64(v)
             except ValueError:
                 item["decoded"] = None
             sec["items"].append(item)

@@ -3,7 +3,9 @@
 Survey of existing reverse-engineering work (2026-06-11), so Fauxcasa builds
 on prior art instead of redoing it. See also `picasa-binary-notes.md` (our own
 strings pass) and `sources/sbktech-2011-picasa-pmp-format.md` (the canonical
-`.pmp` format writeup).
+`.pmp` format writeup). Now distilled and oracle-validated in
+`picasa-db3-validated.md` (.pmp/thumbindex) and `picasa-ini-format.md`
+(.picasa.ini), implemented in `scripts/picasa_db.py`.
 
 ## Recommended primary references
 
@@ -45,7 +47,7 @@ Everything little-endian.
 | Project | Lang / License | State | Covers |
 |---|---|---|---|
 | sbktech blog `Read.java` (in-post code; verbatim copy inside github.com/SaumyaSoman/MiniJarvis) | Java / none | 2011, canonical | Generic .pmp container, all 8 field types |
-| [picasa3meta](https://github.com/vosbergw/picasa3meta) | Python / none | dead 2013 | Broadest single lib: .pmp (40+ imagedata cols), .picasa.ini, thumbindex.db, exiv2 |
+| [picasa3meta](https://github.com/vosbergw/picasa3meta) | Python / GPL-3 (COPYING inside package dir; GitHub misdetects as none) | dead 2013 | Broadest single lib: .pmp (40+ imagedata cols), .picasa.ini, thumbindex.db, exiv2 |
 | Chromium media_galleries (see above) | C++ / BSD-3 | frozen ~2016 | Hardened .pmp reader, albumdata, .picasa.ini album indexer, unit tests |
 | [PicasaDBReader](https://github.com/skisoo/PicasaDBReader) | Java / MIT | 2017, 70★ | All .pmp + thumbindex → CSV; face data export + crop via ImageMagick; path translation |
 | [picasa2digikam](https://github.com/Philipp91/picasa2digikam) | Python / GPL-3 | **active 2026** | ini stars/albums/faces, rect64 (with tests), contacts.xml |
