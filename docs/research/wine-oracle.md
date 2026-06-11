@@ -75,11 +75,23 @@ interaction) still perform the folder scan and write the database, then exit.
     Screensaver, Recently Updated, Emailed, Uploaded, ...`) followed by the
     three watched folders — folders and albums share the albumdata table.
 
-## Differential-testing recipe (next step)
+## Differential-testing recipe
 
-1. Snapshot `db3/` and the library's `.picasa.ini` files (none yet).
+Harness: `scripts/oracle-diff.py` (stdlib-only; watches `db3/`,
+`Picasa2Albums/`, and the synthetic library tree).
+
+1. `uv run scripts/oracle-diff.py snapshot` — baseline.
 2. Perform ONE action in the Picasa UI (star a photo, caption, crop, tag a
    face, make an album).
-3. Diff: new/changed `.pmp` entries, `.picasa.ini` deltas.
-4. Record each action→bytes mapping; build the Fauxcasa parser/writer test
-   suite from these fixtures (synthetic, so committable).
+3. `uv run scripts/oracle-diff.py diff` — decoded report: row-level `.pmp`
+   deltas (all sbktech field types), unified diffs for `.picasa.ini`/`.txt`/
+   `.pal`, first-difference hexdump for other binaries.
+4. `uv run scripts/oracle-diff.py capture <slug> --note "exact UI action"` —
+   writes `fixtures/oracle/NNN-<slug>/{before,after,diff.md,meta.json}` and
+   re-baselines for the next action. Thumbnail/preview caches are reported
+   but not copied (`--include-blobs` overrides).
+5. `uv run scripts/oracle-diff.py pmp <file.pmp>` — ad-hoc decode of any pmp.
+
+Fixture pairs are synthetic → committable; the accumulated
+`fixtures/oracle/` corpus is the ground truth for the Fauxcasa parser/writer
+test suite. Session log: bead `fauxcasa-dcc`.
