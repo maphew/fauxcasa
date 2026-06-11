@@ -95,3 +95,11 @@ Harness: `scripts/oracle-diff.py` (stdlib-only; watches `db3/`,
 Fixture pairs are synthetic → committable; the accumulated
 `fixtures/oracle/` corpus is the ground truth for the Fauxcasa parser/writer
 test suite. Session log: bead `fauxcasa-dcc`.
+
+## Scale runs
+
+For indexing-at-scale experiments, clone the prefix and point the clone's
+`watchedfolders.txt` at a bigger generated library
+(`scripts/make-synthetic-library.py --scale N`) — full recipe and the
+1000-photo results are in `oracle-db3-survey.md`. Never repoint or reset the
+oracle prefix itself: it is the live baseline for differential fixtures.

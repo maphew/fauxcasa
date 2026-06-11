@@ -32,7 +32,7 @@ Usage as a CLI (any of)::
     uv run scripts/picasa_db.py table DB3 imagedata --limit 10
     uv run scripts/picasa_db.py thumbindex DB3/thumbindex.db --paths
     uv run scripts/picasa_db.py ini /photos/2009/.picasa.ini
-    uv run scripts/picasa_db.py survey DB3 --redact
+    uv run scripts/picasa_db.py survey DB3 --library /photos --json
 
 ``--redact`` replaces every decoded string with ``<len=N sha1=8hex>`` so the
 output is safe to share when run against private libraries (field types,
@@ -51,6 +51,7 @@ import math
 import re
 import struct
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -502,6 +503,60 @@ def thumbindex_full_paths(entries: list[ThumbIndexEntry]) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# repository.dat / usernames.dat — version-sentinel key/value stores
+# --------------------------------------------------------------------------
+
+
+class RepositoryError(ValueError):
+    """Raised when repository.dat fails structural validation.
+
+    Messages carry only the file name and numbers (no decoded content),
+    so they are safe to show in redacted output.
+    """
+
+
+def read_repository(path: Path | str) -> list[tuple[str, str]]:
+    """Parse repository.dat (or usernames.dat): NUL-terminated key/value pairs.
+
+    Layout, derived from oracle-written files (no prior-art writeup known):
+
+        u32 magic 0x3fcccccd | u32 pair-count
+        then per pair: NUL-terminated key | NUL-terminated value
+
+    repository.dat holds Picasa's format-version sentinels — the oracle
+    writes KeywordVersion=1, contactsversion=1.0, rawversion=1.1,
+    colorspaceversion=1.1, frversion=1.5, Folders=1, gpsversion=1.0,
+    flat=1, IDPersist=2. usernames.dat shares the layout (0 pairs until a
+    Google account signs in). Order and duplicates are preserved.
+    """
+    path = Path(path)
+    data = path.read_bytes()
+    if len(data) < 8:
+        raise RepositoryError(f"{path.name}: too small ({len(data)} bytes)")
+    magic, count = struct.unpack_from("<II", data, 0)
+    if magic != PMP_MAGIC:
+        raise RepositoryError(f"{path.name}: bad magic 0x{magic:08x}")
+    pairs: list[tuple[str, str]] = []
+    pos = 8
+    for i in range(count):
+        fields: list[str] = []
+        for _ in range(2):
+            end = data.find(b"\x00", pos)
+            if end < 0:
+                raise RepositoryError(
+                    f"{path.name}: truncated in pair {i} of {count} at offset {pos}"
+                )
+            fields.append(data[pos:end].decode("utf-8", "surrogateescape"))
+            pos = end + 1
+        pairs.append((fields[0], fields[1]))
+    if pos != len(data):
+        raise RepositoryError(
+            f"{path.name}: {len(data) - pos} unconsumed bytes after pair {count}"
+        )
+    return pairs
+
+
+# --------------------------------------------------------------------------
 # .picasa.ini
 # --------------------------------------------------------------------------
 
@@ -894,26 +949,53 @@ def cmd_ini(args: argparse.Namespace) -> int:
     return 0
 
 
-# db3 sidecar files Picasa itself creates have lowercase machine names
-# (thumbs2_0.db, repository.dat, scanlist.txt, ...): such names are format
-# vocabulary, safe to print in a survey. Anything else found in the
-# directory gets its name redacted (a stray user file's name could be
-# personal).
-_SURVEY_NAME_RE = re.compile(r"^[a-z0-9_\-]+\.(db|dat|txt|tid|ioq|xml|lck)$")
+# db3 sidecar names Picasa itself creates — exact vocabulary (validated
+# against oracle-written databases) plus the numbered cache/index families.
+# Anything else gets its name redacted: a stray user file's name could be
+# personal, and over-redaction is the safe direction (the record survives
+# as <len/sha1>). Deliberately NOT a shape heuristic: "Passwords.txt"
+# must redact even though it looks machine-ish.
+_SURVEY_KNOWN_FILES = frozenset(
+    """thumbindex.db repository.dat usernames.dat wordhash.dat
+    facetags.txt tags.txt starlist.txt scanlist.txt saverlist.txt""".split()
+)
+_SURVEY_FAMILY_RE = re.compile(
+    r"^(thumbs2?|bigthumbs|previews|albums|profilephotos|facetemplatesV2)"
+    r"_(\d+|index)\.db$"
+)
+
+# .pmp names are printable only when both halves are format vocabulary:
+# the table prefix must be one of the three tables Picasa 3.x writes (per
+# the binary's schema string table, picasa-binary-notes.md) and the column
+# must look like its lowercase machine names — a renamed personal copy
+# ("Aunt Edna Wedding_notes.pmp") fails both gates.
+_PMP_KNOWN_TABLES = frozenset({"imagedata", "albumdata", "catdata"})
+_PMP_COLUMN_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 
 def _survey_name(p: Path) -> str:
-    return p.name if _SURVEY_NAME_RE.match(p.name) else _redact_str(p.name)
+    if p.name in _SURVEY_KNOWN_FILES or _SURVEY_FAMILY_RE.match(p.name):
+        return p.name
+    return _redact_str(p.name)
+
+
+def _survey_pmp_name(p: Path) -> str:
+    table, column = split_pmp_name(p)
+    if table in _PMP_KNOWN_TABLES and _PMP_COLUMN_RE.match(column):
+        return p.name
+    return _redact_str(p.name)
 
 
 def _survey_one(p: Path) -> dict[str, Any]:
     if p.name.endswith("_0"):
-        return {"file": p.name, "kind": "marker", "ok": is_pmp_marker(p)}
+        shown = p.name if p.name[:-2] in _PMP_KNOWN_TABLES else _redact_str(p.name)
+        return {"file": shown, "kind": "marker", "ok": is_pmp_marker(p)}
     if p.suffix == ".pmp":
+        shown = _survey_pmp_name(p)
         try:
             col = read_pmp(p, strict=False)
             return {
-                "file": p.name,
+                "file": shown,
                 "kind": "pmp",
                 "type": f"0x{col.field_type:x}",
                 "type_name": col.type_name,
@@ -923,8 +1005,12 @@ def _survey_one(p: Path) -> dict[str, Any]:
                 "ok": len(col.values) == col.count and col.trailing_bytes == 0,
             }
         except PmpError as e:
-            # PmpError messages carry only the file name and numbers
-            return {"file": p.name, "kind": "pmp", "ok": False, "error": str(e)}
+            # PmpError messages carry only the file name and numbers; strip
+            # the name when it was redacted above
+            err = str(e)
+            if shown != p.name:
+                err = err.replace(p.name, "<redacted>")
+            return {"file": shown, "kind": "pmp", "ok": False, "error": err}
     if p.name == "thumbindex.db":
         try:
             entries = read_thumbindex(p)
@@ -940,8 +1026,293 @@ def _survey_one(p: Path) -> dict[str, Any]:
     return {"file": _survey_name(p), "kind": "other", "bytes": p.stat().st_size}
 
 
+# ---- survey rollups (all counts-only: no decoded values ever escape) ------
+
+_STRING_TYPE_NAMES = ("string", "string6")
+
+
+def _count_populated(col: PmpColumn) -> int:
+    """Values that differ from the type's default (empty string / zero)."""
+    if col.type_name in _STRING_TYPE_NAMES:
+        return sum(1 for v in col.values if v != "")
+    return sum(1 for v in col.values if v != 0)
+
+
+def _read_col(db3: Path, table: str, column: str) -> PmpColumn | None:
+    p = db3 / f"{table}_{column}.pmp"
+    if not p.is_file():
+        return None
+    try:
+        return read_pmp(p, strict=False)
+    except (PmpError, OSError):
+        return None  # already flagged in the per-file section
+
+
+def _survey_tables(db3: Path) -> dict[str, Any]:
+    """Per-table rollup: row count and per-column type/populated stats.
+
+    Table and column names are filename-derived, so they pass the same
+    vocabulary gates as _survey_pmp_name before being used as output keys.
+    """
+    tables: dict[str, Any] = {}
+    for name in sorted({split_pmp_name(p)[0] for p in db3.glob("*_*.pmp")}):
+        cols: dict[str, Any] = {}
+        n_rows = 0
+        for path in sorted(db3.glob(f"{name}_*.pmp")):
+            try:
+                col = read_pmp(path, strict=False)
+            except (PmpError, OSError):
+                continue  # already flagged in the per-file section
+            col_key = (
+                col.column
+                if name in _PMP_KNOWN_TABLES and _PMP_COLUMN_RE.match(col.column)
+                else _redact_str(col.column)
+            )
+            cols[col_key] = {
+                "type": col.type_name,
+                "rows": len(col.values),
+                "populated": _count_populated(col),
+                # cardinality exposes constant/marker columns (e.g. the
+                # facerect "scanned, no face" sentinel) without any values;
+                # NaNs collapse to one bucket (hash(nan) is id-based, so a
+                # set would count each corrupt double as unique)
+                "distinct": len(
+                    {
+                        "<nan>" if isinstance(v, float) and math.isnan(v) else v
+                        for v in col.values
+                    }
+                ),
+            }
+            n_rows = max(n_rows, len(col.values))
+        table_key = name if name in _PMP_KNOWN_TABLES else _redact_str(name)
+        tables[table_key] = {"rows": n_rows, "columns": cols}
+    return tables
+
+
+# Exact version-sentinel vocabulary: the nine keys the oracle writes plus
+# dbVersion from the binary's own string table (picasa-binary-notes.md).
+# Keys outside this set — notably anything in a signed-in usernames.dat,
+# whose populated format embeds account data and has never been observed —
+# are redacted, and values print only under a known key and only when
+# version-number shaped (a 10-digit timestamp or date-like number fails).
+_REPOSITORY_KNOWN_KEYS = frozenset(
+    """KeywordVersion contactsversion rawversion colorspaceversion
+    frversion Folders gpsversion flat IDPersist dbVersion""".split()
+)
+_SENTINEL_VAL_RE = re.compile(r"^[0-9]{1,4}(\.[0-9]{1,4})?$")
+
+
+def _survey_sentinels(db3: Path) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for fname in ("repository.dat", "usernames.dat"):
+        p = db3 / fname
+        if not p.is_file():
+            out[fname] = {"present": False}
+            continue
+        try:
+            pairs = read_repository(p)
+        except RepositoryError as e:
+            out[fname] = {"present": True, "ok": False, "error": str(e)}
+            continue
+        except OSError as e:
+            out[fname] = {"present": True, "ok": False, "error": type(e).__name__}
+            continue
+        out[fname] = {
+            "present": True,
+            "ok": True,
+            "pairs": [
+                [
+                    k if k in _REPOSITORY_KNOWN_KEYS else _redact_str(k),
+                    v
+                    if k in _REPOSITORY_KNOWN_KEYS and _SENTINEL_VAL_RE.match(v)
+                    else _redact_str(v),
+                ]
+                for k, v in pairs
+            ],
+        }
+    return out
+
+
+def _safe_size(p: Path) -> int:
+    """Size, or 0 if the file vanished mid-survey (Picasa may be live)."""
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
+
+
+def _survey_scale(db3: Path) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    ti = db3 / "thumbindex.db"
+    if ti.is_file():
+        try:
+            entries = read_thumbindex(ti, strict=False)
+        except (ThumbIndexError, OSError):
+            entries = None  # already flagged in the per-file section
+        if entries is not None:
+            live = [e for e in entries if not e.is_folder and not e.is_deleted]
+            by_ftype = Counter(e.ftype_name for e in live)
+            out["thumbindex"] = {
+                "entries": len(entries),
+                "folders": sum(1 for e in entries if e.is_folder),
+                "files": len(live),
+                "deleted": sum(1 for e in entries if e.is_deleted),
+                "by_ftype": dict(sorted(by_ftype.items())),
+                # deleted slots keep a stale size; count live files only
+                "file_bytes": sum(e.size for e in live),
+            }
+    files = [p for p in db3.iterdir() if p.is_file()]
+    out["db3_bytes"] = {
+        "pmp": sum(_safe_size(p) for p in files if p.suffix == ".pmp"),
+        # regenerable caches: every .db except the thumbindex catalog
+        "cache_db": sum(
+            _safe_size(p)
+            for p in files
+            if p.suffix == ".db" and p.name != "thumbindex.db"
+        ),
+        "total": sum(_safe_size(p) for p in files),
+    }
+    return out
+
+
+def _count_lines(path: Path) -> int:
+    text = path.read_bytes().decode("utf-8", "surrogateescape")
+    return sum(1 for line in text.splitlines() if line.strip())
+
+
+def _survey_features(db3: Path) -> dict[str, Any]:
+    """Feature-usage counts from db3: how much of the library uses what."""
+    feats: dict[str, Any] = {}
+    for fname, key in (("starlist.txt", "starlist_entries"),):
+        p = db3 / fname
+        if p.is_file():
+            try:
+                feats[key] = _count_lines(p)
+            except OSError:
+                feats[key] = None
+    cat = _read_col(db3, "albumdata", "category")
+    if cat is not None:
+        feats["albumdata_categories"] = {
+            "album": sum(1 for v in cat.values if v == ALBUM_CATEGORY_ALBUM),
+            "folder": sum(1 for v in cat.values if v == ALBUM_CATEGORY_FOLDER),
+            "other": sum(
+                1
+                for v in cat.values
+                if v not in (ALBUM_CATEGORY_ALBUM, ALBUM_CATEGORY_FOLDER)
+            ),
+        }
+    for column in (
+        "caption",
+        "crop64",
+        "rotate",
+        "flipped",
+        "filters",
+        "redo",
+        "edited",
+        "revertable",
+        "facerect",
+        "facerectdata",
+        "text",
+        "textactive",
+    ):
+        col = _read_col(db3, "imagedata", column)
+        if col is not None:
+            feats[f"imagedata_{column}_populated"] = _count_populated(col)
+    return feats
+
+
+def _classify_ini_section(name: str) -> str:
+    n = name.lower()
+    if n in ("picasa", "encoding", "contacts2"):
+        return n
+    if n.startswith(".album:"):
+        return "album"
+    if n == "":
+        return "<headerless>"
+    # filename-like sections hold per-file metadata; anything else is rare
+    return "file" if "." in n else "other"
+
+
+# ini keys that mark an edit on the file when present at all
+_INI_EDIT_KEYS = frozenset(
+    "filters crop crop64 rotate flipped redo textactive".split()
+)
+
+
+def _survey_ini_tree(root: Path) -> dict[str, Any]:
+    """Aggregate .picasa.ini usage across a library tree.
+
+    Counts only — no paths, section names, key names outside the known
+    vocabulary, or values appear in the output, so this is safe to run on
+    a private library by construction.
+    """
+    n_files = 0
+    n_dirs = 0
+    read_errors = 0
+    anomalies = 0
+    sections: Counter[str] = Counter()
+    keys: Counter[str] = Counter()
+    feats: Counter[str] = Counter()
+    for p in sorted(root.rglob("*")):
+        if p.is_dir():
+            n_dirs += 1
+            continue
+        if p.name.lower() not in (".picasa.ini", "picasa.ini") or not p.is_file():
+            continue
+        n_files += 1
+        try:
+            ini = read_picasa_ini(p)
+        except OSError:
+            read_errors += 1
+            continue
+        anomalies += len(ini.anomalies)
+        for s in ini.sections:
+            kind = _classify_ini_section(s.name)
+            sections[kind] += 1
+            if kind == "contacts2":
+                feats["contacts"] += len(s.items)
+                continue
+            for k, v in s.items:
+                kl = k.strip().lower()
+                keys[kl if kl in _INI_KNOWN_KEYS else "<other>"] += 1
+                if kl == "star" and v.strip().lower() == "yes":
+                    feats["starred"] += 1
+                elif kl == "caption" and v.strip():
+                    feats["captioned"] += 1
+                elif kl == "keywords" and v.strip():
+                    feats["keyworded"] += 1
+                elif kl == "geotag":
+                    feats["geotagged"] += 1
+                elif kl == "faces":
+                    try:
+                        faces = parse_faces(v)
+                    except ValueError:
+                        feats["faces_parse_errors"] += 1
+                    else:
+                        feats["face_tags"] += len(faces)
+                        feats["face_tags_named"] += sum(
+                            1 for _, c in faces if c != UNKNOWN_CONTACT
+                        )
+                elif kl == "albums" and v.strip():
+                    feats["album_memberships"] += sum(
+                        1 for t in v.split(",") if t.strip()
+                    )
+                if kl in _INI_EDIT_KEYS:
+                    feats["edit_keys"] += 1
+    return {
+        "ini_files": n_files,
+        # distinguishes "library has no ini files" from a near-empty walk
+        "dirs_walked": n_dirs,
+        "read_errors": read_errors,
+        "anomalies": anomalies,
+        "sections": dict(sorted(sections.items())),
+        "keys": dict(sorted(keys.items())),
+        "features": dict(sorted(feats.items())),
+    }
+
+
 def cmd_survey(args: argparse.Namespace) -> int:
-    """Structural survey of a db3 directory: types, counts, validity.
+    """Structural survey of a db3 directory (and optionally a library tree).
 
     Output contains no decoded string values, timestamps, or non-Picasa
     file names regardless of --redact; this subcommand is meant to be safe
@@ -952,8 +1323,19 @@ def cmd_survey(args: argparse.Namespace) -> int:
     embed the full filesystem path.
     """
     db3 = Path(args.db3)
-    report: list[dict[str, Any]] = []
-    for p in sorted(db3.iterdir()):
+    if args.library and not Path(args.library).is_dir():
+        # fail loudly: a typo'd path would otherwise survey as a plausible
+        # "library with zero ini files". No path in the message — survey
+        # output (stderr included) must stay shareable.
+        print("error: --library path is not a directory", file=sys.stderr)
+        return 2
+    try:
+        listing = sorted(db3.iterdir())
+    except OSError as e:
+        print(f"error: cannot read db3 directory ({type(e).__name__})", file=sys.stderr)
+        return 2
+    files_report: list[dict[str, Any]] = []
+    for p in listing:
         try:
             rec = _survey_one(p)
         except OSError as e:
@@ -963,12 +1345,34 @@ def cmd_survey(args: argparse.Namespace) -> int:
                 "ok": False,
                 "error": type(e).__name__,
             }
-        report.append(rec)
+        files_report.append(rec)
+
+    def rollup(fn: Any, *fn_args: Any) -> Any:
+        # a file vanishing mid-walk (live Picasa) must degrade one section,
+        # not crash the survey with a full path in the traceback
+        try:
+            return fn(*fn_args)
+        except OSError as e:
+            return {"error": type(e).__name__}
+
+    report: dict[str, Any] = {
+        "files": files_report,
+        "tables": rollup(_survey_tables, db3),
+        "sentinels": rollup(_survey_sentinels, db3),
+        "scale": rollup(_survey_scale, db3),
+        "features": rollup(_survey_features, db3),
+    }
+    if args.library:
+        report["library"] = rollup(_survey_ini_tree, Path(args.library))
     if args.json:
         _print_json(report)
     else:
-        for rec in report:
+        for rec in files_report:
             print(rec)
+        for section in ("tables", "sentinels", "scale", "features", "library"):
+            if section in report:
+                print(f"--- {section} ---")
+                _print_json(report[section])
     return 0
 
 
@@ -1013,6 +1417,11 @@ def main(argv: list[str] | None = None) -> int:
         "survey", help="structural survey of a db3 directory", parents=[common]
     )
     p.add_argument("db3")
+    p.add_argument(
+        "--library",
+        default=None,
+        help="also aggregate .picasa.ini usage across this library tree",
+    )
     p.set_defaults(func=cmd_survey)
 
     args = ap.parse_args(argv)

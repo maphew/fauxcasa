@@ -643,9 +643,253 @@ def test_cli_survey_never_raises_and_redacts_foreign_names(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Aunt Edna" not in out
     assert "repository.dat" in out
-    recs = _json.loads(out)
-    assert any(r.get("ok") is False for r in recs)  # corrupt pmp reported
+    report = _json.loads(out)
+    assert any(r.get("ok") is False for r in report["files"])  # corrupt pmp
+    assert report["sentinels"]["repository.dat"]["ok"] is False  # bad magic
     assert str(d) not in out  # no absolute paths anywhere
+
+
+# --------------------------------------------------------------------------
+# repository.dat / usernames.dat
+# --------------------------------------------------------------------------
+
+
+def make_repository(pairs: list[tuple[str, str]]) -> bytes:
+    out = struct.pack("<II", pdb.PMP_MAGIC, len(pairs))
+    for k, v in pairs:
+        out += k.encode() + b"\x00" + v.encode() + b"\x00"
+    return out
+
+
+def test_repository_roundtrip(tmp_path):
+    p = tmp_path / "repository.dat"
+    pairs = [("KeywordVersion", "1"), ("gpsversion", "1.0")]
+    p.write_bytes(make_repository(pairs))
+    assert pdb.read_repository(p) == pairs
+
+
+def test_repository_empty(tmp_path):
+    p = tmp_path / "usernames.dat"
+    p.write_bytes(make_repository([]))
+    assert pdb.read_repository(p) == []
+
+
+def test_repository_bad_magic(tmp_path):
+    p = tmp_path / "repository.dat"
+    p.write_bytes(b"\x00" * 8)
+    with pytest.raises(pdb.RepositoryError, match="magic"):
+        pdb.read_repository(p)
+
+
+def test_repository_truncated(tmp_path):
+    p = tmp_path / "repository.dat"
+    p.write_bytes(make_repository([("a", "1")])[:-1])
+    with pytest.raises(pdb.RepositoryError, match="truncated"):
+        pdb.read_repository(p)
+
+
+def test_repository_trailing_bytes(tmp_path):
+    p = tmp_path / "repository.dat"
+    p.write_bytes(make_repository([("a", "1")]) + b"x")
+    with pytest.raises(pdb.RepositoryError, match="unconsumed"):
+        pdb.read_repository(p)
+
+
+# --------------------------------------------------------------------------
+# survey rollups (tables / sentinels / scale / features / --library)
+# --------------------------------------------------------------------------
+
+
+def _survey_rollup_fixture(tmp_path: Path) -> Path:
+    """A db3 dir whose every user-data value contains the SECRET marker."""
+    db3 = tmp_path / "db3"
+    db3.mkdir()
+    write_pmp(db3, "imagedata_caption.pmp", 0x0, b"SECRETCAP\x00\x00\x00", 3)
+    write_pmp(db3, "imagedata_rotate.pmp", 0x1, struct.pack("<3I", 0, 1, 0), 3)
+    write_pmp(
+        db3, "albumdata_category.pmp", 0x1, struct.pack("<3I", 0, 2, 0xFFFF), 3
+    )
+    (db3 / "thumbindex.db").write_bytes(
+        make_thumbindex(
+            [
+                ("C:\\SECRETDIR\\", 10, 20, 0, 0x01, 0, 1, 0xFFFFFFFF),
+                ("SECRETFILE.jpg", 12, 22, 999, 0x02, 0, 1, 0),
+            ]
+        )
+    )
+    (db3 / "starlist.txt").write_bytes(b"C:\\SECRETDIR\\SECRETFILE.jpg\r\n\r\n")
+    # the four sentinel quadrants: known key + version value (prints),
+    # known key + non-version value, unknown-but-word-shaped key (the
+    # signed-in usernames.dat shape), junk key + junk value (all redact)
+    (db3 / "repository.dat").write_bytes(
+        make_repository(
+            [
+                ("KeywordVersion", "1"),
+                ("contactsversion", "1244102400"),
+                ("username", "SECRETUSER"),
+                ("odd key!", "SECRETVAL"),
+            ]
+        )
+    )
+    return db3
+
+
+def test_survey_rollups(tmp_path, capsys):
+    db3 = _survey_rollup_fixture(tmp_path)
+    assert pdb.main(["survey", str(db3), "--json"]) == 0
+    report = _json.loads(capsys.readouterr().out)
+    assert report["tables"]["imagedata"]["columns"]["caption"] == {
+        "type": "string",
+        "rows": 3,
+        "populated": 1,
+        "distinct": 2,
+    }
+    assert report["features"]["starlist_entries"] == 1
+    assert report["features"]["albumdata_categories"] == {
+        "album": 1,
+        "folder": 1,
+        "other": 1,
+    }
+    ti = report["scale"]["thumbindex"]
+    assert ti["entries"] == 2 and ti["folders"] == 1 and ti["files"] == 1
+    assert ti["by_ftype"] == {"jpeg": 1} and ti["file_bytes"] == 999
+    pairs = dict(map(tuple, report["sentinels"]["repository.dat"]["pairs"]))
+    assert pairs["KeywordVersion"] == "1"
+    # known key, non-version-shaped value: key prints, value redacted
+    assert pairs["contactsversion"].startswith("<len=10 ")
+
+
+def test_survey_rollups_never_leak_values(tmp_path, capsys):
+    db3 = _survey_rollup_fixture(tmp_path)
+    for argv in ([], ["--json"], ["--redact"]):
+        assert pdb.main(["survey", str(db3)] + argv) == 0
+        out = capsys.readouterr().out
+        assert "SECRET" not in out  # captions, paths, odd sentinel values
+        assert "odd key!" not in out  # sentinel key outside vocabulary
+        # word-shaped key outside vocabulary is redacted (quoted: the
+        # legitimate "usernames.dat" file name contains the substring)
+        assert '"username"' not in out
+        assert "1244102400" not in out  # timestamp under a known key
+
+
+def test_survey_usernames_dat_fully_redacted(tmp_path, capsys):
+    """The populated usernames.dat format is unobserved account data:
+    every key and value must redact, however machine-ish they look."""
+    db3 = tmp_path / "db3"
+    db3.mkdir()
+    (db3 / "usernames.dat").write_bytes(
+        make_repository(
+            [("maphew_gmail_com", "20091225"), ("IIDLIST_maphew_lh", "1.0")]
+        )
+    )
+    assert pdb.main(["survey", str(db3), "--json"]) == 0
+    out = capsys.readouterr().out
+    for leak in ("maphew", "gmail", "IIDLIST", "20091225"):
+        assert leak not in out, leak
+    report = _json.loads(out)
+    assert len(report["sentinels"]["usernames.dat"]["pairs"]) == 2
+
+
+def test_survey_filename_gates(tmp_path, capsys):
+    db3 = tmp_path / "db3"
+    db3.mkdir()
+    # known vocabulary prints
+    (db3 / "facetemplatesV2_0.db").write_bytes(b"\x00" * 4)
+    (db3 / "thumbs2_index.db").write_bytes(b"\x00" * 4)
+    # space-free personal names must still redact (no shape heuristics)
+    (db3 / "MomsTherapyNotes.txt").write_text("x")
+    (db3 / "Passwords.dat").write_text("x")
+    # stray *_*.pmp: name redacted in files AND tables sections
+    (db3 / "Aunt Edna Wedding_notes.pmp").write_bytes(b"junk")
+    # valid pmp under a known table but non-machine column name
+    write_pmp(db3, "imagedata_MomSecret.pmp", 0x1, struct.pack("<I", 7), 1)
+    # marker-shaped file of an unknown table
+    (db3 / "secrets_0").write_bytes(struct.pack("<I", pdb.PMP_MAGIC))
+    assert pdb.main(["survey", str(db3), "--json"]) == 0
+    out = capsys.readouterr().out
+    assert "facetemplatesV2_0.db" in out and "thumbs2_index.db" in out
+    for leak in ("MomsTherapyNotes", "Passwords", "Aunt Edna", "Edna Wedding",
+                 "MomSecret", "secrets"):
+        assert leak not in out, leak
+    report = _json.loads(out)
+    assert "imagedata" in report["tables"]  # known table key survives
+
+
+def test_survey_library_missing_dir_fails_loudly(tmp_path, capsys):
+    db3 = tmp_path / "db3"
+    db3.mkdir()
+    missing = tmp_path / "no-such-library"
+    assert pdb.main(["survey", str(db3), "--library", str(missing)]) == 2
+    err = capsys.readouterr().err
+    assert "not a directory" in err
+    assert str(missing) not in err  # error path stays redacted too
+
+
+def test_survey_file_bytes_excludes_deleted_entries(tmp_path, capsys):
+    db3 = tmp_path / "db3"
+    db3.mkdir()
+    rows = SAMPLE_TI + [("", 0, 0, 5000, 0x00, 0, 0, 0xFFFFFFFF)]  # stale size
+    (db3 / "thumbindex.db").write_bytes(make_thumbindex(rows))
+    assert pdb.main(["survey", str(db3), "--json"]) == 0
+    ti = _json.loads(capsys.readouterr().out)["scale"]["thumbindex"]
+    assert ti["deleted"] == 1
+    assert ti["file_bytes"] == 999 + 888  # a.jpg + b.jpg, not the stale 5000
+
+
+def test_survey_distinct_collapses_nan_dates(tmp_path, capsys):
+    db3 = tmp_path / "db3"
+    db3.mkdir()
+    nan = struct.pack("<d", float("nan"))
+    write_pmp(db3, "imagedata_date.pmp", 0x2, nan * 3, 3)
+    assert pdb.main(["survey", str(db3), "--json"]) == 0
+    col = _json.loads(capsys.readouterr().out)["tables"]["imagedata"]["columns"][
+        "date"
+    ]
+    assert col["distinct"] == 1  # one corrupt constant, not three uniques
+
+
+def test_survey_ini_tree(tmp_path, capsys):
+    lib = tmp_path / "lib"
+    (lib / "f1").mkdir(parents=True)
+    (lib / "f1" / ".picasa.ini").write_text(
+        "[SECRETPHOTO.jpg]\n"
+        "star=yes\n"
+        "caption=SECRETCAPTION\n"
+        "keywords=SECRETKW\n"
+        "geotag=48.2,16.3\n"
+        "faces=rect64(1234567890abcdef),ffffffffffffffff;"
+        "rect64(fedcba0987654321),1234567890abcdef\n"
+        "albums=deadbeefdeadbeefdeadbeefdeadbeef\n"
+        "rotate=rotate(1)\n"
+        "SECRETKEY=x\n"
+        "[.album:deadbeefdeadbeefdeadbeefdeadbeef]\n"
+        "name=SECRETALBUM\n"
+        "token=]album:deadbeefdeadbeefdeadbeefdeadbeef\n"
+        "[Contacts2]\n"
+        "1234567890abcdef=SECRETNAME;;\n",
+        encoding="utf-8",
+    )
+    (lib / "f2").mkdir()
+    (lib / "f2" / "Picasa.ini").write_text("[p.jpg]\nstar=yes\n", encoding="utf-8")
+    db3 = tmp_path / "db3"
+    db3.mkdir()
+    assert pdb.main(["survey", str(db3), "--library", str(lib), "--json"]) == 0
+    out = capsys.readouterr().out
+    assert "SECRET" not in out  # no filenames, captions, keys, or contacts
+    report = _json.loads(out)["library"]
+    assert report["ini_files"] == 2
+    assert report["read_errors"] == 0 and report["anomalies"] == 0
+    assert report["sections"] == {"album": 1, "contacts2": 1, "file": 2}
+    assert report["keys"]["<other>"] == 1  # SECRETKEY counted, not named
+    feats = report["features"]
+    assert feats["starred"] == 2
+    assert feats["captioned"] == 1
+    assert feats["keyworded"] == 1
+    assert feats["geotagged"] == 1
+    assert feats["face_tags"] == 2 and feats["face_tags_named"] == 1
+    assert feats["album_memberships"] == 1
+    assert feats["edit_keys"] == 1  # rotate; faces/star/caption are not edits
+    assert feats["contacts"] == 1
 
 
 # --------------------------------------------------------------------------
@@ -742,6 +986,30 @@ def test_oracle_album_dates_plausible():
     for v in col.values:
         dt = pdb.ole_to_datetime(v)
         assert 2000 < dt.year < 2100
+
+
+@needs_oracle
+def test_oracle_repository_sentinels():
+    pairs = dict(pdb.read_repository(ORACLE_DB3 / "repository.dat"))
+    assert pairs["KeywordVersion"] == "1"
+    assert pairs["frversion"] == "1.5"
+    assert pairs["gpsversion"] == "1.0"
+    assert pdb.read_repository(ORACLE_DB3 / "usernames.dat") == []
+
+
+@needs_oracle
+def test_oracle_survey_runs_clean(capsys):
+    argv = ["survey", str(ORACLE_DB3), "--library", str(SYNTH_LIB), "--json"]
+    assert pdb.main(argv) == 0
+    report = _json.loads(capsys.readouterr().out)
+    bad = [r for r in report["files"] if not r.get("ok", True)]
+    assert not bad, bad
+    ti = report["scale"]["thumbindex"]
+    assert ti["files"] >= 24 and ti["deleted"] == 0
+    # every imagedata column row count is bounded by the thumbindex join key
+    assert report["tables"]["imagedata"]["rows"] == ti["entries"]
+    assert report["sentinels"]["repository.dat"]["ok"] is True
+    assert report["library"]["ini_files"] >= 3
 
 
 # --------------------------------------------------------------------------
