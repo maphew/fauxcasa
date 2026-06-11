@@ -45,3 +45,10 @@ with source attribution in its header:
 
 Synthesized observations (features, UI anatomy, behaviors, workflows) extracted
 from the tutorial videos via transcripts + frame analysis.
+
+## picasa-binary-notes.md
+
+Static-analysis (strings) findings from the final Picasa 3.9 Windows binary:
+database schema vocabulary, `.picasa.ini` keys, filter op names, registry
+locations, locking protocol. Installer + extracted tree + full dumps cached in
+`cache/installers/` (gitignored; provenance and SHA-256 in the notes).
