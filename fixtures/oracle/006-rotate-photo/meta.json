@@ -1,0 +1,37 @@
+{
+ "fixture": "006-rotate-photo",
+ "note": "Rotate clockwise in library view (no save): selected photo00.jpg in '2010-12-25 Winter Holiday', Ctrl+R once. Artifacts: ini [photo00.jpg] rotate=rotate(1) + backuphash=43584. JPEG untouched; imagedata_rotate.pmp NOT updated (exists since 005 flush but live edit is ini-only); albumdata_date[6] ('Search results' row) ticked again - it updates on every action, an activity timestamp.",
+ "captured": "2026-06-11T16:14:35+00:00",
+ "baseline": {
+  "label": "after 005-save-crop-to-disk",
+  "created": "2026-06-11T16:11:05+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "fb54664d44d16521a43c0ae84c398869cfa9cfa0a55bda4ff8739febbaba29e5",
+    "size": 108
+   },
+   "after": {
+    "sha256": "f158c69fef4708475792f7f2b4940fbcbfe71e7b508d210d76f38a6986945f38",
+    "size": 108
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d48c17f0473e3dc3f317eb81e1f805e6f4a308d681cee978fe93f3b9c4c13042",
+    "size": 25
+   },
+   "after": {
+    "sha256": "47dfc846bc1e2b6bba96d67622d871818d698a762fc664cd05d49614b9e3d0aa",
+    "size": 76
+   }
+  }
+ }
+}
