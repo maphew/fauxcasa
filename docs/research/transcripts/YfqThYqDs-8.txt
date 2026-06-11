@@ -1,0 +1,149 @@
+[Music]
+hi this is Chris gold with geeks on tour
+and I'm using Picassa right now to
+transfer some picture files from one USB
+external hard drive to another and I
+want to show you how I'm doing it first
+to explain a little bit see I have this
+a passport Drive which I've had for
+quite sometime and I really like
+it but it's only a 250 gbyte and notice
+down here that it's getting kind of full
+so I recently purchased a 500 gigabyte
+Seagate
+drive and it has all this space on it
+what I need to do is transfer all the
+photos I have thousands of photos on the
+passport which I have designated as my P
+drive and I want to move them to the
+Seagate the S Drive first let me show
+you what it looks like just in Windows
+Explorer if I open up my passport
+drive we'll see that I have a folder
+called
+pictures and in there there's going all
+the way back to 2004 there's
+20706 that's that is my notation for the
+year 20 7 and the month of June then
+there's May and April and I want to move
+those to the
+Seagate which I also have a pictures
+folder and it goes back to 2001 I need
+to get those the 2007 on here in Picassa
+when you're in flat folder view that's
+this little button here the normal view
+I can't tell which Drive these are
+on see there's 20712
+20711 and I had it starts with
+2076 which I know is on my passport
+drive and I want to transfer it to the
+Seagate drive I can tell all this though
+if I just go into tree view now I can
+see there's my P drive and here's all
+the folders that are on it I want to
+move these from the P
+drive to the S Drive in the pictures see
+I've moved a lot of them already there's
+2006 but the ones
+remaining are these here's how you do
+it and and by the way why do I want to
+do it in Picasso why don't I just drag
+them over from Windows Explorer well
+because a lot of these pictures have
+have have
+places people tags and they're in albums
+Picassa has a lot of information
+surrounding these pictures if I move
+them outside of Picassa they'll get lost
+to the Picassa information but if I use
+Picassa to move them then all that
+information stays
+intact also Picassa is actually easier
+to do this than Windows Explorer
+step one select the folder that you want
+to move rightclick choose move folder
+now it I know that I'm moving a folder
+from the P drive and I need to send it
+to the S drive so there's the seate
+drive and
+pictures and I want this
+20062 to be in the folder
+2006 you can see right here it says move
+folder to s pictures
+okay and it is moving them first it
+copies once the copy is complete then it
+deletes it does it all for you and it
+takes a few seconds depend this is three
+it's moving 318 pictures now it's almost
+done and I want you to watch over here
+you will see the folder
+disappear from its location in the P
+drive and it will appear in its new
+location there see it's gone from the P
+drive now and if I come up here on the S
+drive we'll see there is 201612 with 308
+pictures I go back to Flat folder View
+and I'll see2 20062 and in the flat
+folder view we don't care what drive
+it's on Picassa is handling all of that
+now you might ask well can I move an
+entire folder
+structure it depends notice that this
+folder here 2072 does have two other
+folders under it I can move this top
+level
+folder to the other drive to the s
+pictures ah now I need it to be
+2007 and it
+will move the
+subfolders however I would not be able
+to select this folder and have it move
+all the ones underneath why because this
+folder notice it just looks like a
+manila folder it doesn't have have the
+little picture thumbnail on it it can't
+move that Picassa can only move folders
+that have pictures inside the
+folder if I put a picture in that folder
+then I suppose I could move the whole
+thing but I kind of like moving each
+month individually it just gives me a
+good secure feeling but I like the fact
+that I can move this whole month and it
+does move the folders that are inside
+it and how about moving folders just
+within a drive so on my S drive now
+where I'm have where I'm keeping all of
+these
+pictures here the S drive I have come to
+the conclusion that I do want them all
+within a folder by year once again you
+don't want to do this just using Windows
+Explorer or you're you lose all the
+extra Picassa information that goes
+along with it so this Memorial Weekend
+folder I look inside and I see that that
+was Memorial weekend of
+2002 so I want to move that Memorial
+Weekend folder inside 2002 but what had
+I said earlier that these this folder
+doesn't actually have any pictures in it
+so I'm going to try that little trick
+and just put one picture directly into
+the memorial weekend folder so I just I
+went into Windows Explorer and I made
+sure to put a picture into just that
+Memorial Weekend folder now notice how
+it has an icon in it now I can right
+click on Memorial
+Weekend move folder so I'm moving this
+Memorial Weekend
+folder into the s pictures
+2002 and notice how fast that worked
+because it wasn't physically copying
+pictures from One drive to another it
+was just moving the location on the disc
+but because I did it with Picassa it's
+going to keep hold of all the special
+Picassa information
+[Music]

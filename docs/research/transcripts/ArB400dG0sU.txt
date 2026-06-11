@@ -1,0 +1,36 @@
+last week I showed you how to make a
+slideshow using an online web
+application called Web 2.0 called photo
+show look at last week's video for that
+but if you're using Picassa you can do a
+similar thing although not quite as
+elegant and you can do it by doing the
+following here I'm in Picassa I'm going
+to click and select a few photos then
+I'm going to go up to
+create and click
+movie when I click create movie I get a
+chance of what size of movie do I want
+I'm just going to do a small for this
+particular demonstration with two
+seconds between each photo and click
+okay then we'll click okay again
+depending on how many pictures you have
+and how large the pictures are the movie
+can take a little while to render once
+the movie is finished Picassa opens up
+the folder where the movie was placed
+usually in the same folder wherever you
+had the pictures so I'm going to double
+click on the movie and play it for you
+it uses the title of the folder that you
+just had as well as the date when you
+created the movie there's no music but
+it does have some panning and zooming on
+the transitions you can pull the movie
+into Windows Movie Maker or any other
+movie editor and add your own music and
+even some more captions and other things
+but at least it's uh something to get
+you started and yet another hidden
+feature in Picassa
