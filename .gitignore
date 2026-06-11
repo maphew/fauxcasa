@@ -13,3 +13,4 @@
 
 # Local env/config (may reference private data paths)
 .env
+__pycache__/

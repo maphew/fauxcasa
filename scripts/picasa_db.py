@@ -101,6 +101,11 @@ class PmpError(ValueError):
     """
 
 
+# MS DATE meaningful range: 0100-01-01 .. 9999-12-31 as days from the epoch
+_OLE_MIN_DAYS = -657434.0
+_OLE_MAX_DAYS = 2958466.0
+
+
 def ole_to_datetime(value: float) -> datetime:
     """Convert an OLE/VARIANT automation date to a naive datetime.
 
@@ -112,7 +117,13 @@ def ole_to_datetime(value: float) -> datetime:
     ``t = 1.0 + t`` to negative fractions (also wrong except at .0/.5);
     we follow the Microsoft definition. Negatives never occur in healthy
     Picasa data (the UI floor is 1903), so flag them as suspect upstream.
+
+    Raises ValueError (never OverflowError) for NaN/inf or values outside
+    the DATE type's year 100-9999 range — corrupt doubles must not crash
+    a caller iterating a damaged column.
     """
+    if not math.isfinite(value) or not _OLE_MIN_DAYS <= value < _OLE_MAX_DAYS:
+        raise ValueError(f"OLE date out of range: {value!r}")
     days = math.trunc(value)
     frac = abs(value - days)
     return OLE_EPOCH + timedelta(days=days) + timedelta(days=frac)
@@ -342,10 +353,17 @@ class ThumbIndexError(ValueError):
 
 
 def filetime_to_datetime(ft: int) -> datetime | None:
-    """Windows FILETIME (100ns ticks since 1601-01-01 UTC) -> datetime."""
+    """Windows FILETIME (100ns ticks since 1601-01-01 UTC) -> datetime.
+
+    Returns None for 0 and for values past datetime's year-9999 range
+    (corrupt timestamps render as None instead of crashing the caller).
+    """
     if ft == 0:
         return None
-    return FILETIME_EPOCH + timedelta(microseconds=ft // 10)
+    try:
+        return FILETIME_EPOCH + timedelta(microseconds=ft // 10)
+    except OverflowError:
+        return None
 
 
 @dataclass
@@ -545,15 +563,18 @@ def read_picasa_ini(path: Path | str) -> PicasaIni:
     sections: list[IniSection] = []
     anomalies: list[str] = []
     current: IniSection | None = None
-    for lineno, line in enumerate(text.split("\n"), 1):
-        line = line.rstrip("\r").strip()
+    for lineno, raw in enumerate(text.split("\n"), 1):
+        raw = raw.rstrip("\r")
+        line = raw.strip()
         if not line:
             continue
         if line.startswith("[") and line.endswith("]"):
             current = IniSection(name=line[1:-1])
             sections.append(current)
             continue
-        key, sep, value = line.partition("=")
+        # split on the raw line so the value keeps its whitespace exactly
+        # (values are user text — a caption may legitimately end in spaces)
+        key, sep, value = raw.partition("=")
         if not sep:
             anomalies.append(f"line {lineno}: no '=' separator")
             continue
@@ -652,7 +673,7 @@ def parse_moddate(value: str) -> datetime:
     ticks = int.from_bytes(bytes.fromhex(s), "little")
     dt = filetime_to_datetime(ticks)
     if dt is None:
-        raise ValueError("moddate is zero")
+        raise ValueError("moddate zero or out of datetime range")
     return dt
 
 
@@ -690,6 +711,24 @@ def _render(value: Any, redact: bool) -> Any:
     return value
 
 
+def _render_ole_date(value: float, redact: bool) -> str:
+    """Render a type-0x2 pmp value. Timestamps are personal data: under
+    --redact neither the decoded date nor the raw float (same information)
+    is shown."""
+    if redact:
+        return "<redacted-date>"
+    try:
+        return f"{value!r} ({ole_to_datetime(value).isoformat()})"
+    except ValueError:
+        return f"{value!r} (invalid date)"
+
+
+def _render_filetime(ft: int, redact: bool) -> str:
+    if redact:
+        return "<redacted-date>"
+    return str(filetime_to_datetime(ft))
+
+
 def _print_json(obj: Any) -> None:
     json.dump(obj, sys.stdout, indent=2, default=str)
     print()
@@ -711,11 +750,14 @@ def cmd_pmp(args: argparse.Namespace) -> int:
         print(head)
         shown = col.values if args.limit is None else col.values[: args.limit]
         if args.json:
-            _print_json([_render(v, args.redact) for v in shown])
+            if col.field_type == 0x2 and args.redact:
+                _print_json(["<redacted-date>"] * len(shown))
+            else:
+                _print_json([_render(v, args.redact) for v in shown])
         else:
             for i, v in enumerate(shown):
                 if col.field_type == 0x2:
-                    v = f"{v!r} ({ole_to_datetime(v).isoformat()})"
+                    v = _render_ole_date(v, args.redact)
                 else:
                     v = _render(v, args.redact)
                 print(f"  [{i}] {v}")
@@ -731,12 +773,19 @@ def cmd_table(args: argparse.Namespace) -> int:
         return 1
     counts = {name: len(c.values) for name, c in table.columns.items()}
     print(f"table {args.table}: {table.n_rows} rows, columns: {counts}")
+
+    def cell(name: str, v: Any) -> Any:
+        if v is not None and table.columns[name].field_type == 0x2 and args.redact:
+            return "<redacted-date>"
+        return _render(v, args.redact)
+
     rows = []
     for i, row in enumerate(table.rows()):
         if args.limit is not None and i >= args.limit:
-            print(f"... {table.n_rows - args.limit} more rows")
+            if not args.json:  # never interleave notes into the JSON stream
+                print(f"... {table.n_rows - args.limit} more rows")
             break
-        rows.append({k: _render(v, args.redact) for k, v in row.items()})
+        rows.append({k: cell(k, v) for k, v in row.items()})
         if not args.json:
             print(f"[{i}] {rows[-1]}")
     if args.json:
@@ -757,8 +806,8 @@ def cmd_thumbindex(args: argparse.Namespace) -> int:
             "folder": e.is_folder,
             "deleted": e.is_deleted,
             "parent": e.parent,
-            "taken": str(filetime_to_datetime(e.taken_filetime)),
-            "modified": str(filetime_to_datetime(e.modified_filetime)),
+            "taken": _render_filetime(e.taken_filetime, args.redact),
+            "modified": _render_filetime(e.modified_filetime, args.redact),
             "size": e.size,
             "ftype": e.ftype_name,
             "flags": e.flags,
@@ -795,24 +844,37 @@ def cmd_ini(args: argparse.Namespace) -> int:
                 "key": _redact_str(k) if redact_key else k,
                 "value": _render(v, args.redact),
             }
+            # Under --redact, decoded views must not reconstruct the value
+            # they decode: emit structural summaries only (counts, op
+            # names from the format vocabulary, parse-ok markers) — no
+            # rects, contact ids, params, or timestamps.
             try:
                 kl = k.lower()
                 if kl == "faces":
-                    item["decoded"] = [
-                        {"rect": r, "contact": c} for r, c in parse_faces(v)
-                    ]
+                    faces = parse_faces(v)
+                    item["decoded"] = (
+                        {"faces": len(faces)}
+                        if args.redact
+                        else [{"rect": r, "contact": c} for r, c in faces]
+                    )
                 elif kl in ("filters", "redo"):
-                    item["decoded"] = parse_filters(v)
+                    ops = parse_filters(v)
+                    item["decoded"] = (
+                        {"ops": [name for name, _ in ops]} if args.redact else ops
+                    )
                 elif kl == "rotate":
                     item["decoded"] = parse_rotate(v)
                 elif kl == "moddate":
-                    item["decoded"] = str(parse_moddate(v))
+                    dt = parse_moddate(v)
+                    item["decoded"] = "<redacted-date>" if args.redact else str(dt)
                 elif kl == "date" and s.name.lower() == "picasa":
                     # [Picasa] date= is an OLE double; [.album:*] date= is
                     # ISO 8601 text and needs no decoding.
-                    item["decoded"] = str(ole_to_datetime(float(v)))
+                    dt = ole_to_datetime(float(v))
+                    item["decoded"] = "<redacted-date>" if args.redact else str(dt)
                 elif kl in ("crop", "crop64") or v.startswith("rect64("):
-                    item["decoded"] = parse_rect64(v)
+                    rect = parse_rect64(v)
+                    item["decoded"] = "<rect64 ok>" if args.redact else rect
             except ValueError:
                 item["decoded"] = None
             sec["items"].append(item)
@@ -832,46 +894,75 @@ def cmd_ini(args: argparse.Namespace) -> int:
     return 0
 
 
+# db3 sidecar files Picasa itself creates have lowercase machine names
+# (thumbs2_0.db, repository.dat, scanlist.txt, ...): such names are format
+# vocabulary, safe to print in a survey. Anything else found in the
+# directory gets its name redacted (a stray user file's name could be
+# personal).
+_SURVEY_NAME_RE = re.compile(r"^[a-z0-9_\-]+\.(db|dat|txt|tid|ioq|xml|lck)$")
+
+
+def _survey_name(p: Path) -> str:
+    return p.name if _SURVEY_NAME_RE.match(p.name) else _redact_str(p.name)
+
+
+def _survey_one(p: Path) -> dict[str, Any]:
+    if p.name.endswith("_0"):
+        return {"file": p.name, "kind": "marker", "ok": is_pmp_marker(p)}
+    if p.suffix == ".pmp":
+        try:
+            col = read_pmp(p, strict=False)
+            return {
+                "file": p.name,
+                "kind": "pmp",
+                "type": f"0x{col.field_type:x}",
+                "type_name": col.type_name,
+                "count": col.count,
+                "parsed": len(col.values),
+                "trailing_bytes": col.trailing_bytes,
+                "ok": len(col.values) == col.count and col.trailing_bytes == 0,
+            }
+        except PmpError as e:
+            # PmpError messages carry only the file name and numbers
+            return {"file": p.name, "kind": "pmp", "ok": False, "error": str(e)}
+    if p.name == "thumbindex.db":
+        try:
+            entries = read_thumbindex(p)
+            return {
+                "file": p.name,
+                "kind": "thumbindex",
+                "entries": len(entries),
+                "folders": sum(1 for e in entries if e.is_folder),
+                "ok": True,
+            }
+        except ThumbIndexError as e:
+            return {"file": p.name, "kind": "thumbindex", "ok": False, "error": str(e)}
+    return {"file": _survey_name(p), "kind": "other", "bytes": p.stat().st_size}
+
+
 def cmd_survey(args: argparse.Namespace) -> int:
     """Structural survey of a db3 directory: types, counts, validity.
 
-    Output contains no decoded string values regardless of --redact; this
-    subcommand is meant to be safe on private databases by construction.
+    Output contains no decoded string values, timestamps, or non-Picasa
+    file names regardless of --redact; this subcommand is meant to be safe
+    on private databases by construction. It never raises on a corrupt
+    file (--lax has no effect here: pmp columns are always read tolerantly
+    and strictness violations are reported as ok: false). OS-level errors
+    are reported as the exception class name only — str(OSError) would
+    embed the full filesystem path.
     """
     db3 = Path(args.db3)
     report: list[dict[str, Any]] = []
     for p in sorted(db3.iterdir()):
-        if p.name.endswith("_0"):
-            rec = {"file": p.name, "kind": "marker", "ok": is_pmp_marker(p)}
-        elif p.suffix == ".pmp":
-            try:
-                col = read_pmp(p, strict=False)
-                rec = {
-                    "file": p.name,
-                    "kind": "pmp",
-                    "type": f"0x{col.field_type:x}",
-                    "type_name": col.type_name,
-                    "count": col.count,
-                    "parsed": len(col.values),
-                    "trailing_bytes": col.trailing_bytes,
-                    "ok": len(col.values) == col.count and col.trailing_bytes == 0,
-                }
-            except (PmpError, OSError) as e:
-                rec = {"file": p.name, "kind": "pmp", "ok": False, "error": str(e)}
-        elif p.name == "thumbindex.db":
-            try:
-                entries = read_thumbindex(p)
-                rec = {
-                    "file": p.name,
-                    "kind": "thumbindex",
-                    "entries": len(entries),
-                    "folders": sum(1 for e in entries if e.is_folder),
-                    "ok": True,
-                }
-            except (ThumbIndexError, OSError) as e:
-                rec = {"file": p.name, "kind": "thumbindex", "ok": False, "error": str(e)}
-        else:
-            rec = {"file": p.name, "kind": "other", "bytes": p.stat().st_size}
+        try:
+            rec = _survey_one(p)
+        except OSError as e:
+            rec = {
+                "file": _survey_name(p),
+                "kind": "error",
+                "ok": False,
+                "error": type(e).__name__,
+            }
         report.append(rec)
     if args.json:
         _print_json(report)

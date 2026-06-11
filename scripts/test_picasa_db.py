@@ -462,6 +462,193 @@ def test_thumbindex_bad_parent_does_not_crash(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# corrupt-value guards (decoders must raise ValueError or return None,
+# never OverflowError, on adversarial inputs)
+# --------------------------------------------------------------------------
+
+
+def test_ole_rejects_nonfinite_and_out_of_range():
+    for bad in [float("nan"), float("inf"), -float("inf"), 1e9, 1e300, -1e9]:
+        with pytest.raises(ValueError):
+            pdb.ole_to_datetime(bad)
+
+
+def test_ole_half_boundary_canonical_encoding():
+    # +0.5 and -0.5 decode identically (MS DATE is non-injective near zero);
+    # the canonical encoding of that instant is the positive form
+    noon = datetime(1899, 12, 30, 12, 0)
+    assert pdb.ole_to_datetime(0.5) == pdb.ole_to_datetime(-0.5) == noon
+    assert pdb.datetime_to_ole(noon) == 0.5
+
+
+def test_datetime_to_ole_aware_input_treated_as_wall_clock():
+    naive = datetime(2009, 7, 4, 10, 0)
+    aware = datetime(2009, 7, 4, 10, 0, tzinfo=timezone.utc)
+    assert pdb.datetime_to_ole(aware) == pdb.datetime_to_ole(naive)
+
+
+def test_filetime_overflow_returns_none():
+    assert pdb.filetime_to_datetime(2**64 - 1) is None
+    assert pdb.filetime_to_datetime(0) is None
+
+
+def test_parse_moddate_overflow_raises_valueerror():
+    for bad in ["ffffffffffffffff", "7fffffffffffffff", "0000000000000000"]:
+        with pytest.raises(ValueError):
+            pdb.parse_moddate(bad)
+
+
+def test_parse_filters_edges():
+    assert pdb.parse_filters("") == []
+    assert pdb.parse_filters("enhance") == [("enhance", [])]
+    assert pdb.parse_filters("enhance=") == [("enhance", [])]
+
+
+def test_parse_rect64_int_range():
+    assert pdb.parse_rect64(0) == (0.0, 0.0, 0.0, 0.0)
+    assert pdb.parse_rect64(2**64 - 1) == (0xFFFF / 65536,) * 4
+    for bad in (-1, 2**64):
+        with pytest.raises(ValueError):
+            pdb.parse_rect64(bad)
+
+
+def test_pmp_column_get_default(tmp_path):
+    col = pdb.read_pmp(write_pmp(tmp_path, "t_c.pmp", 0x1, struct.pack("<I", 7), 1))
+    assert col.get(5, default=0) == 0
+
+
+def test_read_table_missing(tmp_path):
+    table = pdb.read_table(tmp_path, "nothere")
+    assert table.columns == {} and table.n_rows == 0
+    assert pdb.main(["table", str(tmp_path), "nothere"]) == 1
+
+
+def test_is_pmp_marker_missing_file(tmp_path):
+    assert not pdb.is_pmp_marker(tmp_path / "missing_0")
+    assert not pdb.is_pmp_marker(tmp_path / "missing.pmp")
+
+
+def test_ini_value_whitespace_preserved(tmp_path):
+    p = tmp_path / ".picasa.ini"
+    p.write_bytes(b"[x.jpg]\r\ncaption=  pad me  \r\n")
+    sec = pdb.read_picasa_ini(p).sections[0]
+    assert sec.items == [("caption", "  pad me  ")]
+
+
+# --------------------------------------------------------------------------
+# CLI contract tests (JSON purity, --lax plumbing, redaction)
+# --------------------------------------------------------------------------
+
+import json as _json
+
+
+def _json_after_headers(out: str, header_lines: int):
+    return _json.loads("\n".join(out.splitlines()[header_lines:]))
+
+
+def _cli_fixture_dir(tmp_path: Path) -> Path:
+    write_pmp(tmp_path, "img_width.pmp", 0x1, struct.pack("<II", 10, 20), 2)
+    write_pmp(tmp_path, "img_name.pmp", 0x0, b"a\x00b\x00", 2)
+    write_pmp(
+        tmp_path, "img_date.pmp", 0x2, struct.pack("<2d", 39998.5, 40000.25), 2
+    )
+    (tmp_path / "img_0").write_bytes(struct.pack("<I", pdb.PMP_MAGIC))
+    (tmp_path / "thumbindex.db").write_bytes(make_thumbindex(SAMPLE_TI))
+    return tmp_path
+
+
+def test_cli_json_outputs_are_parseable(tmp_path, capsys):
+    d = _cli_fixture_dir(tmp_path)
+    cases = [
+        (["pmp", str(d / "img_width.pmp"), "--json"], 1),
+        (["pmp", str(d / "img_date.pmp"), "--json", "--redact"], 1),
+        (["table", str(d), "img", "--json"], 1),
+        (["table", str(d), "img", "--json", "--limit", "1"], 1),  # no stray note
+        (["thumbindex", str(d / "thumbindex.db"), "--json"], 1),
+        (["survey", str(d), "--json"], 0),
+    ]
+    for argv, headers in cases:
+        assert pdb.main(argv) == 0, argv
+        _json_after_headers(capsys.readouterr().out, headers)  # must not raise
+
+
+def test_cli_ini_json_parseable(tmp_path, capsys):
+    p = tmp_path / ".picasa.ini"
+    p.write_text("[x.jpg]\nstar=yes\n", encoding="utf-8")
+    assert pdb.main(["ini", str(p), "--json"]) == 0
+    data = _json_after_headers(capsys.readouterr().out, 0)
+    assert data["sections"][0]["items"][0]["key"] == "star"
+
+
+def test_cli_lax_plumbing(tmp_path, capsys):
+    bad_pmp = write_pmp(tmp_path, "t_c.pmp", 0x1, struct.pack("<I", 1), 5)
+    with pytest.raises(pdb.PmpError):
+        pdb.main(["pmp", str(bad_pmp)])
+    assert pdb.main(["pmp", str(bad_pmp), "--lax"]) == 0
+    bad_ti = tmp_path / "thumbindex.db"
+    bad_ti.write_bytes(make_thumbindex(SAMPLE_TI) + b"junk")
+    with pytest.raises(pdb.ThumbIndexError):
+        pdb.main(["thumbindex", str(bad_ti)])
+    assert pdb.main(["thumbindex", str(bad_ti), "--lax"]) == 0
+    capsys.readouterr()
+
+
+def test_cli_redact_hides_timestamps(tmp_path, capsys):
+    d = _cli_fixture_dir(tmp_path)
+    assert pdb.main(["pmp", str(d / "img_date.pmp"), "--redact"]) == 0
+    out = capsys.readouterr().out
+    assert "39998" not in out and "2009" not in out
+    assert "<redacted-date>" in out
+    assert pdb.main(["table", str(d), "img", "--redact", "--json"]) == 0
+    rows = _json_after_headers(capsys.readouterr().out, 1)
+    assert all(r["date"] == "<redacted-date>" for r in rows)
+    assert pdb.main(["thumbindex", str(d / "thumbindex.db"), "--redact"]) == 0
+    out = capsys.readouterr().out
+    assert "<redacted-date>" in out and "1601" not in out
+
+
+def test_cli_pmp_corrupt_date_does_not_crash(tmp_path, capsys):
+    p = write_pmp(
+        tmp_path, "t_d.pmp", 0x2, struct.pack("<2d", float("nan"), 1e300), 2
+    )
+    assert pdb.main(["pmp", str(p)]) == 0
+    out = capsys.readouterr().out
+    assert out.count("invalid date") == 2
+
+
+def test_cli_ini_redact_decoded_is_structural_only(tmp_path, capsys):
+    p = tmp_path / ".picasa.ini"
+    p.write_text(
+        "[Picasa]\ndate=39621.924444\n"
+        "[x.jpg]\nfaces=rect64(4a8e8e6b),632e71e2ffd6c6d\n"
+        "filters=crop64=1,10000000f1ddff49;enhance=1;\n"
+        "moddate=8094e2826277cd01\ncrop=rect64(3f845bcb59418507)\n",
+        encoding="utf-8",
+    )
+    assert pdb.main(["ini", str(p), "--redact"]) == 0
+    out = capsys.readouterr().out
+    # decoded summaries keep format vocabulary only
+    assert "crop64" in out and "enhance" in out and "'faces': 1" in out
+    # ...but no params, rects, contact ids, or timestamps
+    for leak in ["10000000f1ddff49", "632e71e2", "0.2481", "2012", "2008", "4a8e"]:
+        assert leak not in out, leak
+
+
+def test_cli_survey_never_raises_and_redacts_foreign_names(tmp_path, capsys):
+    d = _cli_fixture_dir(tmp_path)
+    (d / "t_c.pmp").write_bytes(b"\x00bad")  # corrupt pmp
+    (d / "Aunt Edna Holiday.txt").write_text("x")  # foreign file name
+    (d / "repository.dat").write_bytes(b"\x00" * 8)  # known sidecar name
+    assert pdb.main(["survey", str(d), "--json"]) == 0
+    out = capsys.readouterr().out
+    assert "Aunt Edna" not in out
+    assert "repository.dat" in out
+    recs = _json.loads(out)
+    assert any(r.get("ok") is False for r in recs)  # corrupt pmp reported
+    assert str(d) not in out  # no absolute paths anywhere
+
+
+# --------------------------------------------------------------------------
 # integration: the Wine oracle database
 # --------------------------------------------------------------------------
 
@@ -555,6 +742,69 @@ def test_oracle_album_dates_plausible():
     for v in col.values:
         dt = pdb.ole_to_datetime(v)
         assert 2000 < dt.year < 2100
+
+
+# --------------------------------------------------------------------------
+# integration: committed differential fixtures (fixtures/oracle/NNN-*)
+# --------------------------------------------------------------------------
+
+FIXTURES = REPO / "fixtures" / "oracle"
+
+needs_fixtures = pytest.mark.skipif(
+    not FIXTURES.is_dir(), reason="no oracle differential fixtures present"
+)
+
+
+@needs_fixtures
+def test_fixture_every_pmp_parses_strict():
+    pmps = sorted(FIXTURES.rglob("*.pmp"))
+    assert pmps
+    for p in pmps:
+        col = pdb.read_pmp(p)
+        assert len(col.values) == col.count
+
+
+@needs_fixtures
+def test_fixture_every_thumbindex_parses_strict():
+    files = sorted(FIXTURES.rglob("thumbindex.db"))
+    assert files
+    for p in files:
+        assert pdb.read_thumbindex(p)
+
+
+@needs_fixtures
+def test_fixture_every_picasa_ini_parses_clean():
+    inis = sorted(FIXTURES.rglob(".picasa.ini"))
+    assert inis  # real Picasa-written ini files (CRLF, no [encoding] yet)
+    for p in inis:
+        ini = pdb.read_picasa_ini(p)
+        assert ini.sections and not ini.anomalies
+        for s in ini.sections:
+            assert s.name  # every section is a [filename]
+
+
+@needs_fixtures
+def test_fixture_star_lands_in_ini():
+    p = (
+        FIXTURES
+        / "001-star-photo/after/library/2010-12-25 Winter Holiday/.picasa.ini"
+    )
+    if not p.is_file():
+        pytest.skip("fixture 001 layout changed")
+    sec = pdb.read_picasa_ini(p).section("photo02.jpg")
+    assert sec is not None and sec.get("star") == "yes"
+
+
+@needs_fixtures
+def test_fixture_caption_column_is_variable_length():
+    db3 = FIXTURES / "002-caption-photo/after/db3"
+    if not (db3 / "imagedata_caption.pmp").is_file():
+        pytest.skip("fixture 002 layout changed")
+    cap = pdb.read_pmp(db3 / "imagedata_caption.pmp")
+    # the captioned photo is the last record; earlier rows are empty and
+    # rows past the column's end simply don't exist (25 entries vs 28 rows)
+    assert cap.values[-1] != ""
+    assert all(v == "" for v in cap.values[:-1])
 
 
 if __name__ == "__main__":
