@@ -5,6 +5,9 @@
 .beads-credential-key
 .beads/proxieddb/
 
+# Oracle fixtures are synthetic Picasa db files, not Dolt artifacts
+!fixtures/oracle/**/*.db
+
 # Local media/research cache (rebuild with scripts/fetch-videos.sh)
 /cache/
 
