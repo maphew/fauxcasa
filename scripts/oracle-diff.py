@@ -42,7 +42,12 @@ MANIFEST = SNAPDIR / "manifest.json"
 FIXTURES = REPO / "fixtures" / "oracle"
 
 # Derived caches: reported in diffs, but not copied into fixtures by default.
-BLOB_RE = re.compile(r"^db3/((big)?thumbs2?_\d+\.db|previews_\d+\.db|wordhash\.dat)$")
+# albums_N.db / profilephotos_N.db are windows-thumbs-format caches (album
+# covers, contact photos); *_index.db and thumbindex.db stay semantic.
+BLOB_RE = re.compile(
+    r"^db3/((big)?thumbs2?_\d+\.db|previews_\d+\.db|albums_\d+\.db"
+    r"|profilephotos_\d+\.db|wordhash\.dat)$"
+)
 
 PMP_MAGIC = 0x3FCCCCCD
 PMP_TYPE_NAMES = {
@@ -144,7 +149,8 @@ def parse_pmp(data: bytes):
     except (ValueError, struct.error, IndexError):
         notes.append(f"truncated: only {len(entries)} of {count} entries decodable")
     if off < len(data):
-        notes.append(f"{len(data) - off} trailing bytes after entries: {data[off:off + 32].hex()}")
+        notes.append(f"{len(data) - off} trailing bytes after entries: {data[off:off + 64].hex()}"
+                     + ("..." if len(data) - off > 64 else ""))
     return ftype, count, entries, notes
 
 
@@ -188,25 +194,25 @@ def pmp_diff_lines(before: bytes | None, after: bytes | None) -> list[str]:
         lines.append(f"FIELD TYPE CHANGED: {bt:#x} -> {at:#x}")
     lines.append(f"type {tname}; rows {len(be)} -> {len(ae)}"
                  + (f" (declared {bcount} -> {acount})" if (bcount, acount) != (len(be), len(ae)) else ""))
-    for n in set(bnotes + anotes):
-        lines.append(f"note: {n}")
-    shown = 0
-    for i in range(max(len(be), len(ae))):
-        if shown >= MAX_DIFF_ROWS:
-            lines.append(f"... (more row deltas suppressed, cap {MAX_DIFF_ROWS})")
-            break
+    seen: set[str] = set()
+    for n in [f"before: {n}" for n in bnotes] + [f"after: {n}" for n in anotes]:
+        if n not in seen:
+            seen.add(n)
+            lines.append(f"note: {n}")
+    deltas = [i for i in range(max(len(be), len(ae)))
+              if (be[i] if i < len(be) else None) != (ae[i] if i < len(ae) else None)]
+    for i in deltas[:MAX_DIFF_ROWS]:
         b = be[i] if i < len(be) else None
         a = ae[i] if i < len(ae) else None
-        if b == a:
-            continue
         if b is None:
             lines.append(f"[{i}] (new) {fmt_entry(ftype, a)}")
         elif a is None:
             lines.append(f"[{i}] (removed) was {fmt_entry(ftype, b)}")
         else:
             lines.append(f"[{i}] {fmt_entry(ftype, b)} -> {fmt_entry(ftype, a)}")
-        shown += 1
-    if shown == 0:
+    if len(deltas) > MAX_DIFF_ROWS:
+        lines.append(f"... ({len(deltas) - MAX_DIFF_ROWS} more row deltas suppressed)")
+    if not deltas:
         lines.append("(no row-level differences — header/trailing bytes only)")
     return lines
 
@@ -241,8 +247,11 @@ def text_diff_lines(rel: str, before: bytes | None, after: bytes | None) -> list
             fromfile=f"before/{rel}", tofile=f"after/{rel}", lineterm="", n=2,
         )
     )
-    return diff[:MAX_DIFF_ROWS] + (["... (truncated)"] if len(diff) > MAX_DIFF_ROWS else []) \
-        if diff else ["(byte change with no visible line diff — line endings/encoding?)"]
+    if diff:
+        return diff[:MAX_DIFF_ROWS] + (["... (truncated)"] if len(diff) > MAX_DIFF_ROWS else [])
+    if not (before or after):
+        return ["(empty file)"]
+    return ["(byte change with no visible line diff — line endings/encoding?)"]
 
 
 def binary_summary_lines(before: bytes, after: bytes) -> list[str]:
@@ -277,59 +286,86 @@ def file_diff_lines(rel: str, before: bytes | None, after: bytes | None) -> list
 
 # ----------------------------------------------------------- snapshot / diff
 
-def take_snapshot(label: str) -> None:
+def read_current() -> dict[str, bytes]:
+    """One consistent in-memory read of the watched trees.
+
+    All downstream artifacts (diff report, fixture copies, meta hashes, next
+    baseline) must derive from this single read so they cannot disagree when
+    Picasa flushes mid-command.
+    """
+    state: dict[str, bytes] = {}
+    for rel, path in scan(find_roots()).items():
+        try:
+            state[rel] = path.read_bytes()
+        except FileNotFoundError:  # vanished between scan and read
+            continue
+    return state
+
+
+def take_snapshot(label: str, state: dict[str, bytes] | None = None) -> None:
     roots = find_roots()
-    files = scan(roots)
-    if BASELINE.exists():
-        shutil.rmtree(BASELINE)
+    if state is None:
+        state = read_current()
+    newdir = SNAPDIR / "baseline.new"
+    newman = SNAPDIR / "manifest.new.json"
+    if newdir.exists():
+        shutil.rmtree(newdir)
     manifest = {
         "label": label,
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "roots": {k: str(v) for k, v in roots.items()},
-        "files": {},
+        "files": {rel: {"sha256": sha256(data), "size": len(data)}
+                  for rel, data in state.items()},
     }
-    for rel, path in files.items():
-        data = path.read_bytes()
-        dest = BASELINE / rel
+    for rel, data in state.items():
+        dest = newdir / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
-        manifest["files"][rel] = {"sha256": sha256(data), "size": len(data)}
-    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    MANIFEST.write_text(json.dumps(manifest, indent=1))
-    print(f"snapshot '{label}': {len(files)} files baselined -> {BASELINE.relative_to(REPO)}")
+    newdir.mkdir(parents=True, exist_ok=True)  # state could be empty
+    newman.write_text(json.dumps(manifest, indent=1))
+    if BASELINE.exists():
+        shutil.rmtree(BASELINE)
+    newdir.rename(BASELINE)
+    newman.replace(MANIFEST)
+    print(f"snapshot '{label}': {len(state)} files baselined -> {BASELINE.relative_to(REPO)}")
 
 
 def load_manifest() -> dict:
-    if not MANIFEST.exists():
+    if (SNAPDIR / "manifest.new.json").exists() or (SNAPDIR / "baseline.new").exists():
+        sys.exit("error: interrupted snapshot detected — re-run `oracle-diff.py snapshot`")
+    if not MANIFEST.exists() or not BASELINE.is_dir():
         sys.exit("error: no baseline — run `oracle-diff.py snapshot` first")
     return json.loads(MANIFEST.read_text())
 
 
-def compute_changes(manifest: dict) -> list[tuple[str, str]]:
+def compute_changes(manifest: dict, state: dict[str, bytes]) -> list[tuple[str, str]]:
     """[(rel, status)] where status in added/removed/changed, sorted by rel."""
-    current = scan(find_roots())
     old = manifest["files"]
     changes = []
-    for rel in sorted(set(old) | set(current)):
+    for rel in sorted(set(old) | set(state)):
         if rel not in old:
             changes.append((rel, "added"))
-        elif rel not in current:
+        elif rel not in state:
             changes.append((rel, "removed"))
-        elif sha256(current[rel].read_bytes()) != old[rel]["sha256"]:
+        elif sha256(state[rel]) != old[rel]["sha256"]:
             changes.append((rel, "changed"))
     return changes
 
 
-def build_report(manifest: dict, changes: list[tuple[str, str]]) -> str:
-    current = scan(find_roots())
+def read_baseline(rel: str) -> bytes:
+    return (BASELINE / rel).read_bytes()
+
+
+def build_report(manifest: dict, changes: list[tuple[str, str]],
+                 state: dict[str, bytes]) -> str:
     out: list[str] = []
     semantic = [(r, s) for r, s in changes if not BLOB_RE.match(r)]
     blobs = [(r, s) for r, s in changes if BLOB_RE.match(r)]
     out.append(f"baseline: '{manifest['label']}' ({manifest['created']})")
     out.append(f"{len(changes)} file(s) differ ({len(semantic)} semantic, {len(blobs)} blob/cache)")
     for rel, status in semantic:
-        before = (BASELINE / rel).read_bytes() if status != "added" else None
-        after = current[rel].read_bytes() if status != "removed" else None
+        before = read_baseline(rel) if status != "added" else None
+        after = state.get(rel)
         bsize = "-" if before is None else len(before)
         asize = "-" if after is None else len(after)
         out.append("")
@@ -339,8 +375,8 @@ def build_report(manifest: dict, changes: list[tuple[str, str]]) -> str:
         out.append("")
         out.append("-- blob/cache changes (not copied into fixtures by default):")
         for rel, status in blobs:
-            before = (BASELINE / rel).read_bytes() if status != "added" else None
-            after = current[rel].read_bytes() if status != "removed" else None
+            before = read_baseline(rel) if status != "added" else None
+            after = state.get(rel)
             summary = "; ".join(binary_summary_lines(before or b"", after or b"")[:2])
             out.append(f"   {status}: {rel} — {summary}")
     return "\n".join(out)
@@ -359,22 +395,25 @@ def next_fixture_number() -> int:
     if not FIXTURES.exists():
         return 1
     nums = [int(m.group(1)) for d in FIXTURES.iterdir()
-            if d.is_dir() and (m := re.match(r"^(\d{3})-", d.name))]
+            if d.is_dir() and (m := re.match(r"^(\d+)-", d.name))]
     return max(nums, default=0) + 1
 
 
 def capture(slug: str, note: str, include_blobs: bool) -> None:
     manifest = load_manifest()
-    changes = compute_changes(manifest)
+    state = read_current()
+    changes = compute_changes(manifest, state)
     if not changes:
         sys.exit("error: nothing changed since baseline — no fixture to capture")
-    current = scan(find_roots())
-    report = build_report(manifest, changes)
+    report = build_report(manifest, changes, state)
 
     nnn = next_fixture_number()
     fixdir = FIXTURES / f"{nnn:03d}-{slug}"
+    tmpdir = FIXTURES / f".tmp-{nnn:03d}-{slug}"
     if fixdir.exists():
         sys.exit(f"error: {fixdir} already exists")
+    if tmpdir.exists():
+        shutil.rmtree(tmpdir)
 
     meta = {
         "fixture": f"{nnn:03d}-{slug}",
@@ -388,31 +427,35 @@ def capture(slug: str, note: str, include_blobs: bool) -> None:
         copied = include_blobs or not is_blob
         entry = {"status": status, "blob": is_blob, "copied": copied}
         if status != "added":
-            data = (BASELINE / rel).read_bytes()
+            data = read_baseline(rel)
             entry["before"] = {"sha256": sha256(data), "size": len(data)}
             if copied:
-                dest = fixdir / "before" / rel
+                dest = tmpdir / "before" / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(data)
         if status != "removed":
-            data = current[rel].read_bytes()
+            data = state[rel]
             entry["after"] = {"sha256": sha256(data), "size": len(data)}
             if copied:
-                dest = fixdir / "after" / rel
+                dest = tmpdir / "after" / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(data)
         meta["files"][rel] = entry
 
-    fixdir.mkdir(parents=True, exist_ok=True)
-    (fixdir / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
-    (fixdir / "diff.md").write_text(
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    (tmpdir / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
+    (tmpdir / "diff.md").write_text(
         f"# Fixture {nnn:03d}: {slug}\n\n"
         f"**Action:** {note}\n\n"
         f"**Captured:** {meta['captured']}\n\n"
         "```\n" + report + "\n```\n"
     )
+    tmpdir.rename(fixdir)
     print(f"fixture written: {fixdir.relative_to(REPO)} ({len(changes)} files)")
-    take_snapshot(f"after {nnn:03d}-{slug}")
+    # Re-baseline from the SAME in-memory state the fixture was written from:
+    # anything Picasa flushes after read_current() lands in the next diff
+    # instead of vanishing between fixtures.
+    take_snapshot(f"after {nnn:03d}-{slug}", state)
 
 
 # --------------------------------------------------------------------- main
@@ -441,11 +484,12 @@ def main() -> None:
         take_snapshot(args.label)
     elif args.cmd == "diff":
         manifest = load_manifest()
-        changes = compute_changes(manifest)
+        state = read_current()
+        changes = compute_changes(manifest, state)
         if not changes:
             print(f"no changes since baseline '{manifest['label']}' ({manifest['created']})")
         else:
-            print(build_report(manifest, changes))
+            print(build_report(manifest, changes, state))
     elif args.cmd == "capture":
         capture(slugify(args.slug), args.note, args.include_blobs)
     elif args.cmd == "pmp":
