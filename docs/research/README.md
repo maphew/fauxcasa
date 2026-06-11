@@ -40,6 +40,22 @@ with source attribution in its header:
   data locations and formats.
 - `forensicir-2007-picasa-analysis.md` — forensic analysis of Picasa's on-disk
   artifacts (2007, older Picasa 2-era perspective).
+- `picasaresources/` — 24 key pages archived from the community-maintained
+  Picasa Resources site (how-picasa-works, database internals, network
+  sharing, name tags, custom buttons API, release notes, ...).
+
+## prior-art-parsers.md
+
+Survey of existing open-source Picasa format parsers (Chromium's unit-tested
+.pmp reader, picasa3meta, PicasaDBReader, picasa2digikam, the .picasa.ini
+spec gist, ...) with licenses and recommended primary references.
+
+## picasastarter-notes.md
+
+Mechanisms and lessons from PicasaStarter (multi-database/multi-machine
+wrapper): the AppLocalDataPath registry relocation, virtual-drive path
+workarounds, advisory locking, first-run scan suppression, and the pain
+points a rebuild must design away.
 
 ## picasa-video-notes.md
 
