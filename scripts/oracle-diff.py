@@ -80,6 +80,7 @@ def find_roots() -> dict[str, Path]:
     return {
         "db3": google / "Picasa2" / "db3",
         "albums": google / "Picasa2Albums",
+        "contacts": google / "Picasa2" / "contacts",  # appears on first face tag
         "library": library,
     }
 

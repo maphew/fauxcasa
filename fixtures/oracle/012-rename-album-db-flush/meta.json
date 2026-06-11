@@ -1,0 +1,50 @@
+{
+ "fixture": "012-rename-album-db-flush",
+ "note": "Deferred db flush of fixture 011's album rename (~2min): albumdata_name[10] 'Synthetic Album A' -> 'Synthetic Album B' rewritten in place; albumdata_inisync[7] (Garden Project folder, ini host) FILETIME; albumdata_inisync[10] (the album's own row) changed by ONE BIT (0x9cf208f2.. -> 0x9cf208d2..) - album rows in inisync are not FILETIMEs but some state/flag word.",
+ "captured": "2026-06-11T18:34:35+00:00",
+ "baseline": {
+  "label": "after 011-rename-album",
+  "created": "2026-06-11T18:32:38+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "b6da0f890c36ded9fe21e0754954281500351d3050c799807dcfc136a28e9f60",
+    "size": 108
+   },
+   "after": {
+    "sha256": "b2e662fc34cb30def5e40fe9dbbf5fc2d39d4b06fc63d147e64e780535dc1dd3",
+    "size": 108
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "45b8695d14df91dd00953f5e66dabe4cb693eb6e1f1337a29c97179d2f400906",
+    "size": 108
+   },
+   "after": {
+    "sha256": "7f04e5c58a9d51214d988f9365ed2364b21831fc85613cc44de5117552a337f7",
+    "size": 108
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ddf996cd7301f23d0e8dc4bc52b88a1ccfbf929dc310d343a01a58e4aeaf25a5",
+    "size": 195
+   },
+   "after": {
+    "sha256": "7df71a398e2262aa517b49c39c2357606464c80f3e56f24feec2a8c72c853d18",
+    "size": 195
+   }
+  }
+ }
+}
