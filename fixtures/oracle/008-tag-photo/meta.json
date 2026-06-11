@@ -1,0 +1,37 @@
+{
+ "fixture": "008-tag-photo",
+ "note": "Add keyword/tag: selected photo00.jpg in '2015-03-15 Garden Project' (not an album member), Ctrl+T tags panel, typed 'synthtag', Enter. Immediate artifacts: tag written INTO THE JPEG twice - XMP dc:subject rdf:Bag + IPTC 8BIM dataset 2:25 Keywords (+846 bytes, also adds xmp MetadataDate); ini gets only backuphash=3563. db3/tags.txt still empty, no pmp change yet (lazy flush expected - watching for it as a follow-up fixture).",
+ "captured": "2026-06-11T17:15:08+00:00",
+ "baseline": {
+  "label": "after 007-rotate-db-flush",
+  "created": "2026-06-11T17:07:23+00:00"
+ },
+ "files": {
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "50d5f703cc6bc0f634c2f8d566ccb25d1226fa0e238848bf1096c559467d04a1",
+    "size": 251
+   },
+   "after": {
+    "sha256": "5985d2e5096b65d984d609d5de6981c807d2558dc9e784a62e1f8e2c5d6dc03a",
+    "size": 283
+   }
+  },
+  "library/2015-03-15 Garden Project/photo00.jpg": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7c44394f16a7db302dc66eab10c828f19ea3cd300861beafaff000e9a12266c3",
+    "size": 79466
+   },
+   "after": {
+    "sha256": "e110b4711a149970010a5dface50810ec3a8edc21a43c99048c658c3ea000004",
+    "size": 80312
+   }
+  }
+ }
+}
