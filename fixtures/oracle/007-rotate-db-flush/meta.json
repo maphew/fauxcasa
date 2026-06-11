@@ -1,0 +1,193 @@
+{
+ "fixture": "007-rotate-db-flush",
+ "note": "Deferred db flush of fixture 006's rotate (no new UI action; flush landed ~4min later, observed after parallel-agent investigation). The db-side representation of an unsaved rotate: imagedata_rotate[11]='rotate(1)' (string, matches ini value), imagedata_edited[11]=2, imagedata_backuphash[11]=43584 (matches ini), albumdata_inisync[8] (Winter Holiday folder row) FILETIME updated, rotated thumbnails appended to caches. Row 11 = photo00.jpg in Winter Holiday. Confirms: ini is written synchronously on the action, pmp mirrors arrive on a lazy flush cycle.",
+ "captured": "2026-06-11T17:07:23+00:00",
+ "baseline": {
+  "label": "after 006-rotate-photo",
+  "created": "2026-06-11T16:14:35+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "f158c69fef4708475792f7f2b4940fbcbfe71e7b508d210d76f38a6986945f38",
+    "size": 108
+   },
+   "after": {
+    "sha256": "bf8aceb006675fa4677fd587d2521f59005d741a7d41c7a542fd8df2ff52a575",
+    "size": 108
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "c9a3922f3618d1290da3c177aeefe57f419de3f039dd800ed747d3143c373f17",
+    "size": 108
+   },
+   "after": {
+    "sha256": "99123fa53b064e810997222c893ad0765471923b7b28fad1e6cd4af633369739",
+    "size": 108
+   }
+  },
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "fef89df4f6189888c991c8b49f93639dd81c4b70c12f9953ee6819a249237243",
+    "size": 121951
+   },
+   "after": {
+    "sha256": "a745d146a82dcfab3986cad3e0e63c8f6e6692418cfe58f9f6283113efc96ac2",
+    "size": 127652
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ff8c018f4077844a19bdfac71862cbf5b6fe8462bbc98247da76dafc7322915d",
+    "size": 356
+   },
+   "after": {
+    "sha256": "0b36cbb6ecca464def1b0f92d0ac8e00d529836de49d981e9006641904bf37ea",
+    "size": 356
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "cf97fc2cb150497b2f774d302f7b366aab8de342be2f19ee83f9865508d16f8e",
+    "size": 70
+   },
+   "after": {
+    "sha256": "d6269ae7ddbebdfe475abc2a3fa5dcf67bd726b80a33212cd2e6ea6c0dfab7be",
+    "size": 70
+   }
+  },
+  "db3/imagedata_edited.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8c4510f5ad46ccde3b0f9d856523f3bbc6c72164ac0bd3830553e3033d414b59",
+    "size": 44
+   },
+   "after": {
+    "sha256": "cfa88d8b7238d382f904d53dae63e8410bf065073bd136608c6595a1fda2cfe4",
+    "size": 44
+   }
+  },
+  "db3/imagedata_rotate.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "bf6e4a99177ef8c8e1b9f9ed1d4ae9d5cceb11727f5da81cff2a86fd6057fe08",
+    "size": 44
+   },
+   "after": {
+    "sha256": "8ef935eef8b2f15ee7fddd279253e0ad8e30cf162e0c5b3addab4f6c2c03dde1",
+    "size": 53
+   }
+  },
+  "db3/previews_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "c99f64bb54940574a4dc146be532287bbcf2bc623893a39c7d505c16252a4575",
+    "size": 377376
+   },
+   "after": {
+    "sha256": "b0a73110846bdbd9943f37d0da16c3945c6d7011e09df639a45d8589eae2bc68",
+    "size": 394955
+   }
+  },
+  "db3/previews_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9856c4e6473124c36744cca7730a8a4ca20cf5910457b6ed4ab69b4c52fc49cb",
+    "size": 356
+   },
+   "after": {
+    "sha256": "fc1ab90677808e6ab5c9413f89ed1697e2520aab4b4b8dfa5fec6f4bf4c910de",
+    "size": 356
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "27fbec590c7bb9e89258116bc5a32076e6a8c56ce00a33195e50be5ff58810a9",
+    "size": 29457
+   },
+   "after": {
+    "sha256": "b8e14e8e5459beac4593e0b4faeea56c2e872e7af1cd7927deb2ac3fdc32a84c",
+    "size": 30506
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7c13faa4ef82b43387c68ade9bbbdaa06d08237f87c20d1ae326e4eb72dcb672",
+    "size": 356
+   },
+   "after": {
+    "sha256": "a0e67db8722f46f811be6f1999760ab900ea30857b112fbbd372c4d414c68a48",
+    "size": 356
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "0b2489e72fd19e9afb395e41e693badeba825faaa17c72c73c67eec023a42382",
+    "size": 79613
+   },
+   "after": {
+    "sha256": "1d4013abba4cffe46aa38917fa6bd16618874478f0b3a79fa4496f1f0098ef63",
+    "size": 82289
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8669487c143b9cef553b889aa87cf80e411093272869fb609ca3006d0c0128a4",
+    "size": 356
+   },
+   "after": {
+    "sha256": "62e8d7a2b35abcdf66bd3cb28c04aca4da44acc4d46dea61c187e6f21d5aaa7f",
+    "size": 356
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "dabf2eaf1bc23286d1d05817695ea11825dc7fb32d8fb852a44971f449cb5178",
+    "size": 67236
+   },
+   "after": {
+    "sha256": "06d43faf3a9923a4a5604fec40fb91f5fb6bc6fdca838bf8a4d8fb7f42c99468",
+    "size": 67240
+   }
+  }
+ }
+}
