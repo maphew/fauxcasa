@@ -1,0 +1,98 @@
+{
+ "fixture": "009-tag-db-flush",
+ "note": "Deferred db flush of fixture 008's keyword (no UI action, ~6min later): imagedata_tags.pmp CREATED with field type 0x6 (csv-strings) - first type-6 sighting - row [2]='synthtag', only 3 rows (sparse field file, shorter than table); backuphash[2]=3563 mirrors ini; originslow[2] hash set; albumdata_inisync[7] (Garden Project row) FILETIME; thumbindex record for photo00.jpg updated (moddate FILETIME + size); wordhash indexed the tag. tags.txt STILL empty - keywords do not live there.",
+ "captured": "2026-06-11T17:16:18+00:00",
+ "baseline": {
+  "label": "after 008-tag-photo",
+  "created": "2026-06-11T17:15:08+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "bf8aceb006675fa4677fd587d2521f59005d741a7d41c7a542fd8df2ff52a575",
+    "size": 108
+   },
+   "after": {
+    "sha256": "d53ec56e4922fd7ee143bd396fa73a8c479d7791ca30a75d135d3d863f849482",
+    "size": 108
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "99123fa53b064e810997222c893ad0765471923b7b28fad1e6cd4af633369739",
+    "size": 108
+   },
+   "after": {
+    "sha256": "2340e6baf4688a3b3bc10824842201b48459a2492b31a7b531dbb9936142b10c",
+    "size": 108
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d6269ae7ddbebdfe475abc2a3fa5dcf67bd726b80a33212cd2e6ea6c0dfab7be",
+    "size": 70
+   },
+   "after": {
+    "sha256": "4590abd63ef8e90d204dd80e22b5fa4c0c8a9a05cc87dfe9d106889fd1c65d4b",
+    "size": 70
+   }
+  },
+  "db3/imagedata_originslow.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "3c84ff6e6dbc9da0bda77f969e131adebc36d6a70bb3f3fa6284a7e14fddf0b6",
+    "size": 220
+   },
+   "after": {
+    "sha256": "74c9ed1921c04a201a03fd5a908b85eb9503016371bff3a1c25f0a5275208d7f",
+    "size": 220
+   }
+  },
+  "db3/imagedata_tags.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "5c1f3215c66eb97c67c70525ffd097f4639e894277ad0f2505f96ada8b9ebedd",
+    "size": 31
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "2acf2a39b775f78dabaa8f72e84be3743ce76bc196ccff8191df6d1576baec1d",
+    "size": 1429
+   },
+   "after": {
+    "sha256": "551961f341b9d85b9a0b274d60319af10d89347c117ae884e1440d88a99b4e1f",
+    "size": 1429
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "06d43faf3a9923a4a5604fec40fb91f5fb6bc6fdca838bf8a4d8fb7f42c99468",
+    "size": 67240
+   },
+   "after": {
+    "sha256": "6d18948e155023984073827a34e1bcb5513b70df492b49a97523e3fe088c838e",
+    "size": 67264
+   }
+  }
+ }
+}
