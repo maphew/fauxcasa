@@ -1,0 +1,37 @@
+{
+ "fixture": "010-unstar-photo",
+ "note": "Remove star: selected starred photo02.jpg in '2010-12-25 Winter Holiday', toggled star off via toolbar. Inverse of 001: ini star=yes line DELETED (no star=no; empty [photo02.jpg] section header remains), starlist.txt line removed (back to 0 bytes). Both synchronous.",
+ "captured": "2026-06-11T18:30:35+00:00",
+ "baseline": {
+  "label": "after 009-tag-db-flush",
+  "created": "2026-06-11T17:16:18+00:00"
+ },
+ "files": {
+  "db3/starlist.txt": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8d3430d3d1d3671af75698a9832077e4100a95e103d1b64bc2817356678ebdb6",
+    "size": 93
+   },
+   "after": {
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "47dfc846bc1e2b6bba96d67622d871818d698a762fc664cd05d49614b9e3d0aa",
+    "size": 76
+   },
+   "after": {
+    "sha256": "02c726cd4ea9bb8f3772909697d5e706e5a807ea857310d5be15a59369101e5b",
+    "size": 66
+   }
+  }
+ }
+}
