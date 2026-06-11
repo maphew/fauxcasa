@@ -1,0 +1,362 @@
+{
+ "fixture": "005-save-crop-to-disk",
+ "note": "File->Save after the unsaved crop of photo03.jpg ('do not ask again' checked in save dialog - future saves are silent). Bake architecture revealed: main ini drops crop=/filters= lines (keeps new backuphash=39767); .picasaoriginals/.picasa.ini created with the undo recipe (filters=, crop=, original width=800/height=600, moddate=FILETIME hex - same bytes appear in thumbindex.db record = file moddate); original JPEG stashed byte-exact in .picasaoriginals/; main JPEG rewritten 26634->17220 (574x259). Save also flushed the whole edit-state pmp family (crop64, edited, filters, flipped, redo, revertable, rotate, text, textactive, colorspace, onlinechecksum): for photo03 row 23 revertable=1, width/height updated, crop64=0/filters='' - db edit state is CLEARED after baking; the recipe lives only in .picasaoriginals ini.",
+ "captured": "2026-06-11T16:11:05+00:00",
+ "baseline": {
+  "label": "after 004-crop-unsaved",
+  "created": "2026-06-11T16:07:43+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7fb94f49203ae80636deed0c0183117cd950993d5bc7322a50a73a0b6cc3375e",
+    "size": 108
+   },
+   "after": {
+    "sha256": "fb54664d44d16521a43c0ae84c398869cfa9cfa0a55bda4ff8739febbaba29e5",
+    "size": 108
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a66f259edf188ee2aaa75ae4a91ca08a31c08d63d28631c1b69c173f53740ed2",
+    "size": 108
+   },
+   "after": {
+    "sha256": "c9a3922f3618d1290da3c177aeefe57f419de3f039dd800ed747d3143c373f17",
+    "size": 108
+   }
+  },
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "36fc2769bb2a07909e1b8070b15137adbc86299b862c9b68e0dea5c8f1921ea2",
+    "size": 116637
+   },
+   "after": {
+    "sha256": "fef89df4f6189888c991c8b49f93639dd81c4b70c12f9953ee6819a249237243",
+    "size": 121951
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "625b2d26c276c21d9e5d313108a266b4f1a02337955c78867e833046d5151104",
+    "size": 356
+   },
+   "after": {
+    "sha256": "ff8c018f4077844a19bdfac71862cbf5b6fe8462bbc98247da76dafc7322915d",
+    "size": 356
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "e3a0222ec87086d0b2b84a4698bbb04d0f9f52b49fa038676b6979799aa95c70",
+    "size": 70
+   },
+   "after": {
+    "sha256": "cf97fc2cb150497b2f774d302f7b366aab8de342be2f19ee83f9865508d16f8e",
+    "size": 70
+   }
+  },
+  "db3/imagedata_colorspace.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "8c4510f5ad46ccde3b0f9d856523f3bbc6c72164ac0bd3830553e3033d414b59",
+    "size": 44
+   }
+  },
+  "db3/imagedata_crop64.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "9ec8270ebb9f964723ed1c6c4ec7c8127b8bfcc777599170ad77d17a472510bd",
+    "size": 212
+   }
+  },
+  "db3/imagedata_edited.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "8c4510f5ad46ccde3b0f9d856523f3bbc6c72164ac0bd3830553e3033d414b59",
+    "size": 44
+   }
+  },
+  "db3/imagedata_filters.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "bf6e4a99177ef8c8e1b9f9ed1d4ae9d5cceb11727f5da81cff2a86fd6057fe08",
+    "size": 44
+   }
+  },
+  "db3/imagedata_flipped.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "bf6e4a99177ef8c8e1b9f9ed1d4ae9d5cceb11727f5da81cff2a86fd6057fe08",
+    "size": 44
+   }
+  },
+  "db3/imagedata_height.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7d8e62f0f8c50d169ea80c465db7bc977e1ac1efd0968c23eb4f17dc574ec288",
+    "size": 132
+   },
+   "after": {
+    "sha256": "48b2f2f1632e3a8b85a940fa9c308a020950ff136ec37377e4de300eb3934be0",
+    "size": 132
+   }
+  },
+  "db3/imagedata_onlinechecksum.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "286ef3f082755529aef617f77e5288369744fd8579a473158151824e87bbfcdf",
+    "size": 116
+   }
+  },
+  "db3/imagedata_originslow.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d4ede6e3a4b8bcac058c338f2bb4fc87584bb033a72aa915554eaa0f2af78d72",
+    "size": 220
+   },
+   "after": {
+    "sha256": "3c84ff6e6dbc9da0bda77f969e131adebc36d6a70bb3f3fa6284a7e14fddf0b6",
+    "size": 220
+   }
+  },
+  "db3/imagedata_redo.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "bf6e4a99177ef8c8e1b9f9ed1d4ae9d5cceb11727f5da81cff2a86fd6057fe08",
+    "size": 44
+   }
+  },
+  "db3/imagedata_revertable.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "c312411f74b49b80ca6093bd33871188c3eff4f7c4ab907eaf84bdedeb9bd46b",
+    "size": 44
+   }
+  },
+  "db3/imagedata_rotate.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "bf6e4a99177ef8c8e1b9f9ed1d4ae9d5cceb11727f5da81cff2a86fd6057fe08",
+    "size": 44
+   }
+  },
+  "db3/imagedata_text.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "bf6e4a99177ef8c8e1b9f9ed1d4ae9d5cceb11727f5da81cff2a86fd6057fe08",
+    "size": 44
+   }
+  },
+  "db3/imagedata_textactive.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "8c4510f5ad46ccde3b0f9d856523f3bbc6c72164ac0bd3830553e3033d414b59",
+    "size": 44
+   }
+  },
+  "db3/imagedata_width.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "bbc69fe5e0666cb29d5e46ee13f50e630f4b4a27516aed2fd0fb82005f0422dc",
+    "size": 132
+   },
+   "after": {
+    "sha256": "f28dd5a5a145410212ffa5f3cbabff37fb431dc9eb7e1e113441e9bca9121042",
+    "size": 132
+   }
+  },
+  "db3/previews_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "4ab3c3882430fd01216a81fd0b204f9a91f018ed4880727ec65ecc4e63593dc6",
+    "size": 360844
+   },
+   "after": {
+    "sha256": "c99f64bb54940574a4dc146be532287bbcf2bc623893a39c7d505c16252a4575",
+    "size": 377376
+   }
+  },
+  "db3/previews_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "3e6fcabb128553723b86788868d885f80265d0a4a9048ac08c6cd08f37aef896",
+    "size": 356
+   },
+   "after": {
+    "sha256": "9856c4e6473124c36744cca7730a8a4ca20cf5910457b6ed4ab69b4c52fc49cb",
+    "size": 356
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "dca7d3af271a4ab664b9a49474478b76e401a0045f7e9ac0a95727b985977944",
+    "size": 1429
+   },
+   "after": {
+    "sha256": "2acf2a39b775f78dabaa8f72e84be3743ce76bc196ccff8191df6d1576baec1d",
+    "size": 1429
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "339eaa489f51ce008803343fa92ad8564292c602b248cdbd952b73958d0c4150",
+    "size": 28483
+   },
+   "after": {
+    "sha256": "27fbec590c7bb9e89258116bc5a32076e6a8c56ce00a33195e50be5ff58810a9",
+    "size": 29457
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ea6ac565d02aa841f0aa8f195b63bbdd722442201ffabedd001791200ae39713",
+    "size": 356
+   },
+   "after": {
+    "sha256": "7c13faa4ef82b43387c68ade9bbbdaa06d08237f87c20d1ae326e4eb72dcb672",
+    "size": 356
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "bfc5a07e84c89b139b73cef8a2eb7ed83c3c2b90c7faf5c0ccfe49cb08f10cdb",
+    "size": 76755
+   },
+   "after": {
+    "sha256": "0b2489e72fd19e9afb395e41e693badeba825faaa17c72c73c67eec023a42382",
+    "size": 79613
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "1ff9c86f2d492d3138bbc717f753adf0ad85b81e37e28df2bfd9b9f20a16e2ba",
+    "size": 356
+   },
+   "after": {
+    "sha256": "8669487c143b9cef553b889aa87cf80e411093272869fb609ca3006d0c0128a4",
+    "size": 356
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "15b91a42bd8e1464ffdad8da1ab9b63eaa04b730952cb1835e585a5a42059972",
+    "size": 67216
+   },
+   "after": {
+    "sha256": "dabf2eaf1bc23286d1d05817695ea11825dc7fb32d8fb852a44971f449cb5178",
+    "size": 67236
+   }
+  },
+  "library/2009-07-04 Beach Day/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d83b52f46cf1f9a74017ff760d531124234de6fc790ca531193b45ebcf60dd19",
+    "size": 130
+   },
+   "after": {
+    "sha256": "29a780e76b863dca027cfcb92c2f058b4f3b95ba231742c6db8795442a8ab6f0",
+    "size": 65
+   }
+  },
+  "library/2009-07-04 Beach Day/.picasaoriginals/.picasa.ini": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "11b6005aab8bb8d6dbd891bc4a64db909a68397db50f05421191b0c5a9fbcbe3",
+    "size": 143
+   }
+  },
+  "library/2009-07-04 Beach Day/.picasaoriginals/photo03.jpg": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "5ca0f62b7d24ae9f3cab626bde805384db5b0205696df3f69288c5dbafe3ee13",
+    "size": 26634
+   }
+  },
+  "library/2009-07-04 Beach Day/photo03.jpg": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "5ca0f62b7d24ae9f3cab626bde805384db5b0205696df3f69288c5dbafe3ee13",
+    "size": 26634
+   },
+   "after": {
+    "sha256": "b6b3acfbcac226460b194cbecd17bcb9e8e16e9cd48c300046b17c5ba90948a7",
+    "size": 17220
+   }
+  }
+ }
+}
