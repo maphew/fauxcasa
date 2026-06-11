@@ -1,0 +1,24 @@
+{
+ "fixture": "004-crop-unsaved",
+ "note": "Crop WITHOUT saving: in '2009-07-04 Beach Day' double-clicked photo03.jpg, Crop, drag rectangle, Apply, Back to Library (no File->Save). Artifacts: .picasa.ini ONLY - [photo03.jpg] gains crop=rect64(dc3369dc570a51e) + filters=crop64=1,dc3369dc570a51e; + backuphash=64082. rect64 = 4x16-bit fixed-point fractions of image dims (l=0x0dc3 t=0x369d r=0xc570 b=0xa51e). NO db3 change, JPEG untouched, no .picasaoriginals - fully non-destructive edit.",
+ "captured": "2026-06-11T16:07:43+00:00",
+ "baseline": {
+  "label": "after 003-create-album",
+  "created": "2026-06-11T15:37:27+00:00"
+ },
+ "files": {
+  "library/2009-07-04 Beach Day/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7ae022f2397552c56e2bb81902e9be0b756caec0e10efc4db59993ec7c6cb195",
+    "size": 32
+   },
+   "after": {
+    "sha256": "d83b52f46cf1f9a74017ff760d531124234de6fc790ca531193b45ebcf60dd19",
+    "size": 130
+   }
+  }
+ }
+}
