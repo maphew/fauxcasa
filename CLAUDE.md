@@ -75,4 +75,15 @@ _Add a brief overview of your project architecture_
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- **Repo tooling/scripts are self-contained Python** with PEP 723 inline
+  metadata and the `#!/usr/bin/env -S uv run --script` shebang, so they run
+  cross-platform with no setup beyond uv
+  (https://docs.astral.sh/uv/guides/scripts/). On Windows: `uv run scripts/<name>.py`.
+  Bundle binary deps as packages where possible (e.g. `imageio-ffmpeg` instead
+  of requiring system ffmpeg). See `scripts/fetch-videos.py` for the pattern.
+  This applies to utility scripts only — **the implementation language for the
+  Fauxcasa application itself is deliberately undecided**; don't let tooling
+  choices prejudge it.
+- **Privacy**: real Picasa test data is personal and lives outside the repo;
+  committed fixtures must be synthetic. See `bd remember` key
+  `privacy-real-picasa-data` for the full rules (loaded at session start).

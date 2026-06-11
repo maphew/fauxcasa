@@ -23,7 +23,7 @@ for easy reading.
 
 The videos themselves and extracted stills are NOT committed (size/copyright);
 they live in the gitignored `cache/videos/<id>/` and can be rebuilt on any
-machine with `scripts/fetch-videos.sh`.
+machine with `scripts/fetch-videos.py`.
 
 ## sources/
 
