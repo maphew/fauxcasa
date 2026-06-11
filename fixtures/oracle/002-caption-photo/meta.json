@@ -1,0 +1,195 @@
+{
+ "fixture": "002-caption-photo",
+ "note": "Caption a photo from edit view: in '2009-07-04 Beach Day' double-clicked a photo (= photo04.jpg), typed caption in the strip under the photo, Enter, Back to Library. Stored text is 'synthetic aption one' (requested 'synthetic caption one' - one keystroke dropped at input; stored consistently everywhere). Artifacts: caption goes to imagedata_caption.pmp + INTO THE JPEG (XMP dc:description + new IPTC/8BIM block, +899 bytes) - NOT into .picasa.ini; ini only gets backuphash=3224 (= imagedata_backuphash.pmp row 24). Action also triggered a global db flush: new pmps (caption, backuphash, originslow, albumdata_inisync), albums_0.db 4->81200 bytes, albums_index.db created, repository.dat entries reordered, thumbindex.db timestamp updated. Star from fixture 001 still has no pmp representation.",
+ "captured": "2026-06-11T15:32:02+00:00",
+ "baseline": {
+  "label": "after 001-star-photo",
+  "created": "2026-06-11T15:28:51+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a458bf0328f7327a4b2e1547d87682382ccbbd42fffcae24e33c6c2776f9d28b",
+    "size": 100
+   },
+   "after": {
+    "sha256": "182b731897f5f3e89724b7be201ba3c22f69cf39721392c1493b40a9ab86d25f",
+    "size": 100
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "99de849b32c12b9e3d471c33d3ce32d9f7990abb5036845c8916e1c9b244aa9c",
+    "size": 100
+   }
+  },
+  "db3/albums_0.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7976acfbc3de10e4e4720f1fe68a3621615536679ef373fd7d6df906c8c86dc4",
+    "size": 4
+   },
+   "after": {
+    "sha256": "db5544a11130140806521900d3092cefeea1b630c023233e491e2d372704c755",
+    "size": 81200
+   }
+  },
+  "db3/albums_index.db": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "32caa48d799b310ef7600fbb3873aef07ea2f8a565d6584701795d4966e7f5af",
+    "size": 140
+   }
+  },
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "8eca0e8db2a1d13b9a7774c9707f2c2e63ee90678e867c4b5eb96390fcc5bc84",
+    "size": 116637
+   },
+   "after": {
+    "sha256": "36fc2769bb2a07909e1b8070b15137adbc86299b862c9b68e0dea5c8f1921ea2",
+    "size": 116637
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "e3a0222ec87086d0b2b84a4698bbb04d0f9f52b49fa038676b6979799aa95c70",
+    "size": 70
+   }
+  },
+  "db3/imagedata_caption.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "85f6fa96d7691d7d9f8015736d92012b7466a955d487e743b36bbb8b5543b8fb",
+    "size": 65
+   }
+  },
+  "db3/imagedata_originslow.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "d4ede6e3a4b8bcac058c338f2bb4fc87584bb033a72aa915554eaa0f2af78d72",
+    "size": 220
+   }
+  },
+  "db3/previews_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "74f1b79ed5da87e9f459ee4b17e060ab5617de2518d6731a5483df5aa80ee695",
+    "size": 360844
+   },
+   "after": {
+    "sha256": "4ab3c3882430fd01216a81fd0b204f9a91f018ed4880727ec65ecc4e63593dc6",
+    "size": 360844
+   }
+  },
+  "db3/repository.dat": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d28508bce821b2f8df7058d7303a3287df370b79b4ffa342ceabb95664d31484",
+    "size": 140
+   },
+   "after": {
+    "sha256": "493a720af10e100e55b548504415ed31af24207451667384bb9a088db9753285",
+    "size": 140
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ad0ecb8be43d9aea11b825a2ff0869450f812b10bde49ce0e9897cea791b2e6e",
+    "size": 1429
+   },
+   "after": {
+    "sha256": "dca7d3af271a4ab664b9a49474478b76e401a0045f7e9ac0a95727b985977944",
+    "size": 1429
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "56b8dc3ad48ecaa49c2d737ab6ed15a772cfded30a591e5b648a9588c9ca90dd",
+    "size": 28483
+   },
+   "after": {
+    "sha256": "339eaa489f51ce008803343fa92ad8564292c602b248cdbd952b73958d0c4150",
+    "size": 28483
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "192c1ee23f2fde6d2cc736f964a52d426e50a1c150c0d83999c3c6aaad9c50d4",
+    "size": 76755
+   },
+   "after": {
+    "sha256": "bfc5a07e84c89b139b73cef8a2eb7ed83c3c2b90c7faf5c0ccfe49cb08f10cdb",
+    "size": 76755
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "f952688f0ac6a0502b72deb75849e429490c64d43e21742849d5461fb3a8595e",
+    "size": 67132
+   },
+   "after": {
+    "sha256": "c9965e2c4d6b33d350c515ce9d95dc920c4bfbe5ffba2a78d08145f101bcf40a",
+    "size": 67184
+   }
+  },
+  "library/2009-07-04 Beach Day/.picasa.ini": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "7ae022f2397552c56e2bb81902e9be0b756caec0e10efc4db59993ec7c6cb195",
+    "size": 32
+   }
+  },
+  "library/2009-07-04 Beach Day/photo04.jpg": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "2662da3fbdd15c42c8aa7ee75b4dc0526af630fe69de39d7e0d1f9245446c47a",
+    "size": 77164
+   },
+   "after": {
+    "sha256": "eb5a5e3511b49977c3fa2f22569b3558c802dba48edb20a906246e7e643bc6b3",
+    "size": 78063
+   }
+  }
+ }
+}
