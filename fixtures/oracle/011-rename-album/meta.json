@@ -1,0 +1,63 @@
+{
+ "fixture": "011-rename-album",
+ "note": "Rename album 'Synthetic Album A' -> 'Synthetic Album B' via left panel. Synchronous phase: ini [.album:uid] name= line rewritten in place; uid and token UNCHANGED (album identity is the uid, name is display-only). albumdata_name.pmp NOT yet updated (lazy). wordhash shrank 8 bytes (re-indexed name). STOWAWAY: albumdata_inisync[8] (Winter Holiday row) tick belongs to fixture 010's unstar, arriving on its lazy cycle - not part of the rename.",
+ "captured": "2026-06-11T18:32:38+00:00",
+ "baseline": {
+  "label": "after 010-unstar-photo",
+  "created": "2026-06-11T18:30:35+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d53ec56e4922fd7ee143bd396fa73a8c479d7791ca30a75d135d3d863f849482",
+    "size": 108
+   },
+   "after": {
+    "sha256": "b6da0f890c36ded9fe21e0754954281500351d3050c799807dcfc136a28e9f60",
+    "size": 108
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "2340e6baf4688a3b3bc10824842201b48459a2492b31a7b531dbb9936142b10c",
+    "size": 108
+   },
+   "after": {
+    "sha256": "45b8695d14df91dd00953f5e66dabe4cb693eb6e1f1337a29c97179d2f400906",
+    "size": 108
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "6d18948e155023984073827a34e1bcb5513b70df492b49a97523e3fe088c838e",
+    "size": 67264
+   },
+   "after": {
+    "sha256": "1a56fcb674b209d50c1af79980888a357f867e10332c2cb321645121f599f01a",
+    "size": 67256
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "5985d2e5096b65d984d609d5de6981c807d2558dc9e784a62e1f8e2c5d6dc03a",
+    "size": 283
+   },
+   "after": {
+    "sha256": "6a04b48b8aa4bde1030f5a3470343fe6afe2beffea38f186b85feab6238f505e",
+    "size": 283
+   }
+  }
+ }
+}
