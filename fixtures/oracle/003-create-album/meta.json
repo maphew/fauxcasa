@@ -1,0 +1,228 @@
+{
+ "fixture": "003-create-album",
+ "note": "Create album from selection: in '2015-03-15 Garden Project' selected photo01.jpg + photo02.jpg (ctrl-click), right-click -> Add to Album -> New Album, named 'Synthetic Album A'. Artifacts: new row [10] in all albumdata_*.pmp (name, uid=f07f69266e7760526d5b1553c7f451fa, token=']album:<uid>', category=0, date=2015-03-15T09:59:59 = photo date not creation date, empty description/location/music); folder .picasa.ini gains [.album:<uid>] section (name/token/date) + 'albums=<uid>' under each member photo's section. NO .pal file in Picasa2Albums. albumdata_inisync[7] (folder row) set to FILETIME = ini-sync timestamp hypothesis. albums_0.db +75KB appended; 4x *_index.db few-byte changes.",
+ "captured": "2026-06-11T15:37:27+00:00",
+ "baseline": {
+  "label": "after 002-caption-photo",
+  "created": "2026-06-11T15:32:02+00:00"
+ },
+ "files": {
+  "db3/albumdata_category.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "b2f259f71e4f2f6b40443aa2a53a7b073a70a633413b76700e5aa8e3cc81bdea",
+    "size": 60
+   },
+   "after": {
+    "sha256": "5249f181e9601f44a42805761aeab7935991bfb419ab98839f3b361639234d55",
+    "size": 64
+   }
+  },
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "182b731897f5f3e89724b7be201ba3c22f69cf39721392c1493b40a9ab86d25f",
+    "size": 100
+   },
+   "after": {
+    "sha256": "7fb94f49203ae80636deed0c0183117cd950993d5bc7322a50a73a0b6cc3375e",
+    "size": 108
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "33b8dd9554c0c9cf7045bc3b6280e7672cd5bdaaaa493012e8c104bc3d769694",
+    "size": 52
+   },
+   "after": {
+    "sha256": "bbc6c63a75d2f59c71f2e0780de34f73696ba201f1fe3c33ad2467835e4c8182",
+    "size": 53
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "99de849b32c12b9e3d471c33d3ce32d9f7990abb5036845c8916e1c9b244aa9c",
+    "size": 100
+   },
+   "after": {
+    "sha256": "a66f259edf188ee2aaa75ae4a91ca08a31c08d63d28631c1b69c173f53740ed2",
+    "size": 108
+   }
+  },
+  "db3/albumdata_location.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8525c383ac9c9a09b8ee10c940fecf67eed85ea5cd5436aa591a160fa15f1fdf",
+    "size": 30
+   },
+   "after": {
+    "sha256": "517a1c149f0dceb05b36c4f2e5ada80d89ff3e53af6098c66097b037371e0390",
+    "size": 31
+   }
+  },
+  "db3/albumdata_music.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "10e9a477166935f09e27aeed3119f3251fff0752f2050f18d36b051395ffe5e4",
+    "size": 27
+   },
+   "after": {
+    "sha256": "517a1c149f0dceb05b36c4f2e5ada80d89ff3e53af6098c66097b037371e0390",
+    "size": 31
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "1deb6c21477a98c75b5a10f3233ff2406367f4c47e917395dc6b51651093816e",
+    "size": 177
+   },
+   "after": {
+    "sha256": "ddf996cd7301f23d0e8dc4bc52b88a1ccfbf929dc310d343a01a58e4aeaf25a5",
+    "size": 195
+   }
+  },
+  "db3/albumdata_token.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "1bf73d6cc51917f39b0a7e8b0044be6679d1233095303198fd5b2d3360f5a463",
+    "size": 220
+   },
+   "after": {
+    "sha256": "de9c98f2c26f40334872879b5723820af19696217c1f44df749e9fad06267621",
+    "size": 260
+   }
+  },
+  "db3/albumdata_uid.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9bd0c5e3a18ae9c0720139bf91bb70e999fcf9e3a0a44775a98a85c05522b27e",
+    "size": 350
+   },
+   "after": {
+    "sha256": "db12605f67f20c1955b436cfebcb7d34428379fa53f9be1e7a0a55a97667ec15",
+    "size": 383
+   }
+  },
+  "db3/albums_0.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "db5544a11130140806521900d3092cefeea1b630c023233e491e2d372704c755",
+    "size": 81200
+   },
+   "after": {
+    "sha256": "c8ef5327ee344cae3dfa52bf24a8f2cd0f54c7b892befb92987ae6e64a531c35",
+    "size": 156184
+   }
+  },
+  "db3/albums_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "32caa48d799b310ef7600fbb3873aef07ea2f8a565d6584701795d4966e7f5af",
+    "size": 140
+   },
+   "after": {
+    "sha256": "7b11cb9bd5cfa7c1f7a97eba2cdbccd7e20622f7403b62c1eee46dc59bd08cd1",
+    "size": 152
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7861158d43cbc3d9bc18cc0be282ddd05a5197119d2eb6baafeeb9ad4e565f68",
+    "size": 356
+   },
+   "after": {
+    "sha256": "625b2d26c276c21d9e5d313108a266b4f1a02337955c78867e833046d5151104",
+    "size": 356
+   }
+  },
+  "db3/previews_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "85c038e41ac0424df17ead1fb3e5ab5462787c996877fd4cc7c268d2b5ba21fc",
+    "size": 356
+   },
+   "after": {
+    "sha256": "3e6fcabb128553723b86788868d885f80265d0a4a9048ac08c6cd08f37aef896",
+    "size": 356
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9e6d9dfe5bfded8983c74c70c4436a46838b95e8c97d96bb0ad935975884c113",
+    "size": 356
+   },
+   "after": {
+    "sha256": "ea6ac565d02aa841f0aa8f195b63bbdd722442201ffabedd001791200ae39713",
+    "size": 356
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8bf90c080f13a302c68c875ef03d116e89ab7cea7b3206b105da9f58dbf10811",
+    "size": 356
+   },
+   "after": {
+    "sha256": "1ff9c86f2d492d3138bbc717f753adf0ad85b81e37e28df2bfd9b9f20a16e2ba",
+    "size": 356
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "c9965e2c4d6b33d350c515ce9d95dc920c4bfbe5ffba2a78d08145f101bcf40a",
+    "size": 67184
+   },
+   "after": {
+    "sha256": "15b91a42bd8e1464ffdad8da1ab9b63eaa04b730952cb1835e585a5a42059972",
+    "size": 67216
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "50d5f703cc6bc0f634c2f8d566ccb25d1226fa0e238848bf1096c559467d04a1",
+    "size": 251
+   }
+  }
+ }
+}
