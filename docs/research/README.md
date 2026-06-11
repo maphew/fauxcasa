@@ -50,6 +50,12 @@ Survey of existing open-source Picasa format parsers (Chromium's unit-tested
 .pmp reader, picasa3meta, PicasaDBReader, picasa2digikam, the .picasa.ini
 spec gist, ...) with licenses and recommended primary references.
 
+## wine-oracle.md
+
+Real Picasa 3.9 running under Wine against the synthetic library: setup,
+launch commands, validation results (round-trip .pmp parse confirmed), and
+the differential-testing recipe.
+
 ## picasastarter-notes.md
 
 Mechanisms and lessons from PicasaStarter (multi-database/multi-machine

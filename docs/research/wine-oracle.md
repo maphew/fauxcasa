@@ -1,0 +1,85 @@
+# The Wine Picasa oracle
+
+Real Picasa 3.9 running under Wine on the dev machine, indexing the synthetic
+photo library — our ground-truth generator for differential format testing.
+Stood up and validated 2026-06-11.
+
+## Why
+
+Instead of trusting 2011-era format writeups, we make the real binary produce
+fresh artifacts on demand: change something in Picasa, diff the resulting
+`.pmp`/`.picasa.ini` bytes; later, feed Fauxcasa-written files back to real
+Picasa and confirm it accepts them. All data is synthetic
+(`scripts/make-synthetic-library.py`), so none of this touches the privacy
+rules.
+
+## Setup (reproducible)
+
+1. Wine flatpak, user-level:
+   `flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo`
+   `flatpak install --user -y flathub app/org.winehq.Wine/x86_64/stable-25.08`
+2. Synthetic library: `scripts/make-synthetic-library.py` →
+   `cache/synthetic-library/` (3 folders × 8 EXIF-dated JPEGs).
+3. Install Picasa silently into a dedicated prefix (installer cached, see
+   `picasa-binary-notes.md` for provenance):
+
+   ```sh
+   flatpak run --filesystem=home \
+     --env=WINEPREFIX=$PWD/cache/wine-oracle \
+     --env=WINEDLLOVERRIDES="mscoree,mshtml=" \
+     org.winehq.Wine cache/installers/picasa39-setup.exe /S
+   ```
+4. Pre-seed first-run scan suppression (the PicasaStarter recipe — see
+   `picasastarter-notes.md`) under
+   `cache/wine-oracle/drive_c/users/<user>/AppData/Local/Google/`:
+   - `Picasa2Albums/watchedfolders.txt` — CRLF line:
+     `Z:\...\cache\synthetic-library` (Wine maps `/` as `Z:`)
+   - `Picasa2Albums/frexcludefolders.txt` — empty
+   - `Picasa2/db3/thumbs_index.db` — 356-byte seed file (fetched from the
+     PicasaStarter mirror's embedded resource)
+
+## Launch
+
+```sh
+flatpak run --filesystem=home \
+  --env=WINEPREFIX=$PWD/cache/wine-oracle \
+  --env=WINEDLLOVERRIDES="mscoree,mshtml=" \
+  org.winehq.Wine "C:\\Program Files (x86)\\Google\\Picasa3\\Picasa3.exe"
+```
+
+First interactive run asks about usage feedback and backup (decline both);
+after that it shows the standard Picasa window and works. Headless runs (no
+interaction) still perform the folder scan and write the database, then exit.
+
+## Validation results (2026-06-11)
+
+- Watched-folder seeding works: `scanlist.txt` = `+C:\` `+Z:\`;
+  `thumbindex.db` contains the three synthetic folders (full paths, UTF-8/
+  ASCII) and all 24 photos (stored name-only — files join to parent folders
+  by index, matching the `imagedata.parent` field design).
+- Database appears in `db3/` within ~20s of first launch: the full
+  `.pmp` set for `albumdata`/`catdata`/`imagedata` plus `thumbs2_0.db`,
+  `bigthumbs_0.db`, `previews_*`, `repository.dat`, `facetemplatesV2_0.db` —
+  matching the schema vocabulary recovered from the binary
+  (`picasa-binary-notes.md`).
+- **Round-trip parse confirmed**: a ~30-line Python reader using the sbktech
+  header layout (magic `0x3fcccccd`, type, `0x1332`, `0x00000002`, type,
+  `0x1332`, count) correctly read oracle-written files:
+  - `imagedata_width/height.pmp` (type 0x1 uint32) → exactly our synthetic
+    dimensions; first rows are 0 (folder rows; `imagedata_filetype` = 1 for
+    folders, 2 for JPEG photos; 28 rows = 24 photos + folder entries)
+  - `catdata_name.pmp` (type 0x0 string) → Picasa's internal categories:
+    `Labels, Projects (internal), Folders on Disk, Web Albums, Web Drive,
+    Exported Pictures, Other Stuff, Hidden Folders, People`
+  - `albumdata_name.pmp` → built-in virtual albums (`Starred Photos,
+    Screensaver, Recently Updated, Emailed, Uploaded, ...`) followed by the
+    three watched folders — folders and albums share the albumdata table.
+
+## Differential-testing recipe (next step)
+
+1. Snapshot `db3/` and the library's `.picasa.ini` files (none yet).
+2. Perform ONE action in the Picasa UI (star a photo, caption, crop, tag a
+   face, make an album).
+3. Diff: new/changed `.pmp` entries, `.picasa.ini` deltas.
+4. Record each action→bytes mapping; build the Fauxcasa parser/writer test
+   suite from these fixtures (synthetic, so committable).
