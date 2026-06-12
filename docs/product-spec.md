@@ -71,7 +71,10 @@ that rule.
   telemetry. Picasa's release history is a graveyard of cloud-coupled features
   that decayed as services churned; the durable core was 100% local (face
   tagging outlived every service around it). Nothing in Fauxcasa may *depend*
-  on a hosted service.
+  on a hosted service. (Peer-to-peer multi-machine sync — no hosted backend,
+  user's own machines — is *not* banned by this: it's a far-range prospect
+  the architecture must keep open; §3 Concurrency, §5 LATER. *Owner
+  priority.*)
 - **Not Photoshop, not Lightroom, not darktable.** Editing depth stays at
   Picasa's bar: crop, straighten, one-clicks, tuning sliders, simple effects.
   RAW files render automatically "as if JPEG"; real raw development is
@@ -313,6 +316,12 @@ drives can remount anywhere.
   (last-writer-wins) with a surfaced reconciliation note. Fauxcasa never
   holds a sidecar open and never rewrites one it hasn't re-read. This is the
   live half of the N6 test.
+- **Future-proofing (*owner priority*):** local-first is the ethic, but
+  multi-machine peer-to-peer sync is an open prospect the architecture must
+  not foreclose. Concretely: durable state stays in mergeable shapes —
+  per-record files, append-style journals, stable UIDs — never in forms
+  that assume a single forever-writer. Extant P2P projects are the study
+  list when the time is right (§5 LATER).
 - **⚖ argue** if the multi-machine NAS scenario needs more than
   single-writer-alternation in v1 (§10 item 10).
 
@@ -558,6 +567,24 @@ guarantee (N2) — that is a different act and is not gated here.
   owner (2026-06-11): highly desirable, but pointless before browsing,
   search, organization, and non-destructive edits exist. Privacy-gated:
   explicit opt-in, fully local.
+- **Duplicate management** (*owner priority*, sequenced after face
+  recognition): detection and optional removal or collapsing, leveled
+  deliberately because each level is a different problem —
+  - **L1 — byte-identical files.** The floor, and nearly free to *detect*:
+    §3 file identity already hashes every file, so equal hashes are already
+    in the catalog. The hard part is collapse semantics: the copies carry
+    separate per-location state (stars, captions, album memberships, sort
+    positions) that must be merged, not discarded (§10 item 14).
+  - **L2 — identical pixels, differing metadata.** Same image, divergent
+    EXIF/XMP/IPTC — grows into diff/merge tooling (view both, pick fields,
+    reconcile), which is its own surface.
+  - **L3 — perceptual similarity.** Downsampled, resized, re-encoded,
+    lossy-recompressed variants; needs perceptual hashing and a
+    review-before-act UI.
+  - **L4 — reserved.** The ladder is open-ended; more levels would not
+    surprise us.
+  L1 lands after face recognition and before content recognition; L2+
+  float — they are not necessarily before content recognition.
 - Geotag map panel (swappable tile provider, offline-degrading — Picasa's
   Maps-API dependency broke twice via deprecation).
 - Timeline view.
@@ -577,11 +604,19 @@ guarantee (N2) — that is a different act and is not gated here.
   dependency (§1 non-goals); results land as ordinary, reviewable
   keywords/attributes in tier-2 state (N3) — searchable suggestions the
   user accepts or ignores, never self-applied curation. Sequenced after
-  face recognition.
+  face recognition and duplicate management L1 (the L2+ dupe levels may
+  land on either side of it).
 - Custom buttons / external-tool API (tray-consuming, export-then-act, with
   a consent gate Picasa lacked).
 - Standalone fast viewer + OS file associations.
 - Full localization (string externalization is already day-one).
+- **Multi-machine sync, peer-to-peer** (far-range, *owner priority*):
+  local-first stays the ethic — no hosted backend, ever (§1) — but
+  same-owner multi-machine libraries are a real scenario (the NAS story is
+  the degenerate case) and P2P sync is the eventual answer. v1's only
+  obligation is architectural: don't foreclose it (§3 "Future-proofing").
+  Study the extant art (Syncthing-class file sync, CRDT-based stores, P2P
+  photo tools) when the time is right.
 
 ### OUT — dead, replaced, or against the soul
 
@@ -751,7 +786,8 @@ measurable exit criteria — zero data-loss incidents, zero N1–N7 violations,
 weekly Picasa-opens-the-library differential checks green, owner signs off.
 
 **v1 = M1–M4.** Face recognition is the sole headline of the next release
-(§5 LATER); maps, printing, gallery export follow.
+(§5 LATER); then duplicate management L1, then content recognition; maps,
+printing, gallery export interleave as they fit.
 
 **Gate coverage:** N1→M2 · N2→M3 · N3→M2 · N4→M1 (read-only rows; write/watch
 rows at M2/M4) · N5→M2 (+M4 NAS) · N6→M4 · N7→M2. Formats + decode
@@ -786,7 +822,9 @@ items. Argue here, then edit the spec.
 9. **Updates** (§5 Maintenance) — spec says opt-in version check, never
    auto-install; argue for fully-offline instead.
 10. **Concurrency model** (§3) — single-writer + alternation vs something
-    stronger for the multi-machine NAS scenario.
+    stronger for the multi-machine NAS scenario — and which durable-state
+    primitives keep the far-range P2P-sync door open (§3
+    "Future-proofing").
 11. ~~V6 slideshow question~~ — **settled (owner, 2026-06-11):** both halves
     are desirable. Playback is M1; the minimal Picasa-2-level renderer rides
     M4 (§5 In & out); the full Movie Maker stays LATER.
@@ -799,6 +837,11 @@ items. Argue here, then edit the spec.
     models only, or also per-batch opt-in remote LLM assist? And where is
     the line between assistive suggestions (in) and auto-curation (banned by
     §1)? Needs argument before any v2 design work.
+14. **Duplicate-collapse semantics** (§5 LATER) — what does "collapsing"
+    mean: merge per-copy state into one survivor? a canonical file plus
+    references? hardlinks? What is reversible vs destructive, and how much
+    of the L2 metadata diff/merge surface is worth building? Needs argument
+    before the dupe release is designed.
 
 ---
 
