@@ -1004,7 +1004,12 @@ def test_oracle_thumbindex_matches_imagedata():
     assert len(entries) == filetype.count
     for e in entries:
         assert e.is_folder == (e.ftype == 1)
-        assert e.valid == 1  # invariant in the oracle data
+        if e.valid != 1:
+            # delete tombstone: zeroed in place, row count preserved, and
+            # the imagedata filetype row is zeroed too (fixture 015)
+            assert (e.name, e.size, e.ftype, e.parent) == ("", 0, 0, None)
+            assert filetype.values[e.index] == 0
+            continue
         if e.is_facecrop:
             # the face-crop row's u8 holds the low byte of its imagedata
             # filetype (1001 = 0x3e9 -> 0xe9); observed-shape pin (014
@@ -1110,8 +1115,10 @@ def test_oracle_survey_runs_clean(capsys):
     bad = [r for r in report["files"] if not r.get("ok", True)]
     assert not bad, bad
     ti = report["scale"]["thumbindex"]
-    assert ti["files"] >= 24 and ti["deleted"] == 0
-    assert ti["face_crops"] == 1  # the 014 fixture session's manual face tag
+    # the oracle is a growing baseline: deletes tombstone rows in place
+    # (fixture 015), so live + tombstoned never drops below the original 24
+    assert ti["files"] + ti["deleted"] >= 24
+    assert ti["face_crops"] >= 1  # the 014 fixture session's manual face tag
     assert "face-crop" not in ti["by_ftype"]  # virtual records aren't files
     # every imagedata column row count is bounded by the thumbindex join key
     assert report["tables"]["imagedata"]["rows"] == ti["entries"]
