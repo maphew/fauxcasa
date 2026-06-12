@@ -98,6 +98,71 @@ stable — fixture 002 recorded Picasa itself reordering the block during an
 ordinary caption flush. Whether Picasa tolerates missing or different
 sentinels is the subject of the acceptance experiment below.
 
+### Sentinel acceptance experiment (fauxcasa-5kl, 2026-06-12)
+
+Eleven variants of repository.dat/usernames.dat were fed to real Picasa
+3.9.141, each in a disposable clone of the oracle prefix (state 'after
+020-folder-description') with a private `dosdevices/z:` staging tree, so
+the `Z:\` paths baked into db3 resolved to clone-local library copies and
+the live oracle was never touched. Each run: launch on an isolated
+headless Xwayland display, 6 min idle watch, `taskkill` WM_CLOSE close,
+20 s settle, then a sha256 census diff over db3 + contacts + Picasa2Albums
++ staged library + prefix registry. Harness:
+`scripts/oracle-sentinel-experiment.py` (subcommands `master` / `run` /
+`report` / `clean`; weston launch line in its docstring).
+
+| variant fed | repository.dat outcome | side effects beyond noise floor |
+|---|---|---|
+| untouched (control) | rewritten byte-identical content, order normalized | none — defines the noise floor below |
+| pairs reversed | accepted; canonical rewrite | none |
+| file deleted | regenerated, all nine canonical pairs | colorspace + face migrations |
+| valid file, 0 pairs | regenerated | colorspace + face migrations |
+| `frversion` dropped | restored at canonical `1.5` | face migration only |
+| `frversion=1.0` (lower) | forced back to `1.5` | face migration only |
+| `frversion=9.9` (higher) | forced back to `1.5` | face migration only |
+| unknown `fauxcasa=1` added | **preserved across rewrite** | none |
+| magic bytes corrupted | discarded wholesale, regenerated | colorspace + face migrations |
+| truncated mid-pair (tail lost) | readable prefix salvaged; lost tail keys restored from defaults | none (version keys sat before the cut) |
+| usernames.dat with fake account pair | (repository untouched) fake pair **preserved** | none |
+
+Findings:
+
+- **Sentinels are equality-gated migration triggers.** Any mismatch on a
+  version key — missing, lower, *or higher* — re-runs that subsystem's
+  migration and stamps the binary's own canonical value. `frversion`
+  mismatch alone: `imagedata_facerectdata.pmp` rewritten and
+  **`facetemplatesV2_0.db` deleted** (face-recognition state destroyed);
+  whole-file loss adds an `imagedata_colorspace.pmp` rewrite
+  (`colorspaceversion`). No variant caused a library rescan, a refusal,
+  a dialog, or a crash.
+- **Write timing**: repository.dat is rewritten on the ~3 min lazy flush
+  when dirty and unconditionally at every clean close (the close rewrite
+  normalizes pair order — the live oracle's `IDPersist`/`flat` flip).
+  usernames.dat is rewritten on the same flush cycle.
+- **Both files round-trip foreign keys.** An unknown repository key and a
+  fake usernames account pair both survived Picasa's own rewrites —
+  `ytRepository` is a durable general key/value store, consistent with the
+  disassembly. A Fauxcasa marker key planted there would persist.
+- **Robustness is asymmetric**: a corrupt header discards everything (and
+  fires every migration); truncation inside the data is salvaged
+  pair-by-pair with defaults filling the tail.
+- **Launch+close noise floor** (identical across all variants): the
+  `albumdata_date[6]` activity tick, a one-time uid assignment to any
+  album row lacking one (here the 014 person album), an in-place
+  `thumbindex.db` touch, wine registry churn — plus the repository.dat
+  rewrite itself. One run also paid off pending ini-sync debt
+  (an album description materialized into `albumdata_description.pmp` and
+  the folder ini), unrelated to its variant.
+
+**Writer-compat requirement (the bead's question):** a Fauxcasa writer
+must emit the nine canonical pairs with exact values — anything else is
+*accepted* but punished with silent migration churn, including deletion of
+the user's face-recognition templates on next Picasa launch. Order is
+free, extra keys are safe, and a missing file is survivable-but-lossy.
+Caveat: runs were display-less (Wine null driver) except the
+control/corrupt-magic verification re-runs under X11, which behaved
+identically; unclean-exit behavior was not tested.
+
 ## Feature usage
 
 db3 side: `starlist.txt` 1 entry (001), 1 caption (002), 1 rotate (006),
@@ -187,8 +252,12 @@ Results (run 2026-06-11, ~4 minutes wall clock):
   db3 edit columns from ini on rescan — `albumdata_inisync` exists but its
   semantics are unconfirmed).
 - `repository.dat` holds nine version sentinels — trivial to write; emit
-  the same pairs (order varies between Picasa's own flushes; whether Picasa
-  accepts foreign or differing sentinel blocks is untested).
+  the same pairs with exact canonical values. The acceptance experiment
+  above shows Picasa tolerates any foreign block without complaint, but
+  re-runs equality-gated migrations for every wrong/missing version key —
+  destroying face templates among other things — so "accepted" and
+  "harmless" are not the same thing. Order is free; extra keys round-trip
+  (`scripts/picasa_db.py` has `write_repository`).
 - Cache files (`thumbs*`, `previews*`, `bigthumbs*`, `albums_0.db`) are the
   bulk of db3 by bytes and are regenerable; Fauxcasa can ignore their
   contents and let Picasa rebuild them.
