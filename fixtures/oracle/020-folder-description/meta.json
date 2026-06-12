@@ -1,0 +1,167 @@
+{
+ "fixture": "020-folder-description",
+ "note": "Edit FOLDER description (the album-description variant is a separate fixture - user edited the folder '2015-03-15 Garden Project', via the folder header/edit-description UI). Sync phase: folder ini gets the full [Picasa] folder-identity block materialized, not just the edited field: name= (folder name), description=description edit in garden project: done!, date=42078.416667 (Picasa epoch days float = 2015-03-15 10:00, the folder's date), P2category=Folders on Disk. Flush (+~3min, included): albumdata_description[7] = description VERBATIM (row 7 = Garden Project folder row, confirmed by matching inisync[7] FILETIME tick), albumdata_date[6] activity tick, thumbnail index/blob churn (bigthumbs +4156 - folder thumb re-render). Key for writer: editing ONE field of folder metadata writes the WHOLE [Picasa] block.",
+ "captured": "2026-06-12T16:22:54+00:00",
+ "baseline": {
+  "label": "after 019-save-text-to-disk",
+  "created": "2026-06-12T16:17:02+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "f605acf805ef72dd00130e0a12fbdff15cdc854c39a2363cba7dd5462fb373e9",
+    "size": 116
+   },
+   "after": {
+    "sha256": "8bd0a200e735a10f76a9ae0e7ffd8e3821549d271f395d67819357094bca66bb",
+    "size": 116
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "b81def827ada834b5812c6b45df147502a413d273ec11e843a4df063a9885778",
+    "size": 54
+   },
+   "after": {
+    "sha256": "94851f37ed3bfe5555f660e1efc5bbaee18a80f70dcfbd18ac0b296036b276ee",
+    "size": 95
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "b3ed0119a2ffbd98315e3abfc29e6a954056f5e84a3a042fb0a865ccb94432b4",
+    "size": 108
+   },
+   "after": {
+    "sha256": "fd48ae7f3eb584b610ff5fcc32cf65bf87ac9df3c05bd00238c36a4c27db8d61",
+    "size": 108
+   }
+  },
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "700300439ef1002202270c0f1652f97fc6ac125708c849edea37831b69703225",
+    "size": 151381
+   },
+   "after": {
+    "sha256": "dd86ae5c9df48460e5259b7432cc7372e06c995f1b02cdd67b8dba4f329ffad3",
+    "size": 155537
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "83386356108c9ab5f92d2e59b2145eba2c332d6069e7fc1c119b20ef08934685",
+    "size": 368
+   },
+   "after": {
+    "sha256": "7e7ba250b9940deaa4e450a1f3152a95fbedccd7a631277a9532c5720a7e118a",
+    "size": 368
+   }
+  },
+  "db3/previews_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "cacb838ca4a07264a1fad443a5517e17223be1004b842fd85f64fa00829eab88",
+    "size": 424420
+   },
+   "after": {
+    "sha256": "49deb04354c7c3f4911fecea13e5718cfea287190d2df67b0b681c6fb052b1c4",
+    "size": 424420
+   }
+  },
+  "db3/previews_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ba8a64feeec86d0a7815ac2c0c2919521a3b097d776ad78b2d6512df9987c88a",
+    "size": 356
+   },
+   "after": {
+    "sha256": "43ac6ac246ba3def50c8c692776aee76539da101476ac2ec228d1ee70ae47611",
+    "size": 356
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "e5a635dab2b2de9d2b87c005d9390d6e4ea8e85a5a5355a1c0350b12631c30df",
+    "size": 34415
+   },
+   "after": {
+    "sha256": "651e57b717769f396404a1c1fbd8e0ad7b51a79599d4f162d1a39a4a5b4fe258",
+    "size": 34415
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "db77804dcbee5eda1b6b38a7da4d9c694ee4684d7331c57c243aebb47c36b220",
+    "size": 368
+   },
+   "after": {
+    "sha256": "1e6501e8d60b5096e88b610f71bdff92911906b1889866230dc7b539e540319f",
+    "size": 368
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "860928d77d4fcc9cccfbd567a1347f86e6c5a6bdedd4ef72ee85c048e22c2115",
+    "size": 94424
+   },
+   "after": {
+    "sha256": "94ba5f9732c4497a3de71218ea519ed524d6a7fe2a2ca4f1eafd286a3de86cb8",
+    "size": 94424
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "dd74e833e3357815ee3b92c4cb8125dfb3cc84cbc240ea5b4f6b1b8b4498b02b",
+    "size": 368
+   },
+   "after": {
+    "sha256": "8e95cbd1ebd86f70a820c9caa6ecf8ab7d50d010624243b08a841de6db2408f5",
+    "size": 368
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "4afd3fdfe4ca2be6fb37fa2cb180fd883996fc22efdf48caf47cb6dbde3dae26",
+    "size": 387
+   },
+   "after": {
+    "sha256": "06178036380781e4743ca6d41dd3b90d0eed4a9940b54bed3b49709ef3d40c5e",
+    "size": 531
+   }
+  }
+ }
+}
