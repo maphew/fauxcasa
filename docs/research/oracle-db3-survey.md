@@ -80,13 +80,23 @@ key/value pairs (reader: `read_repository`):
 | flat | 1 |
 | IDPersist | 2 |
 
-`usernames.dat` shares the layout, 0 pairs (no Google sign-in; its populated
-format is unobserved and presumed to hold account data — the survey redacts
-all of its pairs unconditionally). A Fauxcasa writer should emit the same
-nine key/value pairs, but note: pair *order* is not stable — fixture 002
-recorded Picasa itself reordering the block during an ordinary caption
-flush — and whether Picasa tolerates missing or different sentinels is
-untested (a future oracle experiment: feed it a modified repository.dat).
+`usernames.dat` shares the layout, 0 pairs (no Google sign-in). Disassembly
+of the repository accessors (fauxcasa-5kl, see `picasa-binary-notes.md`)
+settled what static analysis can: the binary reads two more repository.dat
+keys it never wrote at the oracle — `DBID` (replication/database id) and
+`syncversion` (Picasaweb sync) — while `dbVersion`, despite sitting in the
+same string table, is a registry `Preferences\` value, not a repository
+key. usernames.dat is the same `ytRepository` class (member
+`m_usernameRepository`), and **no literal key strings for it exist in the
+binary**: its keys are built at runtime from account identifiers (values
+compared against `"1"`), so the populated format keys on the account
+identity itself and cannot be characterized without a live Google sign-in —
+which the long-retired Picasaweb/ClientLogin endpoints no longer offer. The
+survey accordingly keeps redacting unknown keys unconditionally. A Fauxcasa
+writer should emit the same nine key/value pairs; pair *order* is not
+stable — fixture 002 recorded Picasa itself reordering the block during an
+ordinary caption flush. Whether Picasa tolerates missing or different
+sentinels is the subject of the acceptance experiment below.
 
 ## Feature usage
 

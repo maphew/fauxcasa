@@ -574,6 +574,25 @@ def read_repository(path: Path | str) -> list[tuple[str, str]]:
     return pairs
 
 
+def encode_repository(pairs: list[tuple[str, str]]) -> bytes:
+    """Encode key/value pairs in repository.dat layout (inverse of
+    read_repository). Order and duplicates are preserved; keys and values
+    must not contain NUL."""
+    out = bytearray(struct.pack("<II", PMP_MAGIC, len(pairs)))
+    for k, v in pairs:
+        for s in (k, v):
+            b = s.encode("utf-8", "surrogateescape")
+            if b"\x00" in b:
+                raise ValueError("repository strings must not contain NUL")
+            out += b + b"\x00"
+    return bytes(out)
+
+
+def write_repository(path: Path | str, pairs: list[tuple[str, str]]) -> None:
+    """Write a repository.dat/usernames.dat file from key/value pairs."""
+    Path(path).write_bytes(encode_repository(pairs))
+
+
 # --------------------------------------------------------------------------
 # .picasa.ini
 # --------------------------------------------------------------------------
@@ -1109,14 +1128,19 @@ def _survey_tables(db3: Path) -> dict[str, Any]:
 
 
 # Exact version-sentinel vocabulary: the nine keys the oracle writes plus
-# dbVersion from the binary's own string table (picasa-binary-notes.md).
+# DBID and syncversion, which the binary's repository-getter call sites read
+# but the oracle has never written (disassembly of Picasa3.exe, fauxcasa-5kl;
+# DBID is a replication/database id, so its non-version-shaped value still
+# redacts). dbVersion, despite sitting in the same string table, is a
+# registry Preferences\ value, not a repository.dat key.
 # Keys outside this set — notably anything in a signed-in usernames.dat,
-# whose populated format embeds account data and has never been observed —
-# are redacted, and values print only under a known key and only when
-# version-number shaped (a 10-digit timestamp or date-like number fails).
+# whose keys are the account identifiers themselves (no literal key strings
+# exist in the binary) — are redacted, and values print only under a known
+# key and only when version-number shaped (a 10-digit timestamp or
+# date-like number fails).
 _REPOSITORY_KNOWN_KEYS = frozenset(
     """KeywordVersion contactsversion rawversion colorspaceversion
-    frversion Folders gpsversion flat IDPersist dbVersion""".split()
+    frversion Folders gpsversion flat IDPersist DBID syncversion""".split()
 )
 _SENTINEL_VAL_RE = re.compile(r"^[0-9]{1,4}(\.[0-9]{1,4})?$")
 

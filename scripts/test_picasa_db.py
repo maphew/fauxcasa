@@ -720,6 +720,24 @@ def test_repository_trailing_bytes(tmp_path):
         pdb.read_repository(p)
 
 
+def test_encode_repository_matches_oracle_layout():
+    pairs = [("KeywordVersion", "1"), ("gpsversion", "1.0")]
+    assert pdb.encode_repository(pairs) == make_repository(pairs)
+    assert pdb.encode_repository([]) == make_repository([])
+
+
+def test_write_repository_roundtrip(tmp_path):
+    p = tmp_path / "repository.dat"
+    pairs = [("KeywordVersion", "1"), ("a", "a"), ("a", "a")]  # dupes preserved
+    pdb.write_repository(p, pairs)
+    assert pdb.read_repository(p) == pairs
+
+
+def test_encode_repository_rejects_nul():
+    with pytest.raises(ValueError, match="NUL"):
+        pdb.encode_repository([("a\x00b", "1")])
+
+
 # --------------------------------------------------------------------------
 # survey rollups (tables / sentinels / scale / features / --library)
 # --------------------------------------------------------------------------

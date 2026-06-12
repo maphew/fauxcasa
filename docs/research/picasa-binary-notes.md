@@ -40,6 +40,24 @@ personalbumrecvalues2, peoplealbumchecksum, tagdate, fdbhash, backuphash`
 Version-sentinel strings adjacent to the schema: `dbVersion, P2category,
 contactsversion, frversion, gpsversion, colorspaceversion, rawversion`.
 
+Code-xref follow-up (fauxcasa-5kl disassembly of the repository accessors at
+0x4141d0 get / 0x4143c0 set): the keys actually read through the
+repository.dat accessor are the nine the oracle writes **plus `DBID` and
+`syncversion`** (replication id and Picasaweb-sync version — `DBID` is
+corroborated by the discovery string
+`server=picasa,computer=%s,user=%s,httpport=%d,repl=1,dbid=%s`). `dbVersion`
+and `P2category`, despite sitting in the same string table, do *not* flow
+through the repository accessor — `dbVersion` is a registry
+`Preferences\dbVersion` value, `P2category` is category/INI code.
+`repository.dat` is class `ytRepository`, member `m_repo`;
+`usernames.dat` is the same class, member `m_usernameRepository` — same
+on-disk layout. No literal usernames.dat key strings exist in the binary:
+the ~9 variable-key accessor call sites build keys at runtime from account
+identifiers and compare values against `"1"`, so a populated usernames.dat
+keys on the account identity itself (statically uncharacterizable). The
+shared magic `0x3fcccccd` is the IEEE-754 float **1.6** — read it as a
+format-version constant.
+
 ## Database directory contents
 
 - Directory literals: `#db3\` and `#db3_d\` (the `_d` variant appears to be a
