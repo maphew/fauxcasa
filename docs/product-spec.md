@@ -290,11 +290,16 @@ read-only. The reject flag mirrors to the XMP rejected convention
 (`Rating = -1`) under the same rules. Binary star stays — it's the Picasa
 soul (*owner priority*; **⚖ argue** for 0–5 ratings instead).
 
-**⚖ argue — cache location.** Machine-local default (fast local disk even when
-the library is on NAS/USB; nothing portable lives there) vs in-library default
-(one dir to back up… but backups don't need regenerable thumbnails, and NAS
-round-trips would hurt the instant-feel budget). Spec says machine-local,
-configurable.
+**Cache location — settled procedure (owner, 2026-06-11): measured, not
+argued.** The default is decided empirically at M1: run the §7 gates on the
+slow-volume profile with the cache machine-local vs in-library (and the
+hybrid: catalog + search index always machine-local, thumbnails optionally
+in-library so a traveling drive carries warm thumbs). **Machine-local is the
+working hypothesis** — grid scroll is thousands of small random reads,
+exactly the pattern NAS/USB round-trips punish, and it was Picasa's own
+choice — but the measurement rules. Low-stakes by construction: the cache is
+disposable (N3) and the location is configurable per library, so the default
+is reversible at any time and the minority case is always served.
 
 **A "library"** = one library-home directory (the root for tier-2 library-level
 state) plus N watched roots, possibly on other volumes. Libraries are
@@ -844,7 +849,10 @@ items. Argue here, then edit the spec.
 2. ~~Face recognition in v1.5, not v1~~ — **settled (owner, 2026-06-11):**
    sequencing confirmed — highly desirable, pointless before
    browse/search/organize/edit exist. Stays the bound v1.5 headline.
-3. **Cache location default** (§3) — machine-local vs in-library.
+3. ~~Cache location default~~ — **settled procedure (owner, 2026-06-11):**
+   decided by measurement at M1 — §7 gates on the slow-volume profile,
+   machine-local vs in-library vs hybrid; machine-local is the working
+   hypothesis. Configurable per library regardless, so reversible (§3).
 4. ~~Windows tier in v1~~ — **settled (owner, 2026-06-11):** first-class in
    v1; Windows and Mac users are where the people who need the most help
    live. The dogfood-gap risk is owned in §8.
