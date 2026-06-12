@@ -270,7 +270,7 @@ adopts the policy with the leaks fixed:
 
 | Tier | What | Where | Notes |
 |---|---|---|---|
-| 1. Standard metadata | captions, keywords, date, geotags, face regions | in-file XMP/IPTC, governed by the write policy (§5 P1: sidecar-first in v1, deliberate write-back) | so the data outlives Fauxcasa too |
+| 1. Standard metadata | captions, keywords, date, geotags, face regions | in-file XMP/IPTC, governed by the write policy (§5 P1: staged in sidecars, explicit make-permanent — the non-destructive edit model applied to metadata) | so the data outlives Fauxcasa too |
 | 2. App state | edit stacks, stars, albums+order, people, watch config, ignored faces, video metadata overrides | human-readable files inside the library: per-folder sidecars for per-photo state (per-photo *records* within the folder file, merged per-record — never whole-file clobber; travels with a folder copy), a library-home directory for library-level state | Picasa leaked albums/contacts/watch-lists into the user profile — the exact reason libraries weren't portable. Fixed. |
 | 3. Cache | catalog index, thumbnails, search index | machine-local by default, location configurable | disposable by N3; ~1–2% of library size at full tier depth |
 
@@ -538,39 +538,53 @@ Maintenance & trust
   but Picasa's broken updater stranded users on vulnerable builds).
 - i18n string externalization from day one (full localization is post-v1).
 
-### P1 — the in-file metadata write policy (**⚖ argue**, the genuinely hard call)
+### P1 — the in-file metadata write policy (settled in direction — owner, 2026-06-11)
 
 The evidence pulls both ways. The storage-tiering principle and the face-tag
-lock-in disaster say *write standard metadata into files by default* — it's
-the only storage that outlives every app. The MakerNote corruption bug
-(Picasa corrupted Olympus/Kodak vendor EXIF when writing metadata) says
-*never touch originals you can't round-trip*. And the trust ladder (§9) says
-the scariest right — mutating decades of originals — should not be granted in
-the same milestone as the app's first write of any kind. Resolution:
+lock-in disaster say *write standard metadata into files* — it's the only
+storage that outlives every app, and sidecars are easily left behind by the
+unaware, both people and tools (the owner leans EXIF-heavy for exactly this
+reason). The MakerNote corruption bug (Picasa corrupted Olympus/Kodak vendor
+EXIF when writing metadata) says *never touch originals you can't
+round-trip* — and thou must never lose a person's data. The ruling dissolves
+the tension by reusing a pattern the product already has: **metadata follows
+the non-destructive edit model.** Three principles govern it (owner's
+words): *silence is a problem; undo is a safety net; nothing is perfect.*
 
 This policy governs *metadata* writes into originals. Pixel writes happen
 only via explicit, user-invoked Save, with its own original-stashing
 guarantee (N2) — that is a different act and is not gated here.
 
-- **v1 default: sidecar-first.** Metadata operations do not write originals.
-  Captions, keywords, and confirmed face regions live in sidecars/tier-2,
-  fully exportable.
-- **Write-back is deliberate, supported, and honest:** a per-library "write
-  standard metadata into my files" switch plus a resumable, progress- and
-  failure-reporting batch operation (both directions). Enabling the switch
-  offers retroactive backfill — Picasa's non-retroactive opt-in was the
-  lock-in trap, and footgun 13 is honored by making backfill one explicit
-  action, not an experimental afterthought.
-- **The writer must be proven before it's default:** round-trip verification
+- **Staged by default.** Post-import metadata changes (captions, keywords,
+  confirmed faces, geotags) land in sidecars/tier-2 first — the metadata
+  analog of an unsaved edit recipe. Fully exportable at all times.
+- **Make permanent is the save act.** Writing through to in-file
+  EXIF/XMP/IPTC is one explicit gesture away — per photo, per selection, or
+  as a resumable, progress- and failure-reporting batch op (both
+  directions). A per-library **auto mode** (new metadata goes permanent
+  automatically) is the EXIF-heavy end state; enabling it offers
+  retroactive backfill — Picasa's non-retroactive opt-in was the lock-in
+  trap (footgun 13).
+- **State is visible.** A subtle cue distinguishes in-file from
+  sidecar-only metadata — and likewise unsaved-recipe from baked for pixel
+  edits — so "which other apps can see this?" is never a mystery. (Unsaved
+  edits being invisible to every other app was a chronic, documented Picasa
+  confusion; the cue designs it away.)
+- **Undo is a safety net.** Make-permanent is reversible: the prior in-file
+  metadata state is journaled before every write, so it can be undone the
+  way Undo Save un-bakes pixels. The writer itself: round-trip verification
   that re-parses offset-sensitive structures (MakerNotes embed absolute
   offsets — byte-comparing non-target segments is *not* sufficient; never
-  relocate the EXIF APP1 segment, or re-parse MakerNotes after write), built
-  on a mature metadata library (exiv2/exiftool-class — wrap, don't
-  hand-roll), fuzz-tested against vendor samples. Files failing verification
-  fall back to sidecar with a surfaced notice (N7).
-- **Flipping the default on** (for JPEG) is a post-v1 decision, after the
-  verified writer has soak time on the dogfood archive. The machinery itself
-  (switch, verified writer, batch op) ships in v1 — it is an M4 deliverable.
+  relocate the EXIF APP1 segment, or re-parse MakerNotes after write),
+  built on a mature metadata library (exiv2/exiftool-class — wrap, don't
+  hand-roll), fuzz-tested against vendor samples. Files failing
+  verification stay sidecar-only with a surfaced notice (N7) — silence is a
+  problem. Nothing is perfect; the net is layered for it.
+- **Default trajectory:** v1 ships staged-by-default with auto mode off;
+  switching auto mode on for JPEG is a post-v1 decision, after the verified
+  writer has soak time on the dogfood archive. The machinery itself
+  (make-permanent gestures, state cues, undo journal, verified writer)
+  ships in v1 — it is an M4 deliverable.
 - RAW and video originals are never written, ever; XMP sidecar files serve
   interop for them.
 
@@ -784,17 +798,19 @@ everything Fauxcasa wrote, machine-checked; N1 (folder-copy), N3 (rebuild),
 N5 (crash), N7 (silent-failure) gates green in CI.
 
 **M3 — Edit without fear.** The edit room: full non-destructive stack, named
-durable undo, Save / Undo Save / Revert with `.picasaoriginals` compat,
-export-with-edits (incl. the email preset). *Gate:* N2 green; fixture-replay
+durable undo, Save / Undo Save / Revert with `.picasaoriginals` compat, the
+unsaved-vs-baked state cue (§5 P1), export-with-edits (incl. the email
+preset). *Gate:* N2 green; fixture-replay
 equivalence — Fauxcasa reproduces the oracle corpus's edit semantics
 (004/005 crop-save round-trip, etc.).
 
 **M4 — Live in it.** Watching + external-change reconciliation, device
 import, Move Folder, trash-everywhere, library relocation, minimal Backup
 Sets, manual face tagging + people registry + face-data import, batch
-rename, maintenance surface, the P1 write-back machinery (per-library
-switch, offset-aware verified writer, resumable batch op — default stays
-off), the minimal movie renderer, first-class Windows builds (N-gates + §7
+rename, maintenance surface, the P1 make-permanent machinery (per-photo/
+selection/batch gestures, metadata-state cue, undo journal, offset-aware
+verified writer — auto mode stays off), the minimal movie renderer,
+first-class Windows builds (N-gates + §7
 budgets green in Windows CI). *Gate:* N6 green in CI —
 both halves: app-closed external moves and the foreign-write variant;
 N5/N6/§7 gates additionally pass under a NAS profile (simulated latency
@@ -809,7 +825,7 @@ printing, gallery export interleave as they fit.
 
 **Gate coverage:** N1→M2 · N2→M3 · N3→M2 · N4→M1 (read-only rows; write/watch
 rows at M2/M4) · N5→M2 (+M4 NAS) · N6→M4 · N7→M2. Formats + decode
-isolation→M1. Backup, cohabitation, NAS profile, P1 write-back machinery,
+isolation→M1. Backup, cohabitation, NAS profile, P1 make-permanent machinery,
 movie renderer, first-class Windows CI→M4.
 
 ---
@@ -819,9 +835,12 @@ movie renderer, first-class Windows CI→M4.
 Decisions this spec makes that most deserve a fight, plus genuinely open
 items. Argue here, then edit the spec.
 
-1. **P1 in-file write policy** (§5 P1) — v1 sidecar-first with deliberate,
-   verified write-back; flipping default-on is post-v1. The counter-argument:
-   sidecar-first delays the interop everyone migrating *out* of Picasa wants.
+1. ~~P1 in-file write policy~~ — **settled in direction (owner,
+   2026-06-11):** metadata follows the non-destructive edit model — staged
+   in sidecars, explicit make-permanent to EXIF (the owner leans
+   EXIF-heavy: sidecars get left behind by unaware people and tools),
+   visible in-file/sidecar state cues, journaled undo. Still open: when
+   auto mode becomes the JPEG default (post-v1, after writer soak).
 2. ~~Face recognition in v1.5, not v1~~ — **settled (owner, 2026-06-11):**
    sequencing confirmed — highly desirable, pointless before
    browse/search/organize/edit exist. Stays the bound v1.5 headline.
