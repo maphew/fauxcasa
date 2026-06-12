@@ -98,7 +98,7 @@ test suite. Session log: bead `fauxcasa-dcc`.
 
 ## Differential findings (2026-06-11 session, fixtures 001–013)
 
-Harvested corpus: `fixtures/oracle/001-star-photo` … `013-face-tag-manual`
+Harvested corpus: `fixtures/oracle/001-star-photo` … `014-face-tag-new-person`
 (each has `diff.md` with decoded deltas). Action→storage map:
 
 | Action | Synchronous (at action time) | Lazy flush (~2–6 min cycle) |
@@ -112,7 +112,8 @@ Harvested corpus: `fixtures/oracle/001-star-photo` … `013-face-tag-manual`
 | Crop (unsaved) | ini only: `crop=rect64(...)` + `filters=crop64=1,...` (4×16-bit fixed-point fractions) | — |
 | File→Save | recipe moves to `.picasaoriginals/.picasa.ini` (filters/crop + orig dims + `moddate` FILETIME); original stashed byte-exact; JPEG rewritten | edit-state pmp family (`revertable=1`, new width/height, `crop64`/`filters` **cleared** after bake) |
 | Rotate (unsaved) | ini `rotate=rotate(1)` | `imagedata_rotate` `'rotate(1)'` string, `edited=2` |
-| Manual face tag | name into JPEG XMP `dc:subject` + ini `backuphash` | `imagedata_tags` row. **Face geometry never reached disk** (no facerect/facetemplates/contacts.xml, even at exit) — manual-region flow needs a retry |
+| Manual face tag (013, People-panel flow) | name into JPEG XMP `dc:subject` + ini `backuphash` | `imagedata_tags` row. **Face geometry never reached disk** (no facerect/facetemplates/contacts.xml, even at exit) |
+| Manual face tag (014, New Person dialog flow — the retry that worked) | ini `faces=rect64(...),<uid>` + `[Contacts2]` section; **no JPEG XMP at all** | `contacts/contacts.xml`; person album row (`]facealbum:<row>`, category 8, `albumcontactids`=uid); virtual imagedata row (`filetype=1001`) + own thumbindex entry holding the rect — see `picasa-db3-validated.md` "Empty-name records" |
 
 General write model:
 

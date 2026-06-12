@@ -428,6 +428,21 @@ def test_thumbindex_deleted_entry(tmp_path):
     entries = pdb.read_thumbindex(p)
     assert entries[4].is_deleted
     assert not entries[4].is_folder  # deleted, not a folder, despite no parent
+    assert not entries[4].is_facecrop  # no parent retained -> true deletion
+    assert pdb.thumbindex_full_paths(entries)[4] == ""
+
+
+def test_thumbindex_facecrop_entry(tmp_path):
+    # empty name + retained valid parent = face-crop virtual record
+    # (shape as observed in the oracle: ftype 0xe9, flags 3, valid 1, size 1)
+    p = tmp_path / "thumbindex.db"
+    rows = SAMPLE_TI + [("", 0, 0, 1, 0xE9, 3, 1, 2)]
+    p.write_bytes(make_thumbindex(rows))
+    entries = pdb.read_thumbindex(p)
+    e = entries[4]
+    assert e.is_facecrop
+    assert not e.is_deleted and not e.is_folder
+    assert e.ftype_name == "face-crop"
     assert pdb.thumbindex_full_paths(entries)[4] == ""
 
 
@@ -553,8 +568,18 @@ def _cli_fixture_dir(tmp_path: Path) -> Path:
         tmp_path, "img_date.pmp", 0x2, struct.pack("<2d", 39998.5, 40000.25), 2
     )
     (tmp_path / "img_0").write_bytes(struct.pack("<I", pdb.PMP_MAGIC))
-    (tmp_path / "thumbindex.db").write_bytes(make_thumbindex(SAMPLE_TI))
+    (tmp_path / "thumbindex.db").write_bytes(
+        make_thumbindex(SAMPLE_TI + [("", 0, 0, 1, 0xE9, 3, 1, 2)])
+    )
     return tmp_path
+
+
+def test_cli_thumbindex_facecrop_field(tmp_path, capsys):
+    d = _cli_fixture_dir(tmp_path)
+    assert pdb.main(["thumbindex", str(d / "thumbindex.db"), "--json"]) == 0
+    recs = _json_after_headers(capsys.readouterr().out, 1)
+    assert recs[-1]["facecrop"] is True and recs[-1]["deleted"] is False
+    assert recs[0]["facecrop"] is False
 
 
 def test_cli_json_outputs_are_parseable(tmp_path, capsys):
@@ -714,6 +739,8 @@ def _survey_rollup_fixture(tmp_path: Path) -> Path:
             [
                 ("C:\\SECRETDIR\\", 10, 20, 0, 0x01, 0, 1, 0xFFFFFFFF),
                 ("SECRETFILE.jpg", 12, 22, 999, 0x02, 0, 1, 0),
+                ("", 0, 0, 1, 0xE9, 3, 1, 1),  # face crop of SECRETFILE
+                ("", 0, 0, 5000, 0x00, 0, 0, 0xFFFFFFFF),  # deleted slot
             ]
         )
     )
@@ -751,7 +778,8 @@ def test_survey_rollups(tmp_path, capsys):
         "other": 1,
     }
     ti = report["scale"]["thumbindex"]
-    assert ti["entries"] == 2 and ti["folders"] == 1 and ti["files"] == 1
+    assert ti["entries"] == 4 and ti["folders"] == 1 and ti["files"] == 1
+    assert ti["deleted"] == 1 and ti["face_crops"] == 1
     assert ti["by_ftype"] == {"jpeg": 1} and ti["file_bytes"] == 999
     pairs = dict(map(tuple, report["sentinels"]["repository.dat"]["pairs"]))
     assert pairs["KeywordVersion"] == "1"
@@ -833,7 +861,21 @@ def test_survey_file_bytes_excludes_deleted_entries(tmp_path, capsys):
     assert pdb.main(["survey", str(db3), "--json"]) == 0
     ti = _json.loads(capsys.readouterr().out)["scale"]["thumbindex"]
     assert ti["deleted"] == 1
+    assert ti["face_crops"] == 0
     assert ti["file_bytes"] == 999 + 888  # a.jpg + b.jpg, not the stale 5000
+
+
+def test_survey_face_crops_counted_separately(tmp_path, capsys):
+    db3 = tmp_path / "db3"
+    db3.mkdir()
+    rows = SAMPLE_TI + [("", 0, 0, 1, 0xE9, 3, 1, 2)]  # oracle facecrop shape
+    (db3 / "thumbindex.db").write_bytes(make_thumbindex(rows))
+    assert pdb.main(["survey", str(db3), "--json"]) == 0
+    ti = _json.loads(capsys.readouterr().out)["scale"]["thumbindex"]
+    assert ti["face_crops"] == 1 and ti["deleted"] == 0
+    assert ti["files"] == 2  # the virtual record is not a file on disk
+    assert ti["file_bytes"] == 999 + 888  # its size=1 is not a byte count
+    assert "face-crop" not in ti["by_ftype"]
 
 
 def test_survey_distinct_collapses_nan_dates(tmp_path, capsys):
@@ -943,10 +985,55 @@ def test_oracle_thumbindex_matches_imagedata():
     filetype = pdb.read_pmp(ORACLE_DB3 / "imagedata_filetype.pmp")
     assert len(entries) == filetype.count
     for e in entries:
-        # the thumbindex ftype byte mirrors imagedata.filetype (1=dir, 2=jpeg)
-        assert e.ftype == filetype.values[e.index]
         assert e.is_folder == (e.ftype == 1)
-        assert e.valid == 1 and e.flags == 0  # invariant in the oracle data
+        assert e.valid == 1  # invariant in the oracle data
+        if e.is_facecrop:
+            # the face-crop row's u8 holds the low byte of its imagedata
+            # filetype (1001 = 0x3e9 -> 0xe9); observed-shape pin (014
+            # face-tag fixture session), relax if future evidence diverges
+            assert filetype.values[e.index] == 1001
+            assert e.ftype == filetype.values[e.index] & 0xFF
+            assert e.flags == 3 and e.size == 1
+            parent = entries[e.parent]
+            assert not parent.is_folder and parent.name  # crops a photo
+        else:
+            # the thumbindex ftype byte mirrors imagedata.filetype
+            # exactly on real entries (1=dir, 2=jpeg)
+            assert e.ftype == filetype.values[e.index]
+            assert e.flags == 0
+
+
+@needs_oracle
+def test_oracle_facecrop_virtual_rows():
+    """Face-crop records carry a virtual imagedata row: crop64 == facerect
+    == the rect64 Picasa wrote to the folder ini faces= line, photo dims
+    copied from the parent, personalbumid -> the person album (token
+    ]facealbum:<row>, category 8)."""
+    entries = pdb.read_thumbindex(ORACLE_DB3 / "thumbindex.db")
+    paths = pdb.thumbindex_full_paths(entries)
+    crops = [e for e in entries if e.is_facecrop]
+    assert crops  # the 014 face-tag fixture session left one
+    img = pdb.read_table(ORACLE_DB3, "imagedata")
+    token = pdb.read_pmp(ORACLE_DB3 / "albumdata_token.pmp")
+    category = pdb.read_pmp(ORACLE_DB3 / "albumdata_category.pmp")
+    for e in crops:
+        row, parent_row = img.row(e.index), img.row(e.parent)
+        assert row["crop64"] == row["facerect"] != 0
+        l, t, r, b = pdb.parse_rect64(row["facerect"])
+        assert 0 <= l < r <= 1 and 0 <= t < b <= 1  # plausible geometry
+        # the same rect sits in the parent folder's ini faces= line
+        local = _oracle_path_to_local(paths[e.parent])
+        ini = pdb.read_picasa_ini(local.parent / ".picasa.ini")
+        faces = pdb.parse_faces(ini.section(local.name).get("faces"))
+        assert (l, t, r, b) in [rect for rect, _ in faces]
+        assert (row["width"], row["height"]) == (
+            parent_row["width"],
+            parent_row["height"],
+        )
+        pid = row["personalbumid"]
+        assert token.values[pid] == f"]facealbum:{pid}"
+        assert category.values[pid] == 8  # people album
+        assert 2000 < pdb.ole_to_datetime(row["tagdate"]).year < 2100
 
 
 def _oracle_path_to_local(win_path: str) -> Path | None:
@@ -1006,6 +1093,8 @@ def test_oracle_survey_runs_clean(capsys):
     assert not bad, bad
     ti = report["scale"]["thumbindex"]
     assert ti["files"] >= 24 and ti["deleted"] == 0
+    assert ti["face_crops"] == 1  # the 014 fixture session's manual face tag
+    assert "face-crop" not in ti["by_ftype"]  # virtual records aren't files
     # every imagedata column row count is bounded by the thumbindex join key
     assert report["tables"]["imagedata"]["rows"] == ti["entries"]
     assert report["sentinels"]["repository.dat"]["ok"] is True

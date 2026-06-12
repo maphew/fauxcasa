@@ -330,6 +330,8 @@ FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 
 # File-type codes for ThumbIndexEntry.ftype, re-derived from xkikeg/PicasaDB
 # (Data/PicasaDB.hs; layout facts only). '?' = that project's own uncertainty.
+# 0xE9 was "empty" in xkikeg; on the oracle's face-crop virtual record it
+# equals the low byte of imagedata filetype 1001 (0x3E9).
 THUMBINDEX_FILE_TYPES = {
     0x00: "empty",
     0x01: "directory",
@@ -345,7 +347,7 @@ THUMBINDEX_FILE_TYPES = {
     0x0E: "png",
     0x12: "nikon-raw",
     0x1E: "xml",
-    0xE9: "empty",
+    0xE9: "face-crop",
 }
 
 
@@ -380,22 +382,32 @@ class ThumbIndexEntry:
 
     The 26 bytes between name and parent follow xkikeg/PicasaDB's
     decomposition (u64 + u64 + u32 + u8 + u32 + u8), with semantics
-    refined against the Wine oracle (all 28 entries cross-checked against
-    the synthetic library):
+    refined against the Wine oracle (28 real entries plus the face-crop
+    virtual record, cross-checked against the synthetic library):
 
     - ``taken_filetime``: NOT the filesystem creation time (prior art's
       guess) — for photos with EXIF it matches DateTimeOriginal exactly,
       converted local->UTC; without EXIF it falls back to file mtime.
     - ``modified_filetime``: file mtime (matched on-disk mtime 28/28).
-    - ``size``: byte size of the file (exact match 28/28; folders 0).
-      xkikeg treats these 4 bytes as opaque; size fits our oracle.
-    - ``ftype``: see THUMBINDEX_FILE_TYPES (1/5=directory, 2=jpeg, ...).
-    - ``flags``: opaque u32, observed 0.
+    - ``size``: byte size of the file (exact match 28/28; folders 0,
+      face-crop records 1 — not a real size).
+    - ``ftype``: see THUMBINDEX_FILE_TYPES (1/5=directory, 2=jpeg, ...);
+      mirrors imagedata.filetype exactly on real entries; on the
+      face-crop record it equals its low byte (1001 = 0x3E9 there,
+      0xE9 here).
+    - ``flags``: opaque u32, observed 0 on every real entry and 3 on the
+      oracle's face-crop record.
     - ``valid``: 0 = invalidated entry (xkikeg enforces that such entries
-      carry no parent index); observed 1 everywhere in the oracle.
+      carry no parent index); observed 1 everywhere in the oracle,
+      including the face-crop record.
 
-    An empty ``name`` marks a deleted record (per picasa3meta); record
-    numbers are never reused, so deleted rows keep their slot.
+    An empty ``name`` marks a record with no file of its own. Two cases,
+    discriminated by ``parent`` (per picasa3meta, confirmed by the oracle):
+    a retained valid parent means a *face-crop* virtual record (the crop
+    of one tagged face, child of the photo it was tagged on, both
+    FILETIMEs 0 — see ``is_facecrop``); parent 0xffffffff means a
+    *deleted* record (slot retained, record numbers never reuse; not yet
+    observed in our oracle).
     """
 
     index: int
@@ -410,11 +422,15 @@ class ThumbIndexEntry:
 
     @property
     def is_folder(self) -> bool:
-        return self.parent is None and not self.is_deleted
+        return self.parent is None and self.name != ""
 
     @property
     def is_deleted(self) -> bool:
-        return self.name == ""
+        return self.name == "" and self.parent is None
+
+    @property
+    def is_facecrop(self) -> bool:
+        return self.name == "" and self.parent is not None
 
     @property
     def ftype_name(self) -> str:
@@ -479,13 +495,15 @@ def read_thumbindex(path: Path | str, *, strict: bool = True) -> list[ThumbIndex
 def thumbindex_full_paths(entries: list[ThumbIndexEntry]) -> list[str]:
     """Resolve each entry to its full path.
 
-    Folder entries already store one; deleted entries resolve to "".
-    Parent chains are followed defensively even though Picasa only ever
-    writes a single level (files -> folder with absolute path).
+    Folder entries already store one; deleted and face-crop entries have
+    no file of their own and resolve to "" (follow ``parent`` yourself if
+    you want the photo a face crop belongs to). Parent chains are followed
+    defensively even though Picasa only ever writes a single level
+    (files -> folder with absolute path).
     """
     paths: list[str] = []
     for e in entries:
-        if e.is_deleted:
+        if not e.name:
             paths.append("")
             continue
         parts = [e.name]
@@ -860,6 +878,7 @@ def cmd_thumbindex(args: argparse.Namespace) -> int:
             "path" if args.paths else "name": _render(shown, args.redact),
             "folder": e.is_folder,
             "deleted": e.is_deleted,
+            "facecrop": e.is_facecrop,
             "parent": e.parent,
             "taken": _render_filetime(e.taken_filetime, args.redact),
             "modified": _render_filetime(e.modified_filetime, args.redact),
@@ -1150,15 +1169,17 @@ def _survey_scale(db3: Path) -> dict[str, Any]:
         except (ThumbIndexError, OSError):
             entries = None  # already flagged in the per-file section
         if entries is not None:
-            live = [e for e in entries if not e.is_folder and not e.is_deleted]
+            live = [e for e in entries if e.name and not e.is_folder]
             by_ftype = Counter(e.ftype_name for e in live)
             out["thumbindex"] = {
                 "entries": len(entries),
                 "folders": sum(1 for e in entries if e.is_folder),
                 "files": len(live),
                 "deleted": sum(1 for e in entries if e.is_deleted),
+                "face_crops": sum(1 for e in entries if e.is_facecrop),
                 "by_ftype": dict(sorted(by_ftype.items())),
-                # deleted slots keep a stale size; count live files only
+                # deleted slots keep a stale size and face crops aren't
+                # files on disk; count live files only
                 "file_bytes": sum(e.size for e in live),
             }
     files = [p for p in db3.iterdir() if p.is_file()]

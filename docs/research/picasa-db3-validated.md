@@ -1,6 +1,6 @@
 # db3 binary formats: validated reference (.pmp, thumbindex.db)
 
-Status 2026-06-11: every claim below was either byte-verified against the
+Status 2026-06-12: every claim below was either byte-verified against the
 Wine-oracle database (real Picasa 3.9.141 indexing the synthetic library —
 see `wine-oracle.md`) or re-derived from prior art with the source noted.
 This is the normative reference for `scripts/picasa_db.py`; the executable
@@ -52,11 +52,19 @@ the built-in virtual albums and the earliest EXIF date for folder rows.
 ### albumdata semantics (from Chromium picasa_album_table_reader, BSD-3)
 
 `category`: 0 = album (token must start `]album:`), 2 = folder on disk
-(`filename` holds the path), 0xffff = invalid sentinel. Rows with empty
-name/uid are garbage (deleted/auto-generated) and skipped. Oracle confirms:
-rows 0–6 are stock virtual albums (`]star`, `]screensaver`, `]updated`,
-`]history:email`, `]history:upload`, `]unknownface`, `]search`), rows 7–9
-the watched folders with full `Z:\` paths and `]album:<32hex>` tokens.
+(`filename` holds the path), 8 = people album (oracle: the stock
+`]unknownface` row and per-person `]facealbum:<row>` rows created by face
+tagging), 0xffff = invalid sentinel. Chromium — which consumes only
+categories 0 and 2 — skips rows with empty name/uid as garbage
+(deleted/auto-generated); do NOT apply that rule to people albums: the
+oracle's person album carries no uid at all (the `uid` column is simply
+not extended to its row — its identity lives in `albumcontactids`,
+byte-equal to the ini `[Contacts2]` key and the contacts.xml contact id).
+Oracle confirms: rows 0–6 are stock virtual albums (`]star`,
+`]screensaver`, `]updated`, `]history:email`, `]history:upload`,
+`]unknownface`, `]search`), rows 7–9 the watched folders with full `Z:\`
+paths and `]album:<32hex>` tokens, row 10 a user-created category-0 album
+(fixture sessions 003/011), row 11 the person album from session 014.
 
 ## thumbindex.db
 
@@ -64,14 +72,20 @@ the watched folders with full `Z:\` paths and `]album:<32hex>` tokens.
 u32 magic 0x40466666 | u32 entry-count
 per entry:
   NUL-terminated path/name (UTF-8)
-  u64 taken     FILETIME ── EXIF DateTimeOriginal (local→UTC), mtime fallback
-  u64 modified  FILETIME ── file mtime (matched on-disk 28/28)
-  u32 size      ── byte size of the file (exact match 28/28; folders 0)
+  u64 taken     FILETIME ── EXIF DateTimeOriginal (local→UTC), mtime
+                   fallback; 0 on the face-crop record
+  u64 modified  FILETIME ── file mtime (matched on-disk 28/28; face-crop 0)
+  u32 size      ── byte size of the file (exact match 28/28; folders 0,
+                   face-crop records 1 — not a real size)
   u8  ftype     ── 0x01/0x05 directory, 0x02 jpeg, 0x03 gif, 0x07 psd,
                    0x08 avi, 0x0d tiff, 0x0e png, 0x12 nikon-raw, 0x1e xml,
-                   0x00/0xe9 empty (table from xkikeg/PicasaDB)
-  u32 flags     ── opaque; 0 throughout the oracle
-  u8  valid     ── 0 = invalidated (then parent must be none); 1 in oracle
+                   0x00 empty (table from xkikeg/PicasaDB), 0xe9 face-crop
+                   (xkikeg said "empty"; on the oracle's face-crop record
+                   it equals the low byte of imagedata filetype 0x3e9)
+  u32 flags     ── opaque; 0 on every real entry, 3 on the oracle's
+                   face-crop record
+  u8  valid     ── 0 = invalidated (then parent must be none); 1 in oracle,
+                   including the face-crop record
   u32 parent    ── entry index of containing folder; 0xffffffff = none
 ```
 
@@ -82,20 +96,39 @@ creation time — for the 21 synthetic photos with EXIF DateTimeOriginal it
 equals that tag exactly (converted local→UTC); for the 7 entries without
 (folders + the photo00.jpg files, which carry EXIF but no DateTime tags)
 it falls back to mtime. The `size` u32 is opaque in xkikeg but matched
-stat() byte-for-byte on all 28 oracle entries.
+stat() byte-for-byte on all 28 real oracle entries (the face-crop
+record's size is 1 — not a real size).
 
-Join model (validated 28/28): **record number in thumbindex == record
+Join model (validated 29/29): **record number in thumbindex == record
 number in imagedata**. Folder entries store full absolute paths (always
 `parent = 0xffffffff`, even for nested folders); file entries store bare
 names and join through `parent` — a single level of indirection. The
-oracle's `ftype` byte agrees with `imagedata_filetype` at every record.
+oracle's `ftype` byte holds the **low byte** of `imagedata_filetype` at
+every record (real entries have filetype ≤ 0x1e so the bytes agree
+outright; the face-crop record is 1001 = 0x3e9 there and 0xe9 here).
 Dimensions/sizes joined through this mapping match the real JPEGs 24/24.
 
-Edge cases from picasa3meta (not yet reproduced in our oracle): empty name
-= deleted record (slot retained, record numbers never reuse); empty-name
-entries whose original parent index is valid are face-crop records; their
-reader also accepted 0xff as a name terminator (unexplained — we require
-NUL until evidence appears).
+### Empty-name records: face crops vs deletions
+
+An empty name marks a record with no file of its own; `parent`
+discriminates the two cases picasa3meta describes. **Face-crop records
+(parent retained) are now reproduced in our oracle**: the manual face tag
+of fixture session 014 created one on its lazy db flush. Observed shape —
+empty name, `parent` = the photo the face was tagged on, `valid` 1,
+`flags` 3, `size` 1, `ftype` 0xe9, both FILETIMEs 0. Its imagedata row is
+a virtual face row: `filetype` 1001 (0x3e9), `crop64` == `facerect` ==
+the rect64 written to the ini `faces=` line, `width`/`height` copied from
+the parent photo's row, `personalbumid` -> the albumdata person-album row
+(token `]facealbum:<row>`, category 8, `albumcontactids` = the contact
+uid), `tagdate` = the tagging time as an OLE date. The parent photo's own
+row gets the rect in `facerect` (was the 0x1 sentinel before). Sparse
+pmps are padded up to the new row count with their type's default
+(`crop64` uint64 0, `rotate` empty string).
+
+True deletions (empty name, parent 0xffffffff, slot retained because
+record numbers never reuse) remain unreproduced in our oracle.
+picasa3meta's reader also accepted 0xff as a name terminator (unexplained
+— we require NUL until evidence appears).
 
 ## Prior-art license notes (correction)
 
