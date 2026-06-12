@@ -81,10 +81,13 @@ that rule.
   uninstall are side-effect-free on user files.
 - **Not security software.** No password-protected "hidden" folders defeated
   by deleting a file (Picasa's was). Hiding is cosmetic and labeled as such.
-- **Not a social network, not an AI curator.** No feeds, no algorithmically
-  generated collections or suggestions, no cloud ML. (Picasa's own
-  *mechanical* auto-collections — Starred Photos, Recently Updated — are
-  beloved, deterministic, and in scope; see §5.)
+- **Not a social network, not a pushy AI curator.** No feeds, no
+  auto-generated collections pushed at the user, no required cloud ML.
+  (Picasa's own *mechanical* auto-collections — Starred Photos, Recently
+  Updated — are beloved, deterministic, and in scope; see §5. And the
+  non-goal bans curation-by-default, not assistance: local, opt-in ML that
+  helps you *search and tag* — object/colour/sentiment recognition — is on
+  the medium-range roadmap, §5 LATER, *owner priority*.)
 
 ---
 
@@ -300,9 +303,11 @@ drives can remount anywhere.
   Picasas on one DB meant corruption; we make that failure impossible to hit
   silently.
 - **Fauxcasa vs Picasa (the cohabitation protocol):** Picasa honors no lock
-  of ours, so the rule is **alternation, not simultaneity**: simultaneous
-  open of both apps against one library is unsupported and detected where
-  possible (Picasa's lock artifacts: `_lock.lck` family). Sidecars Picasa
+  of ours, so the rule is **alternation, not simultaneity** — in plain
+  words: switch between the two apps as often as you like, but only one
+  open at a time on a given library. Simultaneous open of both apps is
+  unsupported and detected where possible (Picasa's lock artifacts:
+  `_lock.lck` family). Sidecars Picasa
   touched while we weren't looking are first-class external changes: detected
   by mtime/content on rescan and folder-open, merged per-key
   (last-writer-wins) with a surfaced reconciliation note. Fauxcasa never
@@ -367,10 +372,12 @@ could enable deeper coexistence later — it gates nothing in v1.
 
 **⚖ argue — how long does write-compat rule?** Writing Picasa's ini grammar
 forever freezes us to an undocumented 2011 format; dropping it breaks the
-migrate-gradually story. Spec says: v1 is **succession via alternation** —
-full ini write-compat so the user can alternate between both apps during the
-trust-building period and fall back losslessly at any time (never both open
-at once; §3 cohabitation protocol). Fauxcasa-native state (album order,
+migrate-gradually story. Spec says: v1 is **a handoff with a safety period**
+("succession via alternation"): Fauxcasa's goal is to *replace* Picasa, and
+during the trust-building period full ini write-compat means the user can
+switch between the two apps freely — a week in Fauxcasa, fall back to real
+Picasa anytime, nothing lost in either direction — provided only one app is
+open at a time (§3 cohabitation protocol). Fauxcasa-native state (album order,
 ignored faces, people registry, video overrides — things Picasa has no home
 for) goes in clearly-marked *additional* files Picasa ignores. Post-v1, if
 the sidecar format needs to evolve, ini stays as an export/sync target rather
@@ -467,6 +474,12 @@ In & out
   is the interim story: the library root is complete, so any file-level
   backup tool backs up everything.)
 - Slideshow (basic, per-folder/album play button).
+- Minimal movie/slideshow renderer (*owner priority* — both halves of the V6
+  tutorial are loved): Picasa-2 level — acts on the selection/album, slide
+  delay + output size, auto title slide (name + date), pan/zoom transitions,
+  no audio; output lands in the Exports collection and the file manager
+  opens on completion. Rides the bundled decoders. The full Movie Maker
+  (audio fitting, captions, transitions) stays LATER.
 - Locate on disk / reveal original.
 
 Formats
@@ -541,10 +554,10 @@ guarantee (N2) — that is a different act and is not gated here.
   sliders is the loved workflow for the archive's untagged decades. Deferred
   because it is the single largest engineering line-item in the corpus, and
   bound: **it is the sole headline of the release immediately after v1; no
-  other LATER item may queue ahead of it.** (The binding governs post-v1
-  releases — pulling the minimal V6 renderer into v1's M4, §10 item 11,
-  would not violate it.) Privacy-gated: explicit opt-in, fully local.
-  **⚖ argue** if it must be in v1 instead.
+  other LATER item may queue ahead of it.** Sequencing confirmed by the
+  owner (2026-06-11): highly desirable, but pointless before browsing,
+  search, organization, and non-destructive edits exist. Privacy-gated:
+  explicit opt-in, fully local.
 - Geotag map panel (swappable tile provider, offline-degrading — Picasa's
   Maps-API dependency broke twice via deprecation).
 - Timeline view.
@@ -552,13 +565,19 @@ guarantee (N2) — that is a different act and is not gated here.
 - Static-gallery export — the serverless heir to Sync to Web's durable
   concept (per-folder/album opt-in mirroring of *edited renditions* to a
   share target).
-- Movie/slideshow rendering. ⚖ **ask the owner:** `begin.md` links the V6
-  "Simple Photo Slideshow" tutorial, which is actually the *Create Movie*
-  render-a-file feature, not in-app playback. If the rendered keepsake is the
-  loved half, a Picasa-2-level renderer (delay + size + title slide, no
-  audio) is small atop the bundled decoders and could ride M4; the full
-  Movie Maker stays here.
+- Full Movie Maker (audio track + fit-photos-into-audio, captions,
+  transition styles, per-slide control). The minimal renderer is already in
+  v1 (§5 In & out — owner settled the V6 question: both halves are loved).
 - Collage, screensaver.
+- **Content recognition — the medium-range roadmap** (*owner priority*,
+  v2+): object, colour, scene, and sentiment recognition via local ML —
+  the modern capability Picasa classic never had — to power search and
+  bulk keywording. Soul constraints: local models by default; any remote
+  LLM assist is explicit per-batch opt-in, never required, never a
+  dependency (§1 non-goals); results land as ordinary, reviewable
+  keywords/attributes in tier-2 state (N3) — searchable suggestions the
+  user accepts or ignores, never self-applied curation. Sequenced after
+  face recognition.
 - Custom buttons / external-tool API (tray-consuming, export-then-act, with
   a consent gate Picasa lacked).
 - Standalone fast viewer + OS file associations.
@@ -644,20 +663,24 @@ locked. "Electron + 1.5 GB resident" fails the soul test regardless.
 
 ## 8. Target platforms
 
-- **Linux: first-class in v1** (*owner priority* — the dev/dogfood platform,
-  and an unserved market that still runs Picasa under Wine in 2026).
-- **Windows: format-first, app-second (⚖ argue).** The legacy libraries and
-  the family machines are Windows — but coexistence runs through the file
-  formats (ini/XMP write-compat verified by the oracle, which itself runs
-  under Wine on Linux), not through Fauxcasa-on-Windows. v1 ships
-  format-compatibility + CI-built Windows binaries at beta quality; Windows
-  is promoted to first-class in v1.x when a Windows machine is in the daily
-  dogfood loop. Nothing may preclude it (trash and filename semantics are
-  owned in v1 in §5; hidden-attribute and path translation in the
-  cross-platform paragraph below).
-- **macOS: architectural target, not a v1 release.** Nothing may preclude it
-  (Picasa's user base was Win+Mac, and Mac quirks like the `Picasa3` db path
-  are already in the import scope), but it ships when someone can dogfood it.
+- **Linux: first in line** (*owner priority* — the dev/dogfood platform, and
+  an unserved market that still runs Picasa under Wine in 2026). First in
+  line means it leads development, not that the others are lesser tiers.
+- **Windows: first-class in v1** (*owner priority*, settled 2026-06-11:
+  "that's where the people who need the most help live" — the legacy
+  libraries and the family machines are Windows). Consequences owned
+  honestly: the N-gates and §7 budgets run in Windows CI, the
+  trash/hidden-attribute/path/keymap items below are v1 work, and the known
+  risk — first-class without daily dogfooding — is mitigated by Windows CI
+  gate runs, the oracle's Windows-format corpus, and family beta testers as
+  the dogfood proxy.
+- **macOS: first-class intent, gated on hardware** (*owner priority*: Mac
+  users equally deserve the help; the owner has no Mac). Nothing may
+  preclude it — Mac quirks like the `Picasa3` db path are already in the
+  import scope, keymaps and trash semantics are designed per-platform from
+  day one — and it ships as soon as there is hardware to test on (CI
+  cross-builds + community testers wanted; §10 item 5). Until then it is
+  blocked on access, not demoted by intent.
 
 Cross-platform consequences owned in v1: trash semantics per platform +
 library-local trash on trashless storage; hidden-file conventions (legacy
@@ -718,7 +741,8 @@ import, Move Folder, trash-everywhere, library relocation, minimal Backup
 Sets, manual face tagging + people registry + face-data import, batch
 rename, maintenance surface, the P1 write-back machinery (per-library
 switch, offset-aware verified writer, resumable batch op — default stays
-off), CI-built Windows binaries at beta quality. *Gate:* N6 green in CI —
+off), the minimal movie renderer, first-class Windows builds (N-gates + §7
+budgets green in Windows CI). *Gate:* N6 green in CI —
 both halves: app-closed external moves and the foreign-write variant;
 N5/N6/§7 gates additionally pass under a NAS profile (simulated latency
 acceptable); the P1 writer's round-trip verification corpus green; plus the
@@ -732,7 +756,7 @@ weekly Picasa-opens-the-library differential checks green, owner signs off.
 **Gate coverage:** N1→M2 · N2→M3 · N3→M2 · N4→M1 (read-only rows; write/watch
 rows at M2/M4) · N5→M2 (+M4 NAS) · N6→M4 · N7→M2. Formats + decode
 isolation→M1. Backup, cohabitation, NAS profile, P1 write-back machinery,
-Windows beta binaries→M4.
+movie renderer, first-class Windows CI→M4.
 
 ---
 
@@ -744,12 +768,16 @@ items. Argue here, then edit the spec.
 1. **P1 in-file write policy** (§5 P1) — v1 sidecar-first with deliberate,
    verified write-back; flipping default-on is post-v1. The counter-argument:
    sidecar-first delays the interop everyone migrating *out* of Picasa wants.
-2. **Face recognition in v1.5, not v1** (§5 LATER) — manual tagging +
-   lossless import first, recognition as the bound next headline. If
-   recognition is the thing that makes it *Picasa* for you, challenge here.
+2. ~~Face recognition in v1.5, not v1~~ — **settled (owner, 2026-06-11):**
+   sequencing confirmed — highly desirable, pointless before
+   browse/search/organize/edit exist. Stays the bound v1.5 headline.
 3. **Cache location default** (§3) — machine-local vs in-library.
-4. **Windows tier in v1** (§8) — format-first + beta binaries vs first-class.
-5. **macOS in the v1 cycle** (§8).
+4. ~~Windows tier in v1~~ — **settled (owner, 2026-06-11):** first-class in
+   v1; Windows and Mac users are where the people who need the most help
+   live. The dogfood-gap risk is owned in §8.
+5. **macOS** — intent settled (first-class as soon as testable, owner
+   2026-06-11); the *open* question is access: who has the Mac hardware or
+   testers, and when?
 6. **Write-compat horizon** (§4) — succession via alternation (ini-compat
    through v1, native evolution later) vs indefinite cohabitation.
 7. **Star model** (§3) — binary star forever vs 0–5 ratings.
@@ -759,12 +787,18 @@ items. Argue here, then edit the spec.
    auto-install; argue for fully-offline instead.
 10. **Concurrency model** (§3) — single-writer + alternation vs something
     stronger for the multi-machine NAS scenario.
-11. **V6 slideshow question** (§5 LATER) — which half of the slideshow video
-    did the owner love: playback (in v1) or the rendered movie file (LATER,
-    could ride M4 in Picasa-2-minimal form)? Needs an owner answer.
+11. ~~V6 slideshow question~~ — **settled (owner, 2026-06-11):** both halves
+    are desirable. Playback is M1; the minimal Picasa-2-level renderer rides
+    M4 (§5 In & out); the full Movie Maker stays LATER.
 12. **Implementation stack** — explicitly *not* this document (fauxcasa-6hf),
     but constrained by §7: any candidate must demo the scroll + cold-start
     budgets in a prototype, and set the RAM/installer budgets, at M0 exit.
+    (Windows first-class in v1 — item 4 — now also weighs on the choice:
+    the stack must build and test cleanly on Windows CI from the start.)
+13. **Content-recognition boundaries** (§5 LATER, medium-range) — local
+    models only, or also per-batch opt-in remote LLM assist? And where is
+    the line between assistive suggestions (in) and auto-curation (banned by
+    §1)? Needs argument before any v2 design work.
 
 ---
 
@@ -784,6 +818,11 @@ items. Argue here, then edit the spec.
 - **db3** — Picasa's machine-local catalog directory (`.pmp` column files +
   caches); **ini** — the per-folder `.picasa.ini` sidecars. Formats:
   `picasa-db3-validated.md`, `picasa-ini-format.md`.
+- **Succession via alternation** — v1's coexistence stance: Fauxcasa aims to
+  *replace* Picasa, with a safety period where the user can switch freely
+  between the two apps on one library (either direction, anytime, losslessly)
+  as long as only one is open at a time. Simultaneous dual-open is
+  unsupported (§3, §4).
 - **Tracker IDs** (`fauxcasa-XXX`) — beads issues; `bd show <id>`.
 - **The tutorial corpus** — the eight archived Picasa tutorial videos
   analyzed in `picasa-video-notes.md` (V1–V8).
