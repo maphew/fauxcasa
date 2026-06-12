@@ -96,9 +96,9 @@ Fixture pairs are synthetic → committable; the accumulated
 `fixtures/oracle/` corpus is the ground truth for the Fauxcasa parser/writer
 test suite. Session log: bead `fauxcasa-dcc`.
 
-## Differential findings (2026-06-11 session, fixtures 001–013)
+## Differential findings (2026-06-11/12 sessions, fixtures 001–015)
 
-Harvested corpus: `fixtures/oracle/001-star-photo` … `014-face-tag-new-person`
+Harvested corpus: `fixtures/oracle/001-star-photo` … `015-delete-photo`
 (each has `diff.md` with decoded deltas). Action→storage map:
 
 | Action | Synchronous (at action time) | Lazy flush (~2–6 min cycle) |
@@ -114,6 +114,7 @@ Harvested corpus: `fixtures/oracle/001-star-photo` … `014-face-tag-new-person`
 | Rotate (unsaved) | ini `rotate=rotate(1)` | `imagedata_rotate` `'rotate(1)'` string, `edited=2` |
 | Manual face tag (013, People-panel flow) | name into JPEG XMP `dc:subject` + ini `backuphash` | `imagedata_tags` row. **Face geometry never reached disk** (no facerect/facetemplates/contacts.xml, even at exit) |
 | Manual face tag (014, New Person dialog flow — the retry that worked) | ini `faces=rect64(...),<uid>` + `[Contacts2]` section; **no JPEG XMP at all** | `contacts/contacts.xml`; person album row (`]facealbum:<row>`, category 8, `albumcontactids`=uid); virtual imagedata row (`filetype=1001`) + own thumbindex entry holding the rect — see `picasa-db3-validated.md` "Empty-name records" |
+| Delete photo | file moved byte-exact to OS trash (Wine: XDG trash w/ `.trashinfo`; Windows: Recycle Bin via `FOF_ALLOWUNDO`); one in-place `albums_0.db` change. **No ini change in either phase** | imagedata row **tombstoned in place** (`filetype` 2→0; table stays same row count, no pmp compaction); thumbindex entry zeroed; 'Search results' count decrements; wordhash shrinks |
 
 General write model:
 
@@ -132,7 +133,11 @@ General write model:
   timestamps): identify the acted-on file from the diff, never from grid
   position. One caption keystroke was dropped under Wine ('aption') —
   always read back the stored text.
-- Save dialog has "do not ask again" checked since fixture 005.
+- **Idle noise floor is zero**: Picasa left running idle ~8h (overnight,
+  2026-06-12) wrote nothing — any diff vs baseline is attributable to the
+  last action.
+- Save dialog has "do not ask again" checked since fixture 005; delete
+  confirmation likewise suppressed since fixture 015.
 
 ## Scale runs
 
