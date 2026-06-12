@@ -23,7 +23,13 @@ its comment thread, the tutorial-video transcripts). (2) The real-DB survey
 priorities** (argue these with maphew, not with the evidence): the project
 exists to succeed a treasured multi-decade family Picasa archive on a home
 network; the owner runs Linux daily; `begin.md` is the founding motivation.
-Calls driven by (3) are tagged *owner priority* below.
+Calls driven by (3) are tagged *owner priority* below. (4) **Field reports**
+from people still running Picasa in 2026, as they arrive — the first
+(2026-06-11): a friend who uses Picasa daily as the catalog and browse layer
+over Lightroom-processed output stored in a designed folder structure
+("the day it stops working will be a sad day"); treasured features named:
+watched folders, watermarks, export to different resolutions, tagging,
+sorting, collections.
 
 ---
 
@@ -79,7 +85,9 @@ that rule.
   Picasa's bar: crop, straighten, one-clicks, tuning sliders, simple effects.
   RAW files render automatically "as if JPEG"; real raw development is
   explicitly someone else's job (and externally produced JPEGs dropped into a
-  watched folder just appear — that's the interop contract).
+  watched folder just appear — that's the interop contract, and it's a
+  workflow people run today: shoot → process in Lightroom → finished files
+  land in a folder structure Picasa watches and catalogs).
 - **Not a managed-library importer.** Never copy-into-app-library. Install and
   uninstall are side-effect-free on user files.
 - **Not security software.** No password-protected "hidden" folders defeated
@@ -501,10 +509,14 @@ In & out
   flow, async acquisition, per-photo star/exclude (X key), duplicate
   exclusion on by default, card policy defaulting to "leave card alone",
   date-named destination, cross-platform filename hygiene.
-- Export with edits applied: original-size option, optional order-preserving
-  numbering, JPEG conversion by default, Exports collection, plus a
-  "for email" preset (resize + JPEG, hand off to `mailto:`/xdg-email — the
-  family sharing path, kept without any Google integration). Export is also
+- Export with edits applied: original-size option, resize to any chosen
+  resolution (multi-resolution exports are a field-reported treasured
+  workflow), optional text watermark (Picasa parity — also field-reported
+  treasured; was missing from this spec until a real user named it),
+  optional order-preserving numbering, JPEG conversion by default, Exports
+  collection, plus a "for email" preset (resize + JPEG, hand off to
+  `mailto:`/xdg-email — the family sharing path, kept without any Google
+  integration). Export is also
   the "open with external tool" path — pending edits always render unless the
   user explicitly asks for raw originals (Picasa's silent
   unedited-file-passthrough confused everyone).
