@@ -230,7 +230,10 @@ Two layers, exactly as Picasa had them, because the model was right:
   implicitly (Picasa's rename-photos-from-an-album renamed the source files
   on disk — designed away).
 - Per-photo user state: **star** (binary flag, a cross-cutting selection
-  predicate other features filter on), **caption**, **keywords**,
+  predicate other features filter on), **reject flag ("reverse star",
+  *owner request*)** — the star's negative twin for culling: one keystroke
+  while browsing, viewing, or in a slideshow marks a photo undesirable;
+  setting either flag clears the other, **caption**, **keywords**,
   **faces** (region + person ref, with suggested/confirmed/ignored states —
   in v1 the *suggested* state is populated solely by imported Picasa data;
   the recognition engine that generates new suggestions is v1.5), **geotag**
@@ -283,8 +286,9 @@ diagnostics, never dropped.
 write-back is enabled (§5 P1), stars mirror to XMP `Rating` (5 ↔ starred)
 asynchronously; foreign `Rating` changes detected on rescan are *offered* as
 star changes (transitions to/from 5) and logged; ratings 1–4 display
-read-only. Binary star stays — it's the Picasa soul (*owner priority*;
-**⚖ argue** for 0–5 ratings instead).
+read-only. The reject flag mirrors to the XMP rejected convention
+(`Rating = -1`) under the same rules. Binary star stays — it's the Picasa
+soul (*owner priority*; **⚖ argue** for 0–5 ratings instead).
 
 **⚖ argue — cache location.** Machine-local default (fast local disk even when
 the library is on NAS/USB; nothing portable lives there) vs in-library default
@@ -406,14 +410,14 @@ Library & navigation
 - Continuous-scroll thumbnail grid across all groups, pinned group headers,
   live counts everywhere, thumbnail zoom slider, conventional scrollbar
   **plus** Picasa's jump-to-folder/end buttons (the recentering thumb was an
-  admitted footgun — dropped). Thumbnail corner badges (star, geotag) in
-  every grid context.
+  admitted footgun — dropped). Thumbnail corner badges (star, reject,
+  geotag) in every grid context.
 - Flat + tree folder views (tree shows volumes; flat shows path on demand);
   per-folder sort modes (date / name / size / manual — manual is one mode
   among them, durable per N3).
 - Picasa-native auto-collections: **Starred Photos** (with scoped views per
-  footgun 17) and **Recently Updated** (plus the Exports collection, under
-  In & out below).
+  footgun 17) and **Recently Updated** (plus the Exports collection under
+  In & out, and the **Rejected** collection under Organize, below).
 - Selection tray: persistent cross-folder selection with Hold/Clear, live
   type-aware readout ("Folder Selected — 14 photos"), the universal input to
   every output action, with enablement keyed to selection type.
@@ -421,14 +425,23 @@ Library & navigation
   folder names; negation (`-term`); results are a selectable, bulk-operable
   set; a native All Photos view (Picasa users needed a magic negation-search
   hack to get one).
-- Keyboard triage loop: star, next/prev (incl. J/K), select/hold, 100% zoom
-  toggle, hover full-screen peek, reveal-in-file-manager, platform-correct
-  Ctrl/Cmd. Picasa-compatible bindings as the default scheme.
+- Keyboard triage loop: star, reverse star (X), next/prev (incl. J/K),
+  select/hold, 100% zoom toggle, hover full-screen peek,
+  reveal-in-file-manager, platform-correct Ctrl/Cmd. Picasa-compatible
+  bindings as the default scheme.
 - Status bar: collection aggregate / single-photo metadata dual mode.
 
 Organize
 
 - Stars (one keystroke, instant, reversible), captions, keywords.
+- Reverse star (*owner request*; **⚖ argue** — priority deliberately unset
+  by the owner; spec says v1/M2 because it rides the star machinery
+  end-to-end): one keystroke (X, Picasa's import-exclude muscle memory)
+  flags a photo as undesirable from the grid, the viewer, or a running
+  slideshow; a **Rejected** auto-collection shows them all as easily as
+  Starred Photos for bulk move/delete/unflag. Rejected photos stay visible
+  in normal browsing (badged) — they join the single filter surface, never
+  a sixth invisible hide mechanism (N7, footgun 10). Never auto-deletes.
 - Albums: create/fill both ways (create-then-drag and select-then-add),
   drag-to-sidebar drop targets, persistent manual order, year grouping.
 - Persistent manual sort order in folders (survives rescans; new files get an
@@ -482,7 +495,8 @@ In & out
   the "rest easy" feature with discs replaced by drives. (Until it ships, N3
   is the interim story: the library root is complete, so any file-level
   backup tool backs up everything.)
-- Slideshow (basic, per-folder/album play button).
+- Slideshow (basic, per-folder/album play button; the overlay controls
+  include star and reverse star, so a slideshow doubles as a triage pass).
 - Minimal movie/slideshow renderer (*owner priority* — both halves of the V6
   tutorial are loved): Picasa-2 level — acts on the selection/album, slide
   delay + output size, auto title slide (name + date), pan/zoom transitions,
@@ -757,9 +771,10 @@ requirement. *Gate:* N4 budgets green on the 100k synthetic library;
 `picasa_db.py survey` cross-check shows zero ingest loss on synthetic
 corpora; owner confirms the same on the family archive.
 
-**M2 — Trust it with changes.** Writes: stars, captions, keywords, albums
-(+order), manual sort, hide — persisted sidecar-first (§5 P1) in
-Picasa-compatible ini plus tier-2 native state. Deliverables: the
+**M2 — Trust it with changes.** Writes: stars, reverse stars, captions,
+keywords, albums (+order), manual sort, hide — persisted sidecar-first
+(§5 P1) in Picasa-compatible ini plus tier-2 native state (the reject flag
+is Fauxcasa-native; Picasa has no home for it and ignores it). Deliverables: the
 reproducible oracle harness + golden-fixture fallback (§4), the N5
 kill-fuzzer. *Gate:* oracle differential acceptance — real Picasa reads
 everything Fauxcasa wrote, machine-checked; N1 (folder-copy), N3 (rebuild),
@@ -842,6 +857,11 @@ items. Argue here, then edit the spec.
     references? hardlinks? What is reversible vs destructive, and how much
     of the L2 metadata diff/merge surface is worth building? Needs argument
     before the dupe release is designed.
+15. **Reverse star priority** (§5 Organize) — the owner requested the
+    feature but deliberately set no priority. Spec says v1/M2: it rides the
+    star machinery end-to-end (flag, sidecar record, auto-collection,
+    keystroke, badge, XMP −1 mirror), so the marginal cost is near zero and
+    it completes the triage loop. Argue if it should wait instead.
 
 ---
 
