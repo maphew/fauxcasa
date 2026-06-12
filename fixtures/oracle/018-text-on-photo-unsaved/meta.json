@@ -1,0 +1,206 @@
+{
+ "fixture": "018-text-on-photo-unsaved",
+ "note": "Text on photo, UNSAVED (edit-recipe phase; File->Save bake is next fixture). UI: 2x-clicked photo01.jpg in '2010-12-25 Winter Holiday' -> Text tool (ABC tab) -> clicked on image, typed 'oracle text' (11 chars, no Wine mangling this time) -> Apply -> Back to Library, NO File->Save. Sync phase: ini [photo01.jpg] gets text=1;132;11;oracle text;Times;0.342500,0.685625,0.033333,0.000000;v1,4294967295,4278190080,128.000000,1.000000,0.000000,1.000000,400,0,49152;; + backuphash=24332 + textactive=1. Format reading: count;payload-len;string-len;string;font;x,y,size,rot fractions;v1,fill-ARGB(0xFFFFFFFF white),outline-ARGB(0xFF000000 black),...,weight 400,...;; - and NO filters= entry (unlike crop-unsaved which wrote filters=crop64; text is its own key, not in the filter chain). Flush (+~4min, included): imagedata_text.pmp[12] = ini string VERBATIM, imagedata_textactive[12]=1 (byte), imagedata_edited[12]=1 (byte; rotate had set edited=2), backuphash mirror, folder inisync[8] tick, thumbs/bigthumbs/previews re-rendered with text overlay (entries appended), wordhash +4 ('oracle'/'text' indexed?). NO albumdata_date[6] activity tick this time, no search-results change. JPEG untouched.",
+ "captured": "2026-06-12T16:13:58+00:00",
+ "baseline": {
+  "label": "after 017-hide-photo",
+  "created": "2026-06-12T16:08:56+00:00"
+ },
+ "files": {
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "3ac9aea4f079b1a5a686256cbd8dc7f8947242b868e2f3b6fd6cc6b50f69d3f5",
+    "size": 108
+   },
+   "after": {
+    "sha256": "00f42969712183d3984229f722d5fd922c9d8f0552b2f1663d6157618b7832ec",
+    "size": 108
+   }
+  },
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "36c2e9a185d7460f99e2dd97299bfdc5ab6dd34a301de0ddfd9de2fc542454a9",
+    "size": 147229
+   },
+   "after": {
+    "sha256": "700300439ef1002202270c0f1652f97fc6ac125708c849edea37831b69703225",
+    "size": 151381
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "fdf3674ecbcdbc659bfda8c1b27f57b64b6b8ccde415ef2547197fc2e8adad2c",
+    "size": 368
+   },
+   "after": {
+    "sha256": "83386356108c9ab5f92d2e59b2145eba2c332d6069e7fc1c119b20ef08934685",
+    "size": 368
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9d91938a4de0cc6f179743b3ab359f837439ace674d8b5320427588533599d7a",
+    "size": 70
+   },
+   "after": {
+    "sha256": "a6d0046cbc4c06d08786c62c66afa63c1695dab858add3a37d7b45e3774a1403",
+    "size": 70
+   }
+  },
+  "db3/imagedata_edited.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "cfa88d8b7238d382f904d53dae63e8410bf065073bd136608c6595a1fda2cfe4",
+    "size": 44
+   },
+   "after": {
+    "sha256": "83cf6adad3deb27edca6ac03c17b8f26377e41490aabad9b3e3fd4961877f611",
+    "size": 44
+   }
+  },
+  "db3/imagedata_text.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "bf6e4a99177ef8c8e1b9f9ed1d4ae9d5cceb11727f5da81cff2a86fd6057fe08",
+    "size": 44
+   },
+   "after": {
+    "sha256": "1bc96f6bc4c3916fc5a8324520d9fd9b8b87dcfc5c29663636e63ef4fcb5cfaf",
+    "size": 183
+   }
+  },
+  "db3/imagedata_textactive.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8c4510f5ad46ccde3b0f9d856523f3bbc6c72164ac0bd3830553e3033d414b59",
+    "size": 44
+   },
+   "after": {
+    "sha256": "7728905f63607a80100efb8c6168fb82043457c90bba889b38238c39f825ebd3",
+    "size": 44
+   }
+  },
+  "db3/previews_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "024868acdaf0cd830d1bcff86d44c88f66f4b075c27b5dbe8d8a0c983adeadad",
+    "size": 410319
+   },
+   "after": {
+    "sha256": "cacb838ca4a07264a1fad443a5517e17223be1004b842fd85f64fa00829eab88",
+    "size": 424420
+   }
+  },
+  "db3/previews_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "844103ee2fc117ae408d8ab17c48937fbce348a88a7d51c92af6384164f86023",
+    "size": 356
+   },
+   "after": {
+    "sha256": "ba8a64feeec86d0a7815ac2c0c2919521a3b097d776ad78b2d6512df9987c88a",
+    "size": 356
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "cca3e8e25bf4f639f58573774b13dafcf4a2c2bbfc25c8407413a10f31c2adc4",
+    "size": 33659
+   },
+   "after": {
+    "sha256": "e5a635dab2b2de9d2b87c005d9390d6e4ea8e85a5a5355a1c0350b12631c30df",
+    "size": 34415
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "becb60c526517778e48e98189d6e1473ed2ec1f0d45d37eeb7063d64ca7d0982",
+    "size": 368
+   },
+   "after": {
+    "sha256": "db77804dcbee5eda1b6b38a7da4d9c694ee4684d7331c57c243aebb47c36b220",
+    "size": 368
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "7ab9d309f082c47b04937a3fa595e3c60926c1573c35b8e5c62f580b96c5e542",
+    "size": 92580
+   },
+   "after": {
+    "sha256": "860928d77d4fcc9cccfbd567a1347f86e6c5a6bdedd4ef72ee85c048e22c2115",
+    "size": 94424
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d60130bf409ceda4ef2c5ad14e9cadf77bf74809da1aeb93deb2cbc5ab66b3c1",
+    "size": 368
+   },
+   "after": {
+    "sha256": "dd74e833e3357815ee3b92c4cb8125dfb3cc84cbc240ea5b4f6b1b8b4498b02b",
+    "size": 368
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "d5e0855e6d60d84424cdb79c5cdb7937318a61efca6bba3eda1f2dceaf4cb2bc",
+    "size": 67276
+   },
+   "after": {
+    "sha256": "4b6d7865f71a9e42aa881386281edd8af2612b5e25401504b6ba447327133fd4",
+    "size": 67280
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "c4eb55487515cec45eba529c8935cd313e143c73bbee7a4c225951db7afb4dc6",
+    "size": 93
+   },
+   "after": {
+    "sha256": "60763a13f7480919a891959778cefff57fc1b236926515d34471a170ce501992",
+    "size": 286
+   }
+  }
+ }
+}
