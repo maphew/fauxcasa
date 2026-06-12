@@ -1,0 +1,50 @@
+{
+ "fixture": "021-album-description",
+ "note": "Edit VIRTUAL album description (differential vs 020's folder description). UI: clicked 'Add a description' under the 'Synthetic Album B' header. ATTEMPT 1 left ZERO disk trace across ~10min - the field apparently never committed (needs Enter/click-away; silently dropped under Wine; user later found the field empty). ATTEMPT 2: retyped (intended 'description to renamed album, 2nd attempt'; stored 'descriptin...' - Wine dropped the 'o'), followed by a left-tree selection change; ini write landed within the next 30s poll. Storage model: album description = description= line inside the [.album:f07f6926...] section, which lives in the .picasa.ini of the FOLDER holding the album's member photos ('2015-03-15 Garden Project') - albums have no file of their own (no .pal). Inserted after token=/date= lines. Flush (+~3min, included): albumdata_description[10] (Synthetic Album B row) = text VERBATIM; albumdata_inisync[7] (Garden Project folder row) FILETIME tick; albumdata_inisync[10] (album row) flag-word LOW 32 bits churned, high half stable - more albumrow-flag evidence atop fixture 011's 1-bit change. No thumbnail churn, no activity-date tick.",
+ "captured": "2026-06-12T19:44:08+00:00",
+ "baseline": {
+  "label": "after 020-folder-description",
+  "created": "2026-06-12T16:22:54+00:00"
+ },
+ "files": {
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "94851f37ed3bfe5555f660e1efc5bbaee18a80f70dcfbd18ac0b296036b276ee",
+    "size": 95
+   },
+   "after": {
+    "sha256": "ef7304de054e35c71250acf8785cb36507f753ef0cf2c35eccf550d96d9b93dd",
+    "size": 135
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "fd48ae7f3eb584b610ff5fcc32cf65bf87ac9df3c05bd00238c36a4c27db8d61",
+    "size": 108
+   },
+   "after": {
+    "sha256": "3e575889a52086b53511a30fd7822269562215773183e265049006579527a75f",
+    "size": 108
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "06178036380781e4743ca6d41dd3b90d0eed4a9940b54bed3b49709ef3d40c5e",
+    "size": 531
+   },
+   "after": {
+    "sha256": "e83d04a59c63a2063406bdee0ba8d2bbe3047d52ef6cee95eba5cae62eaa5936",
+    "size": 585
+   }
+  }
+ }
+}
