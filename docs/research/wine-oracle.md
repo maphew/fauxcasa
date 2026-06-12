@@ -96,6 +96,43 @@ Fixture pairs are synthetic → committable; the accumulated
 `fixtures/oracle/` corpus is the ground truth for the Fauxcasa parser/writer
 test suite. Session log: bead `fauxcasa-dcc`.
 
+## Differential findings (2026-06-11 session, fixtures 001–013)
+
+Harvested corpus: `fixtures/oracle/001-star-photo` … `013-face-tag-manual`
+(each has `diff.md` with decoded deltas). Action→storage map:
+
+| Action | Synchronous (at action time) | Lazy flush (~2–6 min cycle) |
+|---|---|---|
+| Star | ini `star=yes` + `db3/starlist.txt` (full `Z:\` path) | nothing observed |
+| Unstar | ini line deleted (never `star=no`); starlist entry removed | `inisync` tick |
+| Caption | JPEG XMP `dc:description` + new IPTC 8BIM block; ini gets `backuphash` only | `imagedata_caption.pmp` (flushed immediately this time — action forced a global db write-out) |
+| Keyword | JPEG XMP `dc:subject` + IPTC 2:25 Keywords; ini `backuphash` | `imagedata_tags.pmp` (type 0x6, sparse), wordhash. `tags.txt` stays empty |
+| New album | `albumdata_*` row (uid, `]album:<uid>` token, date = *photo* date) + ini `[.album:<uid>]` + per-photo `albums=<uid>`. No `.pal` file | — |
+| Rename album | ini `name=` rewritten in place; **uid/token stable** | `albumdata_name` row in place; album's `inisync` row = flag word (1-bit change) |
+| Crop (unsaved) | ini only: `crop=rect64(...)` + `filters=crop64=1,...` (4×16-bit fixed-point fractions) | — |
+| File→Save | recipe moves to `.picasaoriginals/.picasa.ini` (filters/crop + orig dims + `moddate` FILETIME); original stashed byte-exact; JPEG rewritten | edit-state pmp family (`revertable=1`, new width/height, `crop64`/`filters` **cleared** after bake) |
+| Rotate (unsaved) | ini `rotate=rotate(1)` | `imagedata_rotate` `'rotate(1)'` string, `edited=2` |
+| Manual face tag | name into JPEG XMP `dc:subject` + ini `backuphash` | `imagedata_tags` row. **Face geometry never reached disk** (no facerect/facetemplates/contacts.xml, even at exit) — manual-region flow needs a retry |
+
+General write model:
+
+- **Two-phase**: `.picasa.ini` + the photo file (XMP/IPTC) are written
+  synchronously at action time; pmp mirrors arrive on a lazy flush cycle
+  (observed 2–6 min), occasionally immediately when an action forces a db
+  write-out. A clean exit produced **no additional flush** — no shutdown dump.
+- `backuphash=<u16>` lands in the ini for every touched photo and mirrors
+  `imagedata_backuphash.pmp`.
+- `albumdata_inisync`: folder rows = FILETIME of last ini sync; album rows =
+  a flag word. `albumdata_date[6]` ('Search results' row) ticks on every
+  action — an activity timestamp.
+- Field files are sparse (`imagedata_tags.pmp` had 3 rows in a 28-row table)
+  — confirms sbktech's variable-length note.
+- UI grid order ≠ filename order (our synthetic photos share EXIF
+  timestamps): identify the acted-on file from the diff, never from grid
+  position. One caption keystroke was dropped under Wine ('aption') —
+  always read back the stored text.
+- Save dialog has "do not ask again" checked since fixture 005.
+
 ## Scale runs
 
 For indexing-at-scale experiments, clone the prefix and point the clone's
