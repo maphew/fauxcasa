@@ -890,11 +890,22 @@ items. Argue here, then edit the spec.
 11. ~~V6 slideshow question~~ — **settled (owner, 2026-06-11):** both halves
     are desirable. Playback is M1; the minimal Picasa-2-level renderer rides
     M4 (§5 In & out); the full Movie Maker stays LATER.
-12. **Implementation stack** — explicitly *not* this document (fauxcasa-6hf),
-    but constrained by §7: any candidate must demo the scroll + cold-start
-    budgets in a prototype, and set the RAM/installer budgets, at M0 exit.
-    (Windows first-class in v1 — item 4 — now also weighs on the choice:
-    the stack must build and test cleanly on Windows CI from the start.)
+12. **Implementation stack** — explicitly *not* this document
+    (fauxcasa-6hf), but **procedure set (owner, 2026-06-11): trial
+    balloons, timeboxed, decide and move.** The owner's constraints: he is
+    not a programmer (candidate evaluations must be reported in plain
+    language); iteration speed weighs as heavily as raw performance;
+    deciding and moving beats exhaustively finding the "right" answer; the
+    long-term stakes are feared but bounded — by N3, a wrong stack can
+    never hold user data hostage, so a future rewrite is only code.
+    Candidate pool seeded by owner warmth: **wasm, Rust, Go, Python** (and
+    hybrids; wasm's natural role is the §5 decode sandbox + the later
+    extension API, composable with any host). Every balloon performs the
+    same fixed task — render the 100k synthetic library grid from a
+    pre-built cache: cold start to interactive, flick-scroll p99 frame
+    time, resident memory — plus green builds on Linux and Windows CI.
+    First candidate that passes the §7 budgets and iterates fast wins;
+    ties break toward iteration speed, not perf margin.
 13. **Content-recognition boundaries** (§5 LATER, medium-range) — local
     models only, or also per-batch opt-in remote LLM assist? And where is
     the line between assistive suggestions (in) and auto-curation (banned by
