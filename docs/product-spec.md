@@ -383,18 +383,21 @@ rebuild its own caches. Whether Picasa tolerates a foreign-written
 `repository.dat` sentinel block (fauxcasa-5kl) is an open experiment that
 could enable deeper coexistence later — it gates nothing in v1.
 
-**⚖ argue — how long does write-compat rule?** Writing Picasa's ini grammar
-forever freezes us to an undocumented 2011 format; dropping it breaks the
-migrate-gradually story. Spec says: v1 is **a handoff with a safety period**
-("succession via alternation"): Fauxcasa's goal is to *replace* Picasa, and
-during the trust-building period full ini write-compat means the user can
-switch between the two apps freely — a week in Fauxcasa, fall back to real
-Picasa anytime, nothing lost in either direction — provided only one app is
-open at a time (§3 cohabitation protocol). Fauxcasa-native state (album order,
-ignored faces, people registry, video overrides — things Picasa has no home
-for) goes in clearly-marked *additional* files Picasa ignores. Post-v1, if
-the sidecar format needs to evolve, ini stays as an export/sync target rather
-than the native store.
+**Settled — how long does write-compat rule?** (owner, 2026-06-11.) Writing
+Picasa's ini grammar forever would freeze us to an undocumented 2011 format;
+dropping it too early breaks the migrate-gradually story. The ruling: v1 is
+**a handoff with a safety period** ("succession via alternation") —
+Fauxcasa's goal is to *replace* Picasa, and during the trust-building period
+full ini write-compat means the user can switch between the two apps
+freely — a week in Fauxcasa, fall back to real Picasa anytime, nothing lost
+in either direction — provided only one app is open at a time (§3
+cohabitation protocol). Fauxcasa-native state (album order, ignored faces,
+people registry, video overrides — things Picasa has no home for) goes in
+clearly-marked *additional* files Picasa ignores. **Post-v1, if the sidecar
+format needs to evolve, ini becomes an export/sync target rather than the
+native store.** In the owner's words: as much as we love it, Picasa *is*
+dead — or at least bed-ridden and never to rise. The future is something
+else. Compatibility serves the migration; it is not an allegiance.
 
 ---
 
@@ -829,8 +832,11 @@ items. Argue here, then edit the spec.
 5. **macOS** — intent settled (first-class as soon as testable, owner
    2026-06-11); the *open* question is access: who has the Mac hardware or
    testers, and when?
-6. **Write-compat horizon** (§4) — succession via alternation (ini-compat
-   through v1, native evolution later) vs indefinite cohabitation.
+6. ~~Write-compat horizon~~ — **settled (owner, 2026-06-11):** ini
+   write-compat through v1's handoff period; post-v1 the native format may
+   evolve and ini becomes an export/sync target. "Picasa *is* dead — the
+   future is something else." Compatibility serves the migration, not an
+   allegiance (§4).
 7. **Star model** (§3) — binary star forever vs 0–5 ratings.
 8. **db3 sentinel acceptance** (fauxcasa-5kl) — experiment, may unlock deeper
    coexistence; gates nothing.
