@@ -1,0 +1,22 @@
+# Parser test suite (scripts/test_picasa_db.py). Oracle-cache integration
+# tests self-skip when cache/ is absent; the committed differential
+# fixtures (fixtures/oracle/) DO run here — the golden-fixture fallback
+# posture of spec §4.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  picasa-db:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv run scripts/test_picasa_db.py -q
