@@ -336,8 +336,11 @@ drives can remount anywhere.
   per-record files, append-style journals, stable UIDs — never in forms
   that assume a single forever-writer. Extant P2P projects are the study
   list when the time is right (§5 LATER).
-- **⚖ argue** if the multi-machine NAS scenario needs more than
-  single-writer-alternation in v1 (§10 item 10).
+- **Decided (delegated, 2026-06-11):** v1 builds nothing stronger than
+  single-writer + alternation + foreign-change merge. The household
+  multi-machine scenario is sequential use made safe and visible (holder
+  identity), verified by M4's NAS-profile gates; true multi-writer sync is
+  post-v1 and stands on the mergeable-shape primitives above.
 
 ---
 
@@ -391,7 +394,10 @@ machines that have the binary.
 **db3 writing is *not* a v1 goal.** We read db3 (rescue import); we let Picasa
 rebuild its own caches. Whether Picasa tolerates a foreign-written
 `repository.dat` sentinel block (fauxcasa-5kl) is an open experiment that
-could enable deeper coexistence later — it gates nothing in v1.
+could enable deeper coexistence later — it gates nothing in v1. Decided
+(delegated, 2026-06-11): run it opportunistically during M2's
+oracle-harness work, which is the same differential machinery; it informs,
+never gates.
 
 **Settled — how long does write-compat rule?** (owner, 2026-06-11.) Writing
 Picasa's ini grammar forever would freeze us to an undocumented 2011 format;
@@ -452,9 +458,9 @@ Organize
   threshold (≥ N). Legacy `star=yes` imports as 1 star; any nonzero count
   round-trips to Picasa as starred (§3 "Star authority").
 - Captions, keywords.
-- Reverse star (*owner request*; **⚖ argue** — priority deliberately unset
-  by the owner; spec says v1/M2 because it rides the star machinery
-  end-to-end): one keystroke (X, Picasa's import-exclude muscle memory)
+- Reverse star (*owner request*; decided — delegated, 2026-06-11: v1/M2,
+  riding the star machinery end-to-end at near-zero marginal cost): one
+  keystroke (X, Picasa's import-exclude muscle memory)
   flags a photo as undesirable from the grid, the viewer, or a running
   slideshow; a **Rejected** auto-collection shows them all as easily as
   Starred Photos for bulk move/delete/unflag. Rejected photos stay visible
@@ -630,6 +636,15 @@ guarantee (N2) — that is a different act and is not gated here.
     review-before-act UI.
   - **L4 — reserved.** The ladder is open-ended; more levels would not
     surprise us.
+  Collapse semantics decided (delegated, 2026-06-11): **collapse = merge
+  state into one surviving file** — stars take the max, keywords and album
+  memberships union, conflicts surfaced for review — with the other copies
+  going to trash, journaled so undo restores the per-copy state; plus a
+  no-deletion **dupe group** option (copies linked and badged, nothing
+  removed) for the cautious. Hardlinks and canonical-file-plus-references
+  are rejected: both invent a virtual layer over disk, violating
+  folders-are-truth (N1). The L2 diff/merge surface ships minimal —
+  field-level pick-one at collapse time only.
   L1 lands after face recognition and before content recognition; L2+
   float — they are not necessarily before content recognition.
 - Geotag map panel (swappable tile provider, offline-degrading — Picasa's
@@ -650,9 +665,16 @@ guarantee (N2) — that is a different act and is not gated here.
   LLM assist is explicit per-batch opt-in, never required, never a
   dependency (§1 non-goals); results land as ordinary, reviewable
   keywords/attributes in tier-2 state (N3) — searchable suggestions the
-  user accepts or ignores, never self-applied curation. Sequenced after
-  face recognition and duplicate management L1 (the L2+ dupe levels may
-  land on either side of it).
+  user accepts or ignores, never self-applied curation. Boundaries decided
+  (delegated, 2026-06-11): anything automatic or background runs on local
+  models only; remote LLM assist exists solely as an explicit,
+  user-initiated, per-batch action — clearly labeled, off by default, never
+  required, never a dependency. ML output always lands as reviewable
+  suggestions (suggested → confirmed/rejected, the face-tag pattern);
+  anything that changes what the user sees without an explicit accept is on
+  the banned side of the §1 line. Sequenced after face recognition and
+  duplicate management L1 (the L2+ dupe levels may land on either side of
+  it).
 - Custom buttons / external-tool API (tray-consuming, export-then-act, with
   a consent gate Picasa lacked).
 - Standalone fast viewer + OS file associations.
@@ -867,9 +889,11 @@ items. Argue here, then edit the spec.
 4. ~~Windows tier in v1~~ — **settled (owner, 2026-06-11):** first-class in
    v1; Windows and Mac users are where the people who need the most help
    live. The dogfood-gap risk is owned in §8.
-5. **macOS** — intent settled (first-class as soon as testable, owner
-   2026-06-11); the *open* question is access: who has the Mac hardware or
-   testers, and when?
+5. ~~macOS~~ — intent settled (first-class as soon as testable, owner
+   2026-06-11); access **decided (delegated, 2026-06-11):** off the v1
+   critical path; work starts when hardware or committed testers
+   materialize. Until then: CI cross-builds where the chosen stack permits,
+   and a public call for Mac testers when the project opens up (§8).
 6. ~~Write-compat horizon~~ — **settled (owner, 2026-06-11):** ini
    write-compat through v1's handoff period; post-v1 the native format may
    evolve and ini becomes an export/sync target. "Picasa *is* dead — the
@@ -878,15 +902,17 @@ items. Argue here, then edit the spec.
 7. ~~Star model~~ — **settled (owner, 2026-06-11): "stack em!"** Stars are
    0–5; lossless XMP `Rating` mapping; ini `star=yes` stays the
    zero-vs-nonzero compat layer; legacy stars import as 1 (§3).
-8. **db3 sentinel acceptance** (fauxcasa-5kl) — experiment, may unlock deeper
-   coexistence; gates nothing.
+8. ~~db3 sentinel acceptance~~ — **decided (delegated, 2026-06-11):** run
+   opportunistically during M2's oracle-harness window (same differential
+   machinery; fauxcasa-5kl). Informs deeper coexistence; never gates (§4).
 9. ~~Updates~~ — **settled (owner, 2026-06-11): opt in.** Version check
    exists but is off until the user enables it; never auto-install (§5
    Maintenance).
-10. **Concurrency model** (§3) — single-writer + alternation vs something
-    stronger for the multi-machine NAS scenario — and which durable-state
-    primitives keep the far-range P2P-sync door open (§3
-    "Future-proofing").
+10. ~~Concurrency model~~ — **decided (delegated, 2026-06-11):** v1 ships
+    single-writer + alternation + foreign-change merge, nothing stronger;
+    the mergeable-shape primitives (§3 "Future-proofing") are hard
+    requirements so the P2P future stays open. Multi-writer sync is
+    post-v1.
 11. ~~V6 slideshow question~~ — **settled (owner, 2026-06-11):** both halves
     are desirable. Playback is M1; the minimal Picasa-2-level renderer rides
     M4 (§5 In & out); the full Movie Maker stays LATER.
@@ -906,20 +932,28 @@ items. Argue here, then edit the spec.
     time, resident memory — plus green builds on Linux and Windows CI.
     First candidate that passes the §7 budgets and iterates fast wins;
     ties break toward iteration speed, not perf margin.
-13. **Content-recognition boundaries** (§5 LATER, medium-range) — local
-    models only, or also per-batch opt-in remote LLM assist? And where is
-    the line between assistive suggestions (in) and auto-curation (banned by
-    §1)? Needs argument before any v2 design work.
-14. **Duplicate-collapse semantics** (§5 LATER) — what does "collapsing"
-    mean: merge per-copy state into one survivor? a canonical file plus
-    references? hardlinks? What is reversible vs destructive, and how much
-    of the L2 metadata diff/merge surface is worth building? Needs argument
-    before the dupe release is designed.
-15. **Reverse star priority** (§5 Organize) — the owner requested the
-    feature but deliberately set no priority. Spec says v1/M2: it rides the
-    star machinery end-to-end (flag, sidecar record, auto-collection,
-    keystroke, badge, XMP −1 mirror), so the marginal cost is near zero and
-    it completes the triage loop. Argue if it should wait instead.
+13. ~~Content-recognition boundaries~~ — **decided (delegated,
+    2026-06-11):** automatic/background = local models only; remote LLM
+    assist = explicit, user-initiated, per-batch, labeled, off by default,
+    never required. All output is reviewable suggestions; changing what the
+    user sees without an explicit accept is the banned side of the §1 line
+    (§5 LATER).
+14. ~~Duplicate-collapse semantics~~ — **decided (delegated, 2026-06-11):**
+    collapse = merge into one survivor (stars max, keywords/albums union,
+    conflicts surfaced) + others to trash, journaled and undoable; plus a
+    no-deletion dupe-group option. Hardlinks and canonical+references
+    rejected (virtual layer over disk violates N1). L2 diff/merge ships
+    minimal: field-level pick-one at collapse time (§5 LATER).
+15. ~~Reverse star priority~~ — **decided (delegated, 2026-06-11):** v1/M2,
+    riding the star machinery end-to-end at near-zero marginal cost; it
+    completes the triage loop (§5 Organize).
+
+---
+
+**Agenda status, 2026-06-11:** all 15 items resolved — 8 by owner ruling, 1
+by owner-set procedure (cache, measured at M1), 6 delegated to the spec
+(items 5, 8, 10, 13, 14, 15). Delegated decisions remain overturnable by
+argument; new arguments get new numbers.
 
 ---
 
