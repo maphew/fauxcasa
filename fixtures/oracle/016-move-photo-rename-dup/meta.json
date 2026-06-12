@@ -1,0 +1,81 @@
+{
+ "fixture": "016-move-photo-rename-dup",
+ "note": "Move photo between folders, with name-collision rename. UI: dragged photo07.jpg from '2010-12-25 Winter Holiday' onto '2015-03-15 Garden Project' in the left folder tree. Confirm dialog: 'Moving file(s) to Z:\\...\\Garden Project\\. This folder already contains files with the same name. Would you like to rename or skip these files?' [Rename Duplicates] [Skip Duplicates] [Cancel] -> user pressed Rename Duplicates (note: every synthetic folder holds photo00-07, so ANY cross-folder move collides). File side: source unlinked; byte-exact copy (sha256 4d0a200e... verified vs baseline) appears as photo07-001.jpg - Picasa dedupe suffix is '-001'. Sync db: the photo's thumbindex.db entry rewritten IN PLACE with new name+parent (+4 bytes for longer name); wordhash +12. NO imagedata pmp change at all - file identity & folder membership live in thumbindex (name + parent-by-index), so move+rename = one thumbindex rewrite. Flush (+~10min, included here): only albumdata_date[6] activity tick + one 8-byte stamp in albums_index. Search-results count stays 24 (move doesn't change photo count). NO ini change in either folder.",
+ "captured": "2026-06-12T15:30:41+00:00",
+ "baseline": {
+  "label": "after 015-delete-photo",
+  "created": "2026-06-12T15:13:15+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "bbbbedc6f27c2a226d3219dc3beadf0cedc02b57b501b16c51893a6a42d04b7d",
+    "size": 116
+   },
+   "after": {
+    "sha256": "43dcf83c8a6fab4c2765e0252913baeaabd63ad4e8ef37e666118c4a27919949",
+    "size": 116
+   }
+  },
+  "db3/albums_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7635474c96186294d87db53f42be628de6ff8f8ad34a514264b79175db75bf3b",
+    "size": 164
+   },
+   "after": {
+    "sha256": "99ddd163a9c724d2abb5f704bab31b194052646479dcd775d1e72f1382d4aeb0",
+    "size": 164
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ad4818263d367ddcab3cbbab957bf8cde82e34412db5f5ca497cb1f3ba66a90f",
+    "size": 1449
+   },
+   "after": {
+    "sha256": "5ab88b8d51aaa0d1411702910281700a328f84ba1b7c92fb02f2cd5ff82557bd",
+    "size": 1453
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "033aeae538df961745cd8659c583174f6a3fb51cc2c390fe679db221f3d765cc",
+    "size": 67248
+   },
+   "after": {
+    "sha256": "77e6c12eb2965074d73ab5922370e54be7f3348c1b594c5618812c62d6112191",
+    "size": 67260
+   }
+  },
+  "library/2010-12-25 Winter Holiday/photo07.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "4d0a200e821a7f9d7209c0c233b3896306ece1203a2c84ce63c96e893f43318a",
+    "size": 27707
+   }
+  },
+  "library/2015-03-15 Garden Project/photo07-001.jpg": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "4d0a200e821a7f9d7209c0c233b3896306ece1203a2c84ce63c96e893f43318a",
+    "size": 27707
+   }
+  }
+ }
+}
