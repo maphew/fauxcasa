@@ -919,10 +919,10 @@ def cmd_thumbindex(args: argparse.Namespace) -> int:
 # names embedding account names (IIDLIST_<user>_lh, <user>_lh) and backup
 # set names (<set name>-backuphash).
 _INI_KNOWN_KEYS = frozenset(
-    """star caption keywords rotate flipped crop crop64 filters redo faces
-    albums backuphash moddate originhash width height textactive text geotag
-    screensaver name token date description location link category p2category
-    utf8 album""".split()
+    """star hidden caption keywords rotate flipped crop crop64 filters redo
+    faces albums backuphash moddate originhash width height textactive text
+    geotag screensaver name token date description location link category
+    p2category utf8 album""".split()
 )
 
 

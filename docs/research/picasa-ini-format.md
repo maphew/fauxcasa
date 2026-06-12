@@ -44,6 +44,7 @@ The 3.9 binary also holds marker strings `]album`, `]face`, `]ignoreface`,
 | Key | Format | Notes |
 |---|---|---|
 | `star=yes` | literal | presence-only; never `star=no` |
+| `hidden=yes` | literal | hide-photo; ini-only state, **no db-side field** (oracle fixture 017); unhide removes the key |
 | `caption=` | text | only for formats with no IPTC/XMP home; JPEG captions go to IPTC |
 | `keywords=` | CSV | only non-JPEG (JPEG → IPTC) |
 | `rotate=rotate(N)` | N∈0..3 | quarter-turns CW; does NOT transform faces/crop coords |
