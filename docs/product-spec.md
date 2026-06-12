@@ -229,11 +229,13 @@ Two layers, exactly as Picasa had them, because the model was right:
   album never touches files; album-context operations never mutate files
   implicitly (Picasa's rename-photos-from-an-album renamed the source files
   on disk — designed away).
-- Per-photo user state: **star** (binary flag, a cross-cutting selection
-  predicate other features filter on), **reject flag ("reverse star",
+- Per-photo user state: **stars** (0–5, stackable — owner ruling
+  2026-06-11, "stack em!": one keystroke adds a star, taps stack, one
+  gesture clears; still the cross-cutting selection predicate, now
+  thresholdable — "show ≥ 3 stars"), **reject flag ("reverse star",
   *owner request*)** — the star's negative twin for culling: one keystroke
   while browsing, viewing, or in a slideshow marks a photo undesirable;
-  setting either flag clears the other, **caption**, **keywords**,
+  setting either clears the other, **caption**, **keywords**,
   **faces** (region + person ref, with suggested/confirmed/ignored states —
   in v1 the *suggested* state is populated solely by imported Picasa data;
   the recognition engine that generates new suggestions is v1.5), **geotag**
@@ -282,13 +284,16 @@ rule as new files in a manually sorted folder. A copied-in folder whose ini
 references unknown album UIDs gets placeholder albums, surfaced in the import
 diagnostics, never dropped.
 
-**Star authority:** the sidecar star line is authoritative. When in-file
-write-back is enabled (§5 P1), stars mirror to XMP `Rating` (5 ↔ starred)
-asynchronously; foreign `Rating` changes detected on rescan are *offered* as
-star changes (transitions to/from 5) and logged; ratings 1–4 display
-read-only. The reject flag mirrors to the XMP rejected convention
-(`Rating = -1`) under the same rules. Binary star stays — it's the Picasa
-soul (*owner priority*; **⚖ argue** for 0–5 ratings instead).
+**Star authority:** stars are 0–5 and map losslessly to XMP `Rating` 1–5
+(owner ruling, 2026-06-11 — the old binary-vs-ratings asymmetry dissolves;
+the whole `Rating` axis is now coherent: −1 rejected, 0 none, 1–5 stars).
+Split authority follows the album pattern: the Picasa-compatible ini
+`star=yes` line is authoritative for zero-vs-nonzero — any count ≥ 1 writes
+`star=yes`, so alternation with Picasa round-trips, and a Picasa-side unstar
+clears to 0 — while the native tier-2 record holds the exact count and XMP
+`Rating` carries it to other apps when made permanent (§5 P1). Foreign
+`Rating` changes detected on rescan are *offered* as star changes and
+logged. Legacy `star=yes` imports as 1 star.
 
 **Cache location — settled procedure (owner, 2026-06-11): measured, not
 argued.** The default is decided empirically at M1: run the §7 gates on the
@@ -433,7 +438,8 @@ Library & navigation
   folder names; negation (`-term`); results are a selectable, bulk-operable
   set; a native All Photos view (Picasa users needed a magic negation-search
   hack to get one).
-- Keyboard triage loop: star, reverse star (X), next/prev (incl. J/K),
+- Keyboard triage loop: star (taps stack; 0–5 set keys), reverse star (X),
+  next/prev (incl. J/K),
   select/hold, 100% zoom toggle, hover full-screen peek,
   reveal-in-file-manager, platform-correct Ctrl/Cmd. Picasa-compatible
   bindings as the default scheme.
@@ -441,7 +447,11 @@ Library & navigation
 
 Organize
 
-- Stars (one keystroke, instant, reversible), captions, keywords.
+- Stars, stackable 0–5 (*owner ruling*: "stack em!") — one keystroke adds a
+  star, taps stack, one gesture clears; instant, reversible; filterable by
+  threshold (≥ N). Legacy `star=yes` imports as 1 star; any nonzero count
+  round-trips to Picasa as starred (§3 "Star authority").
+- Captions, keywords.
 - Reverse star (*owner request*; **⚖ argue** — priority deliberately unset
   by the owner; spec says v1/M2 because it rides the star machinery
   end-to-end): one keystroke (X, Picasa's import-exclude muscle memory)
@@ -538,9 +548,10 @@ Maintenance & trust
 - One-click verify/rebuild index; per-folder health status; the "what does
   the app think about this file?" inspector; first-run = two questions max
   (scan scope; nothing else), library usable immediately.
-- Updates: opt-in version check only, never auto-install (**⚖ argue**:
-  fully offline instead — even a check-only ping is a network dependency;
-  but Picasa's broken updater stranded users on vulnerable builds).
+- Updates — settled (owner, 2026-06-11): opt-in version check only, never
+  auto-install. Even the check is off until the user turns it on; it exists
+  at all because Picasa's broken updater stranded users on vulnerable
+  builds, but consent comes first.
 - i18n string externalization from day one (full localization is post-v1).
 
 ### P1 — the in-file metadata write policy (settled in direction — owner, 2026-06-11)
@@ -864,11 +875,14 @@ items. Argue here, then edit the spec.
    evolve and ini becomes an export/sync target. "Picasa *is* dead — the
    future is something else." Compatibility serves the migration, not an
    allegiance (§4).
-7. **Star model** (§3) — binary star forever vs 0–5 ratings.
+7. ~~Star model~~ — **settled (owner, 2026-06-11): "stack em!"** Stars are
+   0–5; lossless XMP `Rating` mapping; ini `star=yes` stays the
+   zero-vs-nonzero compat layer; legacy stars import as 1 (§3).
 8. **db3 sentinel acceptance** (fauxcasa-5kl) — experiment, may unlock deeper
    coexistence; gates nothing.
-9. **Updates** (§5 Maintenance) — spec says opt-in version check, never
-   auto-install; argue for fully-offline instead.
+9. ~~Updates~~ — **settled (owner, 2026-06-11): opt in.** Version check
+   exists but is off until the user enables it; never auto-install (§5
+   Maintenance).
 10. **Concurrency model** (§3) — single-writer + alternation vs something
     stronger for the multi-machine NAS scenario — and which durable-state
     primitives keep the far-range P2P-sync door open (§3
