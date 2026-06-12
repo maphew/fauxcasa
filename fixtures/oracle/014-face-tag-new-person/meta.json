@@ -1,0 +1,398 @@
+{
+ "fixture": "014-face-tag-new-person",
+ "note": "Face geometry retry (batch 2) - SUCCESS where 013 stalled. UI: 2x-clicked photo00.jpg in '2015-03-15 Garden Project' -> 'Add a person manually' -> drew box, typed 'synthetic person 1200' in the name field under the box -> confirmed the New Person dialog. Wine doubled a keystroke: stored name is 'synthetiic person 1200' everywhere. Phase 1 (sync, ~1min): ini faces=rect64(6800600097ff9fff),ca5c88ca60f42c0b + new [Contacts2] section 'uid=name;;'; backuphash 3563->600; albums_0.db append. Phase 2 (lazy flush +4min, merged into this capture): contacts/contacts.xml created (contact id=uid, local_contact=1, ISO timestamp w/ TZ); new albumdata row [11] = person album (name, token ']facealbum:11', category=8, albumcontactids NEW pmp uint64=uid); NEW VIRTUAL imagedata row [28] filetype=1001 carrying the face: crop64=facerect=rect64 value, width/height=photo dims (1600x1200), personalbumid NEW pmp=11 (-> person album row), tagdate NEW pmp=action datetime, gets its own thumbindex entry (28->29); photo's own row [2] facerect 0x1 -> rect. Sparse pmps (crop64/rotate) zero-filled to 29 rows. NO JPEG XMP write at all (unlike 013's panel flow which wrote dc:subject synchronously) - contact-dialog flow is ini/db/contacts.xml-side only.",
+ "captured": "2026-06-12T03:43:48+00:00",
+ "baseline": {
+  "label": "after 013-face-tag-manual",
+  "created": "2026-06-11T19:03:45+00:00"
+ },
+ "files": {
+  "contacts/contacts.xml": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "c2922161b5abb5d5b2c4e93321f1e82cf72fe2373d2d3753fdb6e3f3674a86fc",
+    "size": 150
+   }
+  },
+  "db3/albumdata_albumcontactids.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "9dc7a78e5d757e6d1d1e4728533e80cdef4bb2024da9b70d02e0a5438cf3e7b6",
+    "size": 116
+   }
+  },
+  "db3/albumdata_category.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "5249f181e9601f44a42805761aeab7935991bfb419ab98839f3b361639234d55",
+    "size": 64
+   },
+   "after": {
+    "sha256": "38defce5218d6bffe8e0524dc94cb54abfb2a96b5dfc0ef0232887eb9cedb37a",
+    "size": 68
+   }
+  },
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "38e485274122ba8ee8666a9dc7ec2f0be040af943d5bf55fd787bccf94feddbc",
+    "size": 108
+   },
+   "after": {
+    "sha256": "2013eeebed1eaf1ef26b5f6eea968be237e3bbfa78181bab195cd7265a8fb7ad",
+    "size": 116
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "bbc6c63a75d2f59c71f2e0780de34f73696ba201f1fe3c33ad2467835e4c8182",
+    "size": 53
+   },
+   "after": {
+    "sha256": "d2f683e3f4d3f5fdeb9e9a62dd4b5c996aa0982a2016d2da3495ff90f0ecf2ff",
+    "size": 54
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "66b1b50e62fec4a065214ffdb54ee329cfa8bff7ea5699aab6d9d877b3329d5c",
+    "size": 108
+   },
+   "after": {
+    "sha256": "3a548923713e40a01cd06bfff98d5c225ba86e5fc1329275243817656e8e271a",
+    "size": 108
+   }
+  },
+  "db3/albumdata_location.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "517a1c149f0dceb05b36c4f2e5ada80d89ff3e53af6098c66097b037371e0390",
+    "size": 31
+   },
+   "after": {
+    "sha256": "cffcbba1bd5dae3472bdce212d9b42b09efaa14444e432e490e680a33757b5b1",
+    "size": 32
+   }
+  },
+  "db3/albumdata_music.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "517a1c149f0dceb05b36c4f2e5ada80d89ff3e53af6098c66097b037371e0390",
+    "size": 31
+   },
+   "after": {
+    "sha256": "cffcbba1bd5dae3472bdce212d9b42b09efaa14444e432e490e680a33757b5b1",
+    "size": 32
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7df71a398e2262aa517b49c39c2357606464c80f3e56f24feec2a8c72c853d18",
+    "size": 195
+   },
+   "after": {
+    "sha256": "a4e4492b6ff89747bb0c87926170bd174f9d98564d0c396098e21fdebaf94d86",
+    "size": 218
+   }
+  },
+  "db3/albumdata_token.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "de9c98f2c26f40334872879b5723820af19696217c1f44df749e9fad06267621",
+    "size": 260
+   },
+   "after": {
+    "sha256": "45c0d3ce050024504875bebf94f05ac0effa97c56ad9ae13f6712caae7192fb0",
+    "size": 274
+   }
+  },
+  "db3/albums_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "c8ef5327ee344cae3dfa52bf24a8f2cd0f54c7b892befb92987ae6e64a531c35",
+    "size": 156184
+   },
+   "after": {
+    "sha256": "e9b74cba6e7db3bf46253d926b92289cd39d7855bec4b7d23c985e404e098b0a",
+    "size": 210792
+   }
+  },
+  "db3/albums_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7b11cb9bd5cfa7c1f7a97eba2cdbccd7e20622f7403b62c1eee46dc59bd08cd1",
+    "size": 152
+   },
+   "after": {
+    "sha256": "eee1def9ff64853c4df03a4f1e7a7c9b07367dca70492bf49e3bd6ecbeb4ab96",
+    "size": 164
+   }
+  },
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "bcc61a139bae6f61d73748c68c95ed010960862e5f031695f654dde214b336b3",
+    "size": 138121
+   },
+   "after": {
+    "sha256": "36c2e9a185d7460f99e2dd97299bfdc5ab6dd34a301de0ddfd9de2fc542454a9",
+    "size": 147229
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "6206b069a08f793ca036dfe5fe1d6f12d3c8487e4ffd13a38af6ca26aa06c983",
+    "size": 356
+   },
+   "after": {
+    "sha256": "fdf3674ecbcdbc659bfda8c1b27f57b64b6b8ccde415ef2547197fc2e8adad2c",
+    "size": 368
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "48342ec61fe68efd978b2bc3e9444308d1c86e49c2d8c1cef80a1e751301cce2",
+    "size": 70
+   },
+   "after": {
+    "sha256": "9d91938a4de0cc6f179743b3ab359f837439ace674d8b5320427588533599d7a",
+    "size": 70
+   }
+  },
+  "db3/imagedata_crop64.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9ec8270ebb9f964723ed1c6c4ec7c8127b8bfcc777599170ad77d17a472510bd",
+    "size": 212
+   },
+   "after": {
+    "sha256": "b19cdf6eb06ec8ebf520a7130752a2acbed8cbb8f90a0ff24cc10423b95b8c3c",
+    "size": 252
+   }
+  },
+  "db3/imagedata_facerect.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d3eb63f547884d341f7a49af01eee54b54a4a8c96c9fbdf2514c568361dce03a",
+    "size": 244
+   },
+   "after": {
+    "sha256": "2414911836e595ced4144411661c681b6ec6f571c83754a716f2aa6221d84b44",
+    "size": 252
+   }
+  },
+  "db3/imagedata_filetype.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "724ef92567d6a7927459c10b8a375d7f4751b4c8ad25999e4f24804281ccf5ed",
+    "size": 132
+   },
+   "after": {
+    "sha256": "4c719f2a83145b3275d4016e4eb86adfacc43611fd37070b5c55fa01d20497d5",
+    "size": 136
+   }
+  },
+  "db3/imagedata_height.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "48b2f2f1632e3a8b85a940fa9c308a020950ff136ec37377e4de300eb3934be0",
+    "size": 132
+   },
+   "after": {
+    "sha256": "698d763888525c6ac58540142df25ac75aa051eaf0de9896bb6e50fd40dd5add",
+    "size": 136
+   }
+  },
+  "db3/imagedata_personalbumid.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "e0739ecc0bfacccaf0a14e65191f7c28ac0777ae43effcbc95eb5bc4572034a7",
+    "size": 136
+   }
+  },
+  "db3/imagedata_rotate.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8ef935eef8b2f15ee7fddd279253e0ad8e30cf162e0c5b3addab4f6c2c03dde1",
+    "size": 53
+   },
+   "after": {
+    "sha256": "43da43054142087771f2ba3b903854796cc0d0cbe9817d3a805e7c4cd9ac6e2f",
+    "size": 58
+   }
+  },
+  "db3/imagedata_tagdate.pmp": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "47d2f736cd9964c5ca21a0f94e7eb77e87289d1771df658476d4077c781cb3c6",
+    "size": 252
+   }
+  },
+  "db3/imagedata_width.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "f28dd5a5a145410212ffa5f3cbabff37fb431dc9eb7e1e113441e9bca9121042",
+    "size": 132
+   },
+   "after": {
+    "sha256": "15c16ee1cf08cbd1eb7dcb498097521012a4daafe7c54450850c24b67d18333f",
+    "size": 136
+   }
+  },
+  "db3/repository.dat": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "493a720af10e100e55b548504415ed31af24207451667384bb9a088db9753285",
+    "size": 140
+   },
+   "after": {
+    "sha256": "d28508bce821b2f8df7058d7303a3287df370b79b4ffa342ceabb95664d31484",
+    "size": 140
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "e11e892056e57b39b2b294919c7046df06c39d0472a9607c347821b027d35e06",
+    "size": 1429
+   },
+   "after": {
+    "sha256": "56663cf09d8dbeb26dc6e5ed582a207b0e43a5f72ccd51ba8bfac2032e47572a",
+    "size": 1460
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "1e02628040872ed24767bd8f03055771d30dc8e05756ffbc876c5265349c2194",
+    "size": 31446
+   },
+   "after": {
+    "sha256": "cca3e8e25bf4f639f58573774b13dafcf4a2c2bbfc25c8407413a10f31c2adc4",
+    "size": 33659
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "cf01953bb7f624c55a446e23cbdc778a2e7f1488981cd8a303976ba206a769ab",
+    "size": 356
+   },
+   "after": {
+    "sha256": "becb60c526517778e48e98189d6e1473ed2ec1f0d45d37eeb7063d64ca7d0982",
+    "size": 368
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "07f52898aa088ca2a8a73d53d6d63b9d173bb2d6283b83b4df5f59a0a16052dd",
+    "size": 87277
+   },
+   "after": {
+    "sha256": "7ab9d309f082c47b04937a3fa595e3c60926c1573c35b8e5c62f580b96c5e542",
+    "size": 92580
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "0bb3ace24989bc5161979a3d78983c30bcede183d39c41af7d7ba4a9134ffcaa",
+    "size": 356
+   },
+   "after": {
+    "sha256": "d60130bf409ceda4ef2c5ad14e9cadf77bf74809da1aeb93deb2cbc5ab66b3c1",
+    "size": 368
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "9e4304a5c27be902d53a489036fad8d5fa371fd12e5e69ddbf8966abea72b211",
+    "size": 67280
+   },
+   "after": {
+    "sha256": "432529299899bbdb626d3822472a964c056e8d9c6c76ee49cfc4afd34a23a945",
+    "size": 67296
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "6a04b48b8aa4bde1030f5a3470343fe6afe2beffea38f186b85feab6238f505e",
+    "size": 283
+   },
+   "after": {
+    "sha256": "4afd3fdfe4ca2be6fb37fa2cb180fd883996fc22efdf48caf47cb6dbde3dae26",
+    "size": 387
+   }
+  }
+ }
+}
