@@ -1,0 +1,185 @@
+{
+ "fixture": "019-save-text-to-disk",
+ "note": "File->Save the text edit from 018 (bake phase; pairs with 018 like 005 pairs with 004). UI: selected photo01.jpg in '2010-12-25 Winter Holiday', File->Save (dialog suppressed since 005). Sync phase, same architecture as 005: recipe MOVED from library ini (text=/textactive= deleted, backuphash 24332->23770) to NEW .picasaoriginals/.picasa.ini (moddate=a240a7b786fadc01 FILETIME + width=1200 height=1600 original dims + verbatim text= + textactive=1); original stashed BYTE-EXACT (sha256 8fe06860... verified) as .picasaoriginals/photo01.jpg; library JPEG rewritten 66033->55612 with text rendered in. Flush (+~3min, included): imagedata_text[12] cleared, textactive[12] 1->0, edited[12] 1->0, revertable[12] 0->1, backuphash mirror, NEW FIELD imagedata_originslow[12] 0 -> 0x80a4a73eb9f4a17f (uint64, set at bake - revert-tracking key for the stashed original?). width/height pmps UNTOUCHED (text doesn't resize; 005's crop did). thumbindex row decode confirmed: the photo's entry updates in place with new mtime FILETIME (== originals-ini moddate value) followed by u32 file size (0x000101f1=66033 -> 0xd93c=55612) - thumbindex rows carry (name, mtime, size, flags). albumdata_date[6] + folder inisync[8] ticks; wordhash same-size churn.",
+ "captured": "2026-06-12T16:17:02+00:00",
+ "baseline": {
+  "label": "after 018-text-on-photo-unsaved",
+  "created": "2026-06-12T16:13:58+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "29c60cf45b26fe05ec5078af11dcb79b470217cf0e64d72e5c0e3b861ed6a56b",
+    "size": 116
+   },
+   "after": {
+    "sha256": "f605acf805ef72dd00130e0a12fbdff15cdc854c39a2363cba7dd5462fb373e9",
+    "size": 116
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "00f42969712183d3984229f722d5fd922c9d8f0552b2f1663d6157618b7832ec",
+    "size": 108
+   },
+   "after": {
+    "sha256": "b3ed0119a2ffbd98315e3abfc29e6a954056f5e84a3a042fb0a865ccb94432b4",
+    "size": 108
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a6d0046cbc4c06d08786c62c66afa63c1695dab858add3a37d7b45e3774a1403",
+    "size": 70
+   },
+   "after": {
+    "sha256": "9567e088555b7de97b1a5cea540749d5d54369289213b9aa03b6492dc857537f",
+    "size": 70
+   }
+  },
+  "db3/imagedata_edited.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "83cf6adad3deb27edca6ac03c17b8f26377e41490aabad9b3e3fd4961877f611",
+    "size": 44
+   },
+   "after": {
+    "sha256": "cfa88d8b7238d382f904d53dae63e8410bf065073bd136608c6595a1fda2cfe4",
+    "size": 44
+   }
+  },
+  "db3/imagedata_originslow.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "74c9ed1921c04a201a03fd5a908b85eb9503016371bff3a1c25f0a5275208d7f",
+    "size": 220
+   },
+   "after": {
+    "sha256": "4e9b06929e66b8abd59aef871f68297448245a255266fca5e3e700c422b38685",
+    "size": 220
+   }
+  },
+  "db3/imagedata_revertable.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "c312411f74b49b80ca6093bd33871188c3eff4f7c4ab907eaf84bdedeb9bd46b",
+    "size": 44
+   },
+   "after": {
+    "sha256": "ecd1dbcfd4d84c700887cd5c39211526231f7932b85bb50b5b250f763706a66d",
+    "size": 44
+   }
+  },
+  "db3/imagedata_text.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "1bc96f6bc4c3916fc5a8324520d9fd9b8b87dcfc5c29663636e63ef4fcb5cfaf",
+    "size": 183
+   },
+   "after": {
+    "sha256": "bf6e4a99177ef8c8e1b9f9ed1d4ae9d5cceb11727f5da81cff2a86fd6057fe08",
+    "size": 44
+   }
+  },
+  "db3/imagedata_textactive.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7728905f63607a80100efb8c6168fb82043457c90bba889b38238c39f825ebd3",
+    "size": 44
+   },
+   "after": {
+    "sha256": "8c4510f5ad46ccde3b0f9d856523f3bbc6c72164ac0bd3830553e3033d414b59",
+    "size": 44
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "5ab88b8d51aaa0d1411702910281700a328f84ba1b7c92fb02f2cd5ff82557bd",
+    "size": 1453
+   },
+   "after": {
+    "sha256": "f1abb799c077ef214a5487c2e4066a8d6891a7afc717f652ba3f017fb147eb9e",
+    "size": 1453
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "4b6d7865f71a9e42aa881386281edd8af2612b5e25401504b6ba447327133fd4",
+    "size": 67280
+   },
+   "after": {
+    "sha256": "050e514bd00f351f043eb13e3bf3a54e64529c22d03fd275399f9be705c406d7",
+    "size": 67280
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "60763a13f7480919a891959778cefff57fc1b236926515d34471a170ce501992",
+    "size": 286
+   },
+   "after": {
+    "sha256": "4defbdcae3966424622c79539465f507a4a4a77ea6281602c2599fd8fc44d0b6",
+    "size": 126
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasaoriginals/.picasa.ini": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "83abb4fb49f1b6d0f984034b79bb55d9fac944eeef6f88d6c835f75a40e00b7d",
+    "size": 226
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasaoriginals/photo01.jpg": {
+   "status": "added",
+   "blob": false,
+   "copied": true,
+   "after": {
+    "sha256": "8fe068600e37760e49dfbbbd7bcb3caa2694fc71bf524bb28405db4103bf8328",
+    "size": 66033
+   }
+  },
+  "library/2010-12-25 Winter Holiday/photo01.jpg": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8fe068600e37760e49dfbbbd7bcb3caa2694fc71bf524bb28405db4103bf8328",
+    "size": 66033
+   },
+   "after": {
+    "sha256": "be8d46c3f5e7a9584cd3313a313427c6835550662daaebfe1e1941d64e86a869",
+    "size": 55612
+   }
+  }
+ }
+}
