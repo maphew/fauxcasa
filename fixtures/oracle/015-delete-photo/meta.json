@@ -1,0 +1,111 @@
+{
+ "fixture": "015-delete-photo",
+ "note": "Delete photo, synchronous phase. UI: in '2009-07-04 Beach Day' selected 5th grid photo (= photo05.jpg on disk this time), pressed Delete; 'are you sure' dialog -> checked 'don't ask again' (delete-confirm suppressed for rest of session) -> [Delete Image]. Sync phase is minimal: photo05.jpg unlinked from library folder and moved BYTE-EXACT (sha256 fb912160...d3a7f447 verified vs baseline) to the Wine flatpak's freedesktop trash: ~/.var/app/org.winehq.Wine/data/Trash/files/photo05.jpg + info/photo05.jpg.trashinfo (Path= original full path URL-encoded, DeletionDate=2026-06-12T08:11:49 local) - i.e. Wine maps SHFileOperation FOF_ALLOWUNDO to XDG trash; on real Windows this would be the Recycle Bin. Sync phase wrote only that + one in-place change inside albums_0.db blob at 0x9300. Db flush followed within ~1 min and IS included in this fixture: imagedata_filetype[25] 2 -> 0 (photo row TOMBSTONED in place - table stays 29 rows, no compaction of pmp files), photo05's thumbindex.db entry zeroed out (1460 -> 1449 bytes), albumdata_description[6] 'Search results' count 25 -> 24 + date[6] tick, wordhash.dat shrank. NO ini change in either phase. Also: Picasa sat idle overnight (~8h) and wrote NOTHING - idle noise floor is zero.",
+ "captured": "2026-06-12T15:13:15+00:00",
+ "baseline": {
+  "label": "after 014-face-tag-new-person",
+  "created": "2026-06-12T03:43:48+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "2013eeebed1eaf1ef26b5f6eea968be237e3bbfa78181bab195cd7265a8fb7ad",
+    "size": 116
+   },
+   "after": {
+    "sha256": "bbbbedc6f27c2a226d3219dc3beadf0cedc02b57b501b16c51893a6a42d04b7d",
+    "size": 116
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d2f683e3f4d3f5fdeb9e9a62dd4b5c996aa0982a2016d2da3495ff90f0ecf2ff",
+    "size": 54
+   },
+   "after": {
+    "sha256": "23c61de0aa63cc118412dc88e4951c3a5bba61435c924cf7d5e8089f9cca694f",
+    "size": 54
+   }
+  },
+  "db3/albums_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "e9b74cba6e7db3bf46253d926b92289cd39d7855bec4b7d23c985e404e098b0a",
+    "size": 210792
+   },
+   "after": {
+    "sha256": "c5bfbaf123427b77cabfe795a93ad5dee4348df3935182dec78a595d83eb56e2",
+    "size": 210792
+   }
+  },
+  "db3/albums_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "eee1def9ff64853c4df03a4f1e7a7c9b07367dca70492bf49e3bd6ecbeb4ab96",
+    "size": 164
+   },
+   "after": {
+    "sha256": "7635474c96186294d87db53f42be628de6ff8f8ad34a514264b79175db75bf3b",
+    "size": 164
+   }
+  },
+  "db3/imagedata_filetype.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "4c719f2a83145b3275d4016e4eb86adfacc43611fd37070b5c55fa01d20497d5",
+    "size": 136
+   },
+   "after": {
+    "sha256": "7c0bb9542ebb5538f837417108da03668162f34cc251cceeffad5f42f75266f4",
+    "size": 136
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "56663cf09d8dbeb26dc6e5ed582a207b0e43a5f72ccd51ba8bfac2032e47572a",
+    "size": 1460
+   },
+   "after": {
+    "sha256": "ad4818263d367ddcab3cbbab957bf8cde82e34412db5f5ca497cb1f3ba66a90f",
+    "size": 1449
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "432529299899bbdb626d3822472a964c056e8d9c6c76ee49cfc4afd34a23a945",
+    "size": 67296
+   },
+   "after": {
+    "sha256": "033aeae538df961745cd8659c583174f6a3fb51cc2c390fe679db221f3d765cc",
+    "size": 67248
+   }
+  },
+  "library/2009-07-04 Beach Day/photo05.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "fb9121604f2f7cf60b3d3c17be2aec2ca0815be1feb870a51ca4c429d3a7f447",
+    "size": 63459
+   }
+  }
+ }
+}
