@@ -96,9 +96,9 @@ Fixture pairs are synthetic → committable; the accumulated
 `fixtures/oracle/` corpus is the ground truth for the Fauxcasa parser/writer
 test suite. Session log: bead `fauxcasa-dcc`.
 
-## Differential findings (2026-06-11/12 sessions, fixtures 001–015)
+## Differential findings (2026-06-11/12 sessions, fixtures 001–021)
 
-Harvested corpus: `fixtures/oracle/001-star-photo` … `015-delete-photo`
+Harvested corpus: `fixtures/oracle/001-star-photo` … `021-album-description`
 (each has `diff.md` with decoded deltas). Action→storage map:
 
 | Action | Synchronous (at action time) | Lazy flush (~2–6 min cycle) |
@@ -115,6 +115,12 @@ Harvested corpus: `fixtures/oracle/001-star-photo` … `015-delete-photo`
 | Manual face tag (013, People-panel flow) | name into JPEG XMP `dc:subject` + ini `backuphash` | `imagedata_tags` row. **Face geometry never reached disk** (no facerect/facetemplates/contacts.xml, even at exit) |
 | Manual face tag (014, New Person dialog flow — the retry that worked) | ini `faces=rect64(...),<uid>` + `[Contacts2]` section; **no JPEG XMP at all** | `contacts/contacts.xml`; person album row (`]facealbum:<row>`, category 8, `albumcontactids`=uid); virtual imagedata row (`filetype=1001`) + own thumbindex entry holding the rect — see `picasa-db3-validated.md` "Empty-name records" |
 | Delete photo | file moved byte-exact to OS trash (Wine: XDG trash w/ `.trashinfo`; Windows: Recycle Bin via `FOF_ALLOWUNDO`); one in-place `albums_0.db` change. **No ini change in either phase** | imagedata row **tombstoned in place** (`filetype` 2→0; table stays same row count, no pmp compaction); thumbindex entry zeroed; 'Search results' count decrements; wordhash shrinks |
+| Move photo between folders (016) | file relocated byte-exact; name collision → Rename Duplicates dialog → `-001` suffix; **one thumbindex entry rewritten in place** (new name+parent). No imagedata pmp change, no ini — thumbindex is the file-identity/folder-membership table | only `albumdata_date[6]` tick + an `albums_index` stamp |
+| Hide photo (017) | ini `hidden=yes` (no `backuphash` line added) | **no pmp mirror — ini-only state.** Db reacts indirectly: 'Search results' −1, folder `inisync` tick |
+| Text on photo, unsaved (018) | ini `text=count;payload-len;str-len;string;font;x,y,size,rot fractions;v1,fill-ARGB,outline-ARGB,…,weight,…;;` + `textactive=1`. **No `filters=` entry** — text is its own key, outside the filter chain (crop wrote both) | `imagedata_text` = ini string **verbatim**; `textactive`=1, `edited`=1 (byte; rotate had used 2); thumbs/previews re-rendered with the overlay |
+| File→Save text (019) | bake per 005: recipe → `.picasaoriginals/.picasa.ini` (`moddate` FILETIME + orig dims + verbatim recipe), original stashed byte-exact, JPEG rewritten | `text`/`textactive`/`edited` cleared, `revertable`=1, **`imagedata_originslow` uint64 set at bake** (revert-tracking key?); width/height untouched (text doesn't resize). Thumbindex row updated in place — pins row layout as (name, mtime FILETIME, u32 size, flags) |
+| Folder description (020) | **whole `[Picasa]` folder-identity block** materialized in the folder's own ini — `name=`, `description=`, `date=` (epoch-days float), `P2category=` — from a single-field edit | folder row `albumdata_description` verbatim |
+| Album description (021) | `description=` line inserted in the `[.album:uid]` section, which lives in the **member photos' folder ini** (albums own no file; no `.pal`). UI gotcha: the header field **silently drops input** without Enter/click-away — first attempt left zero disk trace | album row `albumdata_description` verbatim; album-row `inisync` flag word churns (low half, high half stable) |
 
 General write model:
 
@@ -131,8 +137,8 @@ General write model:
   — confirms sbktech's variable-length note.
 - UI grid order ≠ filename order (our synthetic photos share EXIF
   timestamps): identify the acted-on file from the diff, never from grid
-  position. One caption keystroke was dropped under Wine ('aption') —
-  always read back the stored text.
+  position. Wine drops/doubles keystrokes routinely — 'aption' (002),
+  'synthetiic' (014), 'descriptin' (021) — always read back the stored text.
 - **Idle noise floor is zero**: Picasa left running idle ~8h (overnight,
   2026-06-12) wrote nothing — any diff vs baseline is attributable to the
   last action.
