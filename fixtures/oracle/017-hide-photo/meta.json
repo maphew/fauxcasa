@@ -1,0 +1,89 @@
+{
+ "fixture": "017-hide-photo",
+ "note": "Hide photo. UI: right-click photo06.jpg in '2010-12-25 Winter Holiday' grid -> Hide. Sync phase: ini-only - new [photo06.jpg] section with hidden=yes (note: no backuphash line added for this photo). Flush (+~5min, included): NO imagedata pmp mirror - hidden state is INI-ONLY, one of the few states with no db-side field. Db reaction is indirect: albumdata_description[6] 'Search results' 24 -> 23 (hidden photos excluded from search), albumdata_inisync[8] (Winter Holiday folder row) FILETIME tick, albumdata_date[6] activity tick, albums_index 8-byte stamp, wordhash +16. JPEG untouched.",
+ "captured": "2026-06-12T16:08:56+00:00",
+ "baseline": {
+  "label": "after 016-move-photo-rename-dup",
+  "created": "2026-06-12T15:30:41+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "43dcf83c8a6fab4c2765e0252913baeaabd63ad4e8ef37e666118c4a27919949",
+    "size": 116
+   },
+   "after": {
+    "sha256": "29c60cf45b26fe05ec5078af11dcb79b470217cf0e64d72e5c0e3b861ed6a56b",
+    "size": 116
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "23c61de0aa63cc118412dc88e4951c3a5bba61435c924cf7d5e8089f9cca694f",
+    "size": 54
+   },
+   "after": {
+    "sha256": "b81def827ada834b5812c6b45df147502a413d273ec11e843a4df063a9885778",
+    "size": 54
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "3a548923713e40a01cd06bfff98d5c225ba86e5fc1329275243817656e8e271a",
+    "size": 108
+   },
+   "after": {
+    "sha256": "3ac9aea4f079b1a5a686256cbd8dc7f8947242b868e2f3b6fd6cc6b50f69d3f5",
+    "size": 108
+   }
+  },
+  "db3/albums_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "99ddd163a9c724d2abb5f704bab31b194052646479dcd775d1e72f1382d4aeb0",
+    "size": 164
+   },
+   "after": {
+    "sha256": "c2784bb1feb596f31672ab7a7dfddd989b7528028f3e52ec183ddb43d2d03c55",
+    "size": 164
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "77e6c12eb2965074d73ab5922370e54be7f3348c1b594c5618812c62d6112191",
+    "size": 67260
+   },
+   "after": {
+    "sha256": "d5e0855e6d60d84424cdb79c5cdb7937318a61efca6bba3eda1f2dceaf4cb2bc",
+    "size": 67276
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "02c726cd4ea9bb8f3772909697d5e706e5a807ea857310d5be15a59369101e5b",
+    "size": 66
+   },
+   "after": {
+    "sha256": "c4eb55487515cec45eba529c8935cd313e143c73bbee7a4c225951db7afb4dc6",
+    "size": 93
+   }
+  }
+ }
+}
