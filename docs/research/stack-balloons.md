@@ -30,36 +30,52 @@ The four candidates (seeded by owner warmth, spec §10 item 12):
 
 ## The numbers (official run, 2026-06-12, all four sequential)
 
-100,000 photos, 374 MB thumbnail cache. Budgets from spec §7: cold start
-< 2 s, scroll p99 frame ≤ 32 ms and max ≤ 100 ms, zero blank tiles,
-memory nowhere near 1.5 GB (working target < 600 MB).
+100,000 photos, 377 MB thumbnail cache. Budgets: cold start < 2 s,
+scroll p99 frame ≤ 32 ms and max ≤ 100 ms, zero blank tiles (spec §7).
+"p99" means: all but the slowest 1% of frames finished within this time
+— it's the smoothness number. On memory, the spec's hard test is
+"nowhere near 1.5 GB"; the stricter "< 600 MB working target" is the
+balloon protocol's own bar (§7 deliberately leaves hard RAM budgets to
+this very decision).
+
+**Bold marks the best value in each row.**
 
 | Metric | rust-egui | go-gio | py-qt | web-wasm | Budget |
 |---|---|---|---|---|---|
-| Cold start to interactive | **91 ms** | **94 ms** | **131 ms** | 1389 ms (1902 ms incl. browser launch) | < 2000 ms |
-| Scroll p99 frame time | 17.9 ms | 18.4 ms | 5.1 ms* | 16.8 ms | ≤ 32 ms |
-| Worst single frame | 22.7 ms | 47.8 ms | 9.5 ms* | 18.3 ms | ≤ 100 ms |
-| Blank-tile frames (of ~5400) | **0** | **0** | **0** | 1 | 0 |
-| Teleport-to-filled | 33–51 ms | 33 ms | 40–44 ms | **367 ms** | (reported, no hard budget) |
-| Resident memory | 551 MB | 607 MB | **184 MB** | 286 MB† | < 600 MB target |
+| Cold start to interactive‡ | **91 ms** | 94 ms | 131 ms | 1389 ms (+ ~0.5 s browser launch = 1902 ms) | < 2000 ms |
+| Scroll p99 frame time | **17.9 ms** | 18.4 ms | 5.1 ms* | 16.8 ms | ≤ 32 ms |
+| Worst single frame | 22.7 ms | 47.8 ms | 9.5 ms* | **18.3 ms** | ≤ 100 ms |
+| Blank-tile frames§ | **0** | **0** | **0** | 1 | 0 |
+| Teleport-to-filled | 33–51 ms | **33 ms** | 40–44 ms | 367 ms | (reported, no hard budget) |
+| Resident memory | 551 MB | 607 MB¶ | **184 MB** | 286 MB† | < 600 MB working target |
 | Lines of code | 514 | 555 | **330** | 723 |
-| Clean build | ~40 s | 9.7 s | none (59 s one-time download) | none |
+| Clean build time | ~40 s | 9.7 s | **no build step** (59 s one-time download) | **no build step** |
 | Edit-and-rerun loop | 2–8 s | 1–2 s | **~1 s** | ~20 s |
 
-\* py-qt's Qt-on-Wayland path isn't vsync-throttled, so it painted ~250
-frames/s where the others were locked to 60 — its frame numbers measure
-raw paint cost and aren't directly comparable. The honest reading: every
-single paint finished in under 10 ms, well inside a 60 Hz frame.
+\* Not comparable to the other columns: the screen refreshes 60 times a
+second, and the other three waited for each refresh before painting the
+next frame; py-qt's toolkit did not wait, painting ~250 frames/s. So its
+numbers measure how fast it can paint, not how smooth it looked. The
+honest reading: every single paint finished in under 10 ms, comfortably
+inside one 60 Hz refresh.
 † Whole browser process tree; ~240 MB of it is the empty Chromium shell
 before any photos.
+‡ Measured on each balloon's own clock. Wall-clock from process launch
+was 93 / 270 / 154 / 1902 ms — all far under budget either way.
+§ Out of ~5,400 rendered frames for the three refresh-locked balloons;
+py-qt's 0 was out of 22,502 (see *).
+¶ Over the 600 MB working target by 7 MB — measured on software
+rendering, where go-gio's texture memory sits in process RAM (see
+caveats); the spec's hard test (nowhere near 1.5 GB) passes easily.
 
-**Every candidate passed the §7 performance budgets**, with two
-web-shell footnotes: its cold start (browser launch dominates, 1.9 s on
-this fast machine) sits right at the 2 s budget line and would likely
-bust on the reference hardware, and its teleport refills (367 ms vs
-~40 ms) reflect fetching thumbs over a local HTTP hop instead of direct
-file reads — partly benchmark scaffolding, partly a real architectural
-tax.
+**Every candidate passed the spec's §7 budgets**, with two qualifiers
+visible in the table: go-gio's memory grazes past our stricter working
+target under software rendering (¶), and web-wasm's cold start — 1.4 s
+of in-page work plus ~0.5 s of browser launch — lands at 1.9 s on this
+fast machine, right at the 2 s line and likely over it on the reference
+hardware. web-wasm's teleport refills (367 ms vs ~40 ms) reflect
+fetching thumbs over a local HTTP hop instead of direct file reads —
+partly benchmark scaffolding, partly a real architectural tax.
 
 ## Honest caveats on the measurements
 
@@ -85,11 +101,13 @@ against the same written protocol, three of them by parallel agents in
 a single evening:
 
 - **py-qt** was the fastest from empty directory to passing the 100k
-  benchmark: ~15 minutes, 326 lines, no compile step, ~1 s edit-rerun
-  loop, zero system dependencies (the Qt wheels bundle everything,
-  including the Wayland driver). Qt's documentation is the most mature
-  of the four. The feared Python bottleneck (the GIL) was a non-issue at
-  this workload because Qt releases it during all heavy C++ calls.
+  benchmark: ~15 minutes, 330 lines, no compile step, ~1 s edit-rerun
+  loop, zero system dependencies (the Qt packages bundle everything).
+  Qt's documentation is the most mature of the four. The feared Python
+  bottleneck — the GIL, Python's global lock that normally stops it
+  using more than one CPU core at a time — was a non-issue at this
+  workload, because Qt does the heavy lifting in C++ with that lock
+  released.
 - **go-gio** compiled the first draft with zero errors, builds in ~10 s
   clean / 1–2 s incremental, and cross-compiles Windows binaries for
   free. The cost: Gio's documentation is thin (the agent worked from
@@ -99,15 +117,17 @@ a single evening:
 - **rust-egui** was solid and unsurprising — but it has the slowest
   edit-loop of the four (40 s clean, multi-second incremental), and it
   took the most fighting in this exercise (dependency declaration, API
-  versions). Its perf showed no advantage over the others *at this
-  task*, because the task is decode-and-blit, not language-bound
-  compute.
+  versions). Its performance showed no advantage over the others *at
+  this task*, because the work is "unpack small images and copy them to
+  the screen" — done by libraries everyone shares, not by the host
+  language itself.
 - **web-wasm** had a near-zero build loop and hit 60 fps easily, but it
   isn't really a shippable stack yet: the probe leaned on an installed
   browser; productizing means an Electron/Tauri/webview packaging
   decision (its own research project), file access through browser
-  sandbox APIs, and a ~240 MB shell floor plus ~1.4 s browser spawn
-  before the first pixel. Notably, **no wasm was needed** — plain JS
+  sandbox APIs, and a ~240 MB shell floor plus ~1.9 s from launch to
+  first pixel (~0.5 s of that is starting the browser itself; the rest
+  is in-page work). Notably, **no wasm was needed** — plain JS
   kept up — so the probe answered "browser shell as host," not "wasm as
   technology." wasm's real role stays the one the spec already names:
   the decode sandbox and the future extension API
@@ -143,8 +163,9 @@ Named consequences, owned now:
    sandbox floor is OS-level worker isolation, host-language
    independent).
 2. **Rust is the named escape hatch** for any inner loop that measurably
-   misses budget (as a compiled extension module inside the Python
-   host). Nothing tonight indicates we'll need it for the UI.
+   misses budget — a small, fast Rust piece bolted inside the Python
+   app where needed, not a rewrite. Nothing tonight indicates we'll
+   need it for the UI.
 3. **Tripwires that would reopen this decision** (the decide-and-move
    fear bound — by N3 a wrong stack never holds data hostage, a rewrite
    is only code):
@@ -159,8 +180,8 @@ Named consequences, owned now:
      will be Qt-typical (~100–150 MB installed); the spec already
      re-anchored austerity on memory and cold start, not installer
      megabytes (§7).
-   - py-qt's vsync caveat gets retired by measuring the M1 grid on a
-     real display with the same harness.
+   - py-qt's screen-sync caveat (the table's * note) gets retired by
+     measuring the M1 grid on a real display with the same harness.
 4. **The balloons stay in-tree and CI-built on Linux + Windows**
    (`.github/workflows/balloons.yml`) so any tripwire can rerun the
    race cheaply — including on the reference-class hardware when

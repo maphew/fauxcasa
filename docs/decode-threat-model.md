@@ -1,9 +1,12 @@
 # Decode isolation: threat model and mechanism choice
 
-**Status:** M0-exit deliverable (fauxcasa-bdj, required by spec §5 Formats
-and chosen *with* the stack per §10 item 12). Written 2026-06-12, agent
-draft for owner review alongside the stack-decision report
-(`docs/research/stack-balloons.md`).
+**Status:** M0-exit deliverable (fauxcasa-bdj). Spec §5 Formats sets the
+requirement and the timing: the isolation mechanism is "chosen with the
+stack (fauxcasa-6hf) against a written threat model, at M0 exit"; §10
+item 12 separately names wasm's decode-sandbox role. Written 2026-06-12.
+**Decision state: proposed** — agent draft for owner review alongside
+the stack-decision report (`docs/research/stack-balloons.md`),
+overturnable by argument like every delegated decision.
 
 ## Why this document exists
 
@@ -13,7 +16,11 @@ decoder-vulnerability patch rounds, and the decoder families we must
 bundle (libjpeg-class, PNG, TIFF, GIF, WebP, LibRaw-class RAW, ffmpeg-class
 video) have a continuous CVE stream to this day. The spec's requirement
 is binding: **decode of untrusted input runs with no ambient authority**
-(§5 Formats), decided before M1 work begins.
+(§5 Formats), decided before M1 work begins. In plain words, "no ambient
+authority" means: the code that opens a photo may touch only the single
+photo it was handed — not your other files, not your disk, not the
+internet — so even a booby-trapped photo that fully hijacks the decoder
+gets nothing.
 
 ## Assets
 
@@ -67,13 +74,27 @@ untrusted bytes ──> [ DECODE SERVICE ]  ──pixels/parsed fields──> tr
 
 ## Mechanism options considered
 
+In plain words first:
+
+- **A — locked room with a mail slot.** Decoding runs in separate helper
+  processes the operating system has stripped of all powers: a photo is
+  passed in through the slot, pixels come back out, and the room has no
+  other doors (no file access, no network).
+- **B — sealed virtual machine.** The decoder programs are rebuilt to
+  run inside a wasm container that physically has no way to reach the
+  outside unless we add one.
+- **C — safer building materials.** Rewrite decoders in a language that
+  prevents the most common kind of security bug — but they still run
+  inside the main app, with all the app's powers, so this alone never
+  meets the requirement.
+
 | Mechanism | What it buys | Costs / limits |
 |---|---|---|
 | **A. Sandboxed decode subprocess pool** — decode runs in worker processes stripped of ambient authority: Linux `bubblewrap`-class namespace + seccomp (or Landlock); Windows AppContainer / restricted token + job object; macOS App Sandbox / `sandbox-exec` profile. Input arrives as an open fd or shared-memory blob; output leaves as pixel buffers over shm; no filesystem view, no network. | Works with the *real* decoder matrix unchanged (ffmpeg-class, LibRaw-class — the §5 "updatable decode library" requirement); crash isolation for free (a decoder segfault costs one job, satisfying N5's spirit); per-job kill/timeout. | Per-platform sandbox engineering (three implementations of "strip authority"); IPC design; care that the broker hands workers only the one file. |
 | **B. wasm-compiled decoders** (wasmtime/wasmer runtime; codecs compiled to wasm32-wasi) | Capability-based by construction, byte-identical sandbox on all three platforms; in-process speed; the spec already names wasm as the natural decode-sandbox + extension-API substrate (§10 item 12). | Codec coverage is the blocker today: jpeg/png/webp compile well; LibRaw is feasible-with-effort; ffmpeg-class video in wasm is still hard/slow. ~1.2–2× decode-time tax. Runtime maturity risk owned by us. |
 | **C. Memory-safe (Rust) decoders in-process** | Eliminates the memory-corruption bug class at the source for covered formats. | Coverage gaps exactly where risk is highest (vendor RAW matrix, video); "memory-safe" crates still embed unsafe/C under the hood; logic bugs still parse attacker input in-process with full authority — does not meet "no ambient authority" on its own. |
 
-## Decision
+## Decision (proposed — owner confirm-or-argue rides fauxcasa-6hf)
 
 **A is the floor, B is the trajectory, C is never sufficient alone.**
 
