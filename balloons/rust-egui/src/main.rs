@@ -296,6 +296,17 @@ impl eframe::App for App {
 
         self.pump_decoded(ctx);
 
+        // The interval just measured belongs to the phase that was active
+        // while the frame was produced — record against it BEFORE the
+        // state machine advances, so a stall landing exactly on a phase
+        // deadline is not silently dropped.
+        let phase_at_interval = self.phase;
+        if matches!(phase_at_interval, Phase::FlickA | Phase::FlickB) {
+            if let Some(ms) = frame_ms {
+                self.metrics.frame_ms.push(ms);
+            }
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(20)))
             .show(ctx, |ui| {
@@ -381,9 +392,6 @@ impl eframe::App for App {
                         }
                     }
                     Phase::FlickA | Phase::FlickB => {
-                        if let Some(ms) = frame_ms {
-                            self.metrics.frame_ms.push(ms);
-                        }
                         if any_blank {
                             self.metrics.blank_tile_frames += 1;
                         }

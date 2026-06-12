@@ -1,0 +1,17 @@
+<!doctype html>
+<!-- Trial balloon: browser-engine shell (canvas 2D + plain JS, no wasm needed
+     for this probe). See balloons/README.md for the fixed task and contract. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>balloon-web-wasm</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #141414; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1280" height="800"></canvas>
+<script src="app.js"></script>
+</body>
+</html>

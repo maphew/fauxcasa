@@ -1,0 +1,4 @@
+# build artifacts
+rust-egui/target/
+go-gio/balloon-go-gio
+go-gio/balloon-go-gio.exe

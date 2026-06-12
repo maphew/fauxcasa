@@ -1,0 +1,81 @@
+# Stack trial balloons (fauxcasa-6hf): green builds on Linux AND Windows
+# from day one is part of the stack-decision evidence (spec §10 item 12).
+# CI builds only — the benchmark itself needs the machine-local 100k cache.
+name: balloons
+
+on:
+  push:
+    paths:
+      - "balloons/**"
+      - ".github/workflows/balloons.yml"
+  pull_request:
+    paths:
+      - "balloons/**"
+      - ".github/workflows/balloons.yml"
+  workflow_dispatch:
+
+jobs:
+  rust-egui:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: balloons/rust-egui
+      - run: cargo build --release
+        working-directory: balloons/rust-egui
+
+  go-gio:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: balloons/go-gio/go.sum
+      - name: Linux build deps (Gio cgo)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libwayland-dev libx11-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev libgles2-mesa-dev \
+            libegl1-mesa-dev libffi-dev libxcursor-dev libxfixes-dev \
+            libvulkan-dev
+      - run: go build -o balloon-go-gio${{ runner.os == 'Windows' && '.exe' || '' }} .
+        working-directory: balloons/go-gio
+
+  py-qt:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Resolve PySide6 env and byte-compile
+        run: |
+          uv run --with PySide6 python -c "import PySide6.QtWidgets; print(PySide6.__version__)"
+          uv run python -m py_compile balloons/py-qt/main.py
+
+  web-wasm:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v5
+      - name: Syntax-check page and runner
+        run: |
+          node --check balloons/web-wasm/app.js
+          uv run python -m py_compile balloons/web-wasm/run.py
