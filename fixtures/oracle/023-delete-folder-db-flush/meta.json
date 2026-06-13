@@ -1,0 +1,128 @@
+{
+ "fixture": "023-delete-folder-db-flush",
+ "note": "Lazy db reorganization following folder-delete 022, surfacing ~35min later when the Picasa window regained focus/activity (no UI action; keyboard menu test that preceded it writes nothing). Picasa RELOCATED the 'Search results' virtual album from row[6] to a freshly-appended row[13] (name/token=']search'/uid/date 2026-06-13 13:55/description '16 results' all re-created at [13]); old row[6] tombstoned IN PLACE (name/token/uid->'', date->949998.0 year-4501 sentinel, same sentinel as the 022 folder row). Also appended a fully-blank placeholder row[12] (all fields '', category 0, date 4501 sentinel). albumdata tables grew 12->14 rows (uid 12->13); category/location/music/filename columns extended with empty cells. Confirms the tombstone-and-grow model: Picasa never compacts row counts -- it blanks dead rows in place (4501-date sentinel as the 'dead' marker) and APPENDS replacements, so the table monotonically grows. Reorg was deferred from the 022 delete and triggered by session activity, not an immediate flush.",
+ "captured": "2026-06-13T20:58:28+00:00",
+ "baseline": {
+  "label": "after 022-delete-folder",
+  "created": "2026-06-13T20:20:28+00:00"
+ },
+ "files": {
+  "db3/albumdata_category.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "38defce5218d6bffe8e0524dc94cb54abfb2a96b5dfc0ef0232887eb9cedb37a",
+    "size": 68
+   },
+   "after": {
+    "sha256": "835feab82394e2c6461fe12ce10538a1e116b1d6dc47a371cce349e03a803ac3",
+    "size": 76
+   }
+  },
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "986bb92b71b6d3cb8ed76e2918fe1023658f8d11f02c77d6c2779f571b5b0fbe",
+    "size": 116
+   },
+   "after": {
+    "sha256": "015806c66964b2c76d124114429e2fb8a474f1b5485b9347febeb78327d121a6",
+    "size": 132
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "74319949821b0eae5216efa8bd24fa101e94cc2c6c27978cdebc8bbbfc2d8509",
+    "size": 135
+   },
+   "after": {
+    "sha256": "d8e6dd0337d7b64f98345ff677668ba50b366c1133e00082d46298902a8683f8",
+    "size": 181
+   }
+  },
+  "db3/albumdata_filename.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "90fd07e5f8bb363cd1516158f7e00432ac5705f45e61b59b7569346a7ebedae0",
+    "size": 190
+   },
+   "after": {
+    "sha256": "7e4d2eb185bba467f1ce4a9b3c1d2813b9e569717802cdcb06f49e254b942d83",
+    "size": 193
+   }
+  },
+  "db3/albumdata_location.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "cffcbba1bd5dae3472bdce212d9b42b09efaa14444e432e490e680a33757b5b1",
+    "size": 32
+   },
+   "after": {
+    "sha256": "749842cb47ca25e1eff669b256a07ebe73a1a918754f712a69bb2c4f236e9390",
+    "size": 34
+   }
+  },
+  "db3/albumdata_music.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "cffcbba1bd5dae3472bdce212d9b42b09efaa14444e432e490e680a33757b5b1",
+    "size": 32
+   },
+   "after": {
+    "sha256": "749842cb47ca25e1eff669b256a07ebe73a1a918754f712a69bb2c4f236e9390",
+    "size": 34
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d68e9a16d3c579bab23a56ebed1132d3ae80eda30beee52917c1c90024ac88dc",
+    "size": 198
+   },
+   "after": {
+    "sha256": "afd9c111f4d173372c6313332d4f075273e7827e94b6412269af89560ad26faf",
+    "size": 200
+   }
+  },
+  "db3/albumdata_token.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "54e471c12ceae84aaed2e7a9f65a4c0ad8a823254e3b43f0126edc91015df2eb",
+    "size": 235
+   },
+   "after": {
+    "sha256": "0e79877a46039b215bfee73aa5b94f266b5777cad0b82c79fe0a8999d4b2916f",
+    "size": 237
+   }
+  },
+  "db3/albumdata_uid.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "f865031bf5657fe6f0fa922fc3768c45f378c163165cc7d18111198582441c83",
+    "size": 384
+   },
+   "after": {
+    "sha256": "2fa300059ad3f1a0798a8a7530e75d36529caa4e3dc785418500ef4090f1a81e",
+    "size": 353
+   }
+  }
+ }
+}

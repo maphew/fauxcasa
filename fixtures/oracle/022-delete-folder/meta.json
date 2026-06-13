@@ -1,0 +1,244 @@
+{
+ "fixture": "022-delete-folder",
+ "note": "Right-click folder '2009-07-04 Beach Day' in ToC -> Delete Folder. Whole folder + its 7 remaining live photos removed from disk; NO OS-trash stash found (searched flatpak wine Trash, host XDG Trash, wine prefix recycle bin, per-fs .Trash-1000) -- contrasts with single-photo delete 015 which trashed photo05.jpg byte-exact. DB rewrite was synchronous (pmps already updated at diff time). albumdata row[9] blanked in place (uid/name/token/filename->'' ) + date[9]->949998.0 (year-4501 sentinel); all member imagedata rows tombstoned filetype->0 (folder row 1->0, 7 photos 2->0; row already-0 from 015 delete); search-results 23->16 (-7 live); thumbindex.db compacted (shrank 1453->1301); wordhash shrank; repository.dat key order swapped. Side effect: sparse albumdata_uid densified -- face album (014) uid backfilled at row[11] ']facealbum:11' = 'synthetiic person 1200'.",
+ "captured": "2026-06-13T20:20:28+00:00",
+ "baseline": {
+  "label": "after 021-album-description",
+  "created": "2026-06-12T19:44:08+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8bd0a200e735a10f76a9ae0e7ffd8e3821549d271f395d67819357094bca66bb",
+    "size": 116
+   },
+   "after": {
+    "sha256": "986bb92b71b6d3cb8ed76e2918fe1023658f8d11f02c77d6c2779f571b5b0fbe",
+    "size": 116
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ef7304de054e35c71250acf8785cb36507f753ef0cf2c35eccf550d96d9b93dd",
+    "size": 135
+   },
+   "after": {
+    "sha256": "74319949821b0eae5216efa8bd24fa101e94cc2c6c27978cdebc8bbbfc2d8509",
+    "size": 135
+   }
+  },
+  "db3/albumdata_filename.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "aeb0a866d45d14560e3ea4840feac7cf1ddb155487913d67a8e2205e4e6c42eb",
+    "size": 265
+   },
+   "after": {
+    "sha256": "90fd07e5f8bb363cd1516158f7e00432ac5705f45e61b59b7569346a7ebedae0",
+    "size": 190
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "3e575889a52086b53511a30fd7822269562215773183e265049006579527a75f",
+    "size": 108
+   },
+   "after": {
+    "sha256": "75b4c1a5247a1262ba056126f0797f1e9dbaf653bdffa1f887042628eb7ca285",
+    "size": 108
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a4e4492b6ff89747bb0c87926170bd174f9d98564d0c396098e21fdebaf94d86",
+    "size": 218
+   },
+   "after": {
+    "sha256": "d68e9a16d3c579bab23a56ebed1132d3ae80eda30beee52917c1c90024ac88dc",
+    "size": 198
+   }
+  },
+  "db3/albumdata_token.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "45c0d3ce050024504875bebf94f05ac0effa97c56ad9ae13f6712caae7192fb0",
+    "size": 274
+   },
+   "after": {
+    "sha256": "54e471c12ceae84aaed2e7a9f65a4c0ad8a823254e3b43f0126edc91015df2eb",
+    "size": 235
+   }
+  },
+  "db3/albumdata_uid.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "db12605f67f20c1955b436cfebcb7d34428379fa53f9be1e7a0a55a97667ec15",
+    "size": 383
+   },
+   "after": {
+    "sha256": "f865031bf5657fe6f0fa922fc3768c45f378c163165cc7d18111198582441c83",
+    "size": 384
+   }
+  },
+  "db3/imagedata_filetype.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7c0bb9542ebb5538f837417108da03668162f34cc251cceeffad5f42f75266f4",
+    "size": 136
+   },
+   "after": {
+    "sha256": "a20d0c56314c09e6911d6742a851a948f5601079a9f666dd79d850d6df32c7f5",
+    "size": 136
+   }
+  },
+  "db3/repository.dat": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d28508bce821b2f8df7058d7303a3287df370b79b4ffa342ceabb95664d31484",
+    "size": 140
+   },
+   "after": {
+    "sha256": "493a720af10e100e55b548504415ed31af24207451667384bb9a088db9753285",
+    "size": 140
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "f1abb799c077ef214a5487c2e4066a8d6891a7afc717f652ba3f017fb147eb9e",
+    "size": 1453
+   },
+   "after": {
+    "sha256": "46fc10d8afee4657507d766ba024ddf8678e063114a0e7c3baf94b9f0759eb0e",
+    "size": 1301
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "050e514bd00f351f043eb13e3bf3a54e64529c22d03fd275399f9be705c406d7",
+    "size": 67280
+   },
+   "after": {
+    "sha256": "9d5301fa5e36cfd17642bfb9055178927c35679b5e5b85b5140e4aa93dd15cf0",
+    "size": 66908
+   }
+  },
+  "library/2009-07-04 Beach Day/.picasa.ini": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ecc2af3f12197b47168a641a284a0cc4e17220401d1381c1d1b3b9d6bd907957",
+    "size": 66
+   }
+  },
+  "library/2009-07-04 Beach Day/.picasaoriginals/.picasa.ini": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "11b6005aab8bb8d6dbd891bc4a64db909a68397db50f05421191b0c5a9fbcbe3",
+    "size": 143
+   }
+  },
+  "library/2009-07-04 Beach Day/.picasaoriginals/photo03.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "5ca0f62b7d24ae9f3cab626bde805384db5b0205696df3f69288c5dbafe3ee13",
+    "size": 26634
+   }
+  },
+  "library/2009-07-04 Beach Day/photo00.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "6c88ec41d162152d42cec487365c62b19a02004241b3ff9ac38fbb46060be0c2",
+    "size": 76421
+   }
+  },
+  "library/2009-07-04 Beach Day/photo01.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "f3c8a24c5d5ab419ed11a127b3f50e0a1da834be036814b333db4dec8f776265",
+    "size": 64413
+   }
+  },
+  "library/2009-07-04 Beach Day/photo02.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d5fc5307b35717c29ccba115b7d337bcaebca71113f570a2213c68752e671c36",
+    "size": 111387
+   }
+  },
+  "library/2009-07-04 Beach Day/photo03.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "b6b3acfbcac226460b194cbecd17bcb9e8e16e9cd48c300046b17c5ba90948a7",
+    "size": 17220
+   }
+  },
+  "library/2009-07-04 Beach Day/photo04.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "642dc104de22d0b092f51cb7edaecb298b4627532bea8d3340d2d618a0d52a68",
+    "size": 78165
+   }
+  },
+  "library/2009-07-04 Beach Day/photo06.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d8b11eec64afe954b14ef1820e716f489e74fdb7f4852886b3562a3f3ec42196",
+    "size": 112393
+   }
+  },
+  "library/2009-07-04 Beach Day/photo07.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "335e67fb766560de4402ab281c2c754fea7ed59f0e819186d7602db2ed549e90",
+    "size": 26545
+   }
+  }
+ }
+}
