@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import struct
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -107,32 +109,77 @@ def cache_dir_for(library: Path, cache_root: Path) -> Path:
     return cache_root / digest
 
 
-def _cheap_signals(catalog: Catalog) -> list[dict]:
-    out = []
-    for p in catalog.photos:
-        try:
-            st = (catalog.root / p.rel).stat()
-            size, mtime = st.st_size, int(st.st_mtime)
-        except OSError:
-            size, mtime = -1, -1
-        out.append({"rel": p.rel, "size": size, "mtime": mtime})
-    return out
+# Index workers: read + hash + scaled-decode + encode each photo on a
+# thread pool. The load-bearing detail is SCALED decode (QImageReader
+# .setScaledSize → libjpeg DCT-scaled decode straight to ~256 px): a
+# naive full decode of a 24 MP original is the entire cost and holds the
+# GIL the whole time, so threads gave zero speedup (~14 photos/s on 3 MB
+# JPEGs, measured). Decoding directly at thumb resolution is ~30× cheaper
+# AND releases the GIL enough that threads scale — ~430 photos/s on one
+# core, ~1500 with 8, far past the §7 ≥30/s budget (fauxcasa-hw0). No
+# multiprocessing or Pillow needed. Capped to keep the UI pump sane.
+INDEX_WORKERS = min(8, (os.cpu_count() or 4))
 
 
-def stale(cache_dir: Path, catalog: Catalog) -> bool:
-    """Cheap-signal check (size + mtime, no hashing) per N6."""
-    meta_path = cache_dir / "catalog.json"
+@dataclass
+class IndexResult:
+    path: Path
+    photos: int
+    elapsed_s: float
+    workers: int
+
+    @property
+    def rate(self) -> float:
+        """Photos per second, including content hashing (the §7 metric)."""
+        return self.photos / self.elapsed_s if self.elapsed_s > 0 else 0.0
+
+
+def _index_one(root: Path, photo, idx: int):
+    """One photo: read bytes, sha256 (N6 identity), SCALED-decode to the
+    256 px thumb box (libjpeg DCT decode — see INDEX_WORKERS), JPEG-encode.
+    Returns everything the fcache and the persisted catalog need, plus the
+    QImage for the live grid feed. A null/corrupt image yields a
+    zero-length blob (error tile)."""
+    from PySide6.QtCore import QBuffer, QIODevice, QSize, Qt
+    from PySide6.QtGui import QImageReader
+
+    src = root / photo.rel
     try:
-        meta = json.loads(meta_path.read_text())
-    except (OSError, ValueError):
-        return True
-    if not isinstance(meta, dict):
-        return True
-    cached = [
-        {"rel": f["rel"], "size": f["size"], "mtime": f["mtime"]}
-        for f in meta.get("files", [])
-    ]
-    return cached != _cheap_signals(catalog)
+        data = src.read_bytes()
+        st = src.stat()
+        size, mtime = st.st_size, int(st.st_mtime)
+    except OSError:
+        data, size, mtime = b"", -1, -1
+    sha = hashlib.sha256(data).hexdigest()
+
+    # setData copies into the buffer's own QByteArray; passing a temporary
+    # QByteArray to QBuffer(...) instead leaves a dangling pointer (PySide6
+    # frees the temporary) and every read silently fails.
+    buf = QBuffer()
+    buf.setData(data)
+    buf.open(QIODevice.OpenModeFlag.ReadOnly)
+    reader = QImageReader(buf)
+    reader.setAutoTransform(False)  # stored-pixel orientation (see catalog.py)
+    sz = reader.size()  # header-only; full pixels not decoded yet
+    if sz.isValid() and (sz.width() > THUMB_EDGE or sz.height() > THUMB_EDGE):
+        s = min(THUMB_EDGE / sz.width(), THUMB_EDGE / sz.height())
+        reader.setScaledSize(QSize(max(1, round(sz.width() * s)),
+                                   max(1, round(sz.height() * s))))
+    img = reader.read()
+    if img.isNull():
+        return idx, b"", 0, 0, size, mtime, sha, None
+    # formats whose header size was unreadable skip the scaled decode above
+    if img.width() > THUMB_EDGE or img.height() > THUMB_EDGE:
+        img = img.scaled(
+            THUMB_EDGE, THUMB_EDGE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    out = QBuffer()
+    out.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(out, "JPEG", JPEG_QUALITY)
+    return idx, bytes(out.data()), img.width(), img.height(), size, mtime, \
+        sha, img
 
 
 def build_cache(
@@ -140,54 +187,41 @@ def build_cache(
     cache_dir: Path,
     progress: Callable[[int, int, object], None] | None = None,
     cancel: threading.Event | None = None,
-) -> Path | None:
-    """Build thumbs.fcache + catalog.json for a (small) library.
+) -> IndexResult | None:
+    """Build thumbs.fcache for a (small) library and fill each photo's
+    identity/staleness signals (size, mtime, sha256) into the catalog in
+    place; the caller persists the catalog. Returns an IndexResult with
+    the measured throughput, or None if cancelled.
 
-    Decodes with Qt (QImage) so the GUI needs no extra image deps; runs
-    on a background thread. `progress(i, total, qimage_or_None)` fires
-    per photo so the grid can show tiles while indexing — the library
-    stays browsable during the initial index (spec §7). A set `cancel`
-    event abandons the build cleanly (returns None, nothing written).
-    """
-    from PySide6.QtCore import QBuffer, QIODevice, Qt
-    from PySide6.QtGui import QImage
+    A thread pool runs the per-photo index work; `progress(i, total,
+    qimage_or_None)` fires as each completes (out of order) so the grid
+    shows tiles while indexing — the library stays browsable during the
+    initial index (spec §7). A set `cancel` event abandons the build
+    cleanly (nothing written)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     out = cache_dir / "thumbs.fcache"
     total = len(catalog.photos)
+    blobs: list[bytes] = [b""] * total
+    dims: list[tuple[int, int]] = [(0, 0)] * total
 
-    blobs: list[bytes] = []
-    dims: list[tuple[int, int]] = []
-    hashes: list[str] = []
-    for i, photo in enumerate(catalog.photos):
-        if cancel is not None and cancel.is_set():
-            return None
-        src = catalog.root / photo.rel
-        try:
-            data = src.read_bytes()
-        except OSError:
-            data = b""
-        hashes.append(hashlib.sha256(data).hexdigest())
-        img = QImage.fromData(data)
-        if img.isNull():
-            blobs.append(b"")
-            dims.append((0, 0))
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=INDEX_WORKERS) as pool:
+        futs = [pool.submit(_index_one, catalog.root, p, i)
+                for i, p in enumerate(catalog.photos)]
+        for fut in as_completed(futs):
+            if cancel is not None and cancel.is_set():
+                pool.shutdown(wait=False, cancel_futures=True)
+                return None
+            idx, blob, w, h, size, mtime, sha, img = fut.result()
+            blobs[idx] = blob
+            dims[idx] = (w, h)
+            photo = catalog.photos[idx]
+            photo.size, photo.mtime, photo.sha256 = size, mtime, sha
             if progress:
-                progress(i, total, None)
-            continue
-        if img.width() > THUMB_EDGE or img.height() > THUMB_EDGE:
-            img = img.scaled(
-                THUMB_EDGE, THUMB_EDGE,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        buf = QBuffer()
-        buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        img.save(buf, "JPEG", JPEG_QUALITY)
-        blobs.append(bytes(buf.data()))
-        dims.append((img.width(), img.height()))
-        if progress:
-            progress(i, total, img)
+                progress(idx, total, img)
+    elapsed = time.perf_counter() - t0
 
     if cancel is not None and cancel.is_set():
         return None
@@ -210,11 +244,5 @@ def build_cache(
         "thumb_edge": THUMB_EDGE,
         "files": [p.rel for p in catalog.photos],
     }, indent=1))
-    signals = _cheap_signals(catalog)
-    for sig, sha in zip(signals, hashes):
-        sig["sha256"] = sha
-    (cache_dir / "catalog.json").write_text(json.dumps({
-        "library": str(catalog.root),
-        "files": signals,
-    }, indent=1))
-    return out
+    return IndexResult(path=out, photos=total, elapsed_s=elapsed,
+                       workers=INDEX_WORKERS)

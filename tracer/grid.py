@@ -118,8 +118,14 @@ class GridView(QAbstractScrollArea):
     # ---------- data & layout ----------
 
     def set_data(self, catalog: Catalog, thumbs: ThumbCache | None) -> None:
+        """Point the grid at a catalog + cache. Also used by reload_data to
+        swap in a reconciled catalog mid-session, so it must invalidate the
+        decoded-tile cache: tiles are keyed by catalog index, and after a
+        rebuild index i is a different photo from a different fcache inode.
+        (No-op cost on the initial empty-grid call.)"""
         self.catalog = catalog
         self.thumbs = thumbs
+        self._invalidate_tiles()
         self.set_filter(None, "")
 
     def set_thumbs(self, thumbs: ThumbCache) -> None:
@@ -264,7 +270,7 @@ class GridView(QAbstractScrollArea):
         failure becomes an error tile, never a dead worker or a job that
         silently evaporates."""
         fd = -1
-        fd_path = None
+        fd_thumbs = None  # the ThumbCache OBJECT the fd was opened for
         while True:
             gen, idx, tile = self.jobs.get()
             thumbs = self.thumbs
@@ -276,12 +282,16 @@ class GridView(QAbstractScrollArea):
                 continue  # scrolled away; re-requested if it comes back
             img = None
             try:  # noqa: the worker must outlive ANY per-job failure
-                if thumbs.path != fd_path:
+                # Reopen when the cache OBJECT changes, not just its path:
+                # a reconcile rebuild replaces the fcache at the same path
+                # (new inode), so a path compare would keep reading the old
+                # unlinked file with the new file's offsets.
+                if thumbs is not fd_thumbs:
                     if fd >= 0:
                         os.close(fd)
-                    fd, fd_path = -1, None
+                    fd, fd_thumbs = -1, None
                     fd = os.open(thumbs.path, os.O_RDONLY)
-                    fd_path = thumbs.path
+                    fd_thumbs = thumbs
                 offset, length, _w, _h = thumbs.entries[idx]
                 if length > 0:
                     buf = os.pread(fd, length, offset)

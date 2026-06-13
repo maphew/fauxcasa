@@ -20,7 +20,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import thumbcache
-from catalog import scan_library, walk_library
+from catalog import (
+    load_catalog,
+    reconcile_walk,
+    save_catalog,
+    scan_library,
+    walk_library,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -162,46 +168,142 @@ def test_duplicate_sections_and_flag_normalization(tmp_path: Path) -> None:
     assert not legacy.visible
 
 
-def test_build_load_bind_roundtrip(library: Path, tmp_path: Path) -> None:
+def test_build_fills_signals_and_binds(library: Path, tmp_path: Path) -> None:
     cat = scan_library(library)
     cache_dir = tmp_path / "cache"
-    out = thumbcache.build_cache(cat, cache_dir)
-    assert out is not None
+    result = thumbcache.build_cache(cat, cache_dir)
+    assert result is not None
+    assert result.photos == 4 and result.rate > 0  # throughput measured
 
-    cache = thumbcache.load_cache(out)
+    cache = thumbcache.load_cache(result.path)
     assert cache.count == 4
     thumbcache.bind(cache, cat)  # must not raise
-    assert not thumbcache.stale(cache_dir, cat)
+
+    # the indexer filled identity + staleness signals into the catalog
+    for p in cat.photos:
+        assert p.size >= 0 and p.mtime >= 0
+        assert p.sha256 is not None and len(p.sha256) == 64
 
     # blobs are real JPEGs with recorded dims
-    with open(out, "rb") as f:
+    with open(result.path, "rb") as f:
         for off, length, w, h in cache.entries:
             assert length > 0 and w > 0 and h > 0
             f.seek(off)
             assert f.read(3) == b"\xff\xd8\xff"
 
-    # catalog.json carries (sha256, size, mtime) per file (N6 identity)
-    meta = json.loads((cache_dir / "catalog.json").read_text())
-    assert len(meta["files"]) == 4
-    assert all(len(f["sha256"]) == 64 for f in meta["files"])
-
-    # library drift => stale by cheap signals, and bind refuses
+    # library drift => bind refuses an out-of-date fcache
     make_jpeg(library / "2021-05-05 Picnic" / "d.jpg")
     cat2 = scan_library(library)
-    assert thumbcache.stale(cache_dir, cat2)
     with pytest.raises(thumbcache.CacheError):
         thumbcache.bind(cache, cat2)
 
 
-def test_load_rejects_old_sidecar(library: Path, tmp_path: Path) -> None:
+def test_persistent_catalog_roundtrip(library: Path, tmp_path: Path) -> None:
+    """A loaded catalog is indistinguishable from a freshly walked one,
+    so a warm start can skip the walk."""
     cat = scan_library(library)
-    out = thumbcache.build_cache(cat, tmp_path / "c")
-    sidecar = out.with_suffix(".fcache.json")
+    thumbcache.build_cache(cat, tmp_path / "c")  # fills signals
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, library)
+    assert loaded is not None
+    assert [p.rel for p in loaded.photos] == [p.rel for p in cat.photos]
+    assert loaded.visible_count == cat.visible_count
+    assert set(loaded.folders) == set(cat.folders)
+    assert set(loaded.albums) == set(cat.albums)
+    a = next(p for p in loaded.photos if p.rel.endswith("Trip/a.jpg"))
+    assert a.star and a.caption == "the beach" and a.rotate == 1
+    assert a.sha256 is not None  # signals survive the round trip
+    # derived fields recomputed, not stored
+    assert a.folder == "2020-01-01 Trip" and a.visible
+    b = next(p for p in loaded.photos if p.rel.endswith("b.jpg"))
+    assert b.hidden and not b.visible
+    # folder description persisted; title derived from the on-disk name
+    assert loaded.folders["2020-01-01 Trip"].description == "fun"
+    assert loaded.folders["2020-01-01 Trip"].title == "2020-01-01 Trip"
+    assert loaded.albums["deadbeefdeadbeefdeadbeefdeadbeef"].name == "Best Of"
+
+
+def test_load_catalog_rejects_foreign_format(tmp_path: Path) -> None:
+    p = tmp_path / "catalog.json"
+    p.write_text(json.dumps({"library": "x", "files": []}))  # old signals-only
+    assert load_catalog(p, tmp_path) is None
+    p.write_text(json.dumps([1, 2, 3]))  # not even an object
+    assert load_catalog(p, tmp_path) is None
+    p.write_text("{ not json")
+    assert load_catalog(p, tmp_path) is None
+    assert load_catalog(tmp_path / "missing.json", tmp_path) is None
+
+
+def test_reconcile_detects_drift(library: Path, tmp_path: Path) -> None:
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")  # fills size/mtime signals
+
+    assert not reconcile_walk(cat, library).changed  # nothing changed yet
+
+    make_jpeg(library / "2021-05-05 Picnic" / "new.jpg")  # add one
+    (library / "2020-01-01 Trip" / "a.jpg").unlink()       # remove one
+    drift = reconcile_walk(cat, library)
+    assert drift.changed and drift.added == 1 and drift.removed == 1
+
+
+def test_reconcile_walk_cancels(library: Path) -> None:
+    import threading
+    cat = scan_library(library)
+    ev = threading.Event()
+    ev.set()  # already cancelled
+    assert reconcile_walk(cat, library, cancel=ev) is None
+
+
+def test_set_data_invalidates_tiles() -> None:
+    """The reconcile swap goes through grid.set_data; it must invalidate
+    the decoded-tile cache or a rebuilt catalog paints stale thumbnails
+    keyed by old indices (the major review finding)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from catalog import Catalog, Folder, Photo
+    from grid import GridView
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    grid = GridView()
+    cat = Catalog(root=Path("/x"),
+                  photos=[Photo(rel="a.jpg", folder="", name="a.jpg")],
+                  folders={"": Folder(rel="", title="x", photo_count=1)},
+                  albums={})
+    grid.set_data(cat, None)
+    # simulate a populated tile cache + an in-flight decode generation
+    grid.tiles[0] = [object(), 1]
+    grid.pending.add(5)
+    gen_before = grid.generation
+    grid.set_data(cat, None)  # the reconcile-style swap
+    assert grid.tiles == {} and grid.pending == set()
+    assert grid.generation > gen_before  # stale queued decodes are dropped
+
+
+def test_load_catalog_survives_malformed_rows(library: Path,
+                                               tmp_path: Path) -> None:
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+    data = json.loads(path.read_text())
+    data["photos"][0] = {"no_rel_key": 1}  # version 1, but a broken row
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, library) is None  # -> caller cold-walks
+
+
+def test_load_rejects_old_sidecar(library: Path, tmp_path: Path) -> None:
+    result = thumbcache.build_cache(cat := scan_library(library), tmp_path / "c")
+    sidecar = result.path.with_suffix(".fcache.json")
     meta = json.loads(sidecar.read_text())
     del meta["files"]
     sidecar.write_text(json.dumps(meta))
     with pytest.raises(thumbcache.CacheError, match="files"):
-        thumbcache.load_cache(out)
+        thumbcache.load_cache(result.path)
+    assert cat  # silence linters
 
 
 def test_load_rejects_corrupt(tmp_path: Path) -> None:
@@ -220,8 +322,8 @@ def test_unreadable_image_gets_error_entry(tmp_path: Path) -> None:
     make_jpeg(root / "f" / "ok.jpg")
     (root / "f" / "corrupt.jpg").write_bytes(b"not a jpeg at all")
     cat = scan_library(root)
-    out = thumbcache.build_cache(cat, tmp_path / "c")
-    cache = thumbcache.load_cache(out)
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    cache = thumbcache.load_cache(result.path)
     by_rel = dict(zip(cache.files, cache.entries))
     assert by_rel["f/corrupt.jpg"][1] == 0  # zero-length = error tile
     assert by_rel["f/ok.jpg"][1] > 0

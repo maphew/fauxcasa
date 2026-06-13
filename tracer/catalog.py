@@ -20,6 +20,7 @@ ignored — only per-photo hidden=yes (oracle fixture 017) is honored.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -50,6 +51,12 @@ class Photo:
     # Picasa stashes pre-edit originals in .picasaoriginals/; those files
     # are catalog entries (cache-order parity) but never shown in the grid.
     visible: bool = True
+    # Identity + staleness signals, filled by the indexer (build_cache),
+    # persisted in the catalog, and used by reconcile (cheap size+mtime
+    # diff) and N6 identity (sha256). -1 / None until indexed.
+    size: int = -1
+    mtime: int = -1
+    sha256: str | None = None
 
 
 @dataclass
@@ -182,14 +189,16 @@ def scan_library(root: Path) -> Catalog:
             title = folder_rel.rsplit("/", 1)[-1] if folder_rel \
                 else (root.name or str(root))  # name is '' at a true root
             psec = secmap.get("picasa")
-            desc = psec.get("description") if psec is not None else None
+            # "" (empty description= line) normalized to None so a loaded
+            # catalog matches a walked one (an absent key reads as None).
+            desc = (psec.get("description") or None) if psec else None
             folders[folder_rel] = Folder(rel=folder_rel, title=title,
                                          description=desc)
 
         sec = secmap.get(name.lower())
         if sec is not None:
             photo.star = _flag(sec, "star")  # presence-only key
-            photo.caption = sec.get("caption")
+            photo.caption = sec.get("caption") or None  # "" -> None
             kw = sec.get("keywords")
             if kw:
                 photo.keywords = tuple(
@@ -241,3 +250,176 @@ def scan_library(root: Path) -> Catalog:
                 albums[uid].members.append(i)
 
     return Catalog(root=root, photos=photos, folders=folders, albums=albums)
+
+
+# ---- persistent catalog (load-without-walking, §7 cold start) ------------
+#
+# The full catalog (display metadata + structure + per-file signals)
+# serialized to JSON so a warm start rebuilds the grid without walking the
+# library. JSON is deliberate: human-readable and language-neutral, so the
+# format survives a stack swap (N3). Folder/name/visible and folder
+# title/photo_count are DERIVED on load (never stored — they'd just drift);
+# only what the walk+ini parse can't reproduce is persisted (folder
+# descriptions, album definitions, per-file signals). Short keys keep the
+# file small, but a hex sha256 dominates each row, so this lands well above
+# the spec's ~50 B/photo binary-catalog target — a compact binary catalog
+# is future work (a tracer is JSON-first).
+
+CATALOG_VERSION = 1
+
+
+def _photo_to_row(p: Photo) -> dict:
+    row: dict = {"r": p.rel}
+    if p.star:
+        row["s"] = 1
+    if p.caption:
+        row["c"] = p.caption
+    if p.keywords:
+        row["k"] = list(p.keywords)
+    if p.rotate:
+        row["o"] = p.rotate
+    if p.hidden:
+        row["h"] = 1
+    if p.albums:
+        row["a"] = list(p.albums)
+    if p.size >= 0:
+        row["z"] = p.size
+    if p.mtime >= 0:
+        row["m"] = p.mtime
+    if p.sha256:
+        row["x"] = p.sha256
+    return row
+
+
+def save_catalog(catalog: Catalog, path: Path) -> None:
+    """Atomically serialize the catalog to `path` (write-temp-rename)."""
+    data = {
+        "version": CATALOG_VERSION,
+        "library": str(catalog.root),
+        "photos": [_photo_to_row(p) for p in catalog.photos],
+        # only folders that carry a description (title/count are derived)
+        "folders": {f.rel: f.description
+                    for f in catalog.folders.values() if f.description},
+        "albums": [
+            {"uid": a.uid, "name": a.name, "date": a.date,
+             "description": a.description, "members": a.members}
+            for a in catalog.albums.values()
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".catalog.tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
+
+
+def load_catalog(path: Path, root: Path) -> Catalog | None:
+    """Reconstruct a Catalog from a persisted file, or None if absent,
+    unreadable, or an older/foreign/corrupt format (-> caller does a cold
+    walk). Derives folder/name/visible and folder title/photo_count the
+    same way scan_library does. Caveat: empty-string caption/description
+    are normalized to None on both paths, so a loaded catalog matches a
+    freshly walked one for every field consumers read."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != CATALOG_VERSION:
+        return None
+    root = root.resolve()
+    rows = data.get("photos")
+    if not isinstance(rows, list):
+        return None
+
+    # Any structural defect in a version-tagged file (the case the version
+    # gate is meant to guard) degrades to a cold walk rather than crashing
+    # startup — main() calls this unguarded.
+    try:
+        photos: list[Photo] = []
+        for row in rows:
+            rel = row["r"]
+            folder, _, name = rel.rpartition("/")
+            p = Photo(
+                rel=rel, folder=folder, name=name,
+                star=bool(row.get("s")), caption=row.get("c"),
+                keywords=tuple(row.get("k", ())), rotate=row.get("o", 0),
+                hidden=bool(row.get("h")), albums=tuple(row.get("a", ())),
+                size=row.get("z", -1), mtime=row.get("m", -1),
+                sha256=row.get("x"),
+            )
+            p.visible = not p.hidden and not _is_stashed(folder)
+            photos.append(p)
+
+        folder_desc = data.get("folders", {})
+        if not isinstance(folder_desc, dict):
+            folder_desc = {}
+        folders: dict[str, Folder] = {}
+        for p in photos:
+            if p.folder not in folders:
+                title = p.folder.rsplit("/", 1)[-1] if p.folder \
+                    else (root.name or str(root))
+                folders[p.folder] = Folder(
+                    rel=p.folder, title=title,
+                    description=folder_desc.get(p.folder))
+            if p.visible:
+                folders[p.folder].photo_count += 1
+
+        albums: dict[str, Album] = {}
+        for a in data.get("albums", []):
+            albums[a["uid"]] = Album(
+                uid=a["uid"], name=a["name"], date=a.get("date"),
+                description=a.get("description"),
+                members=list(a.get("members", [])),
+            )
+    except (KeyError, TypeError, AttributeError, ValueError):
+        return None
+
+    return Catalog(root=root, photos=photos, folders=folders, albums=albums)
+
+
+@dataclass
+class Drift:
+    """Cheap-signal (size+mtime) diff of a persisted catalog vs the live
+    library — the N6 'cheap signals first' check, no hashing."""
+    added: int = 0
+    removed: int = 0
+    modified: int = 0
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.added or self.removed or self.modified)
+
+    def summary(self) -> str:
+        return (f"+{self.added} added, -{self.removed} removed, "
+                f"~{self.modified} modified")
+
+
+def reconcile_walk(catalog: Catalog, root: Path,
+                   cancel=None) -> Drift | None:
+    """Fresh walk + stat, compared to the catalog's stored signals.
+    Photos whose stored signal is absent (-1) can't be compared and are
+    never counted as modified (only a genuine size/mtime change is).
+    Returns None if the cancel event is set mid-walk, so shutdown can
+    reap the background thread promptly instead of waiting out a 100k
+    stat-walk on the join timeout."""
+    root = root.resolve()
+    files = walk_library(root)
+    fresh: dict[str, tuple[int, int]] = {}
+    for i, (p, rel) in enumerate(zip(files, rel_paths(root, files))):
+        if cancel is not None and i % 512 == 0 and cancel.is_set():
+            return None
+        try:
+            st = p.stat()
+            fresh[rel] = (st.st_size, int(st.st_mtime))
+        except OSError:
+            fresh[rel] = (-1, -1)
+    old = {p.rel: (p.size, p.mtime) for p in catalog.photos}
+    drift = Drift()
+    for rel, sig in fresh.items():
+        if rel not in old:
+            drift.added += 1
+        elif old[rel] != (-1, -1) and old[rel] != sig:
+            drift.modified += 1
+    for rel in old:
+        if rel not in fresh:
+            drift.removed += 1
+    return drift

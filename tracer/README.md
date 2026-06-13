@@ -17,12 +17,26 @@ source of truth.
 |---|---|---|
 | Library scan in place | `catalog.py` | walk rule byte-identical to `make-thumbcache.py`, so catalog order == cache order |
 | Picasa metadata | `catalog.py` → `scripts/picasa_db.py` | stars, captions, keywords, rotate, hidden, albums, folder names/descriptions from `.picasa.ini` |
-| Thumbnail cache | `thumbcache.py` | reads/builds packed fcache; machine-local under `cache/tracer-cache/` (N1/N3); identity = sha256 + relpath, staleness = size+mtime cheap signals (N6) |
+| Thumbnail cache | `thumbcache.py` | reads/builds packed fcache; machine-local under `cache/tracer-cache/` (N1/N3); identity = sha256 + relpath, staleness = size+mtime cheap signals (N6). Parallel indexer (threads + **scaled decode**) — see below |
+| Persistent catalog | `catalog.py` | full catalog (metadata + structure + signals) serialized to JSON; a **warm start loads it and skips the walk** (§7 cold start). Background reconcile diffs cheap signals and rebuilds + atomically swaps on drift |
 | Virtualized grid | `grid.py` | balloon lineage: threaded fcache decode, bounded LRU — plus event-driven repaint, real scrollbar, group headers w/ pinned current folder, selection, star badges, error tiles. Never reads originals (N4) |
 | Sidebar | `main.py` | All / Starred / folder tree (filesystem truth) / albums (pure references resolved from `albums=` tokens) |
 | Search | `main.py` | substring over filename + caption + keywords, live filter |
 | Viewer | `viewer.py` | double-click / Enter; async original load (the explicit N4 exception); ←/→ or J/K; Esc back |
-| Instrumentation | `main.py` | `READY` line + JSON: cold-start ms, scan ms, RSS — the §7 numbers |
+| Instrumentation | `main.py` | `READY` line + JSON: cold-start ms, prep ms, `warm`, RSS, and an `indexed` event with photos/s — the §7 numbers |
+
+## The §7 numbers (dev machine, offscreen; overshoots reference HW)
+
+- **Cold start, already-indexed (warm load, no walk):** 100k photos in
+  **467 ms** (`prep` 221 ms to load the 5 MB catalog), vs 1893 ms when a
+  cold walk is needed. Budget < 2 s. ✅
+- **Initial index, including content hashing:** the load-bearing detail
+  is **scaled decode** (`QImageReader.setScaledSize` → libjpeg DCT decode
+  straight to thumb size). A naive full decode of a 24 MP original is the
+  whole cost and holds the GIL (~14 photos/s, threads give no speedup);
+  scaled decode is ~30× cheaper and lets threads scale: **139 photos/s**
+  in-app on realistic 3.3 MB / 8 MP photos (8 workers), vs the §7 ≥ 30/s
+  budget. ✅ No multiprocessing or extra deps needed.
 
 ## Run it
 
@@ -48,13 +62,18 @@ Tests: `uv run tracer/test_tracer.py`
 
 ## Deliberate tracer shortcuts (not product decisions)
 
-- In-app cache builder is sequential and holds blobs in memory — fine
-  for fixture libraries; the real indexer (≥30 photos/s incl. hashing,
-  §7) is separate future work. Big libraries adopt a pre-built fcache.
+- In-app cache builder holds all thumb blobs in memory while writing the
+  fcache — fine for fixture/medium libraries; huge libraries adopt a
+  pre-built fcache (`--thumbs`). Throughput itself is no longer the
+  limit (see above).
 - Single thumbnail resolution (256 px), re-decoded on zoom change; the
   spec calls for a multi-resolution cache.
-- Catalog is in-RAM from a fresh walk each start; no persistent catalog
-  DB yet. Adopted caches get no content hashes.
+- Persistent catalog is JSON (readable, language-neutral per N3), not the
+  spec's compact ~50 B/photo binary catalog. Reconcile rebuilds the
+  whole cache on drift rather than patching incrementally, and does not
+  yet do N6 move-detection (the 2×2 hash-path matrix). Adopt-mode
+  catalogs carry no per-file signals (so reconcile sees only adds/removes
+  there).
 - Search is a linear scan (fast enough ≤100k), not the per-photo word
   index the spec names.
 - `hidden=yes` photos and stash folders (`.picasaoriginals/`, legacy
