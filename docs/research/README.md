@@ -2,7 +2,8 @@
 
 Reference material for reverse-engineering Picasa, gathered from the links in
 `begin.md`. Committed here so it survives link rot and is available to every
-session/machine without re-fetching.
+session/machine without re-fetching. See `NOTICE.md` for the archive's
+source-attribution and licensing policy.
 
 ## transcripts/
 
