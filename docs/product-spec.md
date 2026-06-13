@@ -823,11 +823,16 @@ only check. The build order mirrors the tutorial corpus's own pedagogy:
 organize → edit → faces.
 
 **M0 — Ground truth.** *Done:* format research, validated parsers
-(`picasa_db.py`), Wine oracle + fixtures 001–013, this spec. *Remaining:*
-stack decision (fauxcasa-6hf, gated on §7 prototype evidence); the **100k
-synthetic library generator** (extend `make-synthetic-library.py`: defined
-composition — file-size and EXIF-date distributions, folder shapes, duplicate
-files, mixed formats — so §7 numbers are reproducible).
+(`picasa_db.py`), Wine oracle + fixtures 001–013, this spec; the **100k
+synthetic library generator** (`make-synthetic-library.py --benchmark`:
+defined composition — file-size and EXIF-date distributions, folder shapes,
+duplicate files, mixed formats — so §7 numbers are reproducible); and the
+**stack decision** (fauxcasa-6hf) — **Python + Qt (PySide6)**, on §7
+prototype evidence (four trial balloons all passed the grid budgets at 100k;
+PySide6 won on iteration speed) plus a read-only tracer-bullet slice
+(fauxcasa-pzx). Architecture stays swappable per N3; the one budget still
+unproven for the host language is the §7 index rate including content hashing
+(fauxcasa-hw0). *Remaining:* none — M0 complete.
 
 **M1 — See your library again.** Read-only browser over an existing Picasa
 library: full ingest (ini, .pal, contacts.xml, db3 rescue, XMP) under the §4
