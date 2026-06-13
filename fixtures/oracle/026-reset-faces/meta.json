@@ -1,0 +1,245 @@
+{
+ "fixture": "026-reset-faces",
+ "note": "Remove face tag via right-click photo > Reset Faces, on Garden Project/photo00 (the only face-tagged photo, from 014). Agent-driven on headless :3; no confirm dialog. SYNCHRONOUS: photo00 ini 'faces=rect64(6800600097ff9fff),ca5c88ca60f42c0b' line REMOVED; backuphash bumped 600->22344 (the photo's ini was rewritten). The photo's own face rectangle is gone. PRESERVED -- this is NOT a full teardown of 014, it is a per-photo UNTAG: the ini '[Contacts2]' line (ca5c88...=synthetiic person 1200;;) REMAINS; contacts/contacts.xml UNCHANGED (contact 'synthetiic person 1200' id ca5c88ca60f42c0b, modified_time still 2026-06-11); the People/person tree entry (People (1)) REMAINS; and the VIRTUAL face imagedata row (imagedata_filetype[28]=1001, the face-crop record from 014) REMAINS. So Reset Faces strips a photo's face rect but keeps the contact + recognition infrastructure for reuse (a full contact teardown would be a separate 'delete person' action, not available from the photo's grid context menu). INCIDENTAL (not part of reset): recurring 'Search results' albumdata row reshuffle (row[15] tombstoned w/4501 sentinel -> new row[16]). NB: grid photo context menu offers Reset Faces but no per-person untag (that needs single-photo edit + People panel) and no delete-contact.",
+ "captured": "2026-06-13T22:51:57+00:00",
+ "baseline": {
+  "label": "manual",
+  "created": "2026-06-13T22:40:41+00:00"
+ },
+ "files": {
+  "db3/albumdata_category.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "fb64fa5a48fbcf29d760efa57ed342a3cd0b1f8f50e77e0d2afefe556f705ab0",
+    "size": 84
+   },
+   "after": {
+    "sha256": "25345a56a7a7528d71f62791a93feb904662333009962394ce9025dd1ef1b014",
+    "size": 88
+   }
+  },
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a94f632846fa3cbfaa0c0117bfa2bfdbbb16f548522ce5f256fb68a5bfbf9564",
+    "size": 148
+   },
+   "after": {
+    "sha256": "4f25d5e60cccddb60b7ce32cb0e4657ec3d488b52feb65192d0eb3b33d7116db",
+    "size": 156
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "84f34b0f5b039c7f738116f357d3d2e6b5c51bed02f8dfc512919452d4c00e6c",
+    "size": 227
+   },
+   "after": {
+    "sha256": "522782fb9e3e5a104e0738076ab84a6c82c44a221ef42f9dcddbf1e0fdcb4eda",
+    "size": 250
+   }
+  },
+  "db3/albumdata_filename.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "eb407c06ce3f1a79d78676264d644fb51fa41a211dfbefd140b5adb179e9800d",
+    "size": 195
+   },
+   "after": {
+    "sha256": "a494a807adaff7c22a2e6fa9fade5ce8620f621fef4f88000a0ee261b3109007",
+    "size": 196
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ed167645d347865801042bad2aef06de1c9fcd4a913dc043f4671fcf79ca061c",
+    "size": 108
+   },
+   "after": {
+    "sha256": "174e0fc41199b45934ca67f289d2d27cf10e27c15ee9f627093188c9f74f0596",
+    "size": 108
+   }
+  },
+  "db3/albumdata_location.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "5f4d7b2ad77be462c15eff0ef1de08dad568d74b69dc74892644355870d709dc",
+    "size": 36
+   },
+   "after": {
+    "sha256": "6bc4aea13a9e18cb3aa6104a9c96e932533a91d61dc44f3084966e2a10bf422d",
+    "size": 37
+   }
+  },
+  "db3/albumdata_music.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "5f4d7b2ad77be462c15eff0ef1de08dad568d74b69dc74892644355870d709dc",
+    "size": 36
+   },
+   "after": {
+    "sha256": "6bc4aea13a9e18cb3aa6104a9c96e932533a91d61dc44f3084966e2a10bf422d",
+    "size": 37
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "98b3108461324b065afbc8491b6f54881284cbad1ec23e6149b9d22698ff3297",
+    "size": 185
+   },
+   "after": {
+    "sha256": "343df75399c31dd37af547eaa06ad51c19276e91c6bf954119ea529ad1bc525c",
+    "size": 186
+   }
+  },
+  "db3/albumdata_token.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "6e3d33e2e7ee4a5f33a2d44cd5715dfccaa7eda19ef3ee6814d02fe94527ec9e",
+    "size": 200
+   },
+   "after": {
+    "sha256": "9157231e82d6982898ec4aba421c7209669707909870255c95e7ae49edff89db",
+    "size": 201
+   }
+  },
+  "db3/albumdata_uid.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9bbd3b9c1dfa0e48b868ae8de399e3efd711e08b42b40a96be9ad624f5921777",
+    "size": 323
+   },
+   "after": {
+    "sha256": "ad5e011afe75ba74f7a7bd98e4ceea5cd65c45db0fc8ec8de5a80492460d4eb6",
+    "size": 324
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9567e088555b7de97b1a5cea540749d5d54369289213b9aa03b6492dc857537f",
+    "size": 70
+   },
+   "after": {
+    "sha256": "a23aa7452028888b6420b931089264646949ff93f9028e34d83e621075c8de37",
+    "size": 70
+   }
+  },
+  "db3/imagedata_facerect.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "2414911836e595ced4144411661c681b6ec6f571c83754a716f2aa6221d84b44",
+    "size": 252
+   },
+   "after": {
+    "sha256": "ab36a393fd8f3e28716b0abe2036a1d3dfc63d5f508494e6509e03110bbb6c5e",
+    "size": 252
+   }
+  },
+  "db3/imagedata_filetype.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a20d0c56314c09e6911d6742a851a948f5601079a9f666dd79d850d6df32c7f5",
+    "size": 136
+   },
+   "after": {
+    "sha256": "b445efc75ac29e335c298b0eaa3acc46a989b83c310ba684465590f15be534bd",
+    "size": 136
+   }
+  },
+  "db3/imagedata_personalbumid.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "e0739ecc0bfacccaf0a14e65191f7c28ac0777ae43effcbc95eb5bc4572034a7",
+    "size": 136
+   },
+   "after": {
+    "sha256": "5dc5f032b9e878c0dbb88200588d1a6ab4487da0538154470bef57ad24ed85aa",
+    "size": 136
+   }
+  },
+  "db3/imagedata_tagdate.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "47d2f736cd9964c5ca21a0f94e7eb77e87289d1771df658476d4077c781cb3c6",
+    "size": 252
+   },
+   "after": {
+    "sha256": "4234ec793c708d3c6543cff13b9984f0562924c2a508d41a24832204822fa652",
+    "size": 252
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "c19eb21bef41ff4c385ac9d1a9143f7cc108944f854d72de1b19eaad6407cd41",
+    "size": 1301
+   },
+   "after": {
+    "sha256": "d062dd1dcc777e3d28611a5d0d71f4de9261937abdce25a735eae7aac85ea8cf",
+    "size": 1301
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "3ac368583364ff944ff3939ad65d4279287746106997001e468c926adfb3f05e",
+    "size": 66884
+   },
+   "after": {
+    "sha256": "c205c94e500d31f37829e8f8a40db8ed6b57afa4ab5f637dbadc4f20823d353d",
+    "size": 66876
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "c078569b8878ba1dca62f31b20014d478d390d96693ed2bb8b50e9e02c4c6e3a",
+    "size": 393
+   },
+   "after": {
+    "sha256": "a901d8e14e921b16b250426bbeb8f0e57e107f885a02ce99e61aa503d4da67e7",
+    "size": 346
+   }
+  }
+ }
+}

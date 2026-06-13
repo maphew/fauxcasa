@@ -1,0 +1,111 @@
+{
+ "fixture": "027-revert-baked-edit",
+ "note": "Revert a baked/saved edit to original, on Winter Holiday/photo01 (text bake from 019). Agent-driven on :3: right-click photo01 > Revert (menu item ENABLED only for baked photos, greyed otherwise) > confirm dialog 'Revert to original version of file? This cannot be undone and all changes will be lost. To undo the last save and keep edits click Undo Save.' with 3 buttons [Revert][Undo Save][Cancel] (Cancel is default-focused; 'Undo Save' is a DISTINCT option = undo the save but keep the edit recipe -- NOT used here). SYNCHRONOUS artifacts: (1) working photo01.jpg RESTORED from stash BYTE-EXACT (55612B baked -> 66033B, == the .picasaoriginals original). (2) stash CONSUMED: .picasaoriginals/photo01.jpg removed; .picasaoriginals/.picasa.ini EMPTIED 226->0 bytes (recipe section [photo01.jpg] moddate/width/height/text/textactive deleted; the ini file is left as 0 bytes, NOT unlinked). (3) main folder ini [photo01.jpg]: backuphash 23770->3079 + NEW 'moddate=4f3b6c00b0f9dc01' line added (the restored original's FILETIME). (4) thumbs2_0/thumbs_0/bigthumbs_0/previews_0 all re-rendered at photo01's offset, text overlay gone [blob/cache, not copied]. NOT in this synchronous diff (expect on a lazy flush): the imagedata pmp edit-state clear (revertable 1->0, originslow, width/height) -- watch for a -db-flush variant. Inverts 019-save-text-to-disk / the 005 bake architecture.",
+ "captured": "2026-06-13T22:59:04+00:00",
+ "baseline": {
+  "label": "manual",
+  "created": "2026-06-13T22:52:53+00:00"
+ },
+ "files": {
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "dd86ae5c9df48460e5259b7432cc7372e06c995f1b02cdd67b8dba4f329ffad3",
+    "size": 155537
+   },
+   "after": {
+    "sha256": "a3a7c820b018090bf78c6cdbde5cc408c823957db124401fc9392faf83da3d3f",
+    "size": 155537
+   }
+  },
+  "db3/previews_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "49deb04354c7c3f4911fecea13e5718cfea287190d2df67b0b681c6fb052b1c4",
+    "size": 424420
+   },
+   "after": {
+    "sha256": "bf717c944b8eee07b872ece1cce7578a322e171bb2ce81512e951a92b8c2a7bc",
+    "size": 424420
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "651e57b717769f396404a1c1fbd8e0ad7b51a79599d4f162d1a39a4a5b4fe258",
+    "size": 34415
+   },
+   "after": {
+    "sha256": "d674d054f26f427671ad5eaa8e8733aad68e6822e3f39f39906ea8a49e93107f",
+    "size": 34415
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "94ba5f9732c4497a3de71218ea519ed524d6a7fe2a2ca4f1eafd286a3de86cb8",
+    "size": 94424
+   },
+   "after": {
+    "sha256": "5b56cdcb8bdebcac8cc11c580ed16f290b729e4d39b436af2b95177f3bca669a",
+    "size": 94424
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "c8edf863704a61cdf623bd0a532d8465c79d81cb8182ce44f365530759941131",
+    "size": 114
+   },
+   "after": {
+    "sha256": "d9a70c7b8631866485400665a63a9363f14af98d19b298ae1cf2734be7d92630",
+    "size": 139
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasaoriginals/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "83abb4fb49f1b6d0f984034b79bb55d9fac944eeef6f88d6c835f75a40e00b7d",
+    "size": 226
+   },
+   "after": {
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasaoriginals/photo01.jpg": {
+   "status": "removed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8fe068600e37760e49dfbbbd7bcb3caa2694fc71bf524bb28405db4103bf8328",
+    "size": 66033
+   }
+  },
+  "library/2010-12-25 Winter Holiday/photo01.jpg": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "be8d46c3f5e7a9584cd3313a313427c6835550662daaebfe1e1941d64e86a869",
+    "size": 55612
+   },
+   "after": {
+    "sha256": "8fe068600e37760e49dfbbbd7bcb3caa2694fc71bf524bb28405db4103bf8328",
+    "size": 66033
+   }
+  }
+ }
+}

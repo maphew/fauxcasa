@@ -1,0 +1,141 @@
+{
+ "fixture": "028-revert-db-flush",
+ "note": "Lazy db edit-state flush ~90s after revert 027 (Winter Holiday/photo01). KEY: imagedata_revertable[12] 1->0 -- the db 'has a saved edit / can revert' flag CLEARED; photo01 is pristine again. imagedata_backuphash[12] 23770->3079 (db mirror of the ini backuphash change from 027). thumbindex.db row for photo01: mtime/FILETIME updated to the restored original. thumbs2/thumbs/bigthumbs/previews _index.db re-stamped for the re-rendered un-baked thumbnails. NOT changed: imagedata_originslow (so originslow, which was SET at bake 019, does NOT clear on revert -- revertable is the operative flag, not originslow) and imagedata width/height (text bake didn't resize, so revert doesn't either). INCIDENTAL: albumdata_inisync[8] (WH folder row) tick + albumdata_date[16] (Search results) activity tick. CONCLUSION: revert's db side = clear revertable + sync backuphash + re-index thumbs (file restore itself was synchronous in 027). NEGATIVE RESULT: no reset-faces (026) lazy db teardown ever appeared in this window -- the virtual face imagedata row (filetype[28]=1001) and contact persist, confirming Reset Faces is a pure per-photo untag with no contact/recognition teardown.",
+ "captured": "2026-06-13T23:02:19+00:00",
+ "baseline": {
+  "label": "after 027-revert-baked-edit",
+  "created": "2026-06-13T22:59:04+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "4f25d5e60cccddb60b7ce32cb0e4657ec3d488b52feb65192d0eb3b33d7116db",
+    "size": 156
+   },
+   "after": {
+    "sha256": "69a3c258fec30fdb3d23fb67402d6979b5c26478a949d82f0a5bf6e247f12f39",
+    "size": 156
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "174e0fc41199b45934ca67f289d2d27cf10e27c15ee9f627093188c9f74f0596",
+    "size": 108
+   },
+   "after": {
+    "sha256": "5c5a8e93151a384ec8c945dfb29fa928f96d2dea4d84d0fe9a33a179589a9319",
+    "size": 108
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7e7ba250b9940deaa4e450a1f3152a95fbedccd7a631277a9532c5720a7e118a",
+    "size": 368
+   },
+   "after": {
+    "sha256": "a8ead1bb00f81682fa814783a968dcf14b4e585391dcea8fbfcc12f728810c87",
+    "size": 368
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a23aa7452028888b6420b931089264646949ff93f9028e34d83e621075c8de37",
+    "size": 70
+   },
+   "after": {
+    "sha256": "02cb4467e2aeeea34f73339199f1966ea485f0c381f0e9a9d1c1502de9380098",
+    "size": 70
+   }
+  },
+  "db3/imagedata_revertable.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ecd1dbcfd4d84c700887cd5c39211526231f7932b85bb50b5b250f763706a66d",
+    "size": 44
+   },
+   "after": {
+    "sha256": "c312411f74b49b80ca6093bd33871188c3eff4f7c4ab907eaf84bdedeb9bd46b",
+    "size": 44
+   }
+  },
+  "db3/previews_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "43ac6ac246ba3def50c8c692776aee76539da101476ac2ec228d1ee70ae47611",
+    "size": 356
+   },
+   "after": {
+    "sha256": "3ac49ca6d7716688ccfdaa9a1ff3f7c59d0dea7cfefa4e420037a023708f3045",
+    "size": 356
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d062dd1dcc777e3d28611a5d0d71f4de9261937abdce25a735eae7aac85ea8cf",
+    "size": 1301
+   },
+   "after": {
+    "sha256": "0a1674d2cebf393e60f992d57889c7576a36fde1360d37cdf77d3e4e5e9616db",
+    "size": 1301
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "1e6501e8d60b5096e88b610f71bdff92911906b1889866230dc7b539e540319f",
+    "size": 368
+   },
+   "after": {
+    "sha256": "16ad50ad83bc06df679f44c41ab1c211192c4575b17a54ab13d327486c01ee72",
+    "size": 368
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8e95cbd1ebd86f70a820c9caa6ecf8ab7d50d010624243b08a841de6db2408f5",
+    "size": 368
+   },
+   "after": {
+    "sha256": "88b995e729b82e0fce20fb30469de41fc79c51282223ab1405cb74da298793fc",
+    "size": 368
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "c205c94e500d31f37829e8f8a40db8ed6b57afa4ab5f637dbadc4f20823d353d",
+    "size": 66876
+   },
+   "after": {
+    "sha256": "f6214acf0286f4f9912016d254dbe901ee14b02f37dd7ad057861b8568fefd8f",
+    "size": 66872
+   }
+  }
+ }
+}

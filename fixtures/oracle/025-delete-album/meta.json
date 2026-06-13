@@ -1,0 +1,167 @@
+{
+ "fixture": "025-delete-album",
+ "note": "Delete virtual album 'Synthetic Album B' (inverts 003-create-album/011-rename/021-album-description). Agent-driven on headless :3: tree right-click album > Delete Album > confirm dialog ('Are you sure you want to delete the album \"Synthetic Album B\"?', buttons [Delete Album][No], No is default). NO photo files touched. PERSISTENCE IS LAZY: UI updated instantly (Albums 2->1) but disk flush lagged ~3-4 min (contrast folder-delete 022 which wrote synchronously). FLUSH ARTIFACTS: (1) albumdata row[10] TOMBSTONED IN PLACE - name/token/uid -> '', date[10] -> 949998.0 (year-4501 dead-row sentinel, same as 022 folder + 023 search-reshuffle); row count NOT reduced (tombstone-and-grow). (2) member-folder ini (2015-03-15 Garden Project/.picasa.ini, 585->393B): REMOVED the rich '[.album:uid]' definition block (name/token/date(ISO-8601!)/description) from the top AND removed the per-photo 'albums=uid' membership lines from [photo01]/[photo02]; BUT LEFT a minimal token-only '[.album:uid]\\ntoken=uid' STUB at the bottom (album ghost) -- so the ini still grep-matches '[.album:'. (3) albumdata_inisync[10] (album row flag word) + [7] (Garden folder row) churned; wordhash shrank 16B (blob). INCIDENTAL (not part of delete): the recurring 'Search results' albumdata row reshuffle fired again (row[14] tombstoned w/4501 sentinel -> new row[15]) -- session-activity churn documented in 023.",
+ "captured": "2026-06-13T22:39:41+00:00",
+ "baseline": {
+  "label": "manual",
+  "created": "2026-06-13T22:25:07+00:00"
+ },
+ "files": {
+  "db3/albumdata_category.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "46181b592830ade80067006ccfc270c5a259f759cab25b16b1309dc5ad19187c",
+    "size": 80
+   },
+   "after": {
+    "sha256": "fb64fa5a48fbcf29d760efa57ed342a3cd0b1f8f50e77e0d2afefe556f705ab0",
+    "size": 84
+   }
+  },
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "0a8d2ba6e52b300f5181cea66c045d209906451e6a96bdae26b5e2df9dee53c8",
+    "size": 140
+   },
+   "after": {
+    "sha256": "a94f632846fa3cbfaa0c0117bfa2bfdbbb16f548522ce5f256fb68a5bfbf9564",
+    "size": 148
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "c9780492848092a431017873280bbfb2fa0e46a18062b56db691b86f73c2948e",
+    "size": 204
+   },
+   "after": {
+    "sha256": "84f34b0f5b039c7f738116f357d3d2e6b5c51bed02f8dfc512919452d4c00e6c",
+    "size": 227
+   }
+  },
+  "db3/albumdata_filename.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "aee99d2ac8e8d436205fa3cce0c57aa0b95b28e94bbca74092374c703b93985f",
+    "size": 194
+   },
+   "after": {
+    "sha256": "eb407c06ce3f1a79d78676264d644fb51fa41a211dfbefd140b5adb179e9800d",
+    "size": 195
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7b3577fd0648344e5862e5d2ae008d99237a256a5429586b65ae0924fcb18727",
+    "size": 108
+   },
+   "after": {
+    "sha256": "ed167645d347865801042bad2aef06de1c9fcd4a913dc043f4671fcf79ca061c",
+    "size": 108
+   }
+  },
+  "db3/albumdata_location.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "75a01820d6ac70ba22f5ab8bac23ac77219300729f0902a4c86e427689758c65",
+    "size": 35
+   },
+   "after": {
+    "sha256": "5f4d7b2ad77be462c15eff0ef1de08dad568d74b69dc74892644355870d709dc",
+    "size": 36
+   }
+  },
+  "db3/albumdata_music.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "75a01820d6ac70ba22f5ab8bac23ac77219300729f0902a4c86e427689758c65",
+    "size": 35
+   },
+   "after": {
+    "sha256": "5f4d7b2ad77be462c15eff0ef1de08dad568d74b69dc74892644355870d709dc",
+    "size": 36
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "30fa3fc12865b3b0088f4b5365fbfc487a5eb4e4fd60a0f6b7385593e4e45e7f",
+    "size": 201
+   },
+   "after": {
+    "sha256": "98b3108461324b065afbc8491b6f54881284cbad1ec23e6149b9d22698ff3297",
+    "size": 185
+   }
+  },
+  "db3/albumdata_token.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "038e5a3aff9faf4a780315c50622afd6b020658ec18194ea8eb53d7c4b8f0129",
+    "size": 238
+   },
+   "after": {
+    "sha256": "6e3d33e2e7ee4a5f33a2d44cd5715dfccaa7eda19ef3ee6814d02fe94527ec9e",
+    "size": 200
+   }
+  },
+  "db3/albumdata_uid.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a3ea4f1f630a90fadfde9c65f08d551fbc29e57eaf85295493430cdee5483116",
+    "size": 387
+   },
+   "after": {
+    "sha256": "9bbd3b9c1dfa0e48b868ae8de399e3efd711e08b42b40a96be9ad624f5921777",
+    "size": 323
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "eeac45986fdd7b12f9ec8fc3cb6bdd9250f2f26dba2addda784a63a03f5433b2",
+    "size": 66900
+   },
+   "after": {
+    "sha256": "3ac368583364ff944ff3939ad65d4279287746106997001e468c926adfb3f05e",
+    "size": 66884
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "e83d04a59c63a2063406bdee0ba8d2bbe3047d52ef6cee95eba5cae62eaa5936",
+    "size": 585
+   },
+   "after": {
+    "sha256": "c078569b8878ba1dca62f31b20014d478d390d96693ed2bb8b50e9e02c4c6e3a",
+    "size": 393
+   }
+  }
+ }
+}

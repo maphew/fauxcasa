@@ -51,6 +51,80 @@ First interactive run asks about usage feedback and backup (decline both);
 after that it shows the standard Picasa window and works. Headless runs (no
 interaction) still perform the folder scan and write the database, then exit.
 
+> **Agents driving the oracle: do NOT use the launch above.** It puts Picasa
+> windows on the user's live `:0` desktop and shares their real mouse/keyboard.
+> Use the **headless isolated** method below so the user's session stays free
+> (windows off-screen, no input contention).
+
+### Driving headlessly (isolated display — agent-safe)
+
+Validated 2026-06-13 (`fauxcasa-dcc`). Lets an agent see + drive Picasa with no
+windows on the user's screen and no input contention. It is also effectively
+*required* on GNOME/Wayland: the main session's Xwayland `:0` runs with
+`-enable-ei-portal`, so `xdotool` synthetic input is forced through GNOME's
+RemoteDesktop **consent dialog** (mouse warp is silently blocked, no persistent
+token). A separate headless weston Xwayland has no portal, so `xdotool`
+mouse+keyboard work natively (exact 1:1 px).
+
+1. **Start a dedicated headless compositor.** `weston` lives in the `benchbox`
+   toolbox; it spawns its own Xwayland on the next free display (e.g. `:3`):
+
+   ```sh
+   toolbox run -c benchbox weston --backend=headless --xwayland \
+     --width=1680 --height=1120 --socket=wayland-oracle --idle-time=0 \
+     >/tmp/weston-oracle.log 2>&1 &
+   grep -i 'listening on display' /tmp/weston-oracle.log   # -> the DISPLAY, e.g. :3
+   ```
+
+2. **Launch Picasa onto it.** Keep `--socket=x11` (winex11 needs that plumbing),
+   but override `DISPLAY` *inside* a shell wrapper and **disable winewayland**
+   (otherwise Wine grabs the user's `wayland-0` and renders there / crashes):
+
+   ```sh
+   flatpak run --filesystem=home \
+     --env=WINEPREFIX=$PWD/cache/wine-oracle \
+     --command=sh org.winehq.Wine -c \
+     'unset WAYLAND_DISPLAY; export DISPLAY=:3; \
+      export WINEDLLOVERRIDES="mscoree,mshtml=;winewayland.drv="; \
+      exec wine "C:\\Program Files (x86)\\Google\\Picasa3\\Picasa3.exe"'
+   ```
+
+3. **See + drive** (all on `:3`, 1:1 device px, no HiDPI scaling):
+
+   ```sh
+   ID=$(DISPLAY=:3 xdotool search --name 'Picasa 3' | tail -1)
+   DISPLAY=:3 import -window $ID /tmp/p.png                 # screenshot (ImageMagick)
+   DISPLAY=:3 xdotool mousemove --window $ID X Y click 1    # left click (window-relative)
+   DISPLAY=:3 xdotool click 3                               # right click (context menu)
+   DISPLAY=:3 xdotool key alt+v                             # keyboard
+   ```
+   Dropdowns/context menus are **separate override-redirect windows**: after a
+   click, list them with `xdotool search --all --maxdepth 2 ""` (pick the small
+   tall geometry), `import -window <popup>` to read the items, then click an
+   absolute `:3` coordinate on the chosen row. Hover the row and re-capture to
+   confirm the highlight *before* committing — avoids misclicks.
+
+**Critical gotchas**
+- Do **not** pass `--nosocket=x11`: it unsets `DISPLAY` and disables winex11
+  plumbing → Picasa exits silently with an empty log.
+- Must disable `winewayland.drv`, or Wine renders on the user's `wayland-0`.
+- The flatpak reaches the nested X via the **abstract** socket
+  `@/tmp/.X11-unix/X3` (works only because the flatpak shares the host network
+  namespace; a filesystem bind of the socket into the sandbox `/tmp` does not).
+- **One Picasa per prefix.** Kill any other instance first
+  (`pkill -f Picasa3.exe`); killing an *idle* Picasa writes nothing to the
+  prefix. Never run two instances on the live oracle prefix.
+- `ydotool` is a **dead end for isolation** — it injects at `/dev/uinput`
+  (global), moving the user's real cursor. Use `xdotool` on the headless
+  Xwayland instead.
+- Capture timing: the `.picasa.ini` write can lag the `db3/` write by several
+  seconds — re-run `diff` if the ini delta is missing. Re-`snapshot` right
+  before each action: a "Search results" `albumdata` row reshuffle
+  (tombstone+append, year-4501 date sentinel) fires on session activity after a
+  folder delete and will otherwise contaminate the next diff.
+
+Cross-session copy of this recipe: `bd recall oracle-headless-isolation`.
+
 ## Validation results (2026-06-11)
 
 - Watched-folder seeding works: `scanlist.txt` = `+C:\` `+Z:\`;

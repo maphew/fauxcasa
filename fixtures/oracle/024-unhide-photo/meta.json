@@ -1,0 +1,76 @@
+{
+ "fixture": "024-unhide-photo",
+ "note": "Un-hide photo06 in '2010-12-25 Winter Holiday' (inverts 017-hide-photo). FIRST fully agent-driven fixture (xdotool mouse/keyboard on isolated headless weston :3, off the user's screen). UI: View menu > Hidden Pictures (toggle ON = view-only, ZERO disk write, verified) to reveal the dimmed hidden thumbnail; then right-click photo06 > Unhide. SYNCHRONOUS: ini DELETES the 'hidden=yes' line (NOT rewritten 'hidden=no'), leaving the now-empty '[photo06.jpg]' section header IN PLACE -- ini 126->114 bytes = -12 = len('hidden=yes')+CRLF; confirms CRLF endings, content-line-only deletion, and empty-header retention, exactly mirroring unstar 010's delete-key-not-=no rule. NO JPEG/XMP/backuphash touch. NO imagedata pmp mirror of the hidden field (hidden is ini-only state, no db column to revert). DB reacts INDIRECTLY and ~immediately (action forced a db write-out): albumdata_description[14] 'Search results' 16->17 (photo06 re-enters the searchable set; exact inverse of 017's -1) + albumdata_date[14] activity tick. TIMING: ini write LAGGED the db by several seconds -- diff at click+1s showed only the 2 db rows; the ini line-removal appeared ~8s later. (albumdata row[14] is the post-022/023 relocated Search-results row.)",
+ "captured": "2026-06-13T22:16:06+00:00",
+ "baseline": {
+  "label": "manual",
+  "created": "2026-06-13T21:56:47+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a41ab3624f085609582e222fee0e1c2910808a2201cd3cc4ed2ea48e689da7c0",
+    "size": 140
+   },
+   "after": {
+    "sha256": "0a8d2ba6e52b300f5181cea66c045d209906451e6a96bdae26b5e2df9dee53c8",
+    "size": 140
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "215f7570c869ef7bf0df8f851057de01d3b733ae4ebf8ae66884c02aec4868db",
+    "size": 204
+   },
+   "after": {
+    "sha256": "c9780492848092a431017873280bbfb2fa0e46a18062b56db691b86f73c2948e",
+    "size": 204
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "75b4c1a5247a1262ba056126f0797f1e9dbaf653bdffa1f887042628eb7ca285",
+    "size": 108
+   },
+   "after": {
+    "sha256": "7b3577fd0648344e5862e5d2ae008d99237a256a5429586b65ae0924fcb18727",
+    "size": 108
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "9d5301fa5e36cfd17642bfb9055178927c35679b5e5b85b5140e4aa93dd15cf0",
+    "size": 66908
+   },
+   "after": {
+    "sha256": "eeac45986fdd7b12f9ec8fc3cb6bdd9250f2f26dba2addda784a63a03f5433b2",
+    "size": 66900
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "4defbdcae3966424622c79539465f507a4a4a77ea6281602c2599fd8fc44d0b6",
+    "size": 126
+   },
+   "after": {
+    "sha256": "c8edf863704a61cdf623bd0a532d8465c79d81cb8182ce44f365530759941131",
+    "size": 114
+   }
+  }
+ }
+}
