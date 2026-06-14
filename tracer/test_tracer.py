@@ -430,6 +430,86 @@ def test_evict_bounds_by_bytes(monkeypatch) -> None:
     assert len(g.tiles) <= 150
 
 
+def test_evict_wantband_over_budget_and_entry_floor(monkeypatch) -> None:
+    """The load-bearing _evict invariant the byte-bound test doesn't reach:
+    tiles the current paint WANTS are never evicted, even when the want-band
+    alone blows past every bound, and the entry cap floors at the want-band
+    size. Without these the eviction loop livelocks (re-evicting the very
+    tiles the next paint re-requests) or over-evicts the visible set.
+
+    * want-band over CACHE_BYTES: a want-band whose summed bytes EXCEED the
+      byte budget must keep ALL of its tiles — _evict terminates with the
+      whole set intact (no infinite loop chasing an unreachable budget, no
+      eviction of a wanted tile). This is the single case that separates the
+      correct impl from a livelock / over-eviction regression.
+    * entry-cap floor: entry_cap = max(CACHE_MAX_ENTRIES, len(wanted)+128);
+      when len(wanted)+128 is the larger (binding) term — never exercised by
+      the other tests — the cache trims to THAT floor, not to the smaller
+      CACHE_MAX_ENTRIES, so a large want-band can't be re-evicted to a tiny
+      entry cap every frame.
+    """
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtWidgets import QApplication
+    import grid as gridmod
+    from grid import GridView
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    g = GridView()
+
+    def tile(px: int) -> QImage:
+        im = QImage(px, px, QImage.Format.Format_RGB32)
+        im.fill(QColor(10, 20, 30))
+        return im
+
+    one = tile(64).sizeInBytes()  # 64*64*4 = 16384 B
+    assert one > 0
+
+    # --- want-band over budget: every tile present is wanted and together
+    # they exceed CACHE_BYTES. _evict must keep them all and return; the
+    # by-age list excludes wanted tiles, so there is nothing to evict and no
+    # spin. A regression that evicts wanted tiles, or loops forever chasing
+    # the byte budget, fails here (a livelock would hang the test).
+    monkeypatch.setattr(gridmod, "CACHE_BYTES", 3 * one)       # room for 3
+    monkeypatch.setattr(gridmod, "CACHE_MAX_ENTRIES", 10_000)  # never binds
+    g.tiles.clear()
+    g._cache_bytes = 0
+    for i in range(6):  # 6 * one > 3 * one = CACHE_BYTES
+        img = tile(64)
+        g.tiles[i] = [img, i, img.sizeInBytes()]
+        g._cache_bytes += img.sizeInBytes()
+    g.wanted = frozenset(range(6))  # the whole over-budget set is wanted
+    g._evict()
+    assert set(g.tiles) == set(range(6))          # nothing evicted
+    assert g._cache_bytes == 6 * one              # accounting exact, intact
+    assert g._cache_bytes > gridmod.CACHE_BYTES   # really was over budget
+
+    # --- entry-cap floor binds: len(wanted)+128 (133) > CACHE_MAX_ENTRIES
+    # (10), so the floor is the cap. Zero-byte error tiles exert no byte
+    # pressure, isolating the entry path; eviction trims NON-wanted tiles
+    # oldest-first down to the floor while keeping every wanted tile. A
+    # regression that dropped the floor would trim to CACHE_MAX_ENTRIES (10)
+    # instead, evicting wanted tiles the paint still needs.
+    monkeypatch.setattr(gridmod, "CACHE_BYTES", 1 << 30)  # bytes never bind
+    monkeypatch.setattr(gridmod, "CACHE_MAX_ENTRIES", 10)
+    wanted = set(range(5))
+    floor = len(wanted) + 128  # 133 — the binding term
+    assert floor > gridmod.CACHE_MAX_ENTRIES
+    g.tiles.clear()
+    g._cache_bytes = 0
+    for i in range(200):  # 5 wanted + 195 non-wanted, all 0-byte error tiles
+        g.tiles[i] = [None, i, 0]  # frame_no i (i = newest)
+    g.wanted = frozenset(wanted)
+    g._evict()
+    assert len(g.tiles) == floor   # trimmed to the floor, NOT to 10
+    assert wanted <= set(g.tiles)  # every wanted tile survives
+    # survivors beyond the want-band are the NEWEST non-wanted tiles
+    # (oldest-first eviction): indices 0..4 wanted + 72..199 non-wanted
+    assert max(g.tiles) == 199 and min(g.tiles) == 0
+
+
 def test_load_catalog_survives_malformed_rows(library: Path,
                                                tmp_path: Path) -> None:
     cat = scan_library(library)
