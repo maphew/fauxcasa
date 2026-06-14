@@ -1,0 +1,19 @@
+# Throttle-probe gate (fauxcasa-ncv) — does Qt QWidget raster throttle to vsync on this compositor?
+# 2026-06-13 GNOME/Mutter Wayland, AMD Radeon 780M, eDP-1 @165Hz
+# A vsync-throttled surface would pin paint_hz at ~165 regardless of timer; it does not.
+
+### timer --hz 60
+platform=wayland screen=eDP-1 refresh=165.00Hz frame_period=6.06ms timer_hz=60
+paints=167 paint_hz=55.7 min=5.19 p50=17.00 p99=22.12 max=23.22 ms
+verdict: inconclusive: timer (60Hz) <= refresh; paint_hz ≈ timer just means paints follow the driver. Re-run with --hz > 165 to decide throttling.
+
+### timer --hz 240
+platform=wayland screen=eDP-1 refresh=165.00Hz frame_period=6.06ms timer_hz=240
+paints=705 paint_hz=235.0 min=0.72 p50=4.06 p99=5.28 max=15.06 ms
+verdict: paint_hz exceeds refresh -> UNTHROTTLED (interval is NOT a vsync signal; use frame-production time + the WAYLAND_DEBUG commit/callback cadence)
+
+### timer --hz 1000
+platform=wayland screen=eDP-1 refresh=165.00Hz frame_period=6.06ms timer_hz=1000
+paints=1792 paint_hz=597.3 min=0.57 p50=1.26 p99=4.62 max=13.93 ms
+verdict: paint_hz exceeds refresh -> UNTHROTTLED (interval is NOT a vsync signal; use frame-production time + the WAYLAND_DEBUG commit/callback cadence)
+
