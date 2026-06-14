@@ -275,12 +275,74 @@ def test_set_data_invalidates_tiles() -> None:
                   albums={})
     grid.set_data(cat, None)
     # simulate a populated tile cache + an in-flight decode generation
-    grid.tiles[0] = [object(), 1]
+    grid.tiles[0] = [object(), 1, 999]
+    grid._cache_bytes = 999
     grid.pending.add(5)
     gen_before = grid.generation
     grid.set_data(cat, None)  # the reconcile-style swap
     assert grid.tiles == {} and grid.pending == set()
+    assert grid._cache_bytes == 0  # byte accounting resets with the cache
     assert grid.generation > gen_before  # stale queued decodes are dropped
+
+
+def test_evict_bounds_by_bytes(monkeypatch) -> None:
+    """Decoded-tile eviction is bounded by summed BYTES (oldest-first),
+    never drops a tile the current paint wants, and an entry backstop
+    bounds zero-byte (error) tiles that exert no byte pressure."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtWidgets import QApplication
+    import grid as gridmod
+    from grid import GridView
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    g = GridView()
+
+    def tile(px: int) -> QImage:
+        im = QImage(px, px, QImage.Format.Format_RGB32)
+        im.fill(QColor(10, 20, 30))
+        return im
+
+    one = tile(64).sizeInBytes()  # 64*64*4 = 16384 B
+    assert one > 0
+
+    def fill(n: int) -> None:
+        g.tiles.clear()
+        g._cache_bytes = 0
+        for i in range(n):
+            img = tile(64)
+            g.tiles[i] = [img, i, img.sizeInBytes()]  # frame_no i (i = newest)
+            g._cache_bytes += img.sizeInBytes()
+
+    # byte budget binds: room for 3 tiles, 6 present, none wanted ->
+    # the three NEWEST survive, accounting stays exact
+    monkeypatch.setattr(gridmod, "CACHE_BYTES", 3 * one)
+    monkeypatch.setattr(gridmod, "CACHE_MAX_ENTRIES", 10_000)
+    fill(6)
+    g.wanted = frozenset()
+    g._evict()
+    assert set(g.tiles) == {3, 4, 5}
+    assert g._cache_bytes == 3 * one == sum(g.tiles[i][2] for i in g.tiles)
+
+    # wanted tiles are never evicted, even the oldest, even over budget
+    fill(6)
+    g.wanted = frozenset({0, 1})
+    g._evict()
+    assert {0, 1} <= set(g.tiles)
+    assert g._cache_bytes <= 3 * one
+
+    # entry backstop: zero-byte error tiles exert no byte pressure but an
+    # all-error library still must not grow the dict without bound
+    monkeypatch.setattr(gridmod, "CACHE_MAX_ENTRIES", 150)
+    g.tiles.clear()
+    g._cache_bytes = 0
+    for i in range(300):
+        g.tiles[i] = [None, i, 0]
+    g.wanted = frozenset()
+    g._evict()
+    assert len(g.tiles) <= 150
 
 
 def test_load_catalog_survives_malformed_rows(library: Path,

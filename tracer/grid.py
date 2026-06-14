@@ -31,13 +31,19 @@ HEADER_H = 26
 GROUP_GAP = 10
 PAD = 8
 WORKERS = 4
-# Decoded-tile RAM bound: tiles are pre-scaled to the current tile size
-# at decode, so worst case 1600 * 256*256*4 B ~= 400 MB at max zoom and
-# ~160 MB at the default 160 px — inside the 512 MB working bound. The
-# effective cap grows to cover the current viewport+prefetch band when
-# that exceeds CACHE_CAP (only possible at small tile sizes, where tiles
-# are cheap), so eviction can never thrash tiles the same paint wants.
-CACHE_CAP = 1600
+# Decoded-tile RAM bound. The real cost is BYTES, not entries: tiles are
+# pre-scaled to the current tile size at decode, but a 256x256 RGB32 tile
+# is 256 KB while a 64x64 one is 16 KB — a flat entry cap would let small
+# tiles undershoot the budget and (worse) a non-square library blow past
+# the entry-count worst-case math. So bound by summed decoded bytes
+# (CACHE_BYTES), comfortably inside the §7 512 MB working set, with a
+# generous entry backstop (CACHE_MAX_ENTRIES) so a degenerate all-error
+# library — zero-byte tiles, no byte pressure — still can't grow the dict
+# without bound. The byte budget binds for real tiles; the entry backstop
+# only for tiny/error ones. Neither ever evicts what the current paint
+# wants (the want-band), so eviction can't thrash the tiles a paint needs.
+CACHE_BYTES = 256 * 1024 * 1024
+CACHE_MAX_ENTRIES = 4096
 PREFETCH_SCREENS = 1.0
 
 PLACEHOLDER = QColor(60, 60, 60)
@@ -98,7 +104,8 @@ class GridView(QAbstractScrollArea):
         self.done: queue.SimpleQueue = queue.SimpleQueue()
         self.pending: set[int] = set()
         self.pending_lock = threading.Lock()
-        self.tiles: dict[int, list] = {}  # idx -> [QImage|None(error), frame]
+        self.tiles: dict[int, list] = {}  # idx -> [QImage|None(error), frame, nbytes]
+        self._cache_bytes = 0  # running sum of tiles' decoded bytes (CACHE_BYTES)
         self.frame_no = 0
         # Optional bench hook: callable(t_start, t_end, blank). Set by the
         # scroll benchmark (tracer/bench_scroll.py) to time frame
@@ -202,6 +209,7 @@ class GridView(QAbstractScrollArea):
     def _invalidate_tiles(self) -> None:
         self.generation += 1
         self.tiles.clear()
+        self._cache_bytes = 0
         with self.pending_lock:
             self.pending.clear()
 
@@ -336,8 +344,13 @@ class GridView(QAbstractScrollArea):
                 break
             if gen != self.generation:
                 continue
+            old = self.tiles.get(idx)
+            if old is not None:
+                self._cache_bytes -= old[2]
+            nbytes = img.sizeInBytes() if img is not None else 0
             # Build-fed tiles stay at native size; paint aspect-fits them.
-            self.tiles[idx] = [img, self.frame_no]
+            self.tiles[idx] = [img, self.frame_no, nbytes]
+            self._cache_bytes += nbytes
 
     def _request(self, idx: int) -> None:
         if idx in self.tiles or self.thumbs is None:
@@ -349,20 +362,26 @@ class GridView(QAbstractScrollArea):
         self.jobs.put((self.generation, idx, self.tile))
 
     def _evict(self) -> None:
-        # Never evict what the current paint wants: at small tile sizes a
-        # big viewport's want-band can exceed CACHE_CAP, and trimming to
-        # the cap would re-evict just-requested tiles every frame — a
-        # permanent decode/evict/repaint livelock.
-        cap = max(CACHE_CAP, len(self.wanted) + 128)
-        excess = len(self.tiles) - cap
-        if excess <= 0:
-            return
+        # Trim oldest-first until BOTH bounds hold: summed decoded bytes
+        # <= CACHE_BYTES (the real RAM limit) and entry count <= the
+        # backstop. Never evict what the current paint wants: at small
+        # tile sizes a big viewport's want-band can be large, and the
+        # entry backstop floors at the want-band size so trimming can't
+        # re-evict just-requested tiles every frame (a permanent
+        # decode/evict/repaint livelock). If the want-band alone exceeds a
+        # bound, we keep it anyway — overshooting briefly beats thrashing.
         wanted = self.wanted
+        entry_cap = max(CACHE_MAX_ENTRIES, len(wanted) + 128)
+        if self._cache_bytes <= CACHE_BYTES and len(self.tiles) <= entry_cap:
+            return
         by_age = sorted(
             (kv for kv in self.tiles.items() if kv[0] not in wanted),
             key=lambda kv: kv[1][1],
         )
-        for idx, _ in by_age[:excess]:
+        for idx, ent in by_age:
+            if self._cache_bytes <= CACHE_BYTES and len(self.tiles) <= entry_cap:
+                break
+            self._cache_bytes -= ent[2]
             del self.tiles[idx]
 
     # ---------- hit testing ----------

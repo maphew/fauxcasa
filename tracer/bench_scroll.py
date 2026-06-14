@@ -68,7 +68,13 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from catalog import Catalog, load_catalog, save_catalog, scan_library  # noqa: E402
-from grid import CACHE_CAP, PREFETCH_SCREENS, WORKERS, GridView  # noqa: E402
+from grid import (  # noqa: E402
+    CACHE_BYTES,
+    CACHE_MAX_ENTRIES,
+    PREFETCH_SCREENS,
+    WORKERS,
+    GridView,
+)
 from thumbcache import CacheError, ThumbCache, bind, load_cache  # noqa: E402
 
 TELEPORT_STOPS = (0.25, 0.50, 0.75, 0.99)
@@ -432,7 +438,8 @@ def main() -> int:
             "scroll_screens_per_s": args.screens,
             "scroll_px_per_s": round(speed_px_s()),
             "prefetch_screens": PREFETCH_SCREENS,
-            "cache_cap": CACHE_CAP,
+            "cache_bytes": CACHE_BYTES,
+            "cache_max_entries": CACHE_MAX_ENTRIES,
             "decode_workers": WORKERS,  # grid's runtime decode-thread count
             **deco,
             **read_power(),
