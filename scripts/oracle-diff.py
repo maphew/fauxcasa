@@ -28,6 +28,7 @@ import argparse
 import difflib
 import hashlib
 import json
+import os
 import re
 import shutil
 import struct
@@ -36,7 +37,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SNAPDIR = REPO / "cache" / "oracle-snapshots"
+# Override these three with env vars to target a DISPOSABLE prefix clone instead
+# of the live oracle (bead fauxcasa-zve): ORACLE_PREFIX (the wine prefix root),
+# ORACLE_LIBRARY (the staged synthetic-library copy the clone's Z: resolves to),
+# ORACLE_SNAPDIR (a clone-private snapshot dir so the live baseline is untouched).
+# Defaults reproduce the live-oracle behavior exactly.
+SNAPDIR = Path(os.environ.get("ORACLE_SNAPDIR", REPO / "cache" / "oracle-snapshots"))
 BASELINE = SNAPDIR / "baseline"
 MANIFEST = SNAPDIR / "manifest.json"
 FIXTURES = REPO / "fixtures" / "oracle"
@@ -66,17 +72,14 @@ MAX_DIFF_ROWS = 100  # per-file cap on printed row deltas
 # ---------------------------------------------------------------- roots/scan
 
 def find_roots() -> dict[str, Path]:
-    library = REPO / "cache" / "synthetic-library"
-    hits = sorted(
-        (REPO / "cache" / "wine-oracle" / "drive_c" / "users").glob(
-            "*/AppData/Local/Google"
-        )
-    )
+    library = Path(os.environ.get("ORACLE_LIBRARY", REPO / "cache" / "synthetic-library"))
+    prefix = Path(os.environ.get("ORACLE_PREFIX", REPO / "cache" / "wine-oracle"))
+    hits = sorted((prefix / "drive_c" / "users").glob("*/AppData/Local/Google"))
     google = next((g for g in hits if (g / "Picasa2" / "db3").is_dir()), None)
     if google is None:
-        sys.exit("error: no Picasa2/db3 found under cache/wine-oracle — run Picasa once first")
+        sys.exit(f"error: no Picasa2/db3 found under {prefix} — run Picasa once first")
     if not library.is_dir():
-        sys.exit("error: cache/synthetic-library missing — run scripts/make-synthetic-library.py")
+        sys.exit(f"error: library {library} missing — run scripts/make-synthetic-library.py")
     return {
         "db3": google / "Picasa2" / "db3",
         "albums": google / "Picasa2Albums",
@@ -328,7 +331,11 @@ def take_snapshot(label: str, state: dict[str, bytes] | None = None) -> None:
         shutil.rmtree(BASELINE)
     newdir.rename(BASELINE)
     newman.replace(MANIFEST)
-    print(f"snapshot '{label}': {len(state)} files baselined -> {BASELINE.relative_to(REPO)}")
+    try:
+        shown = BASELINE.relative_to(REPO)
+    except ValueError:  # ORACLE_SNAPDIR pointed outside the repo (clone runs)
+        shown = BASELINE
+    print(f"snapshot '{label}': {len(state)} files baselined -> {shown}")
 
 
 def load_manifest() -> dict:

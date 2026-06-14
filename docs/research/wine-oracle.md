@@ -226,3 +226,59 @@ For indexing-at-scale experiments, clone the prefix and point the clone's
 (`scripts/make-synthetic-library.py --scale N`) — full recipe and the
 1000-photo results are in `oracle-db3-survey.md`. Never repoint or reset the
 oracle prefix itself: it is the live baseline for differential fixtures.
+
+## Capturing differentials on a disposable clone (fauxcasa-zve)
+
+Some actions create **new files + permanent db3 rows in the watched tree**
+(collage/export, and anything that registers a new album/category). Capturing
+those on the live oracle would contaminate the baseline forever, so they run on
+a **disposable clone** of the prefix — same `dosdevices/z:`-staging trick as the
+sentinel experiment (`oracle-db3-survey.md`), which keeps the `Z:\` paths baked
+into db3 resolving to clone-local copies and makes the live prefix/library
+**unreachable** from the clone's drive mappings:
+
+```sh
+CLONE=cache/wine-oracle-export; ZROOT=$CLONE-z
+STAGED=$ZROOT/var/home/matt/dev/fauxcasa/cache/synthetic-library
+cp -a --reflink=auto cache/wine-oracle "$CLONE"          # instant CoW
+mkdir -p "$(dirname "$STAGED")"
+cp -a --reflink=auto cache/synthetic-library "$STAGED"
+ln -sfn "$PWD/$ZROOT" "$CLONE/dosdevices/z:"             # Z: -> staged tree
+for d in Desktop Documents Downloads Pictures; do        # exports land IN the clone
+  rm -f "$CLONE/drive_c/users/matt/$d" && mkdir -p "$CLONE/drive_c/users/matt/$d"; done
+```
+
+Then point the **diff harness** at the clone with three env vars (defaults
+reproduce the live-oracle behavior exactly), so the live baseline cache is
+untouched:
+
+```sh
+export ORACLE_PREFIX=$PWD/cache/wine-oracle-export
+export ORACLE_LIBRARY=$PWD/cache/wine-oracle-export-z/var/home/matt/dev/fauxcasa/cache/synthetic-library
+export ORACLE_SNAPDIR=$PWD/cache/oracle-snapshots-clone
+uv run scripts/oracle-diff.py snapshot   # ... act in Picasa ... then diff / capture
+```
+
+Launch Picasa with `WINEPREFIX=$CLONE` via the headless recipe above.
+
+**Gotcha — the dead Places map busy-loops and blocks all input.** If the cloned
+prefix's `active_metadata_tab` (registry `Software\Google\Picasa\Picasa2\
+Preferences`) is `thumbui/places_toggle`, Picasa opens Places on launch and
+spins forever on the retired Maps endpoint via `ieframe` (the `wine.log` fills
+with `ieframe:bind_to_object failed` at tens of KB/s) — the UI thread never
+processes clicks or keys. Fix before relaunching: set that key to `""` in
+`user.reg` while Picasa is down, **and** add `ieframe` to the disabled DLLs
+(`WINEDLLOVERRIDES="mscoree,mshtml,ieframe=;winewayland.drv="`) so the map
+control fails fast instead of looping. `ieframe` is browser-only — orthogonal to
+the photo catalog, so disabling it doesn't affect export/collage db3 writes.
+
+**Gotcha — coordinates.** `import -window <id>` screenshots are *window-relative*;
+so are `xdotool mousemove --window <id> X Y` clicks. Use `--window` (or add the
+window's screen offset) — feeding raw image pixels to a screen-absolute
+`mousemove` lands the click in empty space and it silently does nothing.
+
+First export finding (fixture 030): an export to the **default (unwatched)**
+`Pictures\Picasa\Exports` location writes the resized JPEGs + a `.picasa.ini`
+folder stub (`[Picasa]` / `P2category=Exported Pictures` / `date=`) but **no db3
+row and no tree node** — the category mark is ini-only (cf hide-photo 017).
+`imagedata_originslow` gets stamped for every source photo the export read.

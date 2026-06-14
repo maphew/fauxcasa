@@ -1,0 +1,50 @@
+{
+ "fixture": "030-export-to-folder",
+ "note": "Export Pictures to Folder on a DISPOSABLE clone of the oracle prefix (dosdevices/z: staged library copy; live oracle prefix + live library untouched). Selected whole '2015-03-15 Garden Project' folder (9 photos) -> bottom Export button -> Export-to-Folder dialog (default location C:\\users\\matt\\(My )Pictures\\Picasa\\Exports, exported-folder name defaulted to source folder name, 'Resize to 800px', quality Automatic, location field is read-only/Browse-only) -> Export. This fixture is the SYNCHRONOUS half; the Exported-Pictures db3 catalog row is lazy -> see 031-export-db-flush. SYNCHRONOUS db3: imagedata_originslow set 0->nonzero u64 for the 8 exported SOURCE photos (rows 3-9,18) \u2014 the per-photo slow content hash (same column populated at bake in 019); export reads each source fully to resize it, which computes it. NOISE: albumdata_date[16] 'Search results' activity tick; wordhash grew (search index, blob). OUT-OF-ROOT on-disk artifacts (clone Pictures, not under the harness's db3/albums/library roots, so documented by hand below + ini copied in): a NEW export folder with 9 resized 800px JPEGs, where a filename collision (two source photos both named photo07.jpg \u2014 the second is the moved-in Winter Holiday #07 from fixture 016) auto-deduped to photo07-001.jpg; AND that folder gets a .picasa.ini folder-identity stub '[Picasa] / P2category=Exported Pictures / date=<export epoch-day>' (cf the [Picasa] block in folder-description 020, but category 'Exported Pictures').",
+ "captured": "2026-06-14T08:32:11+00:00",
+ "baseline": {
+  "label": "clone-baseline-B (pre-export, noise absorbed)",
+  "created": "2026-06-14T08:21:16+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9f17042350575877401afd0e12f13145675ab81704f5ab30de91fa076e206883",
+    "size": 156
+   },
+   "after": {
+    "sha256": "06bacb2f7d7df173278b491bb3439924a05dd5befeb004639bdd330ae92a9f10",
+    "size": 156
+   }
+  },
+  "db3/imagedata_originslow.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "f35215a5f38a4e300fd986602339b56854e50b3ac7c24f44471189a2c5def679",
+    "size": 220
+   },
+   "after": {
+    "sha256": "1737d8be952f29a3facf7c9bc160bd0d47515cd8395477af2b800562398dc3e4",
+    "size": 220
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "2de7482d77d2675d39cdd8d927782182c831705d5af157272cc524a19c57bd0d",
+    "size": 66904
+   },
+   "after": {
+    "sha256": "e4429b0a9ed49c69efb3644201ad9d34ec0448e0b02e0c6355274046d598682f",
+    "size": 66992
+   }
+  }
+ }
+}
