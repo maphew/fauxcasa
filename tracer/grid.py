@@ -25,25 +25,40 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPolygonF, QTransform
 from PySide6.QtWidgets import QAbstractScrollArea
 
 from catalog import Catalog
-from thumbcache import ThumbCache
+from thumbcache import THUMB_EDGE, ThumbCache
 
 HEADER_H = 26
 GROUP_GAP = 10
 PAD = 8
 WORKERS = 4
-# Decoded-tile RAM bound. The real cost is BYTES, not entries: tiles are
-# pre-scaled to the current tile size at decode, but a 256x256 RGB32 tile
-# is 256 KB while a 64x64 one is 16 KB — a flat entry cap would let small
-# tiles undershoot the budget and (worse) a non-square library blow past
-# the entry-count worst-case math. So bound by summed decoded bytes
-# (CACHE_BYTES), comfortably inside the §7 512 MB working set, with a
-# generous entry backstop (CACHE_MAX_ENTRIES) so a degenerate all-error
-# library — zero-byte tiles, no byte pressure — still can't grow the dict
-# without bound. The byte budget binds for real tiles; the entry backstop
-# only for tiny/error ones. Neither ever evicts what the current paint
-# wants (the want-band), so eviction can't thrash the tiles a paint needs.
+# Decoded-tile RAM bound. The real cost is BYTES, not entries. Tiles are
+# kept at native cache resolution (~256 px, TILE_NATIVE) and SCALED IN
+# PAINT to the current zoom, so ONE decode serves every zoom level — zoom
+# no longer re-decodes the JPEG (fauxcasa-z1e). A square 256x256 RGB32
+# tile is 256 KB; a non-square tile fit in the 256 box is smaller (e.g.
+# 256x171 ~175 KB) and an error tile is 0 bytes, so a flat entry cap would
+# mis-budget both ways. So bound by summed decoded bytes (CACHE_BYTES),
+# comfortably inside the §7 512 MB working set, with a generous entry
+# backstop (CACHE_MAX_ENTRIES) so a degenerate all-error library —
+# zero-byte tiles, no byte pressure — still can't grow the dict without
+# bound. Headroom re-examination for the native-tile design: tiles are now
+# uniform across zoom, so the byte budget binds at ~1024 square tiles at
+# EVERY zoom (it used to bind only near max zoom, where tiles were already
+# 256 px; small-zoom tiles used to be ~16 KB and never byte-bound). On the
+# §7 bench window (1280x800) the worst case — min zoom, 1-screen prefetch
+# each way — is a ~560-tile want-band ≈ 140 MB, well under CACHE_BYTES with
+# LRU slack to spare. The byte budget binds for real tiles; the entry
+# backstop only for tiny/error ones. Neither bound ever evicts what the
+# current paint wants (the want-band), so eviction can't thrash the tiles a
+# paint needs; on an extreme window at min zoom the want-band alone can
+# exceed CACHE_BYTES, and _evict keeps it anyway (brief overshoot beats
+# thrash). Live scroll-fps verification on a real compositor is a required
+# follow-up — see tracer/bench_scroll.py.
 CACHE_BYTES = 256 * 1024 * 1024
 CACHE_MAX_ENTRIES = 4096
+# Native decoded-tile edge: the cache's own thumb size. Tiles are decoded
+# at (or capped to) this and scaled to self.tile in paint.
+TILE_NATIVE = THUMB_EDGE
 PREFETCH_SCREENS = 1.0
 
 PLACEHOLDER = QColor(60, 60, 60)
@@ -147,8 +162,8 @@ class GridView(QAbstractScrollArea):
         self.set_filter(None, "")
 
     def set_thumbs(self, thumbs: ThumbCache) -> None:
-        """Swap in a freshly built cache. Build-fed tiles are native
-        256 px; invalidate so everything re-decodes pre-scaled."""
+        """Swap in a freshly built cache. Invalidate so every tile
+        re-decodes from the new cache at native size (paint scales it)."""
         self.thumbs = thumbs
         self._invalidate_tiles()
         self.viewport().update()
@@ -235,11 +250,10 @@ class GridView(QAbstractScrollArea):
             anchor = (g, n)  # group objects survive a zoom relayout
             break
         self.tile = tile
-        if self.thumbs is not None:
-            # Tiles are decoded at tile size; invalidate, re-decode lazily.
-            # During a live build (thumbs None) fed tiles are native 256px
-            # and paint scales them, so nothing to invalidate.
-            self._invalidate_tiles()
+        # No tile invalidation on zoom: tiles are kept at native cache
+        # resolution and scaled in paint, so the same decoded tile serves
+        # every zoom level. Zoom is pure relayout + re-anchor; the JPEG is
+        # never re-decoded just because the tile size changed (fauxcasa-z1e).
         self._relayout()
         if anchor is not None:
             self.verticalScrollBar().setValue(
@@ -292,7 +306,7 @@ class GridView(QAbstractScrollArea):
         fd = -1
         fd_thumbs = None  # the ThumbCache OBJECT the fd was opened for
         while True:
-            gen, idx, tile = self.jobs.get()
+            gen, idx = self.jobs.get()
             thumbs = self.thumbs
             with self.pending_lock:
                 self.pending.discard(idx)
@@ -319,9 +333,14 @@ class GridView(QAbstractScrollArea):
                     if img.isNull():
                         img = None
                 if img is not None:
-                    if img.width() > tile or img.height() > tile:
+                    # Keep the tile at native cache resolution; paint scales
+                    # it to the current tile size, so zoom never re-decodes.
+                    # Cache blobs are already <= TILE_NATIVE; the cap is a
+                    # defensive guard against an oversized blob, not a
+                    # per-zoom pre-scale.
+                    if img.width() > TILE_NATIVE or img.height() > TILE_NATIVE:
                         img = img.scaled(
-                            tile, tile,
+                            TILE_NATIVE, TILE_NATIVE,
                             Qt.AspectRatioMode.KeepAspectRatio,
                             Qt.TransformationMode.SmoothTransformation,
                         )
@@ -354,7 +373,8 @@ class GridView(QAbstractScrollArea):
             if old is not None:
                 self._cache_bytes -= old[2]
             nbytes = img.sizeInBytes() if img is not None else 0
-            # Build-fed tiles stay at native size; paint aspect-fits them.
+            # All tiles are stored at native size; paint aspect-fits and
+            # scales them to the current tile size.
             self.tiles[idx] = [img, self.frame_no, nbytes]
             self._cache_bytes += nbytes
 
@@ -365,7 +385,9 @@ class GridView(QAbstractScrollArea):
             if idx in self.pending:
                 return
             self.pending.add(idx)
-        self.jobs.put((self.generation, idx, self.tile))
+        # No tile size in the job: tiles decode at native resolution and
+        # paint scales them, so a decode is zoom-independent.
+        self.jobs.put((self.generation, idx))
 
     def _evict(self) -> None:
         # Trim oldest-first until BOTH bounds hold: summed decoded bytes
@@ -497,9 +519,10 @@ class GridView(QAbstractScrollArea):
             else:
                 t[1] = self.frame_no
                 img = t[0]
-                # Aspect-fit, centered. Decode-path tiles are pre-scaled
-                # (straight 1:1 blit); build-fed tiles are native 256 px
-                # and get fitted here.
+                # Aspect-fit, centered, and SCALED to the current tile size.
+                # Every tile is held at native (~256 px) resolution, so this
+                # per-paint scale is what makes zoom cheap (no re-decode);
+                # SmoothPixmapTransform (set above) keeps the blit clean.
                 scale = min(self.tile / img.width(),
                             self.tile / img.height(), 1.0)
                 dw = max(1, round(img.width() * scale))
