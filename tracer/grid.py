@@ -53,6 +53,7 @@ HEADER_BG = QColor(34, 34, 34)
 HEADER_FG = QColor(200, 200, 200)
 SELECT = QColor(64, 140, 255)
 STAR_GOLD = QColor(255, 200, 40)
+HIDDEN_VEIL = QColor(0, 0, 0, 110)  # reveal mode: dim hidden/stash tiles
 
 
 def _star_polygon(cx: float, cy: float, r: float) -> QPolygonF:
@@ -97,6 +98,10 @@ class GridView(QAbstractScrollArea):
         self.content_h = 0
         self.cols = 1
         self.selected = -1  # catalog index
+        # Reveal toggle: when True the default ("All photos"/folder) view
+        # also shows hidden=yes photos and stash-folder files, veiled so
+        # they read as not-normally-shown. Owned/driven by MainWindow.
+        self.reveal = False
 
         # decode machinery (balloon lineage)
         self.generation = 0  # bumped on zoom/cache change; stale results drop
@@ -183,7 +188,8 @@ class GridView(QAbstractScrollArea):
             return
         cat = self.catalog
         if indices is None:
-            indices = [i for i, p in enumerate(cat.photos) if p.visible]
+            indices = [i for i, p in enumerate(cat.photos)
+                       if p.visible or self.reveal]
         self.filter_label = label
         by_folder: dict[str, _Group] = {}
         for i in indices:
@@ -502,6 +508,10 @@ class GridView(QAbstractScrollArea):
                                r.y() + (self.tile - dh) // 2, dw, dh)
                 painter.drawImage(target, img)
             photo = self.catalog.photos[idx]
+            # Reveal mode shows hidden=yes / stash files; veil them so they
+            # read as not-normally-shown (star + selection stay on top).
+            if self.reveal and not photo.visible:
+                painter.fillRect(r, HIDDEN_VEIL)
             if photo.star:
                 s = max(7.0, self.tile / 14.0)
                 painter.setPen(Qt.PenStyle.NoPen)

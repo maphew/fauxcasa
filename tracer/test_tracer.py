@@ -414,6 +414,60 @@ def test_default_cache_root_frozen_vs_checkout(monkeypatch, tmp_path: Path) -> N
             == tmp_path / "home" / ".cache" / "fauxcasa-tracer")
 
 
+def test_reveal_total_count_and_filter(library: Path, tmp_path: Path) -> None:
+    """Folder.total_count counts ALL photos (hidden + stash) for reveal-mode
+    UI; it is derived on both scan and load. The grid's default filter shows
+    visible-only until reveal is set, then every photo."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from grid import GridView
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    cat = scan_library(library)
+    assert cat.visible_count == 2  # a.jpg + c.jpg
+    trip = cat.folders["2020-01-01 Trip"]
+    assert trip.photo_count == 1 and trip.total_count == 2  # a visible, b hidden
+    stash = cat.folders["2020-01-01 Trip/.picasaoriginals"]
+    assert stash.photo_count == 0 and stash.total_count == 1  # the stashed orig
+
+    # total_count is derived on the warm-load path too (never persisted)
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+    loaded = load_catalog(path, library)
+    assert loaded.folders["2020-01-01 Trip"].total_count == 2
+    assert loaded.folders["2020-01-01 Trip/.picasaoriginals"].total_count == 1
+
+    g = GridView()
+    g.set_data(cat, None)
+    assert len(g.display) == 2  # default view: visible only
+    g.reveal = True
+    g.set_filter(None, "")
+    assert len(g.display) == 4  # reveal: hidden b.jpg + stashed orig appear
+
+
+def test_mainwindow_reveal_toggle(library: Path) -> None:
+    """The 'Show hidden' checkbox flips the grid into reveal mode and back,
+    rebuilding the sidebar and the All-photos view each way."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    assert not win.grid.reveal and len(win.grid.display) == 2
+    win.reveal_box.setChecked(True)  # fires _toggle_reveal(True)
+    assert win.grid.reveal and len(win.grid.display) == 4
+    win.reveal_box.setChecked(False)
+    assert not win.grid.reveal and len(win.grid.display) == 2
+
+
 def test_pcts_nearest_rank() -> None:
     """bench_scroll.pcts uses a nearest-rank LOWER index so a sub-1.0
     quantile never overshoots to the max (the documented int(n*q)==n trap

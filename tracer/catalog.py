@@ -65,6 +65,7 @@ class Folder:
     title: str
     description: str | None = None
     photo_count: int = 0  # visible photos only
+    total_count: int = 0  # all photos incl. hidden/stash (reveal-mode counts)
 
 
 @dataclass
@@ -242,6 +243,7 @@ def scan_library(root: Path) -> Catalog:
                     )
 
     for i, photo in enumerate(photos):
+        folders[photo.folder].total_count += 1  # reveal-mode count
         if not photo.visible:
             continue
         folders[photo.folder].photo_count += 1
@@ -360,6 +362,7 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
                 folders[p.folder] = Folder(
                     rel=p.folder, title=title,
                     description=folder_desc.get(p.folder))
+            folders[p.folder].total_count += 1  # reveal-mode count
             if p.visible:
                 folders[p.folder].photo_count += 1
 

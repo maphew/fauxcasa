@@ -77,9 +77,11 @@ Tests: `uv run tracer/test_tracer.py`
 - Search is a linear scan (fast enough ≤100k), not the per-photo word
   index the spec names.
 - `hidden=yes` photos and stash folders (`.picasaoriginals/`, legacy
-  `Originals/`) are excluded from every view (no reveal toggle yet);
-  the folder-level "Hidden Folders" category is ignored. No faces, no
-  edits, no writes.
+  `Originals/`) are hidden by default; a **"Show hidden"** toggle reveals
+  them (drawn veiled) across the All/Folders/Starred/Search views. Album
+  membership stays visible-only, and the folder-level "Hidden Folders"
+  category is still ignored — it needs an oracle fixture for its
+  `category=` value. No faces, no edits, no writes.
 - In-file IPTC/XMP is not read: real Picasa stores JPEG captions in
   IPTC, so those are invisible here (ini `caption=` covers the rest).
 - EXIF orientation is not applied anywhere — uniformly stored-pixel
