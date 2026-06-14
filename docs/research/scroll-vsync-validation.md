@@ -110,7 +110,7 @@ pre-mortem:
 - Provenance recorded: refresh, **devicePixelRatio = 2.0** (the 1280×800
   logical window is a **2528×1596 device-pixel** backing store — 4× the
   balloon's pixel count), backing-store px, cols, group/star/rotate
-  fractions, prefetch/cache_cap, on_ac, governor.
+  fractions, prefetch/cache_bytes/cache_max_entries, on_ac, governor.
 
 What we **cannot** measure in-process: true scanout timestamps (Qt doesn't
 use `wp_presentation`). The commit cadence (§5) is the honest proxy.

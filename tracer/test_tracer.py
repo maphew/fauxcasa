@@ -450,22 +450,90 @@ def test_reveal_total_count_and_filter(library: Path, tmp_path: Path) -> None:
 
 def test_mainwindow_reveal_toggle(library: Path) -> None:
     """The 'Show hidden' checkbox flips the grid into reveal mode and back,
-    rebuilding the sidebar and the All-photos view each way."""
+    rebuilding the sidebar (the stash folder reappears) and the status
+    counts (reveal-mode photo/folder tallies), not just the grid filter."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
     from main import MainWindow
 
     app = QApplication.instance() or QApplication([])
     assert app is not None
+
+    def folder_rels(win) -> set:
+        rels = set()
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            data = it.value().data(0, Qt.ItemDataRole.UserRole)
+            if data and data[0] == "folder":
+                rels.add(data[1])
+            it += 1
+        return rels
+
+    STASH = "2020-01-01 Trip/.picasaoriginals"
     cat = scan_library(library)
     win = MainWindow(cat, None, cache_dir=None, build_dir=None)
 
+    # default: visible-only grid, sidebar (no stash folder), and counts
     assert not win.grid.reveal and len(win.grid.display) == 2
+    assert STASH not in folder_rels(win)
+    assert "2 photos · 2 folders" in win.counts_label.text()
+
     win.reveal_box.setChecked(True)  # fires _toggle_reveal(True)
     assert win.grid.reveal and len(win.grid.display) == 4
+    assert STASH in folder_rels(win)  # stash folder revealed in the tree
+    assert "4 photos · 3 folders" in win.counts_label.text()
+
     win.reveal_box.setChecked(False)
     assert not win.grid.reveal and len(win.grid.display) == 2
+    assert STASH not in folder_rels(win)
+    assert "2 photos · 2 folders" in win.counts_label.text()
+
+
+def test_pump_decoded_byte_accounting() -> None:
+    """_pump_decoded keeps _cache_bytes exact when an index is re-decoded
+    in place (the live-build re-feed path): the previous tile's bytes are
+    subtracted exactly once. Only the product feed->done->_pump path hits
+    this branch, so drive it directly here."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtWidgets import QApplication
+    from grid import GridView
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    g = GridView()
+
+    def tile(px: int) -> QImage:
+        im = QImage(px, px, QImage.Format.Format_RGB32)
+        im.fill(QColor(1, 2, 3))
+        return im
+
+    big, small = tile(128), tile(64)
+    gen = g.generation
+
+    g.done.put((gen, 7, big))           # first decode of idx 7
+    g._pump_decoded()
+    assert g.tiles[7][2] == big.sizeInBytes()
+    assert g._cache_bytes == big.sizeInBytes()
+
+    g.done.put((gen, 7, small))         # re-decode same idx, smaller image
+    g._pump_decoded()
+    assert g.tiles[7][2] == small.sizeInBytes()
+    assert g._cache_bytes == small.sizeInBytes()  # NOT big + small
+    assert g._cache_bytes == sum(t[2] for t in g.tiles.values())
+
+    g.done.put((gen, 7, None))          # re-decode to an error tile: 0 bytes
+    g._pump_decoded()
+    assert g.tiles[7][0] is None and g.tiles[7][2] == 0
+    assert g._cache_bytes == 0
+
+    # a stale-generation result is dropped and must not touch the counter
+    g.done.put((gen - 1, 9, big))
+    g._pump_decoded()
+    assert 9 not in g.tiles and g._cache_bytes == 0
 
 
 def test_pcts_nearest_rank() -> None:
