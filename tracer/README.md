@@ -17,6 +17,7 @@ source of truth.
 |---|---|---|
 | Library scan in place | `catalog.py` | walk rule byte-identical to `make-thumbcache.py`, so catalog order == cache order |
 | Picasa metadata | `catalog.py` → `scripts/picasa_db.py` | stars, captions, keywords, rotate, hidden, albums, folder names/descriptions from `.picasa.ini` |
+| In-file metadata | `catalog.py` → `inmeta.py` (at index) | JPEG captions/keywords from XMP `dc:description`/`dc:subject` + IPTC 2:120/2:25 — in-file wins over the ini for tier-1 (§4). EXIF orientation baked at decode |
 | Thumbnail cache | `thumbcache.py` | reads/builds packed fcache; machine-local under `cache/tracer-cache/` (N1/N3); identity = sha256 + relpath, staleness = size+mtime cheap signals (N6). Parallel indexer (threads + **scaled decode**) — see below |
 | Persistent catalog | `catalog.py` | full catalog (metadata + structure + signals) serialized to JSON; a **warm start loads it and skips the walk** (§7 cold start). Background reconcile diffs cheap signals and rebuilds + atomically swaps on drift |
 | Virtualized grid | `grid.py` | balloon lineage: threaded fcache decode, bounded LRU — plus event-driven repaint, real scrollbar, group headers w/ pinned current folder, selection, star badges, error tiles. Never reads originals (N4) |
@@ -58,7 +59,34 @@ QT_QPA_PLATFORM=offscreen uv run tracer/main.py cache/benchmark-library \
 QT_QPA_PLATFORM=offscreen uv run tracer/main.py --quit-after-ready
 ```
 
+From a **frozen bundle** there is no bundled synthetic library, so a
+no-arg launch opens the library you last picked (remembered in
+`<cache-root>/config.json`) or, on first run, prompts for a folder; pass
+a library path to override. A headless frozen launch with no library
+exits cleanly rather than blocking on a dialog nobody can answer.
+
 Tests: `uv run tracer/test_tracer.py`
+
+## EXIF orientation
+
+Policy (decided here; matches Picasa and every modern viewer): **EXIF
+orientation is applied at decode**, so photos display upright, and the
+Picasa `rotate=` user quarter-turns compose *on top* of the corrected
+image. The two transforms are independent — EXIF is the camera's stored
+intent (`picasa-ini-format.md`: "EXIF orientation handling is the
+consumer's job"), `rotate=` is a user gesture relative to stored pixels.
+
+It is applied **consistently across every path**: the in-app indexer
+(`thumbcache.py`, `QImageReader.setAutoTransform`) and the standalone
+builder (`scripts/make-thumbcache.py`, PIL `ImageOps.exif_transpose`)
+bake it into the thumbnail; the viewer auto-transforms the original on
+read. All three use the library's own orientation logic, so all eight
+orientations — mirrors included — are handled correctly without any
+hand-rolled transform. The thumbnail is thus stored display-upright; only
+the cheap `rotate=` turns stay a live display transform, so a rotate never
+invalidates the cache. Synthetic/benchmark photos carry no Orientation
+tag, so the shipped benchmark `.fcache` is pixel-identical under this
+policy and stays valid.
 
 ## Deliberate tracer shortcuts (not product decisions)
 
@@ -82,10 +110,17 @@ Tests: `uv run tracer/test_tracer.py`
   membership stays visible-only, and the folder-level "Hidden Folders"
   category is still ignored — it needs an oracle fixture for its
   `category=` value. No faces, no edits, no writes.
-- In-file IPTC/XMP is not read: real Picasa stores JPEG captions in
-  IPTC, so those are invisible here (ini `caption=` covers the rest).
-- EXIF orientation is not applied anywhere — uniformly stored-pixel
-  rendering, consistent across grid/viewer/both cache builders.
+- In-file metadata is read for JPEG captions/keywords only (XMP
+  `dc:description`/`dc:subject`, IPTC 2:120/2:25 — `inmeta.py`), the
+  tier-1 fields the grid/search/viewer surface; faces-in-XMP, geotags,
+  and in-file dates are out of tracer scope (the product wraps a mature
+  metadata library, spec §5 P1). The read piggybacks on the index (the
+  bytes are already in hand for hashing), so a cold walk shows ini-only
+  captions until the index fills the in-file ones; warm starts load the
+  merged result from the persisted catalog. **Adopt mode (`--thumbs`)
+  binds an external cache without indexing, so its catalog stays ini-only
+  (no in-file ingest)** — the benchmark library it targets carries none
+  anyway; a real library wanting in-file captions runs a normal build.
 - Scripted quits (`--screenshot`/`--quit-after-ready`) abandon an
   in-flight cache build cleanly; it completes on a later run. Pass
   `--finish-build` to hold the quit until the cache lands (raise

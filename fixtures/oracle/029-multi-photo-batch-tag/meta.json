@@ -1,0 +1,141 @@
+{
+ "fixture": "029-multi-photo-batch-tag",
+ "note": "Multi-photo batch keyword, SAME-folder: selected Winter Holiday photo02+photo03 (click + shift-click), opened Tags panel (Ctrl+T), typed 'batchtag', Enter -> applied to BOTH in ONE action. Agent-driven on headless :3 (worktree oracle-batch3). SYNCHRONOUS: both JPEGs rewritten +846B each (identical XMP dc:subject + IPTC keyword, per 008). NEAR-IMMEDIATE flush (tag forced a db write-out, like caption 002): WH folder ini gained 'backuphash=60086' under BOTH [photo02] and [photo03] (ONE ini, two sections, one action); imagedata_backuphash[13],[14] 0->60086 (db mirror); imagedata_tags[13],[14] ''->'batchtag'; imagedata_originslow[13],[14] 0->nonzero. thumbindex photo03 row updated (size grew). albumdata_inisync[8] WH tick + date[16] Search-results churn. KEY FINDINGS: (1) batch = N atomic per-photo writes in one action; deltas = N copies of single-photo 008/009. (2) backuphash is SHARED -- same 60086 for both -> it is derived from the EDIT (the keyword), NOT per-photo content. (3) originslow is PER-PHOTO (0x4a95fdae5554f628 vs 0x52fce680cde37a90) -> a content hash set whenever the JPEG is rewritten; refines 028 (originslow is NOT revert-specific, it is a general 'content changed' marker, set here on tag-write). tags.txt stays empty (per 008). NOTE: imagedata rows [13]/[14] = photo02/photo03. STILL UNTESTED (fauxcasa-ezn): CROSS-folder batch (photos in 2 folders in one action -> do 2 separate .picasa.ini files get written atomically?).",
+ "captured": "2026-06-14T00:34:46+00:00",
+ "baseline": {
+  "label": "manual",
+  "created": "2026-06-14T00:27:41+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "69a3c258fec30fdb3d23fb67402d6979b5c26478a949d82f0a5bf6e247f12f39",
+    "size": 156
+   },
+   "after": {
+    "sha256": "a38a92dcb06dadcfeb025a7b1f82b854536b16882f71224859ded141fd8e5db8",
+    "size": 156
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "5c5a8e93151a384ec8c945dfb29fa928f96d2dea4d84d0fe9a33a179589a9319",
+    "size": 108
+   },
+   "after": {
+    "sha256": "689a0cd3e995a6dca3bffd8b2cc113801a0a9b18142caa67bef3e773b5214ccc",
+    "size": 108
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "02cb4467e2aeeea34f73339199f1966ea485f0c381f0e9a9d1c1502de9380098",
+    "size": 70
+   },
+   "after": {
+    "sha256": "7d10ac93b942f859e20df88d0b1ac77ec2f8b994841163c2bc14e56a3fc0e7b0",
+    "size": 70
+   }
+  },
+  "db3/imagedata_originslow.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "4e9b06929e66b8abd59aef871f68297448245a255266fca5e3e700c422b38685",
+    "size": 220
+   },
+   "after": {
+    "sha256": "f35215a5f38a4e300fd986602339b56854e50b3ac7c24f44471189a2c5def679",
+    "size": 220
+   }
+  },
+  "db3/imagedata_tags.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "838ef0ac14a3880865ab1bbae94eefb66f95fb77b8f73f03922e9945c16ad5e7",
+    "size": 69
+   },
+   "after": {
+    "sha256": "24e3e328561198aa3f794c479fca7dd2911d3d3a73781065f2c001b5339d74ef",
+    "size": 85
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "0a1674d2cebf393e60f992d57889c7576a36fde1360d37cdf77d3e4e5e9616db",
+    "size": 1301
+   },
+   "after": {
+    "sha256": "34c161e79873d0175dd953f134237ea10acabb956bfb1fa9d253fe9ffa0d35fc",
+    "size": 1301
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "f6214acf0286f4f9912016d254dbe901ee14b02f37dd7ad057861b8568fefd8f",
+    "size": 66872
+   },
+   "after": {
+    "sha256": "f35a9aa848ab6f28570393794d8df4e584818cadad34ce10393573c15d48f24d",
+    "size": 66904
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d9a70c7b8631866485400665a63a9363f14af98d19b298ae1cf2734be7d92630",
+    "size": 139
+   },
+   "after": {
+    "sha256": "88744d035dc47a5dc661b915e90bed5cf55cfa4865c1987df9043ccd3c99deef",
+    "size": 190
+   }
+  },
+  "library/2010-12-25 Winter Holiday/photo02.jpg": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "f49f60d3719f1f822e2e3f92ecb8c47c73cf46328998a9e255769fe88e302d75",
+    "size": 113954
+   },
+   "after": {
+    "sha256": "85bfaed39ae74df0ca5dde099cc9b51b8f100c6c7905ad9b5b3fd54f09018f5a",
+    "size": 114800
+   }
+  },
+  "library/2010-12-25 Winter Holiday/photo03.jpg": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "850882b1b7ba33e78241f50a5d5b07038a4af1ad7cf1dddc9da875fa55f23852",
+    "size": 27636
+   },
+   "after": {
+    "sha256": "417be3b80eb422f13dfb8ddf0d087d036bfb00ab56ed1b32afbcb2c1c1f641b9",
+    "size": 28482
+   }
+  }
+ }
+}

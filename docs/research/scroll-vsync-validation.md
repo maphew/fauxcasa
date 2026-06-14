@@ -244,12 +244,17 @@ artifact users would get, not on source.
   ubuntu-latest (`fail-fast: false`), runs the frozen artifact headless,
   **asserts the screenshot is non-blank**, prints bundle size to the step
   summary (warn-only > 200 MB), uploads the bundle + screenshot.
-- **Known follow-up (not blocking):** `main.py`'s `__file__`-relative
-  default library / `--cache-root` point inside the (read-only) bundle when
-  frozen — fine for the CI smoke (it passes explicit paths) and a
-  no-arg launch fails *gracefully* ("library not found"), but a shipping
-  double-click build should derive a writable cache dir under
-  `getattr(sys, 'frozen', False)`. Filed as a follow-up bead.
+- **Frozen-bundle defaults (resolved, fauxcasa-9cz):** `main.py`'s
+  `__file__`-relative defaults would point inside the read-only bundle when
+  frozen. Both halves now branch on `getattr(sys, 'frozen', False)`:
+  `--cache-root` defaults to a per-user writable dir
+  (`$XDG_CACHE_HOME`/`~/.cache/fauxcasa-tracer`), and the library defaults
+  to the one you last opened (remembered in `<cache-root>/config.json`),
+  else a first-run folder picker. A headless/offscreen launch with no
+  library can't prompt, so it exits 2 with a friendly message instead of
+  blocking on a modal dialog — the bundle smoke asserts this graceful
+  no-arg path. (A source checkout is unchanged: the bundled synthetic
+  library stays the default.)
 
 ## 8. Reproduce
 

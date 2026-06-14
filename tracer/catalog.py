@@ -10,12 +10,23 @@ photo. Scanning never writes into the library (N1); metadata parsing
 reuses scripts/picasa_db.py, the project's researched Picasa-format
 reader.
 
-Known tracer-scope gaps (see tracer/README.md): in-file IPTC/XMP
-captions/keywords are not read (real Picasa stores JPEG captions in
-IPTC, ini caption= covers other formats), EXIF orientation is not
-applied anywhere (uniformly stored-pixel rendering, matching the
-thumbnail builders), and the folder-level Hidden Folders category is
-ignored — only per-photo hidden=yes (oracle fixture 017) is honored.
+Captions/keywords precedence (§4 tier-1): scan_library fills
+caption/keywords from the ini here; the indexer (thumbcache.build_cache,
+via tracer/inmeta.py) then overrides them with a JPEG's in-file
+XMP/IPTC values when present — real Picasa stores JPEG captions/keywords
+in-file and uses ini caption=/keywords= only for formats with no
+XMP/IPTC home. So a freshly walked but not-yet-indexed catalog shows
+ini-only captions; once indexed, the persisted catalog and warm starts
+carry the merged result. Adopt mode (--thumbs) is the exception: it binds
+an external thumbnail cache without running the indexer, so its catalog
+stays ini-only (the in-file read piggybacks on the index's file reads,
+which adopt mode skips by design — N4). See tracer/README.md.
+
+Remaining tracer-scope gaps (see tracer/README.md): EXIF orientation is
+applied at decode (Qt/PIL auto-transform, composed with the rotate= user
+turns), but faces-in-XMP, geotags, and in-file dates are not ingested,
+and the folder-level Hidden Folders category is ignored — only per-photo
+hidden=yes (oracle fixture 017) is honored.
 """
 
 from __future__ import annotations
@@ -267,7 +278,17 @@ def scan_library(root: Path) -> Catalog:
 # the spec's ~50 B/photo binary-catalog target — a compact binary catalog
 # is future work (a tracer is JSON-first).
 
-CATALOG_VERSION = 1
+# Bump when a code change alters what an indexed catalog should contain, so
+# load_catalog rejects pre-change machine-local catalogs and main() does a
+# cold walk + rebuild instead of warm-starting stale data. v2: the indexer
+# now reads in-file XMP/IPTC captions/keywords and bakes EXIF orientation
+# into the thumbnail (fauxcasa-w9e) — a v1 catalog has neither, and nothing
+# in the cheap size/mtime drift check would notice (the files are unchanged;
+# only our interpretation of them changed). The fcache MAGIC version is left
+# at 1 on purpose: the packed thumbnail format is unchanged, and the shipped
+# benchmark .fcache stays adoptable (its synthetic photos carry no
+# Orientation tag, so the bake is a no-op).
+CATALOG_VERSION = 2
 
 
 def _photo_to_row(p: Photo) -> dict:
@@ -320,7 +341,10 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
     walk). Derives folder/name/visible and folder title/photo_count the
     same way scan_library does. Caveat: empty-string caption/description
     are normalized to None on both paths, so a loaded catalog matches a
-    freshly walked one for every field consumers read."""
+    freshly walked-AND-indexed one for every field consumers read — the
+    persisted catalog carries the merged in-file caption/keywords that the
+    indexer wrote, which a scan-only walk has not yet applied (see the
+    module docstring)."""
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):

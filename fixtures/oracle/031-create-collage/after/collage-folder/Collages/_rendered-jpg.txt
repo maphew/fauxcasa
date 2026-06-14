@@ -1,0 +1,3 @@
+rendered collage output (derived, not committed):
+  Jun bytes  Project.jpg'
+  dims: 5120x3413 (10x15 @ ~341dpi), JPEG

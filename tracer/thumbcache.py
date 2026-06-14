@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Callable
 
 from catalog import Catalog
+from inmeta import read_jpeg_metadata
 
 MAGIC = b"FCTC"
 THUMB_EDGE = 256
@@ -136,10 +137,17 @@ class IndexResult:
 
 def _index_one(root: Path, photo, idx: int):
     """One photo: read bytes, sha256 (N6 identity), SCALED-decode to the
-    256 px thumb box (libjpeg DCT decode — see INDEX_WORKERS), JPEG-encode.
-    Returns everything the fcache and the persisted catalog need, plus the
-    QImage for the live grid feed. A null/corrupt image yields a
-    zero-length blob (error tile)."""
+    256 px thumb box (libjpeg DCT decode — see INDEX_WORKERS), JPEG-encode,
+    and read in-file caption/keywords (XMP/IPTC) from the bytes already in
+    hand. Returns everything the fcache and the persisted catalog need, plus
+    the QImage for the live grid feed. A null/corrupt image yields a
+    zero-length blob (error tile).
+
+    EXIF orientation IS applied here (setAutoTransform): the thumbnail is
+    baked display-upright, so the grid, the viewer (which auto-transforms the
+    original), and both cache builders agree. The Picasa rotate= user
+    quarter-turns are a separate, live display transform composed on top (see
+    grid/viewer); a rotate change never invalidates the cache."""
     from PySide6.QtCore import QBuffer, QIODevice, QSize, Qt
     from PySide6.QtGui import QImageReader
 
@@ -151,6 +159,7 @@ def _index_one(root: Path, photo, idx: int):
     except OSError:
         data, size, mtime = b"", -1, -1
     sha = hashlib.sha256(data).hexdigest()
+    meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG only)
 
     # setData copies into the buffer's own QByteArray; passing a temporary
     # QByteArray to QBuffer(...) instead leaves a dangling pointer (PySide6
@@ -159,7 +168,12 @@ def _index_one(root: Path, photo, idx: int):
     buf.setData(data)
     buf.open(QIODevice.OpenModeFlag.ReadOnly)
     reader = QImageReader(buf)
-    reader.setAutoTransform(False)  # stored-pixel orientation (see catalog.py)
+    # Apply EXIF orientation at decode (handles all 8 cases, mirrors too);
+    # the thumbnail is stored display-upright. setScaledSize is in pre-
+    # transform pixels — for a 90/270 image the box edges swap but both stay
+    # <= THUMB_EDGE, and the post-read clamp below covers any header that
+    # couldn't be pre-sized.
+    reader.setAutoTransform(True)
     sz = reader.size()  # header-only; full pixels not decoded yet
     if sz.isValid() and (sz.width() > THUMB_EDGE or sz.height() > THUMB_EDGE):
         s = min(THUMB_EDGE / sz.width(), THUMB_EDGE / sz.height())
@@ -167,7 +181,7 @@ def _index_one(root: Path, photo, idx: int):
                                    max(1, round(sz.height() * s))))
     img = reader.read()
     if img.isNull():
-        return idx, b"", 0, 0, size, mtime, sha, None
+        return idx, b"", 0, 0, size, mtime, sha, meta, None
     # formats whose header size was unreadable skip the scaled decode above
     if img.width() > THUMB_EDGE or img.height() > THUMB_EDGE:
         img = img.scaled(
@@ -179,7 +193,7 @@ def _index_one(root: Path, photo, idx: int):
     out.open(QIODevice.OpenModeFlag.WriteOnly)
     img.save(out, "JPEG", JPEG_QUALITY)
     return idx, bytes(out.data()), img.width(), img.height(), size, mtime, \
-        sha, img
+        sha, meta, img
 
 
 def build_cache(
@@ -214,11 +228,20 @@ def build_cache(
             if cancel is not None and cancel.is_set():
                 pool.shutdown(wait=False, cancel_futures=True)
                 return None
-            idx, blob, w, h, size, mtime, sha, img = fut.result()
+            idx, blob, w, h, size, mtime, sha, meta, img = fut.result()
             blobs[idx] = blob
             dims[idx] = (w, h)
             photo = catalog.photos[idx]
             photo.size, photo.mtime, photo.sha256 = size, mtime, sha
+            # §4 precedence: in-file metadata wins over the ini for tier-1
+            # data (captions, keywords) on JPEGs. scan_library already set
+            # any ini value; override only when the file actually carries
+            # one (truthy), so non-JPEGs, untagged JPEGs, and a JPEG with an
+            # empty in-file caption all keep their ini caption/keywords.
+            if meta.caption:
+                photo.caption = meta.caption
+            if meta.keywords:
+                photo.keywords = meta.keywords
             if progress:
                 progress(idx, total, img)
     elapsed = time.perf_counter() - t0

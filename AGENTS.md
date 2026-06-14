@@ -13,6 +13,26 @@ This project uses **bd** (beads) for issue tracking. Run `bd prime` for full wor
 > source of truth; don't `bd import` during normal operation; don't
 > reach for third-party Dolt hosting before trying the default).
 
+## Working safely: commit early and often
+
+**Owner directive (maphew, 2026-06-14): never wait to be asked to commit.**
+Commit each working increment as you go so progress survives power loss,
+crashes, and context resets — re-runnable state is the goal. This is a
+standing instruction and **overrides the conservative "don't commit/push
+unless asked" default** in the managed Beads block below (which itself
+defers to current instructions).
+
+- **Commit** every coherent, green (tests/build pass) increment on a feature
+  branch — don't batch a whole session into one commit, and don't end a
+  session with uncommitted work.
+- Use **branches + worktrees** to isolate work and **PRs** to integrate;
+  with **beads** and **commits** these are the safety nets — use them
+  freely, not only at session close.
+- **Push** (`git push` / `bd dolt push`) at natural checkpoints so the net
+  reaches the remote, not just local disk.
+- The only override: a *current* "do not commit" / "do not push" instruction
+  still wins for that session.
+
 ## Quick Reference
 
 ```bash
@@ -73,9 +93,22 @@ bd close <id>         # Complete work
 
 The managed Beads block is task-tracking guidance, not permission to override repository, user, or orchestrator instructions.
 
-- **Conservative (default)**: Use `bd` for task tracking. Do not run git commits, git pushes, or Dolt remote sync unless explicitly asked. At handoff, report changed files, validation, and suggested next commands.
-- **Minimal**: Keep tool instruction files as pointers to `bd prime`; use the same conservative git policy unless active instructions say otherwise.
-- **Team-maintainer**: Only when the repository explicitly opts in, agents may close beads, run quality gates, commit, and push as part of session close. A current "do not commit" or "do not push" instruction still wins.
+**Active profile: team-maintainer** (repository opt-in by maphew, 2026-06-11).
+
+**Working safely — commit early and often, in a worktree.** Don't wait to
+be asked to commit. Default to working in a dedicated git worktree on a
+feature branch — **always use a worktree unless asked otherwise** — and
+commit each working (tests/build green) increment proactively as you go, so
+progress survives crashes, power loss, and context resets — re-runnable
+state is the goal. Branches, worktrees, beads, commits, and PRs are safety
+nets; use them freely, not only at session close. Push (`git push` / `bd
+dolt push`) at natural checkpoints so the net reaches the remote. Only a
+current "do not commit"/"do not push" instruction overrides this for that
+session.
+
+- **Conservative**: Use `bd` for task tracking. At handoff, report changed files, validation, and suggested next commands.
+- **Minimal**: Keep tool instruction files as pointers to `bd prime`.
+- **Team-maintainer**: Agents close beads, run quality gates, commit early and often, and push at natural checkpoints and session close.
 
 ## Session Completion
 
@@ -86,10 +119,8 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 3. **Update issue status** - Close finished work, update in-progress items
 4. **Handle git/sync by active profile**:
    ```bash
-   # Conservative/minimal/default: report status and proposed commands; wait for approval.
-   git status
-
-   # Team-maintainer opt-in only, unless current instructions forbid it:
+   # Commit working increments as you go (worktree + feature branch). At
+   # checkpoints and session close, also reach the remote — unless told not to:
    git pull --rebase
    bd dolt push
    git push
@@ -99,7 +130,7 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 **Critical rules:**
 - Explicit user or orchestrator instructions override this Beads block.
-- Do not commit or push without clear authority from the active profile or the current user request.
+- Commit early and often to keep work safe; push at natural checkpoints. Only a current "do not commit"/"do not push" instruction holds you back.
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
 

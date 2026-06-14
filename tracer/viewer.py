@@ -67,7 +67,15 @@ class ViewerPage(QWidget):
             # decode, and the emit is guarded against Qt teardown.
             if serial != self._serial:
                 return
-            img = QImage(path)
+            # Apply EXIF orientation on read (setAutoTransform), so the
+            # viewer matches the EXIF-baked grid thumbnails; the Picasa
+            # rotate= user quarter-turns compose on top. See tracer/README
+            # "EXIF orientation".
+            from PySide6.QtGui import QImageReader
+
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            img = reader.read()
             if serial != self._serial:
                 return
             if not img.isNull() and rotate:
