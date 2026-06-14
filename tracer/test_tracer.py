@@ -946,6 +946,219 @@ def test_prompt_for_library_headless_returns_none(tmp_path: Path) -> None:
     assert main._prompt_for_library(tmp_path) is None
 
 
+def test_gui_unavailable_decided_before_qapplication(monkeypatch) -> None:
+    """main._gui_unavailable (fauxcasa-7e5 fix 1) decides headlessness from
+    the ENVIRONMENT ALONE — it must NOT construct a QApplication, because on
+    Linux with the default xcb plugin and no DISPLAY/WAYLAND, QApplication([])
+    aborts the process (exit 134) before any in-process guard can run. A
+    headless Qt platform (offscreen/minimal/vnc) is unavailable; otherwise on
+    Linux a real display (DISPLAY or WAYLAND_DISPLAY) is required, while a
+    non-Linux desktop is assumed to have one."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    for plat in ("offscreen", "minimal", "vnc", "offscreen:somearg"):
+        monkeypatch.setenv("QT_QPA_PLATFORM", plat)
+        assert main._gui_unavailable() is True
+
+    # No headless platform forced: fall through to the per-OS display check.
+    monkeypatch.delenv("QT_QPA_PLATFORM", raising=False)
+    monkeypatch.setattr(main.sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    assert main._gui_unavailable() is True             # Linux, no display
+    monkeypatch.setenv("DISPLAY", ":0")
+    assert main._gui_unavailable() is False            # X11 display present
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    assert main._gui_unavailable() is False            # Wayland present
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(main.sys, "platform", "darwin")
+    assert main._gui_unavailable() is False            # non-Linux: assume GUI
+
+
+def test_remembered_library_ignores_non_object_json(tmp_path: Path) -> None:
+    """main._remembered_library (fauxcasa-7e5 fix 2): a valid-but-non-object
+    config ('null', '42', '[]', a bare string/bool) has no .get and must be
+    treated as 'nothing remembered' (None) — NOT raise an AttributeError past
+    the (OSError, ValueError) catch and crash the launch with a traceback."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    cache_root = tmp_path / "cr"
+    cfg = main._config_path(cache_root)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    for blob in ("null", "42", "[]", '"just a path-shaped string"', "true"):
+        cfg.write_text(blob)
+        assert main._remembered_library(cache_root) is None
+
+
+def test_remember_library_atomic_leaves_no_temp(tmp_path: Path) -> None:
+    """fauxcasa-7e5 fix 3: the config is written via a temp sibling + atomic
+    os.replace, so after a successful remember only config.json exists — never
+    a half-written '.tmp' a concurrent frozen instance could read as torn."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    cache_root = tmp_path / "cr"
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    main._remember_library(cache_root, lib)
+    assert sorted(p.name for p in cache_root.iterdir()) == ["config.json"]
+    assert main._remembered_library(cache_root) == lib
+
+
+def test_remember_library_oserror_is_soft(tmp_path: Path, capsys) -> None:
+    """_remember_library (fauxcasa-7e5) is best-effort: an unwritable cache
+    root — here its parent is a regular file, so mkdir raises NotADirectoryError
+    (an OSError) — must NOT abort the launch. It reports on stderr, returns
+    cleanly, and leaves nothing behind."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file, not a directory")
+    cache_root = blocker / "cr"      # mkdir(parents=True) -> NotADirectoryError
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    main._remember_library(cache_root, lib)            # must not raise
+    assert "could not remember library choice" in capsys.readouterr().err
+    assert not cache_root.exists()
+
+
+def test_resolve_library_distinguishes_not_a_dir_from_missing(
+        monkeypatch, tmp_path: Path, capsys) -> None:
+    """_resolve_library (fauxcasa-7e5 fix 4): an explicit path that EXISTS but
+    is a regular file gets a clear 'not a folder' message; a path that simply
+    isn't there keeps 'library not found'. Both still resolve to None (exit 2),
+    but the wording no longer misleads a user who pointed at a file."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    monkeypatch.setattr(main, "FROZEN", False)
+    cache_root = tmp_path / "cr"
+
+    missing = tmp_path / "nope"
+    assert main._resolve_library(str(missing), cache_root) is None
+    assert "library not found" in capsys.readouterr().err
+
+    a_file = tmp_path / "afile.jpg"
+    a_file.write_text("not a directory")
+    assert main._resolve_library(str(a_file), cache_root) is None
+    err = capsys.readouterr().err
+    assert "not a folder" in err and "library not found" not in err
+
+
+def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
+    """_prompt_for_library happy path (fauxcasa-62b): with a GUI available and
+    the user choosing a folder, it returns the resolved choice AND remembers it
+    for the next no-arg launch. Both headless guards — the env pre-check and the
+    offscreen platformName backstop — are bypassed so the picker body runs; a
+    cancelled (empty) picker still yields None."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QFileDialog
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    chosen = tmp_path / "MyPhotos"
+    chosen.mkdir()
+    cache_root = tmp_path / "cr"
+
+    monkeypatch.setattr(main, "_gui_unavailable", lambda: False)
+    monkeypatch.setattr(QApplication, "platformName", lambda self: "xcb")
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(chosen)))
+
+    got = main._prompt_for_library(cache_root)
+    assert got == chosen.resolve()
+    # the choice is persisted so the next double-click reopens it
+    assert main._remembered_library(cache_root) == chosen.resolve()
+
+    # a cancelled picker (empty string) returns None
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: ""))
+    assert main._prompt_for_library(tmp_path / "cr2") is None
+
+
+def test_main_bad_library_exits_2(tmp_path: Path) -> None:
+    """End-to-end main() via subprocess (fauxcasa-62b): an explicit but
+    nonexistent library exits 2 with a friendly message and NO traceback.
+    Running the real process WITHOUT --cache-root also exercises the
+    cache-root defaulting branch and the argparse wiring that the unit-level
+    _resolve_library tests skip."""
+    import os
+    import subprocess
+    main_py = Path(__file__).resolve().parent / "main.py"
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    missing = tmp_path / "no-such-library-here"
+    proc = subprocess.run([sys.executable, str(main_py), str(missing)],
+                          capture_output=True, text=True, env=env)
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
+    assert "library not found" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="exercises the Linux no-DISPLAY pre-construction guard")
+def test_frozen_noarg_headless_exits_2_without_aborting(tmp_path: Path) -> None:
+    """Regression for fauxcasa-7e5 fix 1 (fauxcasa-62b): a FROZEN no-arg launch
+    on Linux with DISPLAY, WAYLAND_DISPLAY and QT_QPA_PLATFORM ALL UNSET must
+    reach the friendly 'no library selected' exit 2 — NOT abort (exit 134)
+    inside QApplication([]) under the default xcb plugin. The pre-construction
+    _gui_unavailable guard returns before any QApplication is built. This is
+    the unit-speed twin of the frozen-bundle CI leg in bundle.yml."""
+    import os
+    import subprocess
+    tracer_dir = Path(__file__).resolve().parent
+    cache_root = tmp_path / "cr"
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(tracer_dir)!r})\n"
+        "import main\n"
+        "main.FROZEN = True\n"            # simulate a PyInstaller bundle
+        f"sys.argv = ['fauxcasa-tracer', '--cache-root', {str(cache_root)!r}]\n"
+        "sys.exit(main.main())\n"
+    )
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("DISPLAY", "WAYLAND_DISPLAY", "QT_QPA_PLATFORM")}
+    proc = subprocess.run([sys.executable, "-c", code],
+                          capture_output=True, text=True, env=env)
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
+    assert "no library selected" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_main_reuses_existing_qapplication(
+        monkeypatch, library: Path, tmp_path: Path) -> None:
+    """main() must consume a QApplication that already exists in the process —
+    as a frozen first-run picker leaves behind (main.py: `QApplication.instance()
+    or QApplication([])`) — rather than construct a second one, which Qt forbids.
+    Drive a full, self-quitting run on a tiny library and confirm the very same
+    app instance carried through and the run succeeded (exit 0)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    app = QApplication.instance() or QApplication([])   # pre-existing app
+    cache_root = tmp_path / "cr"
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(library), "--cache-root", str(cache_root),
+        "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    rc = main.main()
+    assert rc == 0
+    assert QApplication.instance() is app               # reused, never recreated
+
+
 def test_pcts_nearest_rank() -> None:
     """bench_scroll.pcts uses a nearest-rank LOWER index so a sub-1.0
     quantile never overshoots to the max (the documented int(n*q)==n trap
