@@ -794,6 +794,108 @@ def test_mainwindow_reveal_toggle(library: Path) -> None:
     assert "2 photos · 2 folders" in win.counts_label.text()
 
 
+@pytest.fixture()
+def reveal_library(tmp_path: Path) -> Path:
+    """A library whose one folder holds a visible starred photo and a
+    hidden=yes STARRED photo, so reveal mode changes BOTH a rendered
+    per-folder count (1 -> 2) and the Starred tally (1 -> 2) — exercising
+    _build_sidebar's fcount() and its (visible or reveal) star branch."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "shown.jpg")
+    make_jpeg(root / "Trip" / "secret.jpg")
+    (root / "Trip" / ".picasa.ini").write_text(
+        "[shown.jpg]\r\nstar=yes\r\n"
+        "[secret.jpg]\r\nstar=yes\r\nhidden=yes\r\n"
+    )
+    return root
+
+
+def test_reveal_sidebar_counts_and_starred(reveal_library: Path) -> None:
+    """Reveal mode updates the rendered per-folder count TEXT in the sidebar
+    AND the Starred tally (the hidden-starred path), and a Show-hidden toggle
+    PRESERVES the active (non-All) view rather than resetting to All photos
+    (fauxcasa-f5k / fauxcasa-x1l)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    def item_for(win, kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    cat = scan_library(reveal_library)
+    trip = cat.folders["Trip"]
+    assert trip.photo_count == 1 and trip.total_count == 2  # shown + hidden
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    # default (visible-only): the folder's rendered count is its 1 visible
+    # photo, and the Starred node counts only the visible starred photo.
+    folder_item = item_for(win, "folder", "Trip")
+    assert folder_item is not None and folder_item.text(0).endswith("(1)")
+    assert "(1)" in item_for(win, "starred", "").text(0)
+
+    # Drive an explicit, non-All view: select Starred.
+    win._sidebar_clicked(item_for(win, "starred", ""), 0)
+    assert win.grid.filter_label == "Starred" and len(win.grid.display) == 1
+
+    # Reveal: the per-folder count TEXT now includes the hidden photo (2),
+    # the Starred node text reflects the hidden starred secret.jpg (2), and
+    # the x1l preserved-context behaviour keeps us on Starred — NOT All — now
+    # showing both starred photos.
+    win.reveal_box.setChecked(True)
+    assert item_for(win, "folder", "Trip").text(0).endswith("(2)")
+    assert "(2)" in item_for(win, "starred", "").text(0)
+    assert win.grid.filter_label == "Starred"        # not reset to All
+    assert len(win.grid.display) == 2
+    assert "Starred: 2 photos" in win.counts_label.text()
+    # the sidebar highlight followed the preserved view
+    assert win.tree.currentItem() is item_for(win, "starred", "")
+
+    # Toggle back off: still on Starred, hidden photo gone, count TEXT 1 again.
+    win.reveal_box.setChecked(False)
+    assert win.grid.filter_label == "Starred" and len(win.grid.display) == 1
+    assert item_for(win, "folder", "Trip").text(0).endswith("(1)")
+    assert "(1)" in item_for(win, "starred", "").text(0)
+    assert "Starred: 1 photos" in win.counts_label.text()
+
+
+def test_reveal_preserves_search_view(library: Path) -> None:
+    """A Show-hidden toggle while a search is active keeps the search view
+    and recomputes it for the new reveal state, instead of clearing the box
+    and snapping to All photos (fauxcasa-x1l)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    # Search by extension: matches every photo's filename, but the default
+    # (visible-only) view excludes the hidden b.jpg and the stashed original.
+    win.search.setText(".jpg")
+    assert "Search" in win.counts_label.text()
+    visible_hits = len(win.grid.display)
+    assert visible_hits == 2  # a.jpg + c.jpg
+
+    win.reveal_box.setChecked(True)
+    assert win.search.text() == ".jpg"               # search box preserved
+    assert "Search" in win.counts_label.text()       # not reset to All
+    assert len(win.grid.display) == 4                 # hidden + stash now match
+
+
 def test_pump_decoded_byte_accounting() -> None:
     """_pump_decoded keeps _cache_bytes exact when an index is re-decoded
     in place (the live-build re-feed path): the previous tile's bytes are
