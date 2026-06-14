@@ -38,8 +38,8 @@ WORKERS = 4
 # tile is 256 KB; a non-square tile fit in the 256 box is smaller (e.g.
 # 256x171 ~175 KB) and an error tile is 0 bytes, so a flat entry cap would
 # mis-budget both ways. So bound by summed decoded bytes (CACHE_BYTES),
-# comfortably inside the §7 512 MB working set, with a generous entry
-# backstop (CACHE_MAX_ENTRIES) so a degenerate all-error library —
+# with a generous entry backstop (CACHE_MAX_ENTRIES) so a degenerate
+# all-error library —
 # zero-byte tiles, no byte pressure — still can't grow the dict without
 # bound. Headroom re-examination for the native-tile design: tiles are now
 # uniform across zoom, so the byte budget binds at ~1024 square tiles at
@@ -52,8 +52,13 @@ WORKERS = 4
 # current paint wants (the want-band), so eviction can't thrash the tiles a
 # paint needs; on an extreme window at min zoom the want-band alone can
 # exceed CACHE_BYTES, and _evict keeps it anyway (brief overshoot beats
-# thrash). Live scroll-fps verification on a real compositor is a required
-# follow-up — see tracer/bench_scroll.py.
+# thrash). MEASURED (fauxcasa-5br, bench_scroll.py --zoom min on the §7 100k
+# library): no scroll-fps regression vs the pre-z1e pre-scaled design at
+# default zoom; at MIN zoom the native-tile design costs ~2.6x paint p50 and
+# ~+326 MB RSS (pre 266 -> post 592 MB) — still inside the §7 gates (p99
+# ~13 ms < 32 ms) but total process RSS peaks ~590 MB: under the ~600 MB
+# working target, above the old 512 MB figure. Reclaiming that headroom
+# (lower CACHE_BYTES, or zoom-aware tile sizing) is tracked separately.
 CACHE_BYTES = 256 * 1024 * 1024
 CACHE_MAX_ENTRIES = 4096
 # Native decoded-tile edge: the cache's own thumb size. Tiles are decoded
