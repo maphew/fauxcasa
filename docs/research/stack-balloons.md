@@ -57,7 +57,16 @@ second, and the other three waited for each refresh before painting the
 next frame; py-qt's toolkit did not wait, painting ~250 frames/s. So its
 numbers measure how fast it can paint, not how smooth it looked. The
 honest reading: every single paint finished in under 10 ms, comfortably
-inside one 60 Hz refresh.
+inside one 60 Hz refresh. **[RETIRED 2026-06-13, fauxcasa-ncv]** The
+product grid was since measured on a real 165 Hz display + GPU running
+this same protocol (5 clean runs, ~15.8k frames each): frame *production*
+time p99 5.7 ms / max 10 ms, zero blanks, and the compositor's own log
+shows fresh buffers delivered every 5.9 ms while it paces at the 6.06 ms
+vsync — i.e. genuinely smooth on
+screen, not just fast offscreen. (Qt's raster QWidget is *unthrottled*
+here too, so the honest metric is frame-production time, not interval; the
+asterisk's concern is closed under that bounded claim.) Full method,
+numbers, and caveats: `docs/research/scroll-vsync-validation.md`.
 † Whole browser process tree; ~240 MB of it is the empty Chromium shell
 before any photos.
 ‡ Measured on each balloon's own clock. Wall-clock from process launch
@@ -179,9 +188,16 @@ Named consequences, owned now:
      Windows CI gates run on the artifact users would get. Bundle size
      will be Qt-typical (~100–150 MB installed); the spec already
      re-anchored austerity on memory and cold start, not installer
-     megabytes (§7).
+     megabytes (§7). **[DONE 2026-06-13, fauxcasa-ncv]**
+     `tracer/fauxcasa-tracer.spec` + `.github/workflows/bundle.yml`; the
+     frozen exe runs headless and decodes JPEG (non-blank screenshot).
    - py-qt's screen-sync caveat (the table's * note) gets retired by
      measuring the M1 grid on a real display with the same harness.
+     **[DONE 2026-06-13, fauxcasa-ncv]** — see the table note and
+     `docs/research/scroll-vsync-validation.md`.
+   - *Still owed:* the reference-class hardware run (cold start + scroll +
+     index-rate) — the above used dev hardware stronger than §7 reference,
+     so it is necessary, not sufficient.
 4. **The balloons stay in-tree and CI-built on Linux + Windows**
    (`.github/workflows/balloons.yml`) so any tripwire can rerun the
    race cheaply — including on the reference-class hardware when

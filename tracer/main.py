@@ -86,6 +86,17 @@ from viewer import ViewerPage  # noqa: E402
 APP_NAME = "Fauxcasa"
 
 REPO = Path(__file__).resolve().parent.parent
+FROZEN = getattr(sys, "frozen", False)
+
+
+def _default_cache_root() -> Path:
+    """REPO-relative in a source checkout; a per-user writable dir when
+    frozen — REPO then points inside the read-only PyInstaller bundle, so
+    the app's own disposable cache must go somewhere writable instead."""
+    if FROZEN:
+        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+        return Path(base) / "fauxcasa-tracer"
+    return REPO / "cache" / "tracer-cache"
 
 
 def read_rss_mb() -> tuple[float, float]:
@@ -502,9 +513,10 @@ def main() -> int:
     ap.add_argument("--thumbs", type=Path, default=None,
                     help="adopt an existing .fcache instead of building "
                          "one (e.g. cache/benchmark-thumbs.fcache)")
-    ap.add_argument("--cache-root", type=Path,
-                    default=REPO / "cache" / "tracer-cache",
-                    help="where the app keeps its own disposable caches")
+    ap.add_argument("--cache-root", type=Path, default=None,
+                    help="where the app keeps its own disposable caches "
+                         "(default: <repo>/cache/tracer-cache in a checkout, "
+                         "a per-user cache dir when run as a frozen bundle)")
     ap.add_argument("--rebuild", action="store_true",
                     help="ignore any existing tracer cache and rebuild")
     ap.add_argument("--zoom", type=int, default=160)
@@ -525,6 +537,8 @@ def main() -> int:
                     help="scripted runs (--screenshot/--quit-after-ready) "
                          "abort with exit 1 after this many seconds")
     args = ap.parse_args()
+    if args.cache_root is None:
+        args.cache_root = _default_cache_root()
 
     root = Path(args.library).expanduser().resolve()
     if not root.is_dir():
