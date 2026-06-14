@@ -123,9 +123,15 @@ def _remembered_library(cache_root: Path) -> Path | None:
     missing or garbage config file — recall is a convenience, not a gate."""
     try:
         data = json.loads(_config_path(cache_root).read_text())
-        lib = data.get("library")
     except (OSError, ValueError):
         return None
+    # A valid-but-non-object JSON value ('null', '42', '[]') parses fine but
+    # has no .get — guard it here, else the AttributeError escapes the
+    # (OSError, ValueError) catch and crashes the launch instead of being
+    # treated as 'nothing remembered'.
+    if not isinstance(data, dict):
+        return None
+    lib = data.get("library")
     if not isinstance(lib, str) or not lib:
         return None
     p = Path(lib)
@@ -134,13 +140,40 @@ def _remembered_library(cache_root: Path) -> Path | None:
 
 def _remember_library(cache_root: Path, library: Path) -> None:
     """Persist the chosen library so the next no-arg (double-click) launch
-    reopens it. Best-effort: a write failure must never abort the launch."""
+    reopens it. Best-effort: a write failure must never abort the launch.
+    Writes via a per-process temp sibling + os.replace so a second frozen
+    instance launching concurrently can never read a half-written (torn)
+    config — it sees either the old file or the whole new one."""
+    cfg = _config_path(cache_root)
+    tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
     try:
         cache_root.mkdir(parents=True, exist_ok=True)
-        _config_path(cache_root).write_text(
-            json.dumps({"library": str(library)}))
+        tmp.write_text(json.dumps({"library": str(library)}))
+        os.replace(tmp, cfg)
     except OSError as e:
         print(f"could not remember library choice: {e}", file=sys.stderr)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _gui_unavailable() -> bool:
+    """Whether a real windowing GUI is reachable — decided from the
+    ENVIRONMENT ALONE, before any QApplication is constructed. This matters
+    because on Linux the default 'xcb' plugin, given no DISPLAY/WAYLAND, makes
+    QApplication([]) call qFatal()/abort() (exit 134) — it dies before any
+    post-construction platformName() guard can run. A headless Qt platform
+    (offscreen/minimal/vnc), or a Linux session with neither DISPLAY nor
+    WAYLAND_DISPLAY, means nobody can answer a modal picker, so the caller
+    should bail to the friendly no-library path instead of crashing."""
+    plat = os.environ.get("QT_QPA_PLATFORM", "").split(":", 1)[0].strip()
+    if plat in ("offscreen", "minimal", "vnc"):
+        return True
+    if sys.platform.startswith("linux"):
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return True
+    return False
 
 
 def _prompt_for_library(cache_root: Path) -> Path | None:
@@ -148,10 +181,18 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     user to choose a photo-library folder and remember it. Returns None if
     cancelled — or, under a headless/offscreen platform, immediately,
     rather than blocking forever on a modal dialog nobody can answer."""
+    # Pre-construction guard: bail BEFORE touching QApplication so a Linux
+    # no-DISPLAY launch can't abort the whole process (see _gui_unavailable).
+    if _gui_unavailable():
+        return None
+
     from PySide6.QtWidgets import QApplication, QFileDialog
 
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
+    # Backstop: an in-process headless platform (e.g. forced offscreen with a
+    # DISPLAY present) still can't show a modal — keep this post-construction
+    # guard too.
     if app.platformName() in ("offscreen", "minimal", ""):
         return None
     chosen = QFileDialog.getExistingDirectory(
@@ -161,6 +202,18 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     library = Path(chosen).expanduser().resolve()
     _remember_library(cache_root, library)
     return library
+
+
+def _explain_not_a_library(root: Path) -> None:
+    """Say WHY a path can't be opened as a library on stderr: a path that
+    exists but is a regular file (or other non-dir) gets a clearer message
+    than one that is simply missing — 'library not found' is misleading when
+    the user pointed at a file."""
+    if root.exists():
+        print(f"not a folder — a library must be a directory: {root}",
+              file=sys.stderr)
+    else:
+        print(f"library not found: {root}", file=sys.stderr)
 
 
 def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
@@ -173,7 +226,7 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
     if arg is not None:
         root = Path(arg).expanduser().resolve()
         if not root.is_dir():
-            print(f"library not found: {root}", file=sys.stderr)
+            _explain_not_a_library(root)
             return None
         if FROZEN:
             _remember_library(cache_root, root)
@@ -183,7 +236,7 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
     if default is not None:                       # source checkout
         root = default.expanduser().resolve()
         if not root.is_dir():
-            print(f"library not found: {root}", file=sys.stderr)
+            _explain_not_a_library(root)
             return None
         return root
 
