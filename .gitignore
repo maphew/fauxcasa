@@ -11,6 +11,9 @@
 # Local media/research cache (rebuild with scripts/fetch-videos.sh)
 /cache/
 
+# Agent worktrees (git worktrees created by Claude Code; never tracked)
+.claude/worktrees/
+
 # Local env/config (may reference private data paths)
 .env
 __pycache__/
