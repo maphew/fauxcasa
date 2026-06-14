@@ -70,10 +70,13 @@ def main(path):
         print("no client commits found", file=sys.stderr)
         return 2
     sut = max(commits, key=lambda s: len(commits[s]))
-    cb_done = [ts(ln) for ln in lines
-               if DONE.search(ln) and "-> " not in ln
-               and frame_cb.get(int(DONE.search(ln).group(1))) == sut
-               and ts(ln) is not None]
+    cb_done = []
+    for ln in lines:
+        md = DONE.search(ln)
+        if md and "-> " not in ln and frame_cb.get(int(md.group(1))) == sut:
+            t = ts(ln)
+            if t is not None:
+                cb_done.append(t)
     print(f"SUT surface = wl_surface#{sut} "
           f"({len(commits[sut])} commits; {len(commits)} client surfaces)")
     print("\nCOMMIT cadence (fresh buffer -> compositor; presentable rate):")
