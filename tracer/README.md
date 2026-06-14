@@ -105,9 +105,11 @@ policy and stays valid.
 - Search is a linear scan (fast enough ≤100k), not the per-photo word
   index the spec names.
 - `hidden=yes` photos and stash folders (`.picasaoriginals/`, legacy
-  `Originals/`) are excluded from every view (no reveal toggle yet);
-  the folder-level "Hidden Folders" category is ignored. No faces, no
-  edits, no writes.
+  `Originals/`) are hidden by default; a **"Show hidden"** toggle reveals
+  them (drawn veiled) across the All/Folders/Starred/Search views. Album
+  membership stays visible-only, and the folder-level "Hidden Folders"
+  category is still ignored — it needs an oracle fixture for its
+  `category=` value. No faces, no edits, no writes.
 - In-file metadata is read for JPEG captions/keywords only (XMP
   `dc:description`/`dc:subject`, IPTC 2:120/2:25 — `inmeta.py`), the
   tier-1 fields the grid/search/viewer surface; faces-in-XMP, geotags,

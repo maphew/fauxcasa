@@ -47,6 +47,7 @@ T0 = time.perf_counter()
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -278,6 +279,11 @@ class MainWindow(QMainWindow):
         self.zoom.valueChanged.connect(
             lambda _v: self._zoom_timer.start())
         bar.addWidget(self.zoom)
+        self.reveal_box = QCheckBox("  Show hidden")
+        self.reveal_box.setToolTip(
+            "Reveal hidden=yes photos and stash-folder files (shown veiled)")
+        self.reveal_box.toggled.connect(self._toggle_reveal)
+        bar.addWidget(self.reveal_box)
 
         # --- pages ---
         browser = QWidget()
@@ -302,7 +308,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.counts_label)
         self.statusBar().addWidget(self.progress_label)
         self.statusBar().addPermanentWidget(self.meta_label)
-        self._show_counts("All photos", catalog.visible_count)
+        self._show_counts("All photos", self._shown_count())
 
         # --- wiring ---
         self.grid.photo_selected.connect(self._photo_selected)
@@ -449,7 +455,7 @@ class MainWindow(QMainWindow):
         self.grid.set_data(catalog, thumbs)
         self.tree.clear()
         self._build_sidebar()
-        self._show_counts("All photos", catalog.visible_count)
+        self._show_counts("All photos", self._shown_count())
         self.meta_label.setText("")
 
     def index_busy(self) -> bool:
@@ -468,16 +474,44 @@ class MainWindow(QMainWindow):
         self.build_cancel.set()
         super().closeEvent(event)
 
+    # ---------- reveal (show hidden) ----------
+
+    def _shown_count(self) -> int:
+        """Total photos in the current view mode: all photos when revealing
+        hidden/stash files, else only the normally-visible ones."""
+        cat = self.catalog
+        return len(cat.photos) if self.grid.reveal else cat.visible_count
+
+    def _toggle_reveal(self, on: bool) -> None:
+        """Show/hide hidden=yes photos and stash-folder files. Rebuilds the
+        sidebar (counts and which folders appear both change) and refreshes
+        to the All-photos view — the prior filter may have been a star /
+        search / album scoped to visible photos."""
+        self.grid.reveal = on
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        self.tree.clear()
+        self._build_sidebar()
+        self.grid.set_filter(None, "")
+        self._show_counts("All photos", self._shown_count())
+        self.grid.setFocus()
+
     # ---------- sidebar ----------
 
     def _build_sidebar(self) -> None:
         cat = self.catalog
+        reveal = self.grid.reveal
         t = self.tree
+
+        def fcount(folder) -> int:
+            return folder.total_count if reveal else folder.photo_count
+
         all_item = QTreeWidgetItem(
-            t, [f"All photos  ({cat.visible_count})"])
+            t, [f"All photos  ({self._shown_count()})"])
         all_item.setData(0, Qt.ItemDataRole.UserRole, ("all", ""))
         starred = sum(
-            1 for p in cat.photos if p.visible and p.star)
+            1 for p in cat.photos if (p.visible or reveal) and p.star)
         star_item = QTreeWidgetItem(t, [f"★ Starred  ({starred})"])
         star_item.setData(0, Qt.ItemDataRole.UserRole, ("starred", ""))
 
@@ -497,10 +531,10 @@ class MainWindow(QMainWindow):
             return item
 
         for rel, folder in cat.folders.items():
-            if folder.photo_count == 0:
-                continue  # stash/hidden-only folders stay out of the tree
+            if fcount(folder) == 0:
+                continue  # empty (off-reveal: stash/hidden-only) folders out
             item = node_for(rel)
-            item.setText(0, f"{folder.title}  ({folder.photo_count})")
+            item.setText(0, f"{folder.title}  ({fcount(folder)})")
         folders_root.setExpanded(True)
 
         if cat.albums:
@@ -525,16 +559,16 @@ class MainWindow(QMainWindow):
         cat = self.catalog
         if kind == "all":
             self.grid.set_filter(None, "")
-            self._show_counts("All photos", cat.visible_count)
+            self._show_counts("All photos", self._shown_count())
         elif kind == "starred":
             idxs = [i for i, p in enumerate(cat.photos)
-                    if p.visible and p.star]
+                    if (p.visible or self.grid.reveal) and p.star]
             self.grid.set_filter(idxs, "Starred")
             self._show_counts("Starred", len(idxs))
         elif kind == "folder":
             self.grid.set_filter(None, "")
             self.grid.scroll_to_folder(key)
-            self._show_counts("All photos", cat.visible_count)
+            self._show_counts("All photos", self._shown_count())
         elif kind == "album":
             album = cat.albums[key]
             self.grid.set_filter(list(album.members), album.name)
@@ -548,11 +582,11 @@ class MainWindow(QMainWindow):
         cat = self.catalog
         if not text:
             self.grid.set_filter(None, "")
-            self._show_counts("All photos", cat.visible_count)
+            self._show_counts("All photos", self._shown_count())
             return
         idxs = [
             i for i, p in enumerate(cat.photos)
-            if p.visible and (
+            if (p.visible or self.grid.reveal) and (
                 text in p.name.lower()
                 or (p.caption and text in p.caption.lower())
                 or any(text in k.lower() for k in p.keywords)
@@ -564,8 +598,9 @@ class MainWindow(QMainWindow):
     # ---------- status ----------
 
     def _show_counts(self, label: str, n: int) -> None:
+        reveal = self.grid.reveal
         folders = sum(1 for f in self.catalog.folders.values()
-                      if f.photo_count)
+                      if (f.total_count if reveal else f.photo_count))
         self.counts_label.setText(
             f"  {label}: {n} photos · {folders} folders"
             f" · {len(self.catalog.albums)} albums")
