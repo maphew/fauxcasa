@@ -14,14 +14,26 @@ defers to current instructions).
 - **Commit** every coherent, green (tests/build pass) increment on a feature
   branch — don't batch a whole session into one commit, and don't end a
   session with uncommitted work.
-- Use **branches + worktrees** to isolate work and **PRs** to integrate;
-  with **beads** and **commits** these are the safety nets — use them
-  freely, not only at session close.
+- Default to a **dedicated worktree on a feature branch** to isolate work —
+  always use a worktree unless asked otherwise — and use **PRs** to
+  integrate; with **branches**, **beads**, and **commits** these are the
+  safety nets, used freely, not only at session close.
 - **Push** (`git push` / `bd dolt push`) at natural checkpoints so the net
   reaches the remote, not just local disk.
 - The only override: a *current* "do not commit" / "do not push" instruction
   still wins for that session.
 
+<!--
+  MAINTAINER NOTE — the managed "BEADS INTEGRATION" block below is
+  intentionally customized and diverges from its generator output. It is
+  tagged `profile:minimal hash:970c3bf2`, but the contents were hand-edited to
+  team-maintainer policy (see the "Active profile" line and "Agent Context
+  Profiles" section inside it, plus the top-level "Working safely" section
+  above), so the recorded hash no longer matches the content. Do not let `bd
+  setup` / regen silently revert it: if you regenerate, re-apply these edits
+  (or bump the profile and hash on purpose) rather than clobbering them. This
+  note sits outside the markers so regen cannot remove it without notice.
+-->
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker
 
@@ -50,20 +62,21 @@ The managed Beads block is task-tracking guidance, not permission to override re
 
 **Active profile: team-maintainer** (repository opt-in by maphew, 2026-06-11).
 
-**Working safely — commit early and often, in a worktree.** Don't wait to
-be asked to commit. Default to working in a dedicated git worktree on a
-feature branch — **always use a worktree unless asked otherwise** — and
-commit each working (tests/build green) increment proactively as you go, so
-progress survives crashes, power loss, and context resets — re-runnable
-state is the goal. Branches, worktrees, beads, commits, and PRs are safety
-nets; use them freely, not only at session close. Push (`git push` / `bd
-dolt push`) at natural checkpoints so the net reaches the remote. Only a
-current "do not commit"/"do not push" instruction overrides this for that
-session.
+The **commit-early-and-often** policy in the top-level "Working safely: commit
+early and often" section applies under *every* profile below, so the profiles
+no longer differ in commit authority (this is why the old "don't commit unless
+asked" Conservative default is gone — see that section as the single source of
+truth). What a profile selects instead is the **scope of end-of-session
+automation and handoff** — how much the agent does for you versus reports back:
 
-- **Conservative**: Use `bd` for task tracking. At handoff, report changed files, validation, and suggested next commands.
-- **Minimal**: Keep tool instruction files as pointers to `bd prime`.
-- **Team-maintainer**: Agents close beads, run quality gates, commit early and often, and push at natural checkpoints and session close.
+- **Conservative (report-first)**: Use `bd` for task tracking and commit
+  working increments as usual, but at handoff *report* changed files,
+  validation, and suggested next commands rather than auto-closing beads or
+  pushing.
+- **Minimal**: Keep tool instruction files as thin pointers to `bd prime`;
+  otherwise follow the active profile.
+- **Team-maintainer** (active): Agents also close beads, run quality gates, and
+  push at natural checkpoints and session close.
 
 ## Session Completion
 
