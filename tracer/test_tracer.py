@@ -976,6 +976,149 @@ def test_reveal_preserves_search_view(library: Path) -> None:
     assert len(win.grid.display) == 4                 # hidden + stash now match
 
 
+# ---- folder-level "Hidden Folders" category (fauxcasa-r42) ----------------
+#
+# Synthetic fixtures only (privacy): hand-authored .picasa.ini files + tiny
+# Qt-generated JPEGs. The on-disk format (folder [Picasa] P2category=Hidden
+# Folders, sibling of Folders on Disk) is DOCUMENTED — committed fixture 025
+# carries the Folders-on-Disk block; docs/research/wine-oracle.md lists
+# "Hidden Folders" in the catdata categories — but NOT yet captured in a
+# hide-folder oracle differential (a future 032-hide-folder fixture).
+
+@pytest.fixture()
+def folder_hidden_library(tmp_path: Path) -> Path:
+    """A normal folder tagged with the sibling category (P2category=Folders
+    on Disk) plus a folder placed in Picasa's built-in 'Hidden Folders'
+    collection ([Picasa] P2category=Hidden Folders), which hides the WHOLE
+    folder — every photo under it, mirroring per-photo hidden=yes."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "2020 Trip" / "a.jpg")
+    (root / "2020 Trip" / ".picasa.ini").write_text(
+        "[Picasa]\r\nname=2020 Trip\r\nP2category=Folders on Disk\r\n")
+    make_jpeg(root / "2021 Secret" / "s1.jpg")
+    make_jpeg(root / "2021 Secret" / "s2.jpg")
+    (root / "2021 Secret" / ".picasa.ini").write_text(
+        "[Picasa]\r\nname=2021 Secret\r\nP2category=Hidden Folders\r\n")
+    return root
+
+
+def test_scan_folder_hidden_category(folder_hidden_library: Path) -> None:
+    """A folder in the Hidden Folders category marks Folder.folder_hidden and
+    forces all its photos invisible (counting toward total_count, not
+    photo_count) — while the sibling Folders-on-Disk category does NOT."""
+    cat = scan_library(folder_hidden_library)
+    normal = cat.folders["2020 Trip"]
+    secret = cat.folders["2021 Secret"]
+
+    # the sibling category is a normal, visible folder
+    assert not normal.folder_hidden
+    assert normal.photo_count == 1 and normal.total_count == 1
+
+    # the Hidden Folders category hides the whole folder
+    assert secret.folder_hidden
+    assert secret.photo_count == 0 and secret.total_count == 2
+
+    for p in cat.photos:
+        assert p.visible == (p.folder != "2021 Secret")
+    assert cat.visible_count == 1  # only 2020 Trip/a.jpg
+
+
+def test_folder_hidden_matcher_is_defensive() -> None:
+    """_is_folder_hidden is trimmed + case-insensitive on the exact value,
+    never false-positives on the sibling categories, and tolerates an absent
+    P2category or [Picasa] section."""
+    import catalog
+    from picasa_db import IniSection
+
+    def mk(v: str) -> IniSection:
+        return IniSection(name="Picasa", items=[("P2category", v)])
+
+    assert catalog._is_folder_hidden(mk("Hidden Folders"))
+    assert catalog._is_folder_hidden(mk("  hidden folders  "))  # trim + case
+    assert catalog._is_folder_hidden(mk("HIDDEN FOLDERS"))
+    assert not catalog._is_folder_hidden(mk("Folders on Disk"))  # sibling
+    assert not catalog._is_folder_hidden(mk("Exported Pictures"))
+    assert not catalog._is_folder_hidden(mk(""))
+    assert not catalog._is_folder_hidden(IniSection(name="Picasa"))  # no key
+    assert not catalog._is_folder_hidden(None)  # no [Picasa] section at all
+
+
+def test_folder_hidden_survives_catalog_roundtrip(
+        folder_hidden_library: Path, tmp_path: Path) -> None:
+    """folder_hidden + the derived per-photo visibility round-trip through the
+    persisted catalog (the warm-load path never re-reads inis, so membership
+    is stored in `hidden_folders` and re-derived on load)."""
+    cat = scan_library(folder_hidden_library)
+    thumbcache.build_cache(cat, tmp_path / "c")  # fills signals
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, folder_hidden_library)
+    assert loaded is not None
+    assert loaded.folders["2021 Secret"].folder_hidden
+    assert not loaded.folders["2020 Trip"].folder_hidden
+    assert loaded.folders["2021 Secret"].photo_count == 0
+    assert loaded.folders["2021 Secret"].total_count == 2
+    assert loaded.visible_count == 1
+    for p in loaded.photos:
+        assert p.visible == (p.folder != "2021 Secret")
+
+
+def test_mainwindow_reveal_folder_hidden(folder_hidden_library: Path) -> None:
+    """A folder in the 'Hidden Folders' category is absent from the normal
+    sidebar and excluded from the grid and status counts; the Show-hidden
+    toggle surfaces it and its photos, with reveal-mode per-folder and status
+    counts including them — the same mechanism that surfaces stash folders."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    def folder_rels(win) -> set:
+        rels = set()
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            data = it.value().data(0, Qt.ItemDataRole.UserRole)
+            if data and data[0] == "folder":
+                rels.add(data[1])
+            it += 1
+        return rels
+
+    def folder_item(win, rel: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == ("folder", rel):
+                return it.value()
+            it += 1
+        return None
+
+    SECRET = "2021 Secret"
+    cat = scan_library(folder_hidden_library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    # default: only the normal folder's one visible photo; the hidden folder
+    # is gone from the tree and the status tally counts neither it nor its
+    # photos.
+    assert not win.grid.reveal and len(win.grid.display) == 1
+    assert SECRET not in folder_rels(win)
+    assert "1 photos · 1 folders" in win.counts_label.text()
+
+    win.reveal_box.setChecked(True)  # fires _toggle_reveal(True)
+    assert win.grid.reveal and len(win.grid.display) == 3  # 1 + 2 hidden
+    assert SECRET in folder_rels(win)                      # surfaced in tree
+    assert folder_item(win, SECRET).text(0).endswith("(2)")  # reveal count
+    assert "3 photos · 2 folders" in win.counts_label.text()
+
+    win.reveal_box.setChecked(False)
+    assert not win.grid.reveal and len(win.grid.display) == 1
+    assert SECRET not in folder_rels(win)
+    assert "1 photos · 1 folders" in win.counts_label.text()
+
+
 def test_pump_decoded_byte_accounting() -> None:
     """_pump_decoded keeps _cache_bytes exact when an index is re-decoded
     in place (the live-build re-feed path): the previous tile's bytes are
