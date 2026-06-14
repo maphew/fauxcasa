@@ -109,6 +109,36 @@ jobs:
           print("OK: frozen artifact decodes JPEG thumbnails")
           EOF
 
+      - name: Frozen no-arg launch fails GRACEFULLY (shipping double-click UX)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXE="dist/fauxcasa-tracer/fauxcasa-tracer.exe"
+          else
+            EXE="dist/fauxcasa-tracer/fauxcasa-tracer"
+          fi
+          # No library + a fresh empty cache => nothing remembered. Under
+          # offscreen the first-run folder picker can't prompt, so the app
+          # must exit 2 with a friendly message — never hang on a modal
+          # dialog or dump a traceback. Guards the fauxcasa-9cz frozen UX
+          # (the no-arg path the explicit-library smoke above never hits).
+          set +e
+          OUT=$("$EXE" --cache-root ./noarg-cache 2>&1)
+          RC=$?
+          set -e
+          printf '%s\n' "$OUT"
+          echo "exit=$RC"
+          if [ "$RC" -ne 2 ]; then
+            echo "::error::expected graceful exit 2, got $RC"; exit 1
+          fi
+          if ! printf '%s\n' "$OUT" | grep -q "no library selected"; then
+            echo "::error::missing the friendly no-library message"; exit 1
+          fi
+          if printf '%s\n' "$OUT" | grep -qi "traceback"; then
+            echo "::error::crashed instead of exiting gracefully"; exit 1
+          fi
+          echo "OK: frozen no-arg launch exits gracefully"
+
       - name: Bundle size (soft gate — warn, never fail)
         shell: bash
         run: |

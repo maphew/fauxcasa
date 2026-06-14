@@ -655,6 +655,113 @@ def test_default_cache_root_frozen_vs_checkout(monkeypatch, tmp_path: Path) -> N
             == tmp_path / "home" / ".cache" / "fauxcasa-tracer")
 
 
+def test_default_library_frozen_vs_checkout(monkeypatch) -> None:
+    """main._default_library: the bundled synthetic library in a source
+    checkout; None when frozen (REPO points inside the read-only bundle, so
+    there is nothing to default to — recall/prompt takes over)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    monkeypatch.setattr(main, "FROZEN", False)
+    assert main._default_library() == main.REPO / "cache" / "synthetic-library"
+    monkeypatch.setattr(main, "FROZEN", True)
+    assert main._default_library() is None
+
+
+def test_remember_library_roundtrip(tmp_path: Path) -> None:
+    """The remembered-library config survives a round trip, ignores a
+    library that no longer exists (so the app re-prompts), and tolerates a
+    missing or corrupt config file."""
+    import os
+    import shutil
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    cache_root = tmp_path / "cr"
+    assert main._remembered_library(cache_root) is None  # nothing stored yet
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    main._remember_library(cache_root, lib)
+    assert main._remembered_library(cache_root) == lib
+
+    shutil.rmtree(lib)  # a vanished library is ignored, not returned
+    assert main._remembered_library(cache_root) is None
+
+    main._config_path(cache_root).write_text("{ not json")  # corrupt
+    assert main._remembered_library(cache_root) is None
+    main._config_path(cache_root).write_text(json.dumps({"other": 1}))  # no key
+    assert main._remembered_library(cache_root) is None
+
+
+def test_resolve_library_order(monkeypatch, tmp_path: Path) -> None:
+    """_resolve_library precedence: explicit arg → checkout default →
+    (frozen) remembered → prompt; a frozen explicit arg is remembered."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    cache_root = tmp_path / "cr"
+    explicit = tmp_path / "explicit"
+    explicit.mkdir()
+
+    # explicit arg wins and is NOT remembered in a source checkout
+    monkeypatch.setattr(main, "FROZEN", False)
+    assert main._resolve_library(str(explicit), cache_root) == explicit.resolve()
+    assert main._remembered_library(cache_root) is None
+
+    # an explicit but missing path is an error (None), never a silent prompt
+    monkeypatch.setattr(main, "_prompt_for_library",
+                        lambda cr: pytest.fail("explicit arg must not prompt"))
+    assert main._resolve_library(str(tmp_path / "nope"), cache_root) is None
+
+    # no arg in a checkout → the built-in default (patched to a real dir)
+    fake_default = tmp_path / "synthetic"
+    fake_default.mkdir()
+    monkeypatch.setattr(main, "_default_library", lambda: fake_default)
+    assert main._resolve_library(None, cache_root) == fake_default.resolve()
+
+    # frozen: an explicit arg is remembered for the next double-click
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(main, "_default_library", lambda: None)
+    assert main._resolve_library(str(explicit), cache_root) == explicit.resolve()
+    assert main._remembered_library(cache_root) == explicit.resolve()
+
+    # frozen, no arg → recall the remembered library WITHOUT prompting
+    assert main._resolve_library(None, cache_root) == explicit.resolve()
+
+
+def test_resolve_library_frozen_first_run(monkeypatch, tmp_path: Path) -> None:
+    """Frozen, no library and nothing remembered: a chosen folder is used;
+    a cancelled/headless picker yields None (graceful), not a crash."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    cache_root = tmp_path / "cr"  # empty: nothing remembered
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(main, "_default_library", lambda: None)
+
+    picked = tmp_path / "picked"
+    picked.mkdir()
+    monkeypatch.setattr(main, "_prompt_for_library", lambda cr: picked)
+    assert main._resolve_library(None, cache_root) == picked
+
+    monkeypatch.setattr(main, "_prompt_for_library", lambda cr: None)
+    assert main._resolve_library(None, cache_root) is None
+
+
+def test_prompt_for_library_headless_returns_none(tmp_path: Path) -> None:
+    """Under an offscreen/headless platform there is no one to answer a
+    modal folder dialog — the picker must bail with None, never block."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    assert main._prompt_for_library(tmp_path) is None
+
+
 def test_pcts_nearest_rank() -> None:
     """bench_scroll.pcts uses a nearest-rank LOWER index so a sub-1.0
     quantile never overshoots to the max (the documented int(n*q)==n trap
