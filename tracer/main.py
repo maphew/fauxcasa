@@ -58,6 +58,7 @@ from PySide6.QtWidgets import (
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
+    QTreeWidgetItemIterator,
     QVBoxLayout,
     QWidget,
 )
@@ -484,18 +485,52 @@ class MainWindow(QMainWindow):
 
     def _toggle_reveal(self, on: bool) -> None:
         """Show/hide hidden=yes photos and stash-folder files. Rebuilds the
-        sidebar (counts and which folders appear both change) and refreshes
-        to the All-photos view — the prior filter may have been a star /
-        search / album scoped to visible photos."""
+        sidebar (counts and which folders appear both change) but PRESERVES
+        the active view across the toggle (fauxcasa-x1l): the current search,
+        or the selected folder/album/star, plus the scroll position — rather
+        than snapping back to All photos. The visible set changes under
+        reveal, so each view is recomputed for the new state, not merely
+        re-pointed."""
+        kind, key = self._selected_view()
+        search_text = self.search.text()
+        sb = self.grid.verticalScrollBar()
+        frac = sb.value() / sb.maximum() if sb.maximum() > 0 else 0.0
+
         self.grid.reveal = on
-        self.search.blockSignals(True)
-        self.search.clear()
-        self.search.blockSignals(False)
         self.tree.clear()
         self._build_sidebar()
-        self.grid.set_filter(None, "")
-        self._show_counts("All photos", self._shown_count())
+        self._reselect_view(kind, key)
+
+        if search_text.strip():
+            self._search_changed(search_text)   # reveal-aware re-filter
+            self.grid.scroll_to_fraction(frac)
+        elif kind == "folder":
+            self._apply_view(kind, key)          # scroll_to_folder re-pins it
+        else:
+            self._apply_view(kind, key)
+            self.grid.scroll_to_fraction(frac)   # best-effort scroll restore
         self.grid.setFocus()
+
+    def _selected_view(self) -> tuple[str, str]:
+        """The (kind, key) of the active sidebar selection, defaulting to the
+        All-photos view when nothing selectable is current."""
+        item = self.tree.currentItem()
+        if item is not None:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data is not None:
+                return data
+        return ("all", "")
+
+    def _reselect_view(self, kind: str, key: str) -> None:
+        """Restore the sidebar's current-item highlight to (kind, key) after
+        a rebuild; silently no-ops if that view no longer exists (e.g. a stash
+        folder that only appears under reveal)."""
+        it = QTreeWidgetItemIterator(self.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                self.tree.setCurrentItem(it.value())
+                return
+            it += 1
 
     # ---------- sidebar ----------
 
@@ -552,28 +587,36 @@ class MainWindow(QMainWindow):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if data is None:
             return
-        kind, key = data
+        # Track the active view so a Show-hidden toggle can preserve it
+        # (fauxcasa-x1l). On a real click Qt has already made this the
+        # current item; set it explicitly so a programmatic call agrees.
+        self.tree.setCurrentItem(item)
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
+        self._apply_view(*data)
+        self.grid.setFocus()
+
+    def _apply_view(self, kind: str, key: str) -> None:
+        """Apply a sidebar view's grid filter + status counts WITHOUT touching
+        the search box. Shared by _sidebar_clicked and the Show-hidden toggle,
+        so the toggle can re-apply the active view (recomputed for the new
+        reveal state) instead of snapping to All photos."""
         cat = self.catalog
-        if kind == "all":
-            self.grid.set_filter(None, "")
-            self._show_counts("All photos", self._shown_count())
-        elif kind == "starred":
+        if kind == "starred":
             idxs = [i for i, p in enumerate(cat.photos)
                     if (p.visible or self.grid.reveal) and p.star]
             self.grid.set_filter(idxs, "Starred")
             self._show_counts("Starred", len(idxs))
-        elif kind == "folder":
-            self.grid.set_filter(None, "")
-            self.grid.scroll_to_folder(key)
-            self._show_counts("All photos", self._shown_count())
-        elif kind == "album":
+        elif kind == "album" and key in cat.albums:
             album = cat.albums[key]
             self.grid.set_filter(list(album.members), album.name)
             self._show_counts(f"Album “{album.name}”", len(album.members))
-        self.grid.setFocus()
+        else:  # "all", "folder", or an album that no longer exists
+            self.grid.set_filter(None, "")
+            if kind == "folder":
+                self.grid.scroll_to_folder(key)
+            self._show_counts("All photos", self._shown_count())
 
     # ---------- search ----------
 
