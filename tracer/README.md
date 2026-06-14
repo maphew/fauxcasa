@@ -58,6 +58,12 @@ QT_QPA_PLATFORM=offscreen uv run tracer/main.py cache/benchmark-library \
 QT_QPA_PLATFORM=offscreen uv run tracer/main.py --quit-after-ready
 ```
 
+From a **frozen bundle** there is no bundled synthetic library, so a
+no-arg launch opens the library you last picked (remembered in
+`<cache-root>/config.json`) or, on first run, prompts for a folder; pass
+a library path to override. A headless frozen launch with no library
+exits cleanly rather than blocking on a dialog nobody can answer.
+
 Tests: `uv run tracer/test_tracer.py`
 
 ## Deliberate tracer shortcuts (not product decisions)

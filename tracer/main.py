@@ -99,6 +99,105 @@ def _default_cache_root() -> Path:
     return REPO / "cache" / "tracer-cache"
 
 
+def _default_library() -> Path | None:
+    """The built-in library to open with no argument. A source checkout
+    ships the synthetic fixture library; a frozen bundle ships none (REPO
+    points inside the read-only bundle), so there is no default — the app
+    recalls the last-opened library or prompts on first run instead."""
+    if FROZEN:
+        return None
+    return REPO / "cache" / "synthetic-library"
+
+
+def _config_path(cache_root: Path) -> Path:
+    """Per-user config, beside (never inside) the per-library cache dirs —
+    cache_dir_for() names those by a 16-hex digest, so 'config.json' is
+    collision-free."""
+    return cache_root / "config.json"
+
+
+def _remembered_library(cache_root: Path) -> Path | None:
+    """The library chosen on a previous (frozen) run, if it still exists on
+    disk; a vanished one is ignored so the app re-prompts. Tolerates a
+    missing or garbage config file — recall is a convenience, not a gate."""
+    try:
+        data = json.loads(_config_path(cache_root).read_text())
+        lib = data.get("library")
+    except (OSError, ValueError):
+        return None
+    if not isinstance(lib, str) or not lib:
+        return None
+    p = Path(lib)
+    return p if p.is_dir() else None
+
+
+def _remember_library(cache_root: Path, library: Path) -> None:
+    """Persist the chosen library so the next no-arg (double-click) launch
+    reopens it. Best-effort: a write failure must never abort the launch."""
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        _config_path(cache_root).write_text(
+            json.dumps({"library": str(library)}))
+    except OSError as e:
+        print(f"could not remember library choice: {e}", file=sys.stderr)
+
+
+def _prompt_for_library(cache_root: Path) -> Path | None:
+    """First-run picker for a frozen build with no library yet: ask the
+    user to choose a photo-library folder and remember it. Returns None if
+    cancelled — or, under a headless/offscreen platform, immediately,
+    rather than blocking forever on a modal dialog nobody can answer."""
+    from PySide6.QtWidgets import QApplication, QFileDialog
+
+    app = QApplication.instance() or QApplication([])
+    app.setApplicationName(APP_NAME)
+    if app.platformName() in ("offscreen", "minimal", ""):
+        return None
+    chosen = QFileDialog.getExistingDirectory(
+        None, f"{APP_NAME} — choose your photo library folder")
+    if not chosen:
+        return None
+    library = Path(chosen).expanduser().resolve()
+    _remember_library(cache_root, library)
+    return library
+
+
+def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
+    """Choose and validate the library to browse. Order: an explicit
+    argument, else the built-in default (a checkout's synthetic library),
+    else — for a frozen bundle with neither — the library remembered from a
+    previous run, else a first-run folder picker. A frozen launch also
+    remembers an explicit argument so the next double-click reopens it.
+    Returns None (after explaining why on stderr) when nothing is usable."""
+    if arg is not None:
+        root = Path(arg).expanduser().resolve()
+        if not root.is_dir():
+            print(f"library not found: {root}", file=sys.stderr)
+            return None
+        if FROZEN:
+            _remember_library(cache_root, root)
+        return root
+
+    default = _default_library()
+    if default is not None:                       # source checkout
+        root = default.expanduser().resolve()
+        if not root.is_dir():
+            print(f"library not found: {root}", file=sys.stderr)
+            return None
+        return root
+
+    # Frozen bundle, no library given: recall the last choice or prompt.
+    root = _remembered_library(cache_root)
+    if root is not None:
+        return root
+    root = _prompt_for_library(cache_root)
+    if root is None:
+        print("no library selected — pass a library folder, or pick one "
+              "when prompted", file=sys.stderr)
+        return None
+    return root
+
+
 def read_rss_mb() -> tuple[float, float]:
     """(rss_mb, hwm_mb); zeros where /proc is unavailable (non-Linux)."""
     rss = hwm = 0.0
@@ -507,9 +606,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("library", nargs="?",
-                    default=str(REPO / "cache" / "synthetic-library"),
-                    help="library root to browse (read-only)")
+    ap.add_argument("library", nargs="?", default=None,
+                    help="library root to browse (read-only). Default: the "
+                         "bundled synthetic library in a source checkout; in "
+                         "a frozen build, the library you last opened, or one "
+                         "you pick on first run")
     ap.add_argument("--thumbs", type=Path, default=None,
                     help="adopt an existing .fcache instead of building "
                          "one (e.g. cache/benchmark-thumbs.fcache)")
@@ -540,9 +641,8 @@ def main() -> int:
     if args.cache_root is None:
         args.cache_root = _default_cache_root()
 
-    root = Path(args.library).expanduser().resolve()
-    if not root.is_dir():
-        print(f"library not found: {root}", file=sys.stderr)
+    root = _resolve_library(args.library, args.cache_root)
+    if root is None:
         return 2
 
     # Data prep. Try a WARM start first: load the persisted catalog (no
@@ -599,7 +699,8 @@ def main() -> int:
           f"{len(catalog.folders)} folders, {len(catalog.albums)} albums "
           f"in {prep_ms:.0f} ms", file=sys.stderr)
 
-    app = QApplication([])
+    # A frozen first-run picker may already have created the app.
+    app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, warm=warm,
                      adopt=adopt)
