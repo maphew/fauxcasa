@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "PySide6"]
+# dependencies = ["pytest", "PySide6", "pillow"]
 # ///
 """Tests for the tracer's non-GUI layers: catalog scan + metadata,
 thumbnail-cache build/load/bind, and walk-rule parity with
@@ -19,6 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import inmeta
 import thumbcache
 from catalog import (
     load_catalog,
@@ -38,6 +39,90 @@ def make_jpeg(path: Path, w: int = 64, h: int = 48) -> None:
     img.fill(QColor(120, 160, 200))
     path.parent.mkdir(parents=True, exist_ok=True)
     assert img.save(str(path), "JPEG", 85)
+
+
+# ---- synthetic in-file-metadata builders (privacy-safe: we construct the
+# APP segments by hand to the documented byte framing; no real Picasa data) --
+
+def _jpeg_bytes(w: int = 64, h: int = 48) -> bytes:
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QColor, QImage
+
+    img = QImage(w, h, QImage.Format.Format_RGB32)
+    img.fill(QColor(120, 160, 200))
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert img.save(buf, "JPEG", 90)
+    return bytes(buf.data())
+
+
+def _inject(jpeg: bytes, marker: int, payload: bytes) -> bytes:
+    """Splice an APPn marker segment in right after SOI (FFD8)."""
+    assert jpeg[:2] == b"\xff\xd8"
+    seg = bytes([0xFF, marker]) + struct.pack(">H", len(payload) + 2) + payload
+    return jpeg[:2] + seg + jpeg[2:]
+
+
+def _xmp_app1(caption: str | None = None, keywords: tuple[str, ...] = ()) -> bytes:
+    body = ""
+    if caption is not None:
+        body += ('<dc:description><rdf:Alt>'
+                 f'<rdf:li xml:lang="x-default">{caption}</rdf:li>'
+                 '</rdf:Alt></dc:description>')
+    if keywords:
+        lis = "".join(f"<rdf:li>{k}</rdf:li>" for k in keywords)
+        body += f"<dc:subject><rdf:Bag>{lis}</rdf:Bag></dc:subject>"
+    xml = (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+        'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        f'<rdf:Description rdf:about="">{body}</rdf:Description>'
+        '</rdf:RDF></x:xmpmeta>'
+    )
+    return b"http://ns.adobe.com/xap/1.0/\x00" + xml.encode("utf-8")
+
+
+def _iptc_app13(caption: str | None = None,
+                keywords: tuple[str, ...] = ()) -> bytes:
+    def ds(record: int, dataset: int, value: bytes) -> bytes:
+        return bytes([0x1C, record, dataset]) + struct.pack(">H", len(value)) \
+            + value
+
+    iim = b""
+    if caption is not None:
+        iim += ds(2, 120, caption.encode("utf-8"))
+    for k in keywords:
+        iim += ds(2, 25, k.encode("utf-8"))
+    # 8BIM block: id 0x0404 (IPTC-NAA), empty Pascal name padded to even,
+    # 4-byte size, then the IIM stream padded to even.
+    block = b"8BIM" + struct.pack(">H", 0x0404) + b"\x00\x00" \
+        + struct.pack(">I", len(iim)) + iim
+    if len(iim) % 2:
+        block += b"\x00"
+    return b"Photoshop 3.0\x00" + block
+
+
+def _exif_orientation_app1(orientation: int) -> bytes:
+    tiff = b"II" + struct.pack("<H", 42) + struct.pack("<I", 8)
+    ifd = (struct.pack("<H", 1)
+           + struct.pack("<HHI", 0x0112, 3, 1)  # Orientation, SHORT, count 1
+           + struct.pack("<HH", orientation, 0)  # value in low 2 bytes, LE
+           + struct.pack("<I", 0))               # next-IFD offset
+    return b"Exif\x00\x00" + tiff + ifd
+
+
+def write_jpeg_meta(path: Path, w: int = 64, h: int = 48, *,
+                    xmp: bytes | None = None, iptc: bytes | None = None,
+                    exif_orientation: int | None = None) -> None:
+    data = _jpeg_bytes(w, h)
+    if exif_orientation is not None:
+        data = _inject(data, 0xE1, _exif_orientation_app1(exif_orientation))
+    if xmp is not None:
+        data = _inject(data, 0xE1, xmp)
+    if iptc is not None:
+        data = _inject(data, 0xED, iptc)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
 
 
 @pytest.fixture()
@@ -327,6 +412,224 @@ def test_unreadable_image_gets_error_entry(tmp_path: Path) -> None:
     by_rel = dict(zip(cache.files, cache.entries))
     assert by_rel["f/corrupt.jpg"][1] == 0  # zero-length = error tile
     assert by_rel["f/ok.jpg"][1] > 0
+
+
+# ---- in-file metadata reader (inmeta.py) --------------------------------
+
+def test_inmeta_reads_xmp() -> None:
+    data = _inject(_jpeg_bytes(), 0xE1,
+                   _xmp_app1(caption="a sunset", keywords=("sky", "dusk")))
+    m = inmeta.read_jpeg_metadata(data)
+    assert m.caption == "a sunset"
+    assert m.keywords == ("sky", "dusk")
+
+
+def test_inmeta_reads_iptc() -> None:
+    data = _inject(_jpeg_bytes(), 0xED,
+                   _iptc_app13(caption="harbor", keywords=("boat", "water")))
+    m = inmeta.read_jpeg_metadata(data)
+    assert m.caption == "harbor"
+    assert m.keywords == ("boat", "water")
+
+
+def test_inmeta_xmp_wins_over_iptc() -> None:
+    """Picasa writes both; XMP is its primary store, so XMP is authoritative
+    per field when the two disagree."""
+    data = _jpeg_bytes()
+    data = _inject(data, 0xED, _iptc_app13(caption="legacy", keywords=("old",)))
+    data = _inject(data, 0xE1, _xmp_app1(caption="current", keywords=("new",)))
+    m = inmeta.read_jpeg_metadata(data)
+    assert m.caption == "current"
+    assert m.keywords == ("new",)
+
+
+def test_inmeta_field_level_fallback() -> None:
+    """A field absent from XMP falls back to IPTC rather than vanishing."""
+    data = _jpeg_bytes()
+    data = _inject(data, 0xED, _iptc_app13(keywords=("tagged",)))  # keywords only
+    data = _inject(data, 0xE1, _xmp_app1(caption="just a caption"))  # caption only
+    m = inmeta.read_jpeg_metadata(data)
+    assert m.caption == "just a caption"
+    assert m.keywords == ("tagged",)
+
+
+def test_inmeta_utf8() -> None:
+    data = _inject(_jpeg_bytes(), 0xED,
+                   _iptc_app13(caption="café — naïve", keywords=("Москва",)))
+    m = inmeta.read_jpeg_metadata(data)
+    assert m.caption == "café — naïve"
+    assert m.keywords == ("Москва",)
+
+
+def test_inmeta_iptc_extended_length() -> None:
+    """IPTC datasets can use the extended-length form (octet-count field with
+    the high bit set); the reader must follow it instead of misreading the
+    length inline."""
+    value = "extended".encode("utf-8")
+    # 0x1C, record 2, dataset 120, length-field 0x8002 (2 following octets),
+    # then the 2-byte big-endian length, then the value.
+    ext = (bytes([0x1C, 2, 120]) + struct.pack(">H", 0x8000 | 2)
+           + struct.pack(">H", len(value)) + value)
+    block = (b"8BIM" + struct.pack(">H", 0x0404) + b"\x00\x00"
+             + struct.pack(">I", len(ext)) + ext)
+    if len(ext) % 2:
+        block += b"\x00"
+    app13 = b"Photoshop 3.0\x00" + block
+    m = inmeta.read_jpeg_metadata(_inject(_jpeg_bytes(), 0xED, app13))
+    assert m.caption == "extended"
+
+
+def test_inmeta_empty_iptc_caption_normalizes_to_none() -> None:
+    """A whitespace/NUL-padded or zero-length IPTC 2:120 means 'no caption'
+    (matching the XMP path), so it surfaces as None — never "" — and does not
+    by itself produce a non-EMPTY result."""
+    ws = _inject(_jpeg_bytes(), 0xED,
+                 _iptc_app13(caption="  \x00 ", keywords=("k",)))
+    m = inmeta.read_jpeg_metadata(ws)
+    assert m.caption is None and m.keywords == ("k",)
+    only_empty = _inject(_jpeg_bytes(), 0xED, _iptc_app13(caption=""))
+    assert inmeta.read_jpeg_metadata(only_empty) is inmeta.EMPTY
+
+
+def test_inmeta_empty_for_non_jpeg_and_plain() -> None:
+    assert inmeta.read_jpeg_metadata(b"\x89PNG\r\n\x1a\n") is inmeta.EMPTY
+    assert inmeta.read_jpeg_metadata(b"") is inmeta.EMPTY
+    assert inmeta.read_jpeg_metadata(_jpeg_bytes()) is inmeta.EMPTY  # no APP meta
+
+
+def test_inmeta_fail_soft_on_garbage() -> None:
+    """Truncated/garbled APP segments yield no metadata, never an exception."""
+    data = _inject(_jpeg_bytes(), 0xE1, b"http://ns.adobe.com/xap/1.0/\x00<not xml")
+    assert inmeta.read_jpeg_metadata(data) is inmeta.EMPTY
+    # an EXIF APP1 (not XMP) is ignored by the caption/keyword reader
+    data2 = _inject(_jpeg_bytes(), 0xE1, _exif_orientation_app1(6))
+    assert inmeta.read_jpeg_metadata(data2) is inmeta.EMPTY
+
+
+# ---- §4 precedence: in-file metadata overrides the ini for JPEG tier-1 ---
+
+def test_index_infile_caption_overrides_ini(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    write_jpeg_meta(root / "f" / "p.jpg",
+                    xmp=_xmp_app1(caption="in-file caption",
+                                  keywords=("infile",)))
+    # the ini also names a caption/keywords — in-file must win (§4)
+    (root / "f" / ".picasa.ini").write_text(
+        "[p.jpg]\r\nstar=yes\r\ncaption=ini caption\r\nkeywords=ini\r\n")
+    cat = scan_library(root)
+    p = next(p for p in cat.photos if p.rel == "f/p.jpg")
+    assert p.caption == "ini caption"  # before indexing: ini only
+    assert p.star  # ini-only state (star) survives the in-file override
+
+    thumbcache.build_cache(cat, tmp_path / "c")
+    assert p.caption == "in-file caption"  # index applied in-file precedence
+    assert p.keywords == ("infile",)
+    assert p.star  # untouched
+
+
+def test_index_keeps_ini_caption_when_no_infile(tmp_path: Path) -> None:
+    """A JPEG with no in-file caption keeps the ini value (covers migrated
+    libraries and non-JPEG formats, where the ini is the only home)."""
+    root = tmp_path / "lib"
+    write_jpeg_meta(root / "f" / "q.jpg")  # plain JPEG, no APP metadata
+    (root / "f" / ".picasa.ini").write_text(
+        "[q.jpg]\r\ncaption=ini only\r\nkeywords=a, b\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    q = next(p for p in cat.photos if p.rel == "f/q.jpg")
+    assert q.caption == "ini only"
+    assert q.keywords == ("a", "b")
+
+
+def test_infile_metadata_survives_catalog_roundtrip(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    write_jpeg_meta(root / "f" / "p.jpg",
+                    xmp=_xmp_app1(caption="persisted cap", keywords=("kw1",)))
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+    loaded = load_catalog(path, root)
+    assert loaded is not None
+    p = next(p for p in loaded.photos if p.rel == "f/p.jpg")
+    assert p.caption == "persisted cap" and p.keywords == ("kw1",)
+
+
+# ---- EXIF orientation baked consistently into the thumbnail cache --------
+
+def test_index_bakes_exif_orientation(tmp_path: Path) -> None:
+    """orientation=6 (rotate 90 CW) turns a 64x32 landscape into a 32x64
+    portrait; the baked thumbnail's stored dims must reflect that, while an
+    un-tagged control stays landscape — proving the policy is applied at
+    decode, consistently with the viewer's auto-transform."""
+    root = tmp_path / "lib"
+    write_jpeg_meta(root / "rot.jpg", w=64, h=32, exif_orientation=6)
+    write_jpeg_meta(root / "flat.jpg", w=64, h=32)  # no Orientation tag
+    cat = scan_library(root)
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    cache = thumbcache.load_cache(result.path)
+    dims = {rel: (w, h) for rel, (_o, _l, w, h) in
+            zip(cache.files, cache.entries)}
+    assert dims["rot.jpg"][0] < dims["rot.jpg"][1]   # portrait (rotated)
+    assert dims["flat.jpg"][0] > dims["flat.jpg"][1]  # landscape (untouched)
+
+
+def test_index_orientation_through_scaled_decode(tmp_path: Path) -> None:
+    """The PRODUCTION path: real photos exceed THUMB_EDGE, so the indexer
+    takes the setScaledSize branch — pre-transform pixel space composed with
+    a 90-degree autoTransform. A 600x300 landscape rotated 90 CW must bake to
+    a portrait thumb that fits the 256 box AND keeps the 1:2 aspect (catches
+    any IgnoreAspectRatio distortion in the scaled-decode math)."""
+    root = tmp_path / "lib"
+    write_jpeg_meta(root / "big.jpg", w=600, h=300, exif_orientation=6)
+    cat = scan_library(root)
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    (_o, _l, w, h), = thumbcache.load_cache(result.path).entries
+    assert max(w, h) <= thumbcache.THUMB_EDGE  # fits the box
+    assert w < h                               # portrait (rotated)
+    assert abs((w / h) - 0.5) < 0.05           # aspect preserved, no distortion
+
+
+def test_make_thumbcache_bakes_orientation_like_indexer(tmp_path: Path) -> None:
+    """The standalone builder (scripts/make-thumbcache.py, PIL
+    exif_transpose) must apply orientation the same way the in-app indexer
+    does — backing the README's "consistent across every path" claim."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+
+    rot = tmp_path / "rot.jpg"
+    write_jpeg_meta(rot, w=600, h=300, exif_orientation=6)
+    flat = tmp_path / "flat.jpg"
+    write_jpeg_meta(flat, w=600, h=300)
+    _b, rw, rh = mtc._make_thumb(rot)
+    _b, fw, fh = mtc._make_thumb(flat)
+    assert rw < rh   # rotated -> portrait, matching the Qt indexer
+    assert fw > fh   # untouched -> landscape
+
+
+def test_index_empty_infile_caption_keeps_ini(tmp_path: Path) -> None:
+    """An empty/whitespace in-file caption is 'no caption', not "" — it must
+    not clobber the ini caption (§4 precedence), and the catalog must still
+    round-trip (no '' vs None divergence vs a warm load)."""
+    root = tmp_path / "lib"
+    # caption present-but-empty in IPTC, plus a real ini caption
+    write_jpeg_meta(root / "f" / "p.jpg", iptc=_iptc_app13(caption="   "))
+    (root / "f" / ".picasa.ini").write_text("[p.jpg]\r\ncaption=real ini\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    p = next(p for p in cat.photos if p.rel == "f/p.jpg")
+    assert p.caption == "real ini"  # the empty in-file value did not win
+
+    path = tmp_path / "cat.json"
+    save_catalog(cat, path)
+    loaded = load_catalog(path, root)
+    assert loaded is not None
+    lp = next(p for p in loaded.photos if p.rel == "f/p.jpg")
+    assert lp.caption == "real ini"  # round-trips; no empty-string leak
 
 
 if __name__ == "__main__":
