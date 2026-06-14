@@ -139,6 +139,41 @@ jobs:
           fi
           echo "OK: frozen no-arg launch exits gracefully"
 
+      - name: Frozen no-arg launch with NO display env exits gracefully (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          EXE="dist/fauxcasa-tracer/fauxcasa-tracer"
+          # The shipping double-click failure mode on a headless or
+          # misconfigured Linux box: QT_QPA_PLATFORM, DISPLAY and
+          # WAYLAND_DISPLAY ALL UNSET, so Qt falls back to the default 'xcb'
+          # plugin with no display to connect to. Before fauxcasa-7e5 that made
+          # QApplication([]) call qFatal/abort (exit 134) BEFORE the offscreen
+          # platformName guard could run; the new pre-construction
+          # _gui_unavailable() guard must instead reach the friendly exit 2.
+          # The offscreen step above never exercises this path — it always has
+          # a (headless) platform set, so QApplication never aborts there.
+          unset QT_QPA_PLATFORM DISPLAY WAYLAND_DISPLAY
+          set +e
+          OUT=$("$EXE" --cache-root ./noarg-nodisplay-cache 2>&1)
+          RC=$?
+          set -e
+          printf '%s\n' "$OUT"
+          echo "exit=$RC"
+          if [ "$RC" -eq 134 ]; then
+            echo "::error::aborted (134) in QApplication — the headless guard regressed"; exit 1
+          fi
+          if [ "$RC" -ne 2 ]; then
+            echo "::error::expected graceful exit 2 with no display, got $RC"; exit 1
+          fi
+          if ! printf '%s\n' "$OUT" | grep -q "no library selected"; then
+            echo "::error::missing the friendly no-library message"; exit 1
+          fi
+          if printf '%s\n' "$OUT" | grep -qi "traceback"; then
+            echo "::error::crashed instead of exiting gracefully"; exit 1
+          fi
+          echo "OK: frozen no-arg launch with no display exits gracefully"
+
       - name: Bundle size (soft gate — warn, never fail)
         shell: bash
         run: |
