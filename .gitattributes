@@ -1,0 +1,3 @@
+# Beads append-only audit exports: auto-keep both sides on divergent
+# merges/rebases instead of raising a tail conflict every time.
+.beads/*.jsonl merge=union
