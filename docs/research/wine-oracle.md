@@ -277,8 +277,19 @@ so are `xdotool mousemove --window <id> X Y` clicks. Use `--window` (or add the
 window's screen offset) — feeding raw image pixels to a screen-absolute
 `mousemove` lands the click in empty space and it silently does nothing.
 
-First export finding (fixture 030): an export to the **default (unwatched)**
-`Pictures\Picasa\Exports` location writes the resized JPEGs + a `.picasa.ini`
-folder stub (`[Picasa]` / `P2category=Exported Pictures` / `date=`) but **no db3
-row and no tree node** — the category mark is ini-only (cf hide-photo 017).
-`imagedata_originslow` gets stamped for every source photo the export read.
+First findings — the Create/output differentials this clone enabled:
+
+- **Export to folder (030):** to the **default (unwatched)** `Pictures\Picasa\
+  Exports` location, Picasa writes the resized JPEGs + a `.picasa.ini` folder stub
+  (`[Picasa]` / `P2category=Exported Pictures` / `date=`) but **no db3 row and no
+  tree node** — the category mark is ini-only (cf hide-photo 017).
+  `imagedata_originslow` (content-hash photo id) gets stamped for every source
+  photo the export read.
+- **Picture collage (031):** by contrast, a collage written to the *same* unwatched
+  `Pictures\Picasa\Collages\` tree **is** tracked in db3 — a category-1 `Collages`
+  albumdata row (= catdata "Projects (internal)") + two imagedata rows (the folder
+  + the indexed 5120×3413 render), and the column `imagedata_fileflags.pmp`
+  materializes. On disk it leaves `.picasa.ini` (`P2category=Projects (internal)`),
+  a `.cxf` collage-recipe XML (layout `<node>`s keyed by each photo's `originslow`
+  hash, `[Z]` portable drive token), and the rendered JPEG. So "Projects" are
+  catalogued; plain exports are not.
