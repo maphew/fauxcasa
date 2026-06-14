@@ -68,7 +68,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from catalog import Catalog, load_catalog, save_catalog, scan_library  # noqa: E402
-from grid import CACHE_CAP, PREFETCH_SCREENS, GridView  # noqa: E402
+from grid import CACHE_CAP, PREFETCH_SCREENS, WORKERS, GridView  # noqa: E402
 from thumbcache import CacheError, ThumbCache, bind, load_cache  # noqa: E402
 
 TELEPORT_STOPS = (0.25, 0.50, 0.75, 0.99)
@@ -174,11 +174,17 @@ def read_power() -> dict:
         if v is not None:
             on_ac = (v == "1")
             break
+    # The DRM card index + connector name vary by host/GPU, so glob the
+    # eDP connector rather than pinning card1-eDP-1 (which is null on any
+    # other machine). First match wins; None if there is no eDP panel.
+    vrr = next((first_line(str(p)) for p in
+                sorted(Path("/sys/class/drm").glob("card*-eDP-*/vrr_capable"))),
+               None)
     return {
         "on_ac": on_ac,
         "governor": first_line(
             "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
-        "vrr_capable": first_line("/sys/class/drm/card1-eDP-1/vrr_capable"),
+        "vrr_capable": vrr,
     }
 
 
@@ -400,6 +406,9 @@ def main() -> int:
             load1, _l5, _l15 = os.getloadavg()
         except (OSError, AttributeError):
             load1 = -1.0
+        # ~100 ms frame-callback-timeout cluster: counted once, used both as
+        # a reported metric and as an occlusion/contention tell below.
+        timeout_frames = sum(1 for x in comb_iv if abs(x - TIMEOUT_MS) <= 5.0)
         out = {
             "candidate": "tracer-grid",
             "label": args.label,
@@ -424,7 +433,7 @@ def main() -> int:
             "scroll_px_per_s": round(speed_px_s()),
             "prefetch_screens": PREFETCH_SCREENS,
             "cache_cap": CACHE_CAP,
-            "decode_workers": 4,
+            "decode_workers": WORKERS,  # grid's runtime decode-thread count
             **deco,
             **read_power(),
             "load_avg_1min": round(load1, 2),  # >~2 on this 16-thread box = contended
@@ -448,8 +457,7 @@ def main() -> int:
             "idle_ms_mean": pcts(comb_idle)["mean"],
             "missed_vsync_frames": sum(1 for x in comb_iv
                                        if x > 1.5 * frame_period),
-            "timeout_interval_frames": sum(1 for x in comb_iv
-                                           if abs(x - TIMEOUT_MS) <= 5.0),
+            "timeout_interval_frames": timeout_frames,
             "frames_vs_expected_ratio": round(d["n"] / expected, 3)
             if expected else 0.0,
             "blank_tile_frames": blanks,
@@ -471,8 +479,7 @@ def main() -> int:
             # occlusion/contention tells; require all three to be clean.
             "occlusion_clean": (state["not_visible_ticks"] == 0
                                 and state["fill_timeouts"] == 0
-                                and sum(1 for x in comb_iv
-                                        if abs(x - TIMEOUT_MS) <= 5.0) == 0),
+                                and timeout_frames == 0),
         }
         print(json.dumps(out), flush=True)
         app.quit()

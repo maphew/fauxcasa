@@ -61,6 +61,8 @@ jobs:
               d.mkdir(parents=True)
               for i in range(n):
                   img = QImage(320, 240, QImage.Format.Format_RGB32)
+                  # blue-dominant fill (g=90, b=160). The non-blank assert
+                  # step keys on exactly this palette — keep them in sync.
                   img.fill(QColor(40 * i % 255, 90, 160))
                   assert img.save(str(d / f"photo{i:02d}.jpg"), "JPEG", 85)
           (root / "2019-03-02 Hike" / ".picasa.ini").write_text(
@@ -96,8 +98,10 @@ jobs:
               for x in range(0, img.width(), 5):
                   p = img.pixelColor(x, y)
                   c[(p.red() // 32 * 32, p.green() // 32 * 32, p.blue() // 32 * 32)] += 1
-          # the JPEG fixtures are blue-ish (g~90, b~160); a blank grid would
-          # be only background/placeholder grays => missing qjpeg plugin.
+          # Keyed on the smoke-library fill above (QColor(40*i%255, 90, 160)):
+          # the fixtures are blue-dominant (g~90, b~160), so a decoded grid has
+          # many b>=128, b>g samples. A blank grid is only background/placeholder
+          # grays => qjpeg missing. If that fill palette changes, update this.
           blue = sum(n for (r, g, b), n in c.items() if b >= 128 and b > g and g >= 64)
           print(f"blue-photo samples: {blue}")
           if blue < 50:
