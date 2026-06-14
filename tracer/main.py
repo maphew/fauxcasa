@@ -335,7 +335,8 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.zoom)
         self.reveal_box = QCheckBox("  Show hidden")
         self.reveal_box.setToolTip(
-            "Reveal hidden=yes photos and stash-folder files (shown veiled)")
+            "Reveal hidden=yes photos, stash-folder files, and folders in the "
+            "Hidden Folders category (shown veiled)")
         self.reveal_box.toggled.connect(self._toggle_reveal)
         bar.addWidget(self.reveal_box)
 
