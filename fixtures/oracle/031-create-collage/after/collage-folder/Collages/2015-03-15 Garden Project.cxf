@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<collage version="2" format="15:10" orientation="landscape" theme="picturepile" shadows="1" captions="1" albumUID="b65d79ab3e5ebdb99c67f4fa671c6a2f">
+ <albumTitle>2015-03-15 Garden Project</albumTitle>
+ <albumDate>March 2015</albumDate>
+ <background type="solid" color="FFFFFFFF"/>
+ <spacing value="0.000000"/>
+ <node x="0.161824" y="0.305894" w="0.246826" h="0.494135" theta="-0.071720" scale="337.000000">
+  <theme>noborder</theme>
+  <src>[Z]\var\home\matt\dev\fauxcasa\cache\synthetic-library\2015-03-15 Garden Project\photo01.jpg</src>
+  <uid>fe751dfa20848685f24babcdec09dee2</uid>
+ </node>
+ <node x="0.482314" y="0.244143" w="0.329102" h="0.370601" theta="-0.006645" scale="337.000000">
+  <theme>noborder</theme>
+  <src>[Z]\var\home\matt\dev\fauxcasa\cache\synthetic-library\2015-03-15 Garden Project\photo02.jpg</src>
+  <uid>f7aadf061091cc959515c8981e1e0736</uid>
+ </node>
+ <node x="0.571714" y="0.507722" w="0.329102" h="0.370601" theta="0.005863" scale="337.000000">
+  <theme>noborder</theme>
+  <src>[Z]\var\home\matt\dev\fauxcasa\cache\synthetic-library\2015-03-15 Garden Project\photo03.jpg</src>
+  <uid>1d80a1ab24686b4398b0bf8e89d33381</uid>
+ </node>
+ <node x="0.341003" y="0.466345" w="0.329102" h="0.370601" theta="-0.029949" scale="337.000000">
+  <theme>noborder</theme>
+  <src>[Z]\var\home\matt\dev\fauxcasa\cache\synthetic-library\2015-03-15 Garden Project\photo04.jpg</src>
+  <uid>c9c27f5570bebbfd58f17391f8281542</uid>
+ </node>
+ <node x="0.298983" y="0.037052" w="0.221924" h="0.444282" theta="-0.031307" scale="303.000000">
+  <theme>noborder</theme>
+  <src>[Z]\var\home\matt\dev\fauxcasa\cache\synthetic-library\2015-03-15 Garden Project\photo05.jpg</src>
+  <uid>8b998c1aae891abefdad861c28cbcaba</uid>
+ </node>
+ <node x="0.142072" y="0.214827" w="0.273438" h="0.307918" theta="-0.070581" scale="280.000000">
+  <theme>noborder</theme>
+  <src>[Z]\var\home\matt\dev\fauxcasa\cache\synthetic-library\2015-03-15 Garden Project\photo06.jpg</src>
+  <uid>b72fda9b766565c75249dd5e750656a8</uid>
+ </node>
+ <node x="0.696355" y="0.165619" w="0.256836" h="0.289223" theta="0.013454" scale="263.000000">
+  <theme>noborder</theme>
+  <src>[Z]\var\home\matt\dev\fauxcasa\cache\synthetic-library\2015-03-15 Garden Project\photo07.jpg</src>
+  <uid>209b3c2fd665093ddba26f67a339243c</uid>
+ </node>
+ <node x="0.451672" y="0.676870" w="0.243164" h="0.273827" theta="-0.036531" scale="249.000000">
+  <theme>noborder</theme>
+  <src>[Z]\var\home\matt\dev\fauxcasa\cache\synthetic-library\2015-03-15 Garden Project\photo00.jpg</src>
+  <uid>e742da34c1da4e56c8dc4144d77bd593</uid>
+ </node>
+ <node x="0.481481" y="0.114283" w="0.232422" h="0.261730" theta="-0.016599" scale="238.000000">
+  <theme>noborder</theme>
+  <src>[Z]\var\home\matt\dev\fauxcasa\cache\synthetic-library\2015-03-15 Garden Project\photo07-001.jpg</src>
+  <uid>1245885254a32ad6d7c13171973d9eda</uid>
+ </node>
+</collage>

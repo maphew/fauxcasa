@@ -13,6 +13,26 @@ This project uses **bd** (beads) for issue tracking. Run `bd prime` for full wor
 > source of truth; don't `bd import` during normal operation; don't
 > reach for third-party Dolt hosting before trying the default).
 
+## Working safely: commit early and often
+
+**Owner directive (maphew, 2026-06-14): never wait to be asked to commit.**
+Commit each working increment as you go so progress survives power loss,
+crashes, and context resets — re-runnable state is the goal. This is a
+standing instruction and **overrides the conservative "don't commit/push
+unless asked" default** in the managed Beads block below (which itself
+defers to current instructions).
+
+- **Commit** every coherent, green (tests/build pass) increment on a feature
+  branch — don't batch a whole session into one commit, and don't end a
+  session with uncommitted work.
+- Use **branches + worktrees** to isolate work and **PRs** to integrate;
+  with **beads** and **commits** these are the safety nets — use them
+  freely, not only at session close.
+- **Push** (`git push` / `bd dolt push`) at natural checkpoints so the net
+  reaches the remote, not just local disk.
+- The only override: a *current* "do not commit" / "do not push" instruction
+  still wins for that session.
+
 ## Quick Reference
 
 ```bash
