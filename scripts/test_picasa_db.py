@@ -1160,7 +1160,14 @@ def test_fixture_every_picasa_ini_parses_clean():
     assert inis  # real Picasa-written ini files (CRLF, no [encoding] yet)
     for p in inis:
         ini = pdb.read_picasa_ini(p)
-        assert ini.sections and not ini.anomalies
+        # An empty (0-byte) .picasa.ini is real Picasa output, not a parse
+        # failure: reverting a baked edit consumes the .picasaoriginals
+        # stash and leaves the originals .picasa.ini emptied to 0 bytes
+        # rather than unlinking it (fixture 027-revert-baked-edit). Such a
+        # file parses cleanly to zero sections — non-empty inis must still
+        # carry sections.
+        assert not ini.anomalies
+        assert ini.sections or p.stat().st_size == 0
         for s in ini.sections:
             assert s.name  # every section is a [filename]
 

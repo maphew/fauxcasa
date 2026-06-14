@@ -1,0 +1,13 @@
+# Compositor ground truth (fauxcasa-ncv) — GNOME/Mutter, AMD 780M, eDP-1 @165Hz (6.06ms vsync), screen active
+# WAYLAND_DEBUG=1 over a 6s-flick run; logging perturbs the app's own frame timing, so this is ONLY for the compositor's commit/callback cadence, not the §7 numbers.
+# wp_presentation advertised but NOT used by Qt raster QWidget (0 .presented events) -> no scanout timestamps; commit cadence is the honest proxy.
+
+SUT surface = wl_surface#35 (2152 commits; 1 client surfaces)
+
+COMMIT cadence (fresh buffer -> compositor; presentable rate):
+  {'events': 2152, 'active_intervals_ms': {'p50': 5.93, 'p95': 7.46, 'p99': 11.34, 'max': 28.95, 'min': 1.96, 'n': 2147}, 'active_rate_hz': 172.5, 'n_gaps_ge_50ms': 4, 'largest_gaps_ms': [1975, 1981, 1986, 1992]}
+
+FRAME-CALLBACK .done cadence (compositor frame pacing ≈ vsync):
+  {'events': 1800, 'active_intervals_ms': {'p50': 6.1, 'p95': 12.28, 'p99': 13.41, 'max': 28.5, 'min': 3.65, 'n': 1795}, 'active_rate_hz': 144.4, 'n_gaps_ge_50ms': 4, 'largest_gaps_ms': [1970, 1980, 1982, 1988]}
+
+=> during active scrolling a fresh buffer reaches the compositor every 5.93 ms (p50) / 11.34 ms (p99), so it has a fresh frame to present at essentially every vsync. The 4 gaps >=50 ms are the scripted teleport dwells (static scroll = event-driven idle), not scroll stalls.

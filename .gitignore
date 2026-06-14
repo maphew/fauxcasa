@@ -14,3 +14,11 @@
 # Local env/config (may reference private data paths)
 .env
 __pycache__/
+
+# PyInstaller packaging (fauxcasa-ncv) build outputs + CI smoke artifacts;
+# the bundle is rebuilt in CI / via tracer/fauxcasa-tracer.spec
+/build/
+/dist/
+/ci-library/
+/ci-cache/
+/frozen-ci.png

@@ -18,6 +18,7 @@ import queue
 import threading
 from bisect import bisect_right
 from dataclasses import dataclass, field
+from time import perf_counter
 
 from PySide6.QtCore import QObject, QPointF, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPolygonF, QTransform
@@ -99,6 +100,11 @@ class GridView(QAbstractScrollArea):
         self.pending_lock = threading.Lock()
         self.tiles: dict[int, list] = {}  # idx -> [QImage|None(error), frame]
         self.frame_no = 0
+        # Optional bench hook: callable(t_start, t_end, blank). Set by the
+        # scroll benchmark (tracer/bench_scroll.py) to time frame
+        # production and count blank-tile frames; None in normal use, so
+        # the per-frame cost is one identity compare.
+        self._frame_probe = None
         # Indices the last paint wanted (visible + prefetch). Workers drop
         # jobs that fell out of this set — a fast scrollbar drag would
         # otherwise leave thousands of stale decodes ahead of the visible
@@ -431,6 +437,8 @@ class GridView(QAbstractScrollArea):
     # ---------- painting ----------
 
     def paintEvent(self, _event) -> None:
+        probe = self._frame_probe
+        t_start = perf_counter() if probe is not None else 0.0
         self.frame_no += 1
         self._pump_decoded()
         vp = self.viewport()
@@ -451,11 +459,13 @@ class GridView(QAbstractScrollArea):
         font.setBold(True)
         painter.setFont(font)
 
+        blank = False  # bench: any strictly-visible tile still undecoded
         for g, n, idx in self._visible_items(top, bottom):
             r = self._item_rect(g, n).translated(0, -top)
             t = self.tiles.get(idx)
             if t is None:
                 painter.fillRect(r, PLACEHOLDER)
+                blank = True
             elif t[0] is None:
                 painter.fillRect(r, ERROR_TILE)
                 t[1] = self.frame_no
@@ -497,6 +507,9 @@ class GridView(QAbstractScrollArea):
         for _g, _n, idx in band:
             self._request(idx)
         self._evict()
+
+        if probe is not None:
+            probe(t_start, perf_counter(), blank)
 
     def _draw_header(self, painter: QPainter, g: _Group, y: int,
                      width: int) -> None:

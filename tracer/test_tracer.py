@@ -632,5 +632,47 @@ def test_index_empty_infile_caption_keeps_ini(tmp_path: Path) -> None:
     assert lp.caption == "real ini"  # round-trips; no empty-string leak
 
 
+def test_default_cache_root_frozen_vs_checkout(monkeypatch, tmp_path: Path) -> None:
+    """main._default_cache_root: REPO-relative in a source checkout; a
+    per-user writable dir when frozen (REPO then points inside the
+    read-only PyInstaller bundle, so the disposable cache must go
+    somewhere writable). XDG_CACHE_HOME wins over the ~/.cache fallback."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    monkeypatch.setattr(main, "FROZEN", False)
+    assert main._default_cache_root() == main.REPO / "cache" / "tracer-cache"
+
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert main._default_cache_root() == tmp_path / "xdg" / "fauxcasa-tracer"
+
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setattr(main.Path, "home",
+                        classmethod(lambda cls: tmp_path / "home"))
+    assert (main._default_cache_root()
+            == tmp_path / "home" / ".cache" / "fauxcasa-tracer")
+
+
+def test_pcts_nearest_rank() -> None:
+    """bench_scroll.pcts uses a nearest-rank LOWER index so a sub-1.0
+    quantile never overshoots to the max (the documented int(n*q)==n trap
+    that would report p100 as p99 at n=100)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import bench_scroll as bs
+
+    z = bs.pcts([])
+    assert z["n"] == 0 and z["p99"] == 0.0 and z["max"] == 0.0
+
+    r = bs.pcts([float(i) for i in range(1, 101)])  # 1..100, already sorted
+    assert r["n"] == 100
+    assert r["max"] == 100.0           # s[-1]
+    assert r["min"] == 1.0             # s[0]
+    assert r["p50"] == 50.0            # nearest-rank lower index
+    assert r["p99"] < 100.0            # the trap: must NOT collapse onto max
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
