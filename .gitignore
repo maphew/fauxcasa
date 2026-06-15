@@ -25,4 +25,6 @@ __pycache__/
 /dist/
 /ci-library/
 /ci-cache/
+/gui-cache/
 /frozen-ci.png
+/gui-ci.png
