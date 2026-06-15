@@ -24,9 +24,11 @@ which adopt mode skips by design — N4). See tracer/README.md.
 
 Remaining tracer-scope gaps (see tracer/README.md): EXIF orientation is
 applied at decode (Qt/PIL auto-transform, composed with the rotate= user
-turns), but faces-in-XMP, geotags, and in-file dates are not ingested,
-and the folder-level Hidden Folders category is ignored — only per-photo
-hidden=yes (oracle fixture 017) is honored.
+turns), but faces-in-XMP, geotags, and in-file dates are not ingested.
+The folder-level Hidden Folders category IS now honored: a folder whose
+own [Picasa] section carries `P2category=Hidden Folders` hides all of its
+photos, mirroring per-photo hidden=yes (oracle fixture 017) and the stash
+treatment — see _is_folder_hidden.
 """
 
 from __future__ import annotations
@@ -77,6 +79,11 @@ class Folder:
     description: str | None = None
     photo_count: int = 0  # visible photos only
     total_count: int = 0  # all photos incl. hidden/stash (reveal-mode counts)
+    # The whole folder sits in Picasa's built-in "Hidden Folders" collection
+    # ([Picasa] P2category=Hidden Folders): every photo under it is forced
+    # invisible (like a stash folder), so the sidebar can surface it only
+    # under reveal mode and distinguish it from a normal folder.
+    folder_hidden: bool = False
 
 
 @dataclass
@@ -149,6 +156,32 @@ def _flag(sec: picasa_db.IniSection, key: str) -> bool:
     return (sec.get(key) or "").strip().lower() == "yes"
 
 
+# Picasa hides a WHOLE folder by putting it in the built-in "Hidden Folders"
+# collection, recorded in the folder's own [Picasa] section as
+# `P2category=Hidden Folders` (the sibling of the normal `Folders on Disk`).
+# Matched defensively: trimmed, case-insensitive, against the exact value
+# "Hidden Folders" — an absent or any other P2category (Folders on Disk,
+# Exported Pictures, Projects (internal), …) is NOT folder-hidden, and a
+# folder with no [Picasa] section reads as not hidden.
+#
+# ORACLE GATE: implemented against the DOCUMENTED format — confirmed by
+# committed fixture 025's [Picasa] block (P2category=Folders on Disk) + the
+# catdata category list in docs/research/wine-oracle.md (which lists
+# "Hidden Folders") + the Picasa binary strings — NOT against a captured
+# hide-folder oracle differential (none exists yet; highest fixture is 031).
+# A future `032-hide-folder` capture should confirm the exact category
+# string and any db3 side-effects (catdata membership, the password dialog).
+# Do NOT treat this as oracle-verified.
+_HIDDEN_FOLDERS_CATEGORY = "hidden folders"
+
+
+def _is_folder_hidden(psec: picasa_db.IniSection | None) -> bool:
+    if psec is None:
+        return False
+    return (psec.get("P2category") or "").strip().lower() \
+        == _HIDDEN_FOLDERS_CATEGORY
+
+
 def rel_paths(root: Path, files: list[Path]) -> list[str]:
     """Library-relative POSIX paths — exactly relative_to().as_posix(),
     but via string-slicing the constant root prefix: two relative_to()
@@ -205,7 +238,8 @@ def scan_library(root: Path) -> Catalog:
             # catalog matches a walked one (an absent key reads as None).
             desc = (psec.get("description") or None) if psec else None
             folders[folder_rel] = Folder(rel=folder_rel, title=title,
-                                         description=desc)
+                                         description=desc,
+                                         folder_hidden=_is_folder_hidden(psec))
 
         sec = secmap.get(name.lower())
         if sec is not None:
@@ -229,7 +263,9 @@ def scan_library(root: Path) -> Catalog:
                     a.strip().lower() for a in al.split(",") if a.strip()
                 )
 
-        if photo.hidden:
+        # A whole folder in the "Hidden Folders" collection hides every
+        # photo under it, exactly like per-photo hidden=yes or a stash dir.
+        if photo.hidden or folders[folder_rel].folder_hidden:
             photo.visible = False
         photos.append(photo)
 
@@ -288,7 +324,11 @@ def scan_library(root: Path) -> Catalog:
 # at 1 on purpose: the packed thumbnail format is unchanged, and the shipped
 # benchmark .fcache stays adoptable (its synthetic photos carry no
 # Orientation tag, so the bake is a no-op).
-CATALOG_VERSION = 2
+# v3: the folder-level "Hidden Folders" category (folder [Picasa]
+# P2category=Hidden Folders) now forces its photos invisible and is
+# persisted as a `hidden_folders` list — a v2 catalog has neither, so it
+# would wrongly show a hidden folder's photos; reject it and cold-rebuild.
+CATALOG_VERSION = 3
 
 
 def _photo_to_row(p: Photo) -> dict:
@@ -323,6 +363,11 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
         # only folders that carry a description (title/count are derived)
         "folders": {f.rel: f.description
                     for f in catalog.folders.values() if f.description},
+        # folder-level "Hidden Folders" membership: can't be re-derived on
+        # load (the warm path never re-reads inis), so persist it explicitly
+        # — it drives both per-photo visibility and Folder.folder_hidden.
+        "hidden_folders": [f.rel for f in catalog.folders.values()
+                           if f.folder_hidden],
         "albums": [
             {"uid": a.uid, "name": a.name, "date": a.date,
              "description": a.description, "members": a.members}
@@ -360,6 +405,11 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
     # gate is meant to guard) degrades to a cold walk rather than crashing
     # startup — main() calls this unguarded.
     try:
+        hidden_folders = data.get("hidden_folders", [])
+        if not isinstance(hidden_folders, list):
+            hidden_folders = []
+        hidden_folders = set(hidden_folders)
+
         photos: list[Photo] = []
         for row in rows:
             rel = row["r"]
@@ -372,7 +422,8 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
                 size=row.get("z", -1), mtime=row.get("m", -1),
                 sha256=row.get("x"),
             )
-            p.visible = not p.hidden and not _is_stashed(folder)
+            p.visible = (not p.hidden and not _is_stashed(folder)
+                         and folder not in hidden_folders)
             photos.append(p)
 
         folder_desc = data.get("folders", {})
@@ -385,7 +436,8 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
                     else (root.name or str(root))
                 folders[p.folder] = Folder(
                     rel=p.folder, title=title,
-                    description=folder_desc.get(p.folder))
+                    description=folder_desc.get(p.folder),
+                    folder_hidden=p.folder in hidden_folders)
             folders[p.folder].total_count += 1  # reveal-mode count
             if p.visible:
                 folders[p.folder].photo_count += 1
