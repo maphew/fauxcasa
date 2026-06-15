@@ -164,14 +164,12 @@ def _flag(sec: picasa_db.IniSection, key: str) -> bool:
 # Exported Pictures, Projects (internal), …) is NOT folder-hidden, and a
 # folder with no [Picasa] section reads as not hidden.
 #
-# ORACLE GATE: implemented against the DOCUMENTED format — confirmed by
-# committed fixture 025's [Picasa] block (P2category=Folders on Disk) + the
-# catdata category list in docs/research/wine-oracle.md (which lists
-# "Hidden Folders") + the Picasa binary strings — NOT against a captured
-# hide-folder oracle differential (none exists yet; highest fixture is 031).
-# A future `032-hide-folder` capture should confirm the exact category
-# string and any db3 side-effects (catdata membership, the password dialog).
-# Do NOT treat this as oracle-verified.
+# ORACLE-VERIFIED by fixture 032-hide-folder (fauxcasa-8rl): driving real
+# Picasa 3.9 to hide a folder writes exactly `[Picasa]` + `P2category=Hidden
+# Folders` to the folder's own .picasa.ini (the string mark this matcher
+# reads), with a db3 mirror (the folder's albumdata_category row flips 2
+# 'Folders on Disk' -> 7 'Hidden Folders') and NO per-photo hidden=yes. So the
+# case-insensitive "Hidden Folders" match below is exactly right as-is.
 _HIDDEN_FOLDERS_CATEGORY = "hidden folders"
 
 
