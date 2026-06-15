@@ -133,7 +133,7 @@ class GridView(QAbstractScrollArea):
         self._cache_bytes = 0  # running sum of tiles' decoded bytes (CACHE_BYTES)
         self.frame_no = 0
         # Optional bench hook: callable(t_start, t_end, blank). Set by the
-        # scroll benchmark (tracer/bench_scroll.py) to time frame
+        # scroll benchmark (apps/desktop-python/bench_scroll.py) to time frame
         # production and count blank-tile frames; None in normal use, so
         # the per-frame cost is one identity compare.
         self._frame_probe = None

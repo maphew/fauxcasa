@@ -24,7 +24,7 @@ Scope and stance (a tracer, not the product writer):
   by Qt's QImageReader.setAutoTransform / PIL's exif_transpose (which handle
   all eight orientations, mirrors included), baked into the thumbnail and
   applied to the viewed original, then composed with the Picasa ``rotate=``
-  user quarter-turns. See tracer/README.md "EXIF orientation".
+  user quarter-turns. See apps/desktop-python/README.md "EXIF orientation".
 
 Precedence within the file: XMP wins over IPTC when both are present. Picasa
 writes the two together and they agree, but XMP is its primary store (the

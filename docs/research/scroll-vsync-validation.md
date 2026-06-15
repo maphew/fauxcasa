@@ -8,7 +8,7 @@ implemented and reported below.
 ## TL;DR
 
 1. **The py-qt scroll asterisk is retired.** The *product* grid
-   (`tracer/grid.py`, event-driven repaints) was measured on a real
+   (`apps/desktop-python/grid.py`, event-driven repaints) was measured on a real
    display + real GPU running the balloon protocol (5 clean runs, ~15.8 k
    frames each). Frame **production time** (the honest, throttle-independent
    §7 metric) is **p99 5.7 ms, worst-case max 10.1 ms, with zero blank
@@ -18,7 +18,7 @@ implemented and reported below.
    at the **6.06 ms (165 Hz)** vsync — i.e. it has a fresh frame to present
    at essentially every vsync, so the scroll is genuinely smooth on screen,
    not just "fast to paint offscreen".
-2. **A real Windows-class bundle exists.** `tracer/fauxcasa-tracer.spec`
+2. **A real Windows-class bundle exists.** `apps/desktop-python/fauxcasa-tracer.spec`
    (PyInstaller, onedir) builds a launchable artifact; the **frozen** exe
    runs headless and decodes JPEG thumbnails (non-blank screenshot). CI
    (`.github/workflows/bundle.yml`) builds + smoke-tests it on
@@ -50,7 +50,7 @@ result is actually smooth.
 ## 2. Key discovery: Qt's raster QWidget is *unthrottled* here too
 
 Before trusting any number, the pre-mortem demanded a throttle-probe gate
-(`tracer/vsync_probe.py`, raw output in `ncv-results/throttle-probe.txt`).
+(`apps/desktop-python/vsync_probe.py`, raw output in `ncv-results/throttle-probe.txt`).
 A trivial `QWidget` driven by a fixed-rate timer, on this compositor
 (GNOME/Mutter, Wayland, AMD 780M, **eDP-1 @ 165 Hz**):
 
@@ -81,7 +81,7 @@ actually arrive with the compositor's own commit/callback log (§5).
 
 System under test: the **product** `GridView`, unchanged except a
 zero-cost-when-off frame probe (`grid.py`, `_frame_probe`). Driver:
-`tracer/bench_scroll.py` runs the balloon protocol (cold → flick-A 45 s →
+`apps/desktop-python/bench_scroll.py` runs the balloon protocol (cold → flick-A 45 s →
 teleport 25/50/75/99 % → flick-B 45 s) on the 100 k benchmark cache, in a
 1280×800 logical window, scrolling at a **time-based** offset (so the
 *speed* is exact regardless of paint rate). Controls implemented per the
@@ -218,7 +218,7 @@ is the proxy.
 Deliverable: a real distributable so the Windows CI gates run on the
 artifact users would get, not on source.
 
-- **`tracer/fauxcasa-tracer.spec`** — PyInstaller, **onedir** (not onefile:
+- **`apps/desktop-python/fauxcasa-tracer.spec`** — PyInstaller, **onedir** (not onefile:
   onefile re-extracts the whole bundle each launch → multi-second cold
   start, which fails §7's cold-start anchor), `console=True` (the tracer's
   READY/JSON stdout is how the headless gate validates it; a shipping GUI
@@ -261,7 +261,7 @@ artifact users would get, not on source.
 ```bash
 # 0. throttle-probe gate (is the raster surface vsync-throttled here?)
 for hz in 60 240 1000; do WAYLAND_DISPLAY=wayland-0 QT_QPA_PLATFORM=wayland \
-  uv run tracer/vsync_probe.py --hz $hz; done
+  uv run apps/desktop-python/vsync_probe.py --hz $hz; done
 
 # 1. scroll benchmark (sequential, idle machine; needs the 100k cache).
 #    Deactivate the screensaver first — a locked screen stalls frame
@@ -271,17 +271,17 @@ gdbus call --session --dest org.gnome.ScreenSaver \
   --object-path /org/gnome/ScreenSaver \
   --method org.gnome.ScreenSaver.SetActive false
 systemd-inhibit --what=idle:sleep WAYLAND_DISPLAY=wayland-0 QT_QPA_PLATFORM=wayland \
-  uv run tracer/bench_scroll.py \
+  uv run apps/desktop-python/bench_scroll.py \
     --thumbs cache/benchmark-thumbs.fcache --library cache/benchmark-library \
     --seconds 45 --screens 2.5            # add --drive-hz 60 / --screens 3.0 for the variants
 
 # 2. compositor ground truth
-WAYLAND_DEBUG=1 ... uv run tracer/bench_scroll.py ... --seconds 6 2>wld.log
+WAYLAND_DEBUG=1 ... uv run apps/desktop-python/bench_scroll.py ... --seconds 6 2>wld.log
 uv run scripts/parse-wayland-cadence.py wld.log
 
 # 3. Windows-class bundle (Linux proxy locally; real artifact in CI)
 uv run --with "PySide6-Essentials==6.11.1" --with "pyinstaller==6.20.0" \
-  pyinstaller --noconfirm --clean tracer/fauxcasa-tracer.spec
+  pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 QT_QPA_PLATFORM=offscreen dist/fauxcasa-tracer/fauxcasa-tracer ci-library \
   --cache-root ./ci-cache --finish-build --screenshot frozen-ci.png --scroll-to 0.5
 ```

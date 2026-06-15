@@ -189,7 +189,7 @@ Named consequences, owned now:
      will be Qt-typical (~100–150 MB installed); the spec already
      re-anchored austerity on memory and cold start, not installer
      megabytes (§7). **[DONE 2026-06-13, fauxcasa-ncv]**
-     `tracer/fauxcasa-tracer.spec` + `.github/workflows/bundle.yml`; the
+     `apps/desktop-python/fauxcasa-tracer.spec` + `.github/workflows/bundle.yml`; the
      frozen exe runs headless and decodes JPEG (non-blank screenshot).
    - py-qt's screen-sync caveat (the table's * note) gets retired by
      measuring the M1 grid on a real display with the same harness.

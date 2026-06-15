@@ -12,7 +12,7 @@ reader.
 
 Captions/keywords precedence (§4 tier-1): scan_library fills
 caption/keywords from the ini here; the indexer (thumbcache.build_cache,
-via tracer/inmeta.py) then overrides them with a JPEG's in-file
+via apps/desktop-python/inmeta.py) then overrides them with a JPEG's in-file
 XMP/IPTC values when present — real Picasa stores JPEG captions/keywords
 in-file and uses ini caption=/keywords= only for formats with no
 XMP/IPTC home. So a freshly walked but not-yet-indexed catalog shows
@@ -20,9 +20,9 @@ ini-only captions; once indexed, the persisted catalog and warm starts
 carry the merged result. Adopt mode (--thumbs) is the exception: it binds
 an external thumbnail cache without running the indexer, so its catalog
 stays ini-only (the in-file read piggybacks on the index's file reads,
-which adopt mode skips by design — N4). See tracer/README.md.
+which adopt mode skips by design — N4). See apps/desktop-python/README.md.
 
-Remaining tracer-scope gaps (see tracer/README.md): EXIF orientation is
+Remaining tracer-scope gaps (see apps/desktop-python/README.md): EXIF orientation is
 applied at decode (Qt/PIL auto-transform, composed with the rotate= user
 turns), but faces-in-XMP, geotags, and in-file dates are not ingested.
 The folder-level Hidden Folders category IS now honored: a folder whose
@@ -39,7 +39,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parent.parent
+_REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "scripts"))
 
 import picasa_db  # noqa: E402

@@ -9,7 +9,7 @@ Retires the asterisk on the stack-balloon py-qt scroll numbers. Those ran
 under a HEADLESS weston compositor (llvmpipe) where a 240 Hz QTimer drove
 ~250 unthrottled paints/s, so the table measured "how fast it can paint",
 not "how smooth it looks at vsync". This harness runs the *product* grid
-(tracer/grid.py GridView, event-driven repaints) on the real desktop
+(apps/desktop-python/grid.py GridView, event-driven repaints) on the real desktop
 compositor + GPU and reports the §7 scroll budget honestly.
 
 WHY FRAME-PRODUCTION TIME, NOT PAINT INTERVAL (a measured fact about the
@@ -44,7 +44,7 @@ separately so a thermal/clock droop is visible, not hidden. A "blank"
 frame is one in which a strictly-visible tile was still an undecoded
 placeholder when painted.
 
-    uv run tracer/bench_scroll.py \
+    uv run apps/desktop-python/bench_scroll.py \
         --thumbs cache/benchmark-thumbs.fcache \
         --library cache/benchmark-library [--seconds 45] [--screens 2.5] \
         [--drive-hz N] [--label native] [--no-decorate]
@@ -274,7 +274,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    repo = Path(__file__).resolve().parent.parent
+    repo = Path(__file__).resolve().parents[2]
     ap.add_argument("--thumbs", type=Path,
                     default=repo / "cache" / "benchmark-thumbs.fcache")
     ap.add_argument("--library", type=Path,

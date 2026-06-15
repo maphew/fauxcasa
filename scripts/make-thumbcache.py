@@ -59,7 +59,7 @@ def _make_thumb(path: Path) -> tuple[bytes, int, int]:
 
     with Image.open(path) as img:
         # Bake EXIF orientation (all 8 cases, mirrors too) so this builder
-        # agrees with the in-app one (tracer/thumbcache.py) and the viewer;
+        # agrees with the in-app one (apps/desktop-python/thumbcache.py) and the viewer;
         # the Picasa rotate= user turns are composed live at display, never
         # baked. No-op for images without an Orientation tag.
         img = ImageOps.exif_transpose(img)

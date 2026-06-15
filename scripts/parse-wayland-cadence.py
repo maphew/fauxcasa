@@ -7,7 +7,7 @@
 in-process frame timing can't see (fauxcasa-ncv §7 scroll validation).
 
 When Qt's QWidget raster (wl-shm) surface is NOT frame-callback throttled
-(see tracer/vsync_probe.py), paintEvent timing measures Qt's render-offer
+(see apps/desktop-python/vsync_probe.py), paintEvent timing measures Qt's render-offer
 cadence, not on-screen smoothness. The compositor's own protocol does show
 it: how often Qt delivers a fresh buffer (wl_surface.commit — the rate the
 compositor can present at) and the compositor's frame-callback pacing
@@ -15,7 +15,7 @@ compositor can present at) and the compositor's frame-callback pacing
 with the most commits; active scrolling (intervals < 50 ms) is separated
 from idle gaps (cold / teleport / dwell).
 
-    WAYLAND_DEBUG=1 ... uv run tracer/bench_scroll.py ... 2>wld.log
+    WAYLAND_DEBUG=1 ... uv run apps/desktop-python/bench_scroll.py ... 2>wld.log
     uv run scripts/parse-wayland-cadence.py wld.log
 """
 import re

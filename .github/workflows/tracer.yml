@@ -7,13 +7,13 @@ name: tracer
 on:
   push:
     paths:
-      - "tracer/**"
+      - "apps/desktop-python/**"
       - "scripts/make-thumbcache.py"
       - "scripts/picasa_db.py"
       - ".github/workflows/tracer.yml"
   pull_request:
     paths:
-      - "tracer/**"
+      - "apps/desktop-python/**"
       - "scripts/make-thumbcache.py"
       - "scripts/picasa_db.py"
       - ".github/workflows/tracer.yml"
@@ -37,7 +37,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
       - name: Unit tests
-        run: uv run tracer/test_tracer.py
+        run: uv run apps/desktop-python/test_tracer.py
       - name: Generate a smoke library
         shell: bash
         run: |
@@ -57,10 +57,10 @@ jobs:
           EOF
       - name: End-to-end headless run (scan, build cache, grid, screenshot)
         run: >
-          uv run tracer/main.py ci-library --finish-build
+          uv run apps/desktop-python/main.py ci-library --finish-build
           --screenshot tracer-ci.png --scroll-to 0.5
       - name: Warm second run binds the built cache
-        run: uv run tracer/main.py ci-library --quit-after-ready
+        run: uv run apps/desktop-python/main.py ci-library --quit-after-ready
       - uses: actions/upload-artifact@v4
         with:
           name: tracer-screenshot-${{ matrix.os }}

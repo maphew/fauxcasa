@@ -11,7 +11,7 @@ compositor. Run it at several timer rates:
 
     for hz in 60 240 1000; do
       WAYLAND_DISPLAY=wayland-0 QT_QPA_PLATFORM=wayland \
-        uv run tracer/vsync_probe.py --hz $hz
+        uv run apps/desktop-python/vsync_probe.py --hz $hz
     done
 
 Decision rule (per the methodology pre-mortem):

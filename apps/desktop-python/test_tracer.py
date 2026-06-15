@@ -29,7 +29,7 @@ from catalog import (
     walk_library,
 )
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[2]
 
 
 def make_jpeg(path: Path, w: int = 64, h: int = 48) -> None:
