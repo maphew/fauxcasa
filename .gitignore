@@ -4,6 +4,7 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.beads/*.jsonl
 
 # Oracle fixtures are synthetic Picasa db files, not Dolt artifacts
 !fixtures/oracle/**/*.db
