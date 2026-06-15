@@ -6,6 +6,26 @@ implementation-priority ranking (1–5; negative = anti-feature)** for Fauxcasa.
 
 Produced 2026-06-15 (bead `fauxcasa-dfa`).
 
+## At a glance
+
+~224 ranked rows across 8 menus, 4 context menus, the edit room (5 tabs / **36
+effects** / 5 tool panels), 4 side panels, and 6 modes/dialogs:
+
+| Rank | Rows | What it is |
+|---|---:|---|
+| **5** core | 40 | The Soul + N1–N7 made visible (browse, search, folders-tree, stars, non-destructive edit, delete→trash). |
+| **4** v1-IN | 90 | The explicit v1 feature set. |
+| **3** later/secondary | 54 | v1.5–v2 scope + necessary plumbing. |
+| **2** nice-to-have | 16 | Niche display modes, extra effect packs. |
+| **1** legacy-harmless | 4 | Dead links, obsolete display tuning. |
+| **−1 … −3** anti-feature | 20 | Cloud lock-in & dead Google services — every one a named OUT/non-goal. |
+
+The single loudest signal: **the entire cloud surface is anti-feature
+territory** — "Sign in with Google" (−3) plus ~20 Upload / Web Albums / YouTube /
+Blogger / Order-Prints / Gift-CD / Google-Earth items (−2). They fill much of the
+Create and Tools menus and the whole bottom action bar, and the spec marks every
+one OUT. Cutting them is the Soul, not a loss.
+
 ## How this was produced
 
 The inventory is **empirical**, not from memory or 2011-era writeups. Real
@@ -106,8 +126,8 @@ the user. Those map to the negative ranks below.
 | Slideshow (Ctrl+4) | 4 | v1-IN | Basic slideshow doubles as a triage pass. |
 | Timeline (Ctrl+5) | 3 | LATER | Timeline view. |
 | Search Options | 3 | v1 | Search configuration. |
-| Small Pictures | 2 | nice | Filter tiny images. |
-| Hidden Pictures | 3 | v1 | The single inspectable hidden-filter UI (N7). |
+| Small Pictures | 3 | v1 | Part of the one inspectable filter surface (footgun 10 — no invisible hide). |
+| Hidden Pictures | 4 | v1-IN | The single inspectable hidden-filter UI (N7). |
 | Use Color Management | 2 | nice | Color-managed display. |
 | **Display Mode** ▸ Automatic | 3 | v1 | Sensible default. |
 | Display Mode ▸ 24-bit / 16-bit dithered / Remote Desktop / LCD Whitepoint / Projector / overflow pixels / Mac Gamma 1.6 / Linear Gamma 2.2 / Sepia / B&W | 1 | legacy | 2009-era display-tuning; mostly obsolete. |
@@ -125,7 +145,7 @@ the user. Those map to the negative ranks below.
 | View Slideshow (Ctrl+4) | 4 | v1-IN | Per-folder play. |
 | Refresh Thumbnails | 4 | v1-IN | Re-scan / rebuild (maintenance). |
 | **Sort By** ▸ Name / Date / Size / Reverse order | 4 | v1-IN | Per-folder sort modes. |
-| Hide / Unhide | 3 | v1 | Cosmetic hide, labeled as such (not security). |
+| Hide / Unhide | 4 | v1-IN | One inspectable cosmetic-hide feature (N7); labeled as such, never security. |
 | Print Contact Sheet… (Ctrl+Shift+P) | 3 | LATER | Contact sheets. |
 | Export as HTML Page… | 3 | LATER | Static-gallery export (serverless heir to Sync-to-Web). |
 | Locate on Disk (Ctrl+Enter) | 4 | v1-IN | |
@@ -145,7 +165,7 @@ the user. Those map to the negative ranks below.
 | Batch Edit ▸ Auto Red Eye Correction | 4 | v1-IN | Batched redeye. |
 | Batch Edit ▸ Show Text / Hide Text | 2 | nice | Text-overlay visibility. |
 | Undo All Edits | 5 | core | Per-photo durable undo (the strongest emotional peak in the corpus). |
-| Hide / Unhide | 3 | v1 | |
+| Hide / Unhide | 4 | v1-IN | Single inspectable hide feature (N7). |
 | Reset Faces | 4 | v1-IN | "One-action remove all face data." |
 | Properties (Alt+Enter) | 4 | v1-IN | |
 
@@ -216,7 +236,7 @@ Right-click menus largely duplicate the menu bar; rank the **distinct** items
 | Add to Album ▸ | 4 | v1-IN | |
 | Rotate CW / CCW | 5 | core | |
 | Undo all Edits | 5 | core | |
-| Hide | 3 | v1 | |
+| Hide | 4 | v1-IN | Single inspectable hide feature (N7). |
 | Move to New Folder… | 4 | v1-IN | |
 | Split Folder Here… | 3 | v1 | Split a folder at a photo boundary (real file op). |
 | Open File / Open With ▸ | 3 | LATER | External-tool path. |
@@ -239,7 +259,7 @@ Right-click menus largely duplicate the menu bar; rank the **distinct** items
 | Move to Collection ▸ | 3 | v1 | Collections (year grouping / named collections). |
 | Refresh Thumbnails | 4 | v1-IN | |
 | Sort Folder By ▸ | 4 | v1-IN | |
-| Hide Folder | 3 | v1 | |
+| Hide Folder | 4 | v1-IN | Single inspectable hide feature (N7); cosmetic, not security. |
 | Locate on Disk | 4 | v1-IN | |
 | Remove from Picasa… | 4 | v1-IN | |
 | Move Folder… | 4 | v1-IN | |
@@ -395,12 +415,19 @@ Prints; Publish to Blogger; Create a Gift CD; "Uploaded" filter (−1).
 Earth (the *capability* — local geotag editing and a provider-swappable map
 panel are fine; the Google-Earth/Maps-API binding is not).
 
-**Against the Soul, structurally** — Password-protected hiding (security
-theater; **not present as such** in 3.9's surface but explicitly banned — any
-re-implementation of "hide" must stay cosmetic and labeled); auto-install
-updates / phone-home (Picasa's auto-updater → replaced by the off-by-default
-opt-in check); copy-into-app-library import (Picasa already avoids this — keep it
-that way).
+**Correctly absent (no negative item — their absence is itself spec-correct)** —
+three banned behaviors have **no** UI element in 3.9, so there is nothing to rank
+negative; the point is to keep them absent: password-protected hiding (security
+theater — 3.9 only has cosmetic hide; any re-implementation must stay cosmetic
+and labeled); auto-install updates / phone-home / telemetry (only the
+off-by-default opt-in `Check for Updates` exists, the entire network surface);
+copy-into-app-library import (Picasa never copies into a managed library — keep
+it that way).
+
+> **Why this matters for scoping:** the cloud surface is a *large* fraction of
+> the Create and Tools menus and the whole bottom action bar. Cutting it isn't a
+> loss — it's the Soul. Every one of these decayed when its Google service
+> churned; the durable core (face tags, edits, stars) was 100% local.
 
 ## 7. The core (rank 5)
 
@@ -417,23 +444,59 @@ two extra effect packs (24 of the 36 effects are Picasa-3.9 expansions beyond
 the spec's "12 classic"); the legacy Display-Mode color-tuning list; Maps/Earth
 geotag actions.
 
-**Spec v1-IN features with *no* Picasa-3.9 UI equivalent** (build these *new*,
-not ported) — flagged so the inventory isn't mistaken for the feature list:
+**Spec v1-IN features with *no* (or only partial) Picasa-3.9 UI equivalent**
+(build these *new*, not ported) — flagged so the inventory isn't mistaken for
+the feature list:
 
-- **Reverse-star (X) → a `Rejected` auto-collection** — Picasa had import-time
-  exclude but no first-class reject-in-library + Rejected view.
-- **Jump-to-folder / jump-to-end buttons** replacing Picasa's footgun recentering
-  thumb.
+*High priority (owner-requested / named v1-IN, under-represented in the UI):*
+
+- **Reverse-star / reject — first-class controls.** Picasa only had import-time
+  exclude. Missing: a **bottom-tray Reject button** (peer to Star), the **X-key
+  reject** in grid/viewer/slideshow, a **reject control in the slideshow
+  overlay** (the spec puts star *and* reverse-star there so playback is a triage
+  pass), and a **`Rejected` auto-collection** sidebar node.
+- **Auto-collections as sidebar nodes** — **Starred Photos** (scoped), **Recently
+  Updated**, **Rejected**, **Exports**. Picasa's sidebar only gestures at
+  "Recently Updated"; the set (especially Exports and Rejected) needs to be
+  first-class.
 - **A native All-Photos view** (Picasa needed a negation-search hack).
-- **Multi-resolution export + text watermark** as first-class export options.
+- **Undo Save** (N2 names Save / Undo Save / Revert) — un-bake the file while
+  keeping edits live. *Present in Picasa but appears only after a save, so it was
+  not in these captures* — note this as a capture limitation, not a Picasa gap.
+- **Multi-resolution export + text watermark** — both field-named as treasured,
+  currently buried inside the generic Export dialog; surface them explicitly.
 - **Honest People surface** — explicit unnamed-faces affordance + a visible count
   of not-yet-face-scanned photos (no silent pre-recognition gap, N7).
-- **Library-local trash** where the OS/NAS has none.
+- **Make-permanent metadata gesture + sidecar-vs-in-file state cue (P1)** —
+  `Write faces to XMP` covers faces only; the general per-photo/batch
+  make-permanent gesture + metadata-state cue + undo journal have no UI here.
+- **Library-as-document** — open-library-by-path and multiple libraries (the
+  reason PicasaStarter existed); `Choose database location` covers *cache* only.
+
+*Lower priority (partial coverage, worth itemizing):*
+
+- **Jump-to-folder / jump-to-end buttons** replacing Picasa's footgun recentering
+  thumb (only the plain scrollbar maps over).
 - **One-click verify/rebuild + per-folder health + "what does the app think about
-  this file?" inspector.**
+  this file?" inspector** (only loosely mapped by Refresh Thumbnails).
+- **Library-local trash** where the OS/NAS has none.
+- **Holder-identity lock indicator** ("opened by user@host since 14:02";
+  concurrency) — new, not in Picasa.
+- **Keyboard triage bindings** (J/K next/prev, 0–5 star-set keys, X reject, 1:1
+  zoom toggle, hover full-screen peek) — listed in Picasa's shortcuts but the
+  peek and 1:1 affordances are only partly surfaced.
 - **Updatable RAW decode** (never a frozen in-binary table — Picasa's biggest
   functional decay) and **bundled video decoders** (Picasa delegated to system
   codecs).
+
+## Verification
+
+Rankings were cross-checked by an independent multi-agent pass: seven agents
+ranked the surfaces in isolation against `product-spec.md`, then a reconciliation
+critic enforced cross-surface consistency (same capability → same rank: Folder
+Manager, Undo-All-Edits/Revert, Properties, Reset Faces, Hide/Unhide, Sort-by-Size,
+Move-to-New-Folder all normalized) and produced the gaps list above. Their
+corrections are folded in.
 
 ---
 
