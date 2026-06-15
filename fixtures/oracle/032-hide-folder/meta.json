@@ -1,0 +1,297 @@
+{
+ "fixture": "032-hide-folder",
+ "note": "Hide a folder (move it to Picasa's built-in 'Hidden Folders' collection) on the DISPOSABLE clone (live oracle untouched). UI: selected folder '2010-12-25 Winter Holiday' -> Folder menu -> Hide -> 'Add Password' dialog ('The \"Hidden Folders\" collection is not currently password protected. Would you like to add a password now?') -> clicked 'Don't Add Password'. REAL SIGNATURE: the folder's own .picasa.ini gains a [Picasa] identity block with P2category=Hidden Folders (190->227 B). The category mark appears in BOTH the folder .picasa.ini (string P2category=Hidden Folders, cf export 030 'Exported Pictures' / folder-desc 020 'Folders on Disk') AND db3 -- the folder's EXISTING albumdata_category row[8] flips 2 ('Folders on Disk') -> 7 ('Hidden Folders'), the integer mirror of the ini mark; NO new album/catdata row is created ('Hidden Folders' is built-in catdata category index 7: Labels/Projects(internal)/Folders on Disk/Web Albums/Web Drive/Exported Pictures/Other Stuff/Hidden Folders/People), and NO per-photo hidden=yes is added (contrast hide-PHOTO 017, which writes ini hidden=yes). So folder-hide == one ini [Picasa] section + the folder's albumdata_category[8] flipping to 7 (no new rows). SESSION NOISE in this diff (NOT the hide action): albumdata_* grew 17->18 via the 'Search results' row reshuffle (row[16] tombstoned to the 4501-01-01 date sentinel, re-appended as row[17]) per the harness's documented session-activity gotcha; thumb/preview/index caches (bigthumbs/previews/thumbs/thumbs2 _0+_index, thumbindex, wordhash, repository.dat) re-rendered. VALIDATES fauxcasa-r42: catalog._is_folder_hidden matches [Picasa] P2category=='Hidden Folders' (case-insensitive) -- confirmed correct, no tracer code change needed.",
+ "captured": "2026-06-15T01:05:50+00:00",
+ "baseline": {
+  "label": "manual",
+  "created": "2026-06-15T00:53:49+00:00"
+ },
+ "files": {
+  "db3/albumdata_category.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "25345a56a7a7528d71f62791a93feb904662333009962394ce9025dd1ef1b014",
+    "size": 88
+   },
+   "after": {
+    "sha256": "d796ff58737eb787e599b0a32bf1b0b520ec0010425e4ecba93b0914e181e506",
+    "size": 92
+   }
+  },
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a38a92dcb06dadcfeb025a7b1f82b854536b16882f71224859ded141fd8e5db8",
+    "size": 156
+   },
+   "after": {
+    "sha256": "f4c1706d0a6f7cc2847a81ce0e5d4104ac18d3ead3812fa9c42563f5fbf9d405",
+    "size": 164
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "522782fb9e3e5a104e0738076ab84a6c82c44a221ef42f9dcddbf1e0fdcb4eda",
+    "size": 250
+   },
+   "after": {
+    "sha256": "7232d6afede3fb5366b416b2c1c51c3bc4f1375741546d8045f7fba44c6cb6b8",
+    "size": 273
+   }
+  },
+  "db3/albumdata_filename.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a494a807adaff7c22a2e6fa9fade5ce8620f621fef4f88000a0ee261b3109007",
+    "size": 196
+   },
+   "after": {
+    "sha256": "1e4e2f7e98d5ef269261d29fea218eb062e21832d13d11e857d74e04d33a0b23",
+    "size": 197
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "689a0cd3e995a6dca3bffd8b2cc113801a0a9b18142caa67bef3e773b5214ccc",
+    "size": 108
+   },
+   "after": {
+    "sha256": "56b845598d9fef82befdfb0ff575ea16aa9596d1ae6f8ac0871d3d18f4553f87",
+    "size": 108
+   }
+  },
+  "db3/albumdata_location.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "6bc4aea13a9e18cb3aa6104a9c96e932533a91d61dc44f3084966e2a10bf422d",
+    "size": 37
+   },
+   "after": {
+    "sha256": "7e4726d69c460d5cb11f06ae4c90fb0c318da52bfd35b1b5dbcbd4e8a7bb0871",
+    "size": 38
+   }
+  },
+  "db3/albumdata_music.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "6bc4aea13a9e18cb3aa6104a9c96e932533a91d61dc44f3084966e2a10bf422d",
+    "size": 37
+   },
+   "after": {
+    "sha256": "7e4726d69c460d5cb11f06ae4c90fb0c318da52bfd35b1b5dbcbd4e8a7bb0871",
+    "size": 38
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "343df75399c31dd37af547eaa06ad51c19276e91c6bf954119ea529ad1bc525c",
+    "size": 186
+   },
+   "after": {
+    "sha256": "4dbd07cc42d69f5aa140abb7662714432cab901900b05535900c6b66fe9e37ed",
+    "size": 187
+   }
+  },
+  "db3/albumdata_token.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9157231e82d6982898ec4aba421c7209669707909870255c95e7ae49edff89db",
+    "size": 201
+   },
+   "after": {
+    "sha256": "a22efd40e37db2e896ae035c8a641b9354830f537751f37de5ca604570c07369",
+    "size": 202
+   }
+  },
+  "db3/albumdata_uid.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ad5e011afe75ba74f7a7bd98e4ceea5cd65c45db0fc8ec8de5a80492460d4eb6",
+    "size": 324
+   },
+   "after": {
+    "sha256": "9f00c08576d4db62d0c9e45b720bd551fb9c32577b38b77a556d5827713e4248",
+    "size": 325
+   }
+  },
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "a3a7c820b018090bf78c6cdbde5cc408c823957db124401fc9392faf83da3d3f",
+    "size": 155537
+   },
+   "after": {
+    "sha256": "84b1ff9920e149d4be4f758a032cb129d88e357be5bf6594dd5e43c2e5bede6c",
+    "size": 160493
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a8ead1bb00f81682fa814783a968dcf14b4e585391dcea8fbfcc12f728810c87",
+    "size": 368
+   },
+   "after": {
+    "sha256": "16c82c99719067dcc932d818600dc77014a68814e6541b3e3dd979cb40ef889a",
+    "size": 368
+   }
+  },
+  "db3/previews_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "bf717c944b8eee07b872ece1cce7578a322e171bb2ce81512e951a92b8c2a7bc",
+    "size": 424420
+   },
+   "after": {
+    "sha256": "f8c3fc03121d53b91e5f8913c31dc5d5eaccef370e2daed3e899f8eb0d52e73c",
+    "size": 439513
+   }
+  },
+  "db3/previews_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "3ac49ca6d7716688ccfdaa9a1ff3f7c59d0dea7cfefa4e420037a023708f3045",
+    "size": 356
+   },
+   "after": {
+    "sha256": "597c2f1149dcb6a6fee6efb89786822b001e995ea375d8c10d23f954c0e1fbf3",
+    "size": 356
+   }
+  },
+  "db3/repository.dat": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d28508bce821b2f8df7058d7303a3287df370b79b4ffa342ceabb95664d31484",
+    "size": 140
+   },
+   "after": {
+    "sha256": "493a720af10e100e55b548504415ed31af24207451667384bb9a088db9753285",
+    "size": 140
+   }
+  },
+  "db3/thumbindex.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "34c161e79873d0175dd953f134237ea10acabb956bfb1fa9d253fe9ffa0d35fc",
+    "size": 1301
+   },
+   "after": {
+    "sha256": "1822ed7812c373df36a5cd6d044113721920f6591999eff1577d6a1d09b418db",
+    "size": 1301
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "d674d054f26f427671ad5eaa8e8733aad68e6822e3f39f39906ea8a49e93107f",
+    "size": 34415
+   },
+   "after": {
+    "sha256": "b1c56a727313fe7cfb62b2a8671708ece6a264cde1eb98df56960c4a40d5ee2a",
+    "size": 35344
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "16ad50ad83bc06df679f44c41ab1c211192c4575b17a54ab13d327486c01ee72",
+    "size": 368
+   },
+   "after": {
+    "sha256": "3a19a488f16cd198512bb8163bb63e3e44f3c85b998e70b8c7956fc1c738a51f",
+    "size": 368
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "5b56cdcb8bdebcac8cc11c580ed16f290b729e4d39b436af2b95177f3bca669a",
+    "size": 94424
+   },
+   "after": {
+    "sha256": "db3f9dbdb3c414ceba4dcbcb8783a77877875238b964e659362d4e352aa0b258",
+    "size": 96886
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "88b995e729b82e0fce20fb30469de41fc79c51282223ab1405cb74da298793fc",
+    "size": 368
+   },
+   "after": {
+    "sha256": "eb3e4f56512a8ad8472fb661eadc9da7fe61e7f9435ef0bb64a6671750ec0a31",
+    "size": 368
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "f35a9aa848ab6f28570393794d8df4e584818cadad34ce10393573c15d48f24d",
+    "size": 66904
+   },
+   "after": {
+    "sha256": "2de7482d77d2675d39cdd8d927782182c831705d5af157272cc524a19c57bd0d",
+    "size": 66904
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "88744d035dc47a5dc661b915e90bed5cf55cfa4865c1987df9043ccd3c99deef",
+    "size": 190
+   },
+   "after": {
+    "sha256": "7d6e77058eef8636b9842ed2e379bfce3702e0bcbfe2e5cb0c0119605d1ab3c2",
+    "size": 227
+   }
+  }
+ }
+}
