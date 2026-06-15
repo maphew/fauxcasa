@@ -44,7 +44,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
 
-      - name: Build the bundle (onedir, console, Essentials, pinned)
+      - name: Build both bundles (onedir, console + windowed, Essentials, pinned)
+        # One Analysis -> dist/fauxcasa-tracer (console=True, CI/smoke) AND
+        # dist/fauxcasa-tracer-gui (console=False, shipping). See fauxcasa-pqw.
         run: >
           uv run --with "${{ env.PYSIDE6 }}" --with "${{ env.PYINSTALLER }}"
           pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
@@ -174,13 +176,54 @@ jobs:
           fi
           echo "OK: frozen no-arg launch with no display exits gracefully"
 
+      - name: Windowed (console=False) build logs instead of printing (fauxcasa-pqw)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXE="dist/fauxcasa-tracer-gui/fauxcasa-tracer-gui.exe"
+          else
+            EXE="dist/fauxcasa-tracer-gui/fauxcasa-tracer-gui"
+          fi
+          # The shipping double-click build. A windowed PyInstaller process has
+          # sys.stdout/sys.stderr == None (no console — most starkly on
+          # Windows), so the console smoke above CANNOT be repeated here:
+          # nothing reaches the streams. The rotating log file applog writes IS
+          # the diagnostic of record, so this leg proves the no-console path —
+          # a real screenshot still lands AND the always-on startup status line
+          # reached the log file. Without applog these diagnostics would
+          # silently vanish in a console=False build.
+          set +e
+          "$EXE" ci-library --cache-root ./gui-cache --finish-build \
+            --screenshot gui-ci.png --scroll-to 0.5
+          RC=$?
+          set -e
+          echo "exit=$RC"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::windowed build exited $RC (expected 0)"; exit 1
+          fi
+          if [ ! -s gui-ci.png ]; then
+            echo "::error::windowed build produced no screenshot"; exit 1
+          fi
+          LOG="./gui-cache/fauxcasa-tracer.log"
+          if [ ! -f "$LOG" ]; then
+            echo "::error::no log file ($LOG) — a console=False build's diagnostics would be lost"; exit 1
+          fi
+          echo "----- $LOG -----"; cat "$LOG"
+          if ! grep -Eq "photos,.*folders,.*albums" "$LOG"; then
+            echo "::error::log file is missing the startup status line"; exit 1
+          fi
+          echo "OK: windowed build is silent on stdout/stderr but logged to $LOG"
+
       - name: Bundle size (soft gate — warn, never fail)
         shell: bash
         run: |
-          # pure-Python size so it's identical on Git Bash (Windows) and Linux
-          MB=$(uv run python -c "import pathlib; print(sum(f.stat().st_size for f in pathlib.Path('dist/fauxcasa-tracer').rglob('*') if f.is_file()) // 1048576)")
-          echo "fauxcasa-tracer bundle (${RUNNER_OS}): ${MB} MB"
-          echo "## fauxcasa-tracer bundle (${RUNNER_OS}): ${MB} MB" >> "$GITHUB_STEP_SUMMARY"
+          # pure-Python size so it's identical on Git Bash (Windows) and Linux.
+          # Report both variants; gate on the console bundle (the §7 artifact).
+          size() { uv run python -c "import pathlib,sys; print(sum(f.stat().st_size for f in pathlib.Path(sys.argv[1]).rglob('*') if f.is_file()) // 1048576)" "$1"; }
+          MB=$(size dist/fauxcasa-tracer)
+          GUI_MB=$(size dist/fauxcasa-tracer-gui)
+          echo "fauxcasa-tracer (console) bundle (${RUNNER_OS}): ${MB} MB; gui: ${GUI_MB} MB"
+          echo "## fauxcasa-tracer bundle (${RUNNER_OS}): ${MB} MB console / ${GUI_MB} MB gui" >> "$GITHUB_STEP_SUMMARY"
           if [ "$MB" -gt 200 ]; then
             echo "::warning::bundle is ${MB} MB (over the 200 MB soft budget)"
           fi
@@ -192,6 +235,13 @@ jobs:
           retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
+          name: fauxcasa-tracer-gui-${{ matrix.os }}
+          path: dist/fauxcasa-tracer-gui/**
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
           name: fauxcasa-tracer-${{ matrix.os }}-screenshot
-          path: frozen-ci.png
+          path: |
+            frozen-ci.png
+            gui-ci.png
           retention-days: 14

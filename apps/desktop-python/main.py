@@ -83,6 +83,14 @@ from thumbcache import (  # noqa: E402
 )
 from viewer import ViewerPage  # noqa: E402
 
+import applog  # noqa: E402
+
+# Human diagnostics route through this logger -> a rotating log file (so
+# nothing is lost in a console=False windowed build) + a stderr mirror when a
+# console exists (fauxcasa-pqw). The §7 MACHINE protocol — READY + the
+# ready/exit/indexed JSON — stays on raw stdout below, never through here.
+log = applog.log
+
 # Single source of truth for the (provisional) product name — nothing
 # else may hard-code it.
 APP_NAME = "Fauxcasa"
@@ -153,7 +161,7 @@ def _remember_library(cache_root: Path, library: Path) -> None:
         tmp.write_text(json.dumps({"library": str(library)}))
         os.replace(tmp, cfg)
     except OSError as e:
-        print(f"could not remember library choice: {e}", file=sys.stderr)
+        log.warning("could not remember library choice: %s", e)
         try:
             tmp.unlink()
         except OSError:
@@ -212,10 +220,9 @@ def _explain_not_a_library(root: Path) -> None:
     than one that is simply missing — 'library not found' is misleading when
     the user pointed at a file."""
     if root.exists():
-        print(f"not a folder — a library must be a directory: {root}",
-              file=sys.stderr)
+        log.error("not a folder — a library must be a directory: %s", root)
     else:
-        print(f"library not found: {root}", file=sys.stderr)
+        log.error("library not found: %s", root)
 
 
 def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
@@ -248,8 +255,8 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
         return root
     root = _prompt_for_library(cache_root)
     if root is None:
-        print("no library selected — pass a library folder, or pick one "
-              "when prompted", file=sys.stderr)
+        log.error("no library selected — pass a library folder, or pick one "
+                  "when prompted")
         return None
     return root
 
@@ -416,7 +423,7 @@ class MainWindow(QMainWindow):
                 save_catalog(catalog, build_dir / "catalog.json")
                 _emit(bridge.finished, result, catalog, False)
             except Exception as e:  # report, never crash the UI
-                print(f"cache build failed: {e}", file=sys.stderr)
+                log.error("cache build failed: %s", e)
                 _emit(bridge.finished, None, catalog, False)
 
         self._build_thread = threading.Thread(target=work, daemon=True)
@@ -433,7 +440,7 @@ class MainWindow(QMainWindow):
             try:
                 drift = reconcile_walk(old, old.root, cancel=self.build_cancel)
             except Exception as e:
-                print(f"reconcile walk failed: {e}", file=sys.stderr)
+                log.error("reconcile walk failed: %s", e)
                 return
             if drift is None or self.build_cancel.is_set() or not drift.changed:
                 return  # cancelled, or library unchanged
@@ -456,7 +463,7 @@ class MainWindow(QMainWindow):
                 save_catalog(fresh, cache_dir / "catalog.json")
                 _emit(bridge.finished, result, fresh, True)
             except Exception as e:
-                print(f"reindex failed: {e}", file=sys.stderr)
+                log.error("reindex failed: %s", e)
                 _emit(bridge.finished, None, fresh or old, True)
 
         self._reconcile_thread = threading.Thread(target=work, daemon=True)
@@ -489,7 +496,7 @@ class MainWindow(QMainWindow):
             cache = load_cache(result.path)
             bind(cache, catalog)
         except CacheError as e:
-            print(f"built cache failed to bind: {e}", file=sys.stderr)
+            log.error("built cache failed to bind: %s", e)
             return
         if catalog is self.catalog:
             self.grid.set_thumbs(cache)        # cold build: same catalog
@@ -774,6 +781,12 @@ def main() -> int:
     if args.cache_root is None:
         args.cache_root = _default_cache_root()
 
+    # Wire diagnostics before anything that can log: the rotating log file
+    # lives beside the per-library caches (top-level, like config.json), so a
+    # console=False build still has a record of warnings, Qt messages, and
+    # uncaught tracebacks (fauxcasa-pqw).
+    applog.setup(args.cache_root)
+
     root = _resolve_library(args.library, args.cache_root)
     if root is None:
         return 2
@@ -802,8 +815,7 @@ def main() -> int:
                 bind(cached, loaded)
                 catalog, thumbs, warm = loaded, cached, True
             except (CacheError, OSError) as e:
-                print(f"persisted cache unusable ({e}); rescanning",
-                      file=sys.stderr)
+                log.warning("persisted cache unusable (%s); rescanning", e)
 
     if catalog is None:  # cold path
         catalog = scan_library(root)
@@ -812,7 +824,7 @@ def main() -> int:
                 thumbs = load_cache(args.thumbs)
                 bind(thumbs, catalog)
             except (CacheError, OSError) as e:
-                print(f"cannot adopt {args.thumbs}: {e}", file=sys.stderr)
+                log.error("cannot adopt %s: %s", args.thumbs, e)
                 return 2
             save_catalog(catalog, cat_path)  # warm-start next time
         else:
@@ -822,15 +834,15 @@ def main() -> int:
             and Path(thumbs.library).resolve() != root:
         # bind() compares the full path lists, so a library mismatch with
         # identical walks is survivable — but say so loudly.
-        print(f"WARNING: adopted cache was built for {thumbs.library!r}, "
-              f"not {str(root)!r} — entry paths match, but thumbnails may "
-              f"be from another library", file=sys.stderr)
+        log.warning("adopted cache was built for %r, not %r — entry paths "
+                    "match, but thumbnails may be from another library",
+                    thumbs.library, str(root))
 
     prep_ms = (time.perf_counter() - t_prep) * 1000.0
     mode = "warm-load" if warm else ("adopt" if adopt else "cold-walk")
-    print(f"{mode}: {len(catalog.photos)} photos, "
-          f"{len(catalog.folders)} folders, {len(catalog.albums)} albums "
-          f"in {prep_ms:.0f} ms", file=sys.stderr)
+    log.info("%s: %d photos, %d folders, %d albums in %.0f ms",
+             mode, len(catalog.photos), len(catalog.folders),
+             len(catalog.albums), prep_ms)
 
     # A frozen first-run picker may already have created the app.
     app = QApplication.instance() or QApplication([])
@@ -854,8 +866,7 @@ def main() -> int:
         if win.build_failed:
             # --finish-build promised a cache; a failed build must not
             # masquerade as a green run.
-            print("cache build failed under --finish-build",
-                  file=sys.stderr)
+            log.error("cache build failed under --finish-build")
             app.exit(1)
             return False
         return True
@@ -903,10 +914,9 @@ def main() -> int:
         if args.screenshot is not None and not state["shot"]:
             state["shot"] = True
             if win.grab().save(str(args.screenshot)):
-                print(f"screenshot: {args.screenshot}", file=sys.stderr)
+                log.info("screenshot: %s", args.screenshot)
             else:
-                print(f"FAILED to save screenshot to {args.screenshot}",
-                      file=sys.stderr)
+                log.error("FAILED to save screenshot to %s", args.screenshot)
                 app.exit(1)
                 return
             app.quit()
@@ -923,9 +933,8 @@ def main() -> int:
     # hang CI or masquerade as success.
     if args.screenshot is not None or args.quit_after_ready:
         def on_timeout() -> None:
-            print(f"TIMEOUT after {args.timeout}s — "
-                  f"ready={win.ready_reported} state={state}",
-                  file=sys.stderr)
+            log.error("TIMEOUT after %ss — ready=%s state=%s",
+                      args.timeout, win.ready_reported, state)
             app.exit(1)
 
         QTimer.singleShot(int(args.timeout * 1000), on_timeout)

@@ -1503,5 +1503,93 @@ def test_pcts_nearest_rank() -> None:
     assert r["p99"] < 100.0            # the trap: must NOT collapse onto max
 
 
+# ---------- diagnostics: log file survives console=False (fauxcasa-pqw) ----
+
+def test_applog_writes_logfile_and_mirrors_stderr(tmp_path: Path, capsys) -> None:
+    """applog.setup() returns a log path and fans a record out to BOTH the
+    rotating log file (the only survivor in a console=False windowed build)
+    and the per-emit stderr mirror (so a console — and pytest's capsys —
+    still sees it). The file format carries the level; the stderr mirror is
+    bare, matching the app's old print() UX."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import applog
+
+    log_path = applog.setup(tmp_path / "cr")
+    assert log_path == tmp_path / "cr" / "fauxcasa-tracer.log"
+
+    applog.log.warning("marker-7f3 happened")
+    assert "marker-7f3 happened" in capsys.readouterr().err   # stderr mirror
+    text = log_path.read_text()
+    assert "marker-7f3 happened" in text and "WARNING" in text  # file + level
+
+
+def test_applog_stderr_mirror_noops_when_stream_is_none(
+        monkeypatch, tmp_path: Path) -> None:
+    """A windowed PyInstaller build has sys.stderr == None; the mirror must
+    skip silently rather than raise (which would turn a benign warning into a
+    crash). The log file still records it."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import applog
+
+    log_path = applog.setup(tmp_path / "cr")
+    monkeypatch.setattr(sys, "stderr", None)
+    applog.log.error("survives-none-stderr")        # must not raise
+    monkeypatch.undo()
+    assert "survives-none-stderr" in log_path.read_text()
+
+
+def test_applog_excepthook_logs_traceback(tmp_path: Path) -> None:
+    """The installed sys.excepthook routes an uncaught exception's full
+    traceback to the log file — the only record of a crash when there is no
+    console. Headless, _show_fatal_dialog is a no-op (offscreen guard), so
+    nothing blocks."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import applog
+
+    log_path = applog.setup(tmp_path / "cr")
+    try:
+        raise ValueError("boom-marker-c2")
+    except ValueError:
+        sys.excepthook(*sys.exc_info())          # invoke the installed hook
+    text = log_path.read_text()
+    assert "boom-marker-c2" in text
+    assert "ValueError" in text and "Traceback" in text
+
+
+def test_main_run_logs_and_keeps_stdout_protocol(
+        library: Path, tmp_path: Path) -> None:
+    """End-to-end via subprocess: a real run writes the always-on startup
+    status line to the log file (so a console=False build keeps a diagnostic
+    record) WHILE the §7 machine protocol (READY + the ready JSON) stays on
+    real stdout and is NOT diverted into the log. Pins both halves of
+    fauxcasa-pqw at once."""
+    import os
+    import subprocess
+    main_py = Path(__file__).resolve().parent / "main.py"
+    cache_root = tmp_path / "cr"
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    proc = subprocess.run(
+        [sys.executable, str(main_py), str(library),
+         "--cache-root", str(cache_root),
+         "--quit-after-ready", "--finish-build", "--timeout", "30"],
+        capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+
+    # §7 machine protocol: on stdout, unchanged.
+    assert "READY" in proc.stdout
+    assert '"event": "ready"' in proc.stdout
+
+    # Human diagnostics: in the log file beside the per-library caches.
+    log_path = cache_root / "fauxcasa-tracer.log"
+    assert log_path.is_file()
+    log_text = log_path.read_text()
+    assert "photos," in log_text and "folders," in log_text   # startup line
+    # The machine protocol must NOT have been rerouted into the log.
+    assert "READY" not in log_text and '"event": "ready"' not in log_text
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
