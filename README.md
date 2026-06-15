@@ -9,11 +9,22 @@ It is under active development and not ready for regular use.
 ## Installation
 
 Install uv from [https://docs.astral.sh/uv/](https://docs.astral.sh/uv/).
+Install just from [https://just.systems/](https://just.systems/) for the
+root command runners.
 
 ## Usage
 
 ```
-uv run tracer/main.py ~/Pictures
+just py ~/Pictures
+```
+
+The current desktop prototype lives under `apps/desktop-python/`. Common
+commands are exposed from the repo root:
+
+```
+just py ~/Pictures
+just py-test
+just py-smoke
 ```
 
 ## Storage And Picasa Data

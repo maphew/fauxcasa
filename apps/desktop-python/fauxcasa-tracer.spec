@@ -7,7 +7,7 @@
 #
 # Build from the repo root:
 #   uv run --with "PySide6-Essentials==6.11.1" --with "pyinstaller==6.20.0" \
-#       pyinstaller --noconfirm --clean tracer/fauxcasa-tracer.spec
+#       pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 #
 # Decisions (see the synthesis in the §7-validation report):
 #   * ONEDIR, not onefile: onefile re-extracts the whole bundle to a temp
@@ -32,12 +32,13 @@
 
 import os
 
-# Paths are resolved relative to this spec file (SPECPATH = the tracer/
-# dir), so the build works regardless of the CWD pyinstaller runs from.
+# Paths are resolved relative to this spec file (SPECPATH =
+# apps/desktop-python), so the build works regardless of the CWD
+# pyinstaller runs from.
 _here = SPECPATH
-_repo = os.path.dirname(_here)
+_repo = os.path.dirname(os.path.dirname(_here))
 
-# tracer/main.py imports its siblings (catalog/grid/thumbcache/viewer) as
+# apps/desktop-python/main.py imports its siblings (catalog/grid/thumbcache/viewer) as
 # top-level modules after sys.path.insert(parent) — they are NOT a package,
 # so PyInstaller's module graph needs them named explicitly.
 _hidden = ["catalog", "grid", "thumbcache", "viewer", "picasa_db"]

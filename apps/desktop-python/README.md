@@ -44,19 +44,19 @@ source of truth.
 ```bash
 # default: the synthetic fixture library (builds its own thumb cache
 # on first run, tiles appear live while indexing)
-uv run tracer/main.py
+uv run apps/desktop-python/main.py
 
 # the 100k benchmark library, adopting the pre-built cache
-uv run tracer/main.py cache/benchmark-library --thumbs cache/benchmark-thumbs.fcache
+uv run apps/desktop-python/main.py cache/benchmark-library --thumbs cache/benchmark-thumbs.fcache
 
 # headless screenshot (agents / CI); --finish-build also persists the
 # thumb cache before quitting, so the next run starts warm
-QT_QPA_PLATFORM=offscreen uv run tracer/main.py --finish-build --screenshot /tmp/tracer.png
-QT_QPA_PLATFORM=offscreen uv run tracer/main.py cache/benchmark-library \
+QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/main.py --finish-build --screenshot /tmp/tracer.png
+QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/main.py cache/benchmark-library \
     --thumbs cache/benchmark-thumbs.fcache --screenshot /tmp/t100k.png --scroll-to 0.5
 
 # cold-start probe
-QT_QPA_PLATFORM=offscreen uv run tracer/main.py --quit-after-ready
+QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/main.py --quit-after-ready
 ```
 
 From a **frozen bundle** there is no bundled synthetic library, so a
@@ -65,7 +65,7 @@ no-arg launch opens the library you last picked (remembered in
 a library path to override. A headless frozen launch with no library
 exits cleanly rather than blocking on a dialog nobody can answer.
 
-Tests: `uv run tracer/test_tracer.py`
+Tests: `uv run apps/desktop-python/test_tracer.py`
 
 ## EXIF orientation
 

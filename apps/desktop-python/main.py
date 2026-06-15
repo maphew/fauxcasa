@@ -6,7 +6,7 @@
 """Tracer bullet app (fauxcasa-pzx): a thin but real end-to-end slice of
 the product on the proposed Python + Qt stack.
 
-    uv run tracer/main.py [LIBRARY] [options]
+    uv run apps/desktop-python/main.py [LIBRARY] [options]
 
 Layers wired end to end: library scan in place -> machine-local catalog
 + packed thumbnail cache -> folder tree + albums sidebar -> virtualized
@@ -17,12 +17,12 @@ never anything inside the library (N1/N3).
 Default library is the synthetic fixture library; for the 100k scale
 test, adopt the pre-built benchmark cache:
 
-    uv run tracer/main.py cache/benchmark-library \
+    uv run apps/desktop-python/main.py cache/benchmark-library \
         --thumbs cache/benchmark-thumbs.fcache
 
 Headless verification (agents/CI):
 
-    QT_QPA_PLATFORM=offscreen uv run tracer/main.py \
+    QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/main.py \
         --screenshot /tmp/tracer.png [--scroll-to 0.5] [--quit-after-ready]
 
 Scripted quits abandon any in-flight thumbnail-cache build (cleanly —
@@ -87,7 +87,8 @@ from viewer import ViewerPage  # noqa: E402
 # else may hard-code it.
 APP_NAME = "Fauxcasa"
 
-REPO = Path(__file__).resolve().parent.parent
+APP_DIR = Path(__file__).resolve().parent
+REPO = APP_DIR.parents[1]
 FROZEN = getattr(sys, "frozen", False)
 
 

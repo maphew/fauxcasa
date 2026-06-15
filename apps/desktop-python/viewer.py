@@ -69,8 +69,8 @@ class ViewerPage(QWidget):
                 return
             # Apply EXIF orientation on read (setAutoTransform), so the
             # viewer matches the EXIF-baked grid thumbnails; the Picasa
-            # rotate= user quarter-turns compose on top. See tracer/README
-            # "EXIF orientation".
+            # rotate= user quarter-turns compose on top. See
+            # apps/desktop-python/README.md "EXIF orientation".
             from PySide6.QtGui import QImageReader
 
             reader = QImageReader(path)
