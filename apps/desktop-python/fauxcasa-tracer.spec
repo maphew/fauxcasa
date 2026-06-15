@@ -5,7 +5,7 @@
 # PyInstaller-class, ~100-150 MB is expected and acceptable — §7 anchors
 # austerity on resident memory + cold start, not installer megabytes.
 #
-# Build from the repo root:
+# Build from the repo root (ONE invocation produces BOTH variants below):
 #   uv run --with "PySide6-Essentials==6.11.1" --with "pyinstaller==6.20.0" \
 #       pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 #
@@ -13,10 +13,17 @@
 #   * ONEDIR, not onefile: onefile re-extracts the whole bundle to a temp
 #     dir on every launch (multi-second cold start + AV friction) — that
 #     directly fails §7's cold-start anchor.
-#   * console=True: the tracer prints READY/JSON to stdout, which the
-#     headless CI gate (QT_QPA_PLATFORM=offscreen) reads. A shipping,
-#     double-clickable GUI build flips this to console=False (and must be
-#     smoke-tested via screenshot, not stdout).
+#   * TWO variants from one Analysis (fauxcasa-pqw) — one analysis/PYZ, an
+#     extra cheap COLLECT copy, no second pyinstaller run:
+#       - dist/fauxcasa-tracer/      console=True  — the CI/smoke build. It
+#         prints READY/JSON to stdout (the offscreen headless gate parses it)
+#         and its stderr carries the diagnostics bundle.yml greps.
+#       - dist/fauxcasa-tracer-gui/  console=False — the shipping, double-
+#         clickable build: no black console window. A windowed PyInstaller
+#         process has sys.stdout/sys.stderr == None, so the §7 stdout prints
+#         become harmless no-ops and the human diagnostics + Qt messages +
+#         uncaught tracebacks go to the rotating log file via applog instead.
+#         Smoke-tested by screenshot + asserting that log file, never stdout.
 #   * PySide6-Essentials (the build env, not this file) physically omits
 #     WebEngine/QML/Qt3D/Charts/translations at the source — more robust
 #     than excludes alone. The excludes below are belt-and-suspenders so a
@@ -41,7 +48,7 @@ _repo = os.path.dirname(os.path.dirname(_here))
 # apps/desktop-python/main.py imports its siblings (catalog/grid/thumbcache/viewer) as
 # top-level modules after sys.path.insert(parent) — they are NOT a package,
 # so PyInstaller's module graph needs them named explicitly.
-_hidden = ["catalog", "grid", "thumbcache", "viewer", "picasa_db"]
+_hidden = ["catalog", "grid", "thumbcache", "viewer", "picasa_db", "applog"]
 
 # Qt modules the tracer never touches (QtCore/QtGui/QtWidgets only). Mostly
 # no-ops under PySide6-Essentials, but they make the build self-documenting
@@ -81,17 +88,38 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz, a.scripts, [],
+# Two EXEs off the one Analysis/PYZ, differing ONLY in the console flag and
+# name. The shipping windowed build (console=False) suppresses the console
+# window; diagnostics survive via applog's log file (see the header note).
+_exe_common = dict(
     exclude_binaries=True,
-    name="fauxcasa-tracer",
     debug=False,
     strip=False,
     upx=False,
-    console=True,  # CI/smoke build; flip to False for a shipping GUI build
 )
-coll = COLLECT(
-    exe, a.binaries, a.datas,
+
+exe_console = EXE(
+    pyz, a.scripts, [],
+    name="fauxcasa-tracer",
+    console=True,            # CI/smoke: READY/JSON on stdout, diagnostics on stderr
+    **_exe_common,
+)
+exe_gui = EXE(
+    pyz, a.scripts, [],
+    name="fauxcasa-tracer-gui",
+    console=False,           # shipping double-click: no console window
+    **_exe_common,
+)
+
+# One COLLECT (onedir tree) per variant. a.binaries/a.datas are shared, so
+# the second collect is just a copy — the expensive Analysis ran once.
+coll_console = COLLECT(
+    exe_console, a.binaries, a.datas,
     strip=False, upx=False,
     name="fauxcasa-tracer",
+)
+coll_gui = COLLECT(
+    exe_gui, a.binaries, a.datas,
+    strip=False, upx=False,
+    name="fauxcasa-tracer-gui",
 )
