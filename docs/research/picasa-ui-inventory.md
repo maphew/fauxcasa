@@ -8,7 +8,7 @@ Produced 2026-06-15 (bead `fauxcasa-dfa`).
 
 ## At a glance
 
-~224 ranked rows across 8 menus, 4 context menus, the edit room (5 tabs / **36
+~225 ranked rows across 8 menus, 4 context menus, the edit room (5 tabs / **36
 effects** / 5 tool panels), 4 side panels, and 6 modes/dialogs:
 
 | Rank | Rows | What it is |
@@ -18,7 +18,7 @@ effects** / 5 tool panels), 4 side panels, and 6 modes/dialogs:
 | **3** later/secondary | 54 | v1.5–v2 scope + necessary plumbing. |
 | **2** nice-to-have | 16 | Niche display modes, extra effect packs. |
 | **1** legacy-harmless | 4 | Dead links, obsolete display tuning. |
-| **−1 … −3** anti-feature | 20 | Cloud lock-in & dead Google services — every one a named OUT/non-goal. |
+| **−1 … −3** anti-feature | 21 | Cloud lock-in, dead Google services, and password-protected hiding — every one a named OUT/non-goal. |
 
 The single loudest signal: **the entire cloud surface is anti-feature
 territory** — "Sign in with Google" (−3) plus ~20 Upload / Web Albums / YouTube /
@@ -145,7 +145,8 @@ the user. Those map to the negative ranks below.
 | View Slideshow (Ctrl+4) | 4 | v1-IN | Per-folder play. |
 | Refresh Thumbnails | 4 | v1-IN | Re-scan / rebuild (maintenance). |
 | **Sort By** ▸ Name / Date / Size / Reverse order | 4 | v1-IN | Per-folder sort modes. |
-| Hide / Unhide | 4 | v1-IN | One inspectable cosmetic-hide feature (N7); labeled as such, never security. |
+| Hide / Unhide | 4 | v1-IN | Cosmetic hide *only* (N7); one inspectable filter, labeled as such. |
+| Hide ▸ "Add Password" dialog (password-protect hidden folder) | −3 | ANTI | Security theater: Folder→Hide prompts to set a password; hidden folders land under "Hidden Folders" and unhide demands it — but Picasa's was defeatable by deleting a file. Spec §1 "Not security software." |
 | Print Contact Sheet… (Ctrl+Shift+P) | 3 | LATER | Contact sheets. |
 | Export as HTML Page… | 3 | LATER | Static-gallery export (serverless heir to Sync-to-Web). |
 | Locate on Disk (Ctrl+Enter) | 4 | v1-IN | |
@@ -415,14 +416,21 @@ Prints; Publish to Blogger; Create a Gift CD; "Uploaded" filter (−1).
 Earth (the *capability* — local geotag editing and a provider-swappable map
 panel are fine; the Google-Earth/Maps-API binding is not).
 
+**Security theater (−3)** — Password-protected folder hiding. Folder ▸ Hide
+opens an "Add Password" dialog; password-protected folders collect under a
+"Hidden Folders" category and unhide demands the password
+(`sources/picasaresources/how-to-find-missing-photos.md`). The spec bans it by
+name (§1 "Not security software… No password-protected 'hidden' folders defeated
+by deleting a file"). Fauxcasa's hide must stay **cosmetic and labeled** — the
+plain Hide stays rank 4, but the *password* path is the anti-feature, so it is
+ranked separately above rather than buried inside "hide is harmless."
+
 **Correctly absent (no negative item — their absence is itself spec-correct)** —
-three banned behaviors have **no** UI element in 3.9, so there is nothing to rank
-negative; the point is to keep them absent: password-protected hiding (security
-theater — 3.9 only has cosmetic hide; any re-implementation must stay cosmetic
-and labeled); auto-install updates / phone-home / telemetry (only the
-off-by-default opt-in `Check for Updates` exists, the entire network surface);
-copy-into-app-library import (Picasa never copies into a managed library — keep
-it that way).
+two banned behaviors have **no** UI element in 3.9, so there is nothing to rank
+negative; the point is to keep them absent: auto-install updates / phone-home /
+telemetry (only the off-by-default opt-in `Check for Updates` exists, the entire
+network surface); copy-into-app-library import (Picasa never copies into a
+managed library — keep it that way).
 
 > **Why this matters for scoping:** the cloud surface is a *large* fraction of
 > the Create and Tools menus and the whole bottom action bar. Cutting it isn't a
