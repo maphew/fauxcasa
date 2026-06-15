@@ -12,12 +12,12 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - "tracer/**"
+      - "apps/desktop-python/**"
       - "scripts/picasa_db.py"
       - ".github/workflows/bundle.yml"
   pull_request:
     paths:
-      - "tracer/**"
+      - "apps/desktop-python/**"
       - "scripts/picasa_db.py"
       - ".github/workflows/bundle.yml"
 
@@ -47,7 +47,7 @@ jobs:
       - name: Build the bundle (onedir, console, Essentials, pinned)
         run: >
           uv run --with "${{ env.PYSIDE6 }}" --with "${{ env.PYINSTALLER }}"
-          pyinstaller --noconfirm --clean tracer/fauxcasa-tracer.spec
+          pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 
       - name: Generate a smoke library (JPEG fixtures)
         shell: bash

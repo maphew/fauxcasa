@@ -27,6 +27,13 @@ just py-test
 just py-smoke
 ```
 
+Repository layout:
+
+```
+apps/desktop-python/ = experimental desktop app
+scripts/             = developer/research/build utilities used around the app
+```
+
 ## Storage And Picasa Data
 
 The current `tracer` prototype does not write a photo database into your
