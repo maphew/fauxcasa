@@ -88,6 +88,12 @@ DWELL_S = 2.0
 FILL_TIMEOUT_S = 5.0
 WIN = (1280, 800)
 FLICKS = ("flick_a", "flick_b")
+# Grid zoom bounds, mirroring GridView.set_zoom's clamp (tile = max(64,
+# min(256, tile))). MIN zoom = smallest tile = 64 px; MAX zoom = 256 px.
+# Tiles are decoded once at native ~256 px and scaled in paint (z1e), so
+# these select layout/want-band size, not decode resolution.
+ZOOM_MIN_TILE = 64
+ZOOM_MAX_TILE = 256
 # Frame-callback-timeout signature (QT_WAYLAND_FRAME_CALLBACK_TIMEOUT
 # default ~100 ms): a cluster of intervals here means the compositor
 # stopped sending callbacks (occluded/idle), not real jank.
@@ -163,6 +169,27 @@ def phase_metrics(b: dict, frame_period: float) -> dict:
         if frame_period else 0.0,
         "_dur": dur, "_iv": iv, "_idle": idle,  # for combined aggregation
     }
+
+
+def resolve_zoom(arg: str | None) -> int | None:
+    """Map a --zoom keyword/value to a target tile size in px, or None to
+    leave the grid at its default tile size (today's behavior, so prior
+    runs stay comparable). 'min'/'max' map to the grid's tile-size bounds;
+    a number is an explicit tile size, which GridView.set_zoom clamps into
+    the 64–256 range."""
+    if arg is None:
+        return None
+    a = arg.strip().lower()
+    if a == "min":
+        return ZOOM_MIN_TILE
+    if a == "max":
+        return ZOOM_MAX_TILE
+    try:
+        return int(a)
+    except ValueError:
+        raise SystemExit(
+            f"--zoom: expected 'min', 'max', or an integer tile size, "
+            f"got {arg!r}")
 
 
 def read_power() -> dict:
@@ -257,6 +284,12 @@ def main() -> int:
                     help="scroll speed in screens/s (§7 budget allows <= 3)")
     ap.add_argument("--drive-hz", type=float, default=0.0,
                     help="scroll-update rate; 0 = the panel refresh rate")
+    ap.add_argument("--zoom", default=None,
+                    help="set grid zoom AFTER the cache loads and BEFORE the "
+                         "flick phases: 'min' (64 px tiles), 'max' (256 px "
+                         "tiles), or an explicit tile size in px (clamped to "
+                         "the grid's 64–256 range). Omit to leave the grid at "
+                         "its default tile size, reproducing prior runs.")
     ap.add_argument("--label", default="native")
     ap.add_argument("--run-index", type=int, default=0)
     ap.add_argument("--fullscreen", action="store_true",
@@ -268,6 +301,7 @@ def main() -> int:
     ap.add_argument("--no-decorate", action="store_true",
                     help="leave the catalog undecorated (lightest paint)")
     args = ap.parse_args()
+    target_tile = resolve_zoom(args.zoom)  # validate before the heavy load
 
     if not args.thumbs.is_file():
         print(f"missing fcache: {args.thumbs}", file=sys.stderr)
@@ -303,6 +337,14 @@ def main() -> int:
         grid.show()
     grid.raise_()
     grid.activateWindow()
+
+    # Apply the requested zoom now: the cache (ThumbCache) is already
+    # loaded and the viewport realized, so the cold phase decodes + the
+    # flick phases run at this tile size / want-band. Omitting --zoom
+    # leaves grid.tile at its default, reproducing prior runs exactly.
+    if target_tile is not None:
+        grid.set_zoom(target_tile)
+    print(f"zoom={args.zoom!r} -> tile_px={grid.tile}", file=sys.stderr)
 
     screen = grid.screen() or app.primaryScreen()
     refresh = screen.refreshRate() or 60.0
@@ -433,6 +475,8 @@ def main() -> int:
             "backing_store_px": [round(grid.viewport().width() * dpr),
                                  round(grid.viewport().height() * dpr)],
             "cols": grid.cols,
+            "zoom": args.zoom,            # raw --zoom arg (None = default)
+            "tile_px": grid.tile,         # effective tile size after set_zoom
             "content_h_px": grid.content_h,
             "group_count": len(grid.groups),
             "scroll_screens_per_s": args.screens,

@@ -94,8 +94,11 @@ policy and stays valid.
   fcache — fine for fixture/medium libraries; huge libraries adopt a
   pre-built fcache (`--thumbs`). Throughput itself is no longer the
   limit (see above).
-- Single thumbnail resolution (256 px), re-decoded on zoom change; the
-  spec calls for a multi-resolution cache.
+- Single thumbnail resolution (~256 px native): each tile is decoded
+  **once** at the cache's native size and **scaled in paint** to the
+  current tile size, so zoom is pure relayout + re-anchor and never
+  re-decodes the JPEG (fauxcasa-z1e). The spec calls for a
+  multi-resolution cache.
 - Persistent catalog is JSON (readable, language-neutral per N3), not the
   spec's compact ~50 B/photo binary catalog. Reconcile rebuilds the
   whole cache on drift rather than patching incrementally, and does not
