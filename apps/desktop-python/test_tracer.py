@@ -1274,6 +1274,29 @@ def test_resolve_library_rejects_filesystem_root(
     assert main._remembered_library(cache_root) is None
 
 
+def test_restart_command_source_vs_frozen(monkeypatch, tmp_path: Path) -> None:
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    library = tmp_path / "lib"
+    cache_root = tmp_path / "cr"
+
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(main.sys, "executable", "/tmp/fauxcasa-tracer")
+    assert main._restart_command(library, cache_root) == (
+        "/tmp/fauxcasa-tracer",
+        [str(library), "--cache-root", str(cache_root)],
+    )
+
+    monkeypatch.setattr(main, "FROZEN", False)
+    assert main._restart_command(library, cache_root) == (
+        "/tmp/fauxcasa-tracer",
+        [str(main.APP_DIR / "main.py"), str(library),
+         "--cache-root", str(cache_root)],
+    )
+
+
 def test_resolve_library_frozen_first_run(monkeypatch, tmp_path: Path) -> None:
     """Frozen, no library and nothing remembered: a chosen folder is used;
     a cancelled/headless picker yields None (graceful), not a crash."""
@@ -1463,6 +1486,44 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
     assert main._remembered_library(cache_root_3) == chosen.resolve()
     assert len(warnings) == 1
     assert "not the filesystem root" in warnings[0]
+
+
+def test_mainwindow_open_action_relaunches_with_selected_library(
+        monkeypatch, tmp_path: Path) -> None:
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication, QFileDialog
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    current = tmp_path / "Current"
+    chosen = tmp_path / "Chosen"
+    make_jpeg(current / "a.jpg")
+    make_jpeg(chosen / "b.jpg")
+    cache_root = tmp_path / "cr"
+    cat = scan_library(current)
+    win = main.MainWindow(cat, None, cache_root / "old-cache", None,
+                          cache_root=cache_root)
+
+    started: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(chosen)))
+    monkeypatch.setattr(
+        QProcess,
+        "startDetached",
+        staticmethod(lambda program, args: started.append((program, args))
+                     or True),
+    )
+    monkeypatch.setattr(main, "_restart_command",
+                        lambda root, cr: ("prog", [str(root), str(cr)]))
+
+    win._change_library()
+
+    assert started == [("prog", [str(chosen.resolve()), str(cache_root)])]
+    assert main._remembered_library(cache_root) == chosen.resolve()
 
 
 def test_main_bad_library_exits_2(tmp_path: Path) -> None:
