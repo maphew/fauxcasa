@@ -66,3 +66,5 @@
 # - github.token    → use GITHUB_TOKEN env var instead
 
 sync.remote: "https://github.com/maphew/fauxcasa.git"
+
+federation.remote: "https://github.com/maphew/fauxcasa.git"
