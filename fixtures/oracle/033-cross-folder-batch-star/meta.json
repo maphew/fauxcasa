@@ -1,0 +1,115 @@
+{
+ "fixture": "033-cross-folder-batch-star",
+ "note": "Cross-folder batch star: built album 'xfbatch' from Garden Project/photo05.jpg + Winter Holiday/photo05.jpg (added one at a time), opened the album (flat, no folder headers), Ctrl+A to select BOTH members across folders, then bottom-tray Add/Remove Star. One action -> star=yes written to BOTH folders' .picasa.ini AND both full Z:\\ paths appended to db3/starlist.txt atomically. NB: cross-folder multi-select is ONLY reachable via a flat album + Ctrl+A; Ctrl+click/Shift+click/hold-pin/context-menu all scope to the photo's source folder even inside the album.",
+ "captured": "2026-06-16T04:05:52+00:00",
+ "baseline": {
+  "label": "pre 033 xfbatch album star-all (both photo05 unstarred)",
+  "created": "2026-06-16T03:56:45+00:00"
+ },
+ "files": {
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "2f1c1a0b2ed02a46bae410e12eb1b7f7ff3c22a0ed6d63184c7f18b938991d43",
+    "size": 180
+   },
+   "after": {
+    "sha256": "6bef85571371ad5d20a6087095f5c6e909b1285f4c915f199ae563d71a045b31",
+    "size": 180
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "46cedf33e4c771584763a6f4bf5dd198c6ec2edcca5bbb65f1a618429709b73a",
+    "size": 172
+   },
+   "after": {
+    "sha256": "79cc7577aad041c315cd3a14080f2606edbbb093b542d1faf35145f0f8ae4505",
+    "size": 172
+   }
+  },
+  "db3/albumdata_uid.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "06df17f19c534bd5aed527d65fa3f00a0a6cae0186f5deae5163ede373dc82c2",
+    "size": 359
+   },
+   "after": {
+    "sha256": "74b482bbb9ba7190123ad4e3313ddd044817314d70ab2bd25ee7cf79db45dd81",
+    "size": 392
+   }
+  },
+  "db3/repository.dat": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d28508bce821b2f8df7058d7303a3287df370b79b4ffa342ceabb95664d31484",
+    "size": 140
+   },
+   "after": {
+    "sha256": "493a720af10e100e55b548504415ed31af24207451667384bb9a088db9753285",
+    "size": 140
+   }
+  },
+  "db3/starlist.txt": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0
+   },
+   "after": {
+    "sha256": "1193a4c27548a98e55346d6e062caa809cc4c61dd82503ccead5a234306750bf",
+    "size": 186
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "ba3c71437abf3dc8a4ab6951eae4170ed10389f1fec46d61fb644aa45ac9d809",
+    "size": 66936
+   },
+   "after": {
+    "sha256": "b8f3a065241d2af6f79919bd69d6fb2b5ae01350a14733c5746af37cb6cd5de0",
+    "size": 66952
+   }
+  },
+  "library/2010-12-25 Winter Holiday/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d8103aad68a5d8f9470ec92bbdb09917b656a95900107323927dc809d5e6d8ac",
+    "size": 390
+   },
+   "after": {
+    "sha256": "ad372452bd3c6a9ed4fe7fbad4d1fc95b5c6c572e98020a9bad165691a7f1add",
+    "size": 400
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ff01553cde14526660e342101d34a1c1fd75ea4b28797596d1563a8ac0a62a26",
+    "size": 549
+   },
+   "after": {
+    "sha256": "a21dc7fc29964bccd88b75147d093d217dbfd6f2dbc0908d3160de092894a4c2",
+    "size": 559
+   }
+  }
+ }
+}
