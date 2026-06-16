@@ -117,6 +117,28 @@ mouse+keyboard work natively (exact 1:1 px).
 - `ydotool` is a **dead end for isolation** — it injects at `/dev/uinput`
   (global), moving the user's real cursor. Use `xdotool` on the headless
   Xwayland instead.
+- **Keyboard needs `xdotool key --window <id>` (XSendEvent), not plain
+  `key`/`type` (XTEST).** Under headless weston, Xwayland often has no
+  wayland keyboard focus, so XTEST key events (`xdotool type 'foo'`,
+  `xdotool key ctrl+a`) are silently dropped while *mouse* XTEST still works —
+  you see the search field's caret blink but nothing types, and `Ctrl+A`
+  selects only one photo. Target the Picasa window directly:
+  `xdotool key --window <picasaid> --delay 150 p h o t o 0 5`. (Mouse +
+  keyboard *modifiers held during a click* — e.g. `mousemove … keydown ctrl
+  click 1 keyup ctrl` in one invocation — do work via XTEST.)
+- **Input dies intermittently; re-arm it.** Clicks/keys stop registering when
+  (a) the Picasa surface loses focus (`xdotool getwindowfocus` returns `1`),
+  or (b) a stale **drag-preview overlay** (a ~370×93 child window of Picasa)
+  gets stuck over the grid — `getmouselocation` over a photo then returns the
+  overlay's id, not the main window. Recover with
+  `xdotool mouseup 1; mouseup 3; keyup ctrl shift alt; windowactivate --sync
+  <id>; windowfocus <id>`. If that fails, **restart Picasa** — the prefix
+  state (and any user album you built) persists on disk, so you lose only the
+  in-memory selection/hold. Avoid drag gestures (slider drags, photo drags),
+  which are what leave the overlay stuck.
+- The **left folder/album tree and the bottom selection tray** only accept
+  clicks while the window is focused — re-`windowfocus` before each, or they
+  no-op silently (looks identical to a wrong coordinate).
 - Capture timing: the `.picasa.ini` write can lag the `db3/` write by several
   seconds — re-run `diff` if the ini delta is missing. Re-`snapshot` right
   before each action: a "Search results" `albumdata` row reshuffle
@@ -195,8 +217,26 @@ Harvested corpus: `fixtures/oracle/001-star-photo` … `021-album-description`
 | File→Save text (019) | bake per 005: recipe → `.picasaoriginals/.picasa.ini` (`moddate` FILETIME + orig dims + verbatim recipe), original stashed byte-exact, JPEG rewritten | `text`/`textactive`/`edited` cleared, `revertable`=1, **`imagedata_originslow` uint64 set at bake** (revert-tracking key?); width/height untouched (text doesn't resize). Thumbindex row updated in place — pins row layout as (name, mtime FILETIME, u32 size, flags) |
 | Folder description (020) | **whole `[Picasa]` folder-identity block** materialized in the folder's own ini — `name=`, `description=`, `date=` (epoch-days float), `P2category=` — from a single-field edit | folder row `albumdata_description` verbatim |
 | Album description (021) | `description=` line inserted in the `[.album:uid]` section, which lives in the **member photos' folder ini** (albums own no file; no `.pal`). UI gotcha: the header field **silently drops input** without Enter/click-away — first attempt left zero disk trace | album row `albumdata_description` verbatim; album-row `inisync` flag word churns (low half, high half stable) |
+| Cross-folder batch star (033) | one star action over **two photos in two folders** → `star=yes` added under `[photo05.jpg]` in **both** folders' `.picasa.ini` + **both** full `Z:\` paths appended to `db3/starlist.txt`, atomically. Pure N×(single-photo case 001) — **no batch-only artifact**. The first star of a session also creates the 'Starred Photos' virtual album (`albumdata_uid` +1 row). **The selection had to be made via a flat album + Ctrl+A** (see note below) | none beyond the star (star has no pmp mirror) |
 
 General write model:
+
+- **Cross-folder multi-select is single-folder-scoped for metadata edits.**
+  Picasa 3.9 scopes a metadata-edit selection (star/tag/rotate/hide) to ONE
+  source folder: `Ctrl+click` and `Shift+click` across a folder boundary
+  **reset** the selection to the clicked photo's folder, in the folder view,
+  the search-results view, **and even inside a flat album** that already holds
+  photos from two folders. The "hold"/green-pin tray keeps cross-folder photos
+  visible across navigation but per-photo edits (the bottom Star button, the
+  right-click `Add to Album → Starred Photos`) apply only to the *active*
+  photo, never the held set. **The only way to batch-edit across folders:**
+  build an album spanning the folders (add each photo separately — one active
+  photo per add), open the album (flat, no folder headers), then **`Ctrl+A`**
+  — that selects all members across folders. A single edit then fans out to
+  each member's source-folder ini (fixture 033). So two `.picasa.ini` files
+  *are* written atomically by one action, but only through the album+`Ctrl+A`
+  vehicle. (bead `fauxcasa-ezn`)
+
 
 - **Two-phase**: `.picasa.ini` + the photo file (XMP/IPTC) are written
   synchronously at action time; pmp mirrors arrive on a lazy flush cycle
