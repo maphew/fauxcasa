@@ -1526,6 +1526,49 @@ def test_mainwindow_open_action_relaunches_with_selected_library(
     assert main._remembered_library(cache_root) == chosen.resolve()
 
 
+def test_mainwindow_open_action_warns_when_relaunch_fails(
+        monkeypatch, tmp_path: Path) -> None:
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    current = tmp_path / "Current"
+    chosen = tmp_path / "Chosen"
+    make_jpeg(current / "a.jpg")
+    make_jpeg(chosen / "b.jpg")
+    cache_root = tmp_path / "cr"
+    cat = scan_library(current)
+    win = main.MainWindow(cat, None, cache_root / "old-cache", None,
+                          cache_root=cache_root)
+
+    warnings: list[str] = []
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(chosen)))
+    monkeypatch.setattr(
+        QProcess,
+        "startDetached",
+        staticmethod(lambda _program, _args: (False, 0)),
+    )
+    monkeypatch.setattr(main, "_restart_command",
+                        lambda root, cr: ("prog", [str(root), str(cr)]))
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, _title, msg: warnings.append(msg)),
+    )
+
+    win._change_library()
+
+    assert warnings == [f"Could not open the selected folder:\n"
+                        f"{chosen.resolve()}"]
+    assert main._remembered_library(cache_root) is None
+
+
 def test_main_bad_library_exits_2(tmp_path: Path) -> None:
     """End-to-end main() via subprocess (fauxcasa-62b): an explicit but
     nonexistent library exits 2 with a friendly message and NO traceback.

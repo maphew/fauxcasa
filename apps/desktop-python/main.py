@@ -612,7 +612,9 @@ class MainWindow(QMainWindow):
         if root is None:
             return
         program, args = _restart_command(root, self.cache_root)
-        if not QProcess.startDetached(program, args):
+        started = QProcess.startDetached(program, args)
+        ok = started[0] if isinstance(started, tuple) else started
+        if not ok:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self, APP_NAME, f"Could not open the selected folder:\n{root}")
