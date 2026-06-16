@@ -145,7 +145,25 @@ def _remembered_library(cache_root: Path) -> Path | None:
     if not isinstance(lib, str) or not lib:
         return None
     p = Path(lib)
-    return p if p.is_dir() else None
+    if not p.is_dir():
+        return None
+    if _is_filesystem_root(p):
+        log.warning("ignoring remembered filesystem root library: %s", p)
+        return None
+    return p
+
+
+def _is_filesystem_root(path: Path) -> bool:
+    """True for anchors such as '/', 'C:\\', and UNC share roots.
+
+    Opening a whole volume as a photo library makes the first-run picker vanish
+    while startup recursively scans the OS tree before the main window exists.
+    """
+    try:
+        p = path.resolve()
+    except OSError:
+        p = path.absolute()
+    return p.parent == p
 
 
 def _remember_library(cache_root: Path, library: Path) -> None:
@@ -196,7 +214,7 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     if _gui_unavailable():
         return None
 
-    from PySide6.QtWidgets import QApplication, QFileDialog
+    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
@@ -205,13 +223,22 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     # guard too.
     if app.platformName() in ("offscreen", "minimal", ""):
         return None
-    chosen = QFileDialog.getExistingDirectory(
-        None, f"{APP_NAME} — choose your photo library folder")
-    if not chosen:
-        return None
-    library = Path(chosen).expanduser().resolve()
-    _remember_library(cache_root, library)
-    return library
+    while True:
+        chosen = QFileDialog.getExistingDirectory(
+            None, f"{APP_NAME} — choose your photo library folder")
+        if not chosen:
+            return None
+        library = Path(chosen).expanduser().resolve()
+        if _is_filesystem_root(library):
+            QMessageBox.warning(
+                None,
+                APP_NAME,
+                "Choose a photo-library folder inside this filesystem, "
+                "not the filesystem root.",
+            )
+            continue
+        _remember_library(cache_root, library)
+        return library
 
 
 def _explain_not_a_library(root: Path) -> None:
@@ -223,6 +250,11 @@ def _explain_not_a_library(root: Path) -> None:
         log.error("not a folder — a library must be a directory: %s", root)
     else:
         log.error("library not found: %s", root)
+
+
+def _explain_filesystem_root(root: Path) -> None:
+    log.error("refusing to scan filesystem root as a photo library: %s; "
+              "choose a folder inside it", root)
 
 
 def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
@@ -237,6 +269,9 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
         if not root.is_dir():
             _explain_not_a_library(root)
             return None
+        if _is_filesystem_root(root):
+            _explain_filesystem_root(root)
+            return None
         if FROZEN:
             _remember_library(cache_root, root)
         return root
@@ -246,6 +281,9 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
         root = default.expanduser().resolve()
         if not root.is_dir():
             _explain_not_a_library(root)
+            return None
+        if _is_filesystem_root(root):
+            _explain_filesystem_root(root)
             return None
         return root
 

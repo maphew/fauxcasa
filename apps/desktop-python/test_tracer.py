@@ -1204,6 +1204,22 @@ def test_remember_library_roundtrip(tmp_path: Path) -> None:
     assert main._remembered_library(cache_root) is None
 
 
+def test_remembered_library_ignores_filesystem_root(tmp_path: Path, capsys) -> None:
+    """A frozen first-run mistake can persist '/' as the last library. Treat
+    that as no remembered library so the next launch re-prompts instead of
+    scanning the whole filesystem before any main window exists."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    cache_root = tmp_path / "cr"
+    main._config_path(cache_root).parent.mkdir(parents=True)
+    main._config_path(cache_root).write_text(json.dumps({"library": str(Path("/"))}))
+
+    assert main._remembered_library(cache_root) is None
+    assert "ignoring remembered filesystem root" in capsys.readouterr().err
+
+
 def test_resolve_library_order(monkeypatch, tmp_path: Path) -> None:
     """_resolve_library precedence: explicit arg → checkout default →
     (frozen) remembered → prompt; a frozen explicit arg is remembered."""
@@ -1239,6 +1255,23 @@ def test_resolve_library_order(monkeypatch, tmp_path: Path) -> None:
 
     # frozen, no arg → recall the remembered library WITHOUT prompting
     assert main._resolve_library(None, cache_root) == explicit.resolve()
+
+
+def test_resolve_library_rejects_filesystem_root(
+        monkeypatch, tmp_path: Path, capsys) -> None:
+    """An explicit filesystem root must fail before scan_library() can walk
+    the OS tree. Frozen mode must not remember the bad choice."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    monkeypatch.setattr(main, "FROZEN", True)
+    cache_root = tmp_path / "cr"
+
+    assert main._resolve_library(str(Path("/")), cache_root) is None
+    err = capsys.readouterr().err
+    assert "refusing to scan filesystem root" in err
+    assert main._remembered_library(cache_root) is None
 
 
 def test_resolve_library_frozen_first_run(monkeypatch, tmp_path: Path) -> None:
@@ -1388,7 +1421,7 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
     cancelled (empty) picker still yields None."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtWidgets import QApplication, QFileDialog
+    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
     import main
 
     app = QApplication.instance() or QApplication([])
@@ -1397,21 +1430,39 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
     chosen = tmp_path / "MyPhotos"
     chosen.mkdir()
     cache_root = tmp_path / "cr"
+    warnings: list[str] = []
 
     monkeypatch.setattr(main, "_gui_unavailable", lambda: False)
     monkeypatch.setattr(QApplication, "platformName", lambda self: "xcb")
     monkeypatch.setattr(QFileDialog, "getExistingDirectory",
                         staticmethod(lambda *a, **k: str(chosen)))
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, _title, msg: warnings.append(msg)),
+    )
 
     got = main._prompt_for_library(cache_root)
     assert got == chosen.resolve()
     # the choice is persisted so the next double-click reopens it
     assert main._remembered_library(cache_root) == chosen.resolve()
+    assert warnings == []
 
     # a cancelled picker (empty string) returns None
     monkeypatch.setattr(QFileDialog, "getExistingDirectory",
                         staticmethod(lambda *a, **k: ""))
     assert main._prompt_for_library(tmp_path / "cr2") is None
+
+    # choosing the filesystem root warns and loops back to the picker; the
+    # eventual real folder is what gets persisted.
+    choices = iter([str(Path("/")), str(chosen)])
+    cache_root_3 = tmp_path / "cr3"
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: next(choices)))
+    assert main._prompt_for_library(cache_root_3) == chosen.resolve()
+    assert main._remembered_library(cache_root_3) == chosen.resolve()
+    assert len(warnings) == 1
+    assert "not the filesystem root" in warnings[0]
 
 
 def test_main_bad_library_exits_2(tmp_path: Path) -> None:
