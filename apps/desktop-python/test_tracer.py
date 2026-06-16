@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import inmeta
 import thumbcache
 from catalog import (
+    ScanFilter,
     load_catalog,
     reconcile_walk,
     save_catalog,
@@ -203,6 +204,44 @@ def test_component_sort_order(tmp_path: Path) -> None:
     rels = [p.rel for p in scan_library(root).photos]
     assert rels == ["2020/x.jpg", "2020-01 Trip/x.jpg"]
     assert rels != sorted(rels)  # string sort would invert them
+
+
+def test_scan_filter_ignores_images_outside_dimension_bounds(
+        tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    make_jpeg(root / "icons" / "tiny.jpg", 32, 32)
+    make_jpeg(root / "photos" / "normal.jpg", 640, 480)
+    make_jpeg(root / "source" / "huge.jpg", 2400, 1600)
+
+    cat = scan_library(root, ScanFilter(min_width=100, min_height=100,
+                                        max_width=2000, max_height=1200))
+    assert [p.rel for p in cat.photos] == ["photos/normal.jpg"]
+    assert cat.visible_count == 1
+    assert list(cat.folders) == ["photos"]
+
+
+def test_scan_filter_keeps_unreadable_images_for_error_tiles(
+        tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    bad = root / "broken.jpg"
+    bad.parent.mkdir(parents=True)
+    bad.write_bytes(b"not actually a jpeg")
+
+    cat = scan_library(root, ScanFilter(min_width=100, min_height=100))
+    assert [p.rel for p in cat.photos] == ["broken.jpg"]
+
+
+def test_filtered_cache_dir_is_separate_from_unfiltered(tmp_path: Path) -> None:
+    from thumbcache import cache_dir_for
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    cache_root = tmp_path / "cache"
+    plain = cache_dir_for(root, cache_root)
+    filtered = cache_dir_for(
+        root, cache_root, ScanFilter(min_width=100, min_height=100).cache_key())
+    assert plain != filtered
+    assert cache_dir_for(root, cache_root) == plain
 
 
 def test_rel_paths_match_relative_to(tmp_path: Path) -> None:
@@ -1430,6 +1469,19 @@ def test_main_bad_library_exits_2(tmp_path: Path) -> None:
     assert proc.returncode == 2, (proc.returncode, proc.stderr)
     assert "library not found" in proc.stderr
     assert "Traceback" not in proc.stderr
+
+
+def test_image_size_arg_parser() -> None:
+    import argparse
+    import main
+
+    assert main._parse_image_size_arg("100x200") == (100, 200)
+    assert main._parse_image_size_arg("100X200") == (100, 200)
+    assert main._parse_image_size_arg("100,200") == (100, 200)
+    with pytest.raises(argparse.ArgumentTypeError):
+        main._parse_image_size_arg("100")
+    with pytest.raises(argparse.ArgumentTypeError):
+        main._parse_image_size_arg("0x100")
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"),

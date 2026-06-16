@@ -67,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from catalog import (  # noqa: E402
     Catalog,
+    ScanFilter,
     load_catalog,
     reconcile_walk,
     save_catalog,
@@ -261,6 +262,21 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
     return root
 
 
+def _parse_image_size_arg(value: str) -> tuple[int, int]:
+    raw = value.strip().lower()
+    sep = "x" if "x" in raw else ","
+    parts = raw.split(sep, 1)
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("expected WIDTHxHEIGHT")
+    try:
+        width, height = (int(parts[0]), int(parts[1]))
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("expected WIDTHxHEIGHT") from e
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("WIDTH and HEIGHT must be positive")
+    return width, height
+
+
 def read_rss_mb() -> tuple[float, float]:
     """(rss_mb, hwm_mb); zeros where /proc is unavailable (non-Linux)."""
     rss = hwm = 0.0
@@ -295,10 +311,12 @@ class _BuildBridge(QObject):
 class MainWindow(QMainWindow):
     def __init__(self, catalog: Catalog, thumbs: ThumbCache | None,
                  cache_dir: Path | None, build_dir: Path | None,
+                 scan_filter: ScanFilter | None = None,
                  warm: bool = False, adopt: bool = False):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
+        self.scan_filter = scan_filter
         self.adopt = adopt
         self.ready_reported = False
         self.build_failed = False
@@ -438,7 +456,8 @@ class MainWindow(QMainWindow):
 
         def work() -> None:
             try:
-                drift = reconcile_walk(old, old.root, cancel=self.build_cancel)
+                drift = reconcile_walk(old, old.root, self.scan_filter,
+                                       cancel=self.build_cancel)
             except Exception as e:
                 log.error("reconcile walk failed: %s", e)
                 return
@@ -455,7 +474,7 @@ class MainWindow(QMainWindow):
                   f"library changed ({drift.summary()}) — reindexing…")
             fresh = None
             try:
-                fresh = scan_library(old.root)
+                fresh = scan_library(old.root, self.scan_filter)
                 result = build_cache(fresh, cache_dir, None,
                                      cancel=self.build_cancel)
                 if result is None:
@@ -760,6 +779,14 @@ def main() -> int:
                          "a per-user cache dir when run as a frozen bundle)")
     ap.add_argument("--rebuild", action="store_true",
                     help="ignore any existing tracer cache and rebuild")
+    ap.add_argument("--min-image-size", type=_parse_image_size_arg,
+                    metavar="WIDTHxHEIGHT",
+                    help="ignore images smaller than WIDTHxHEIGHT during "
+                         "catalog scan (for icons and thumbnails)")
+    ap.add_argument("--max-image-size", type=_parse_image_size_arg,
+                    metavar="WIDTHxHEIGHT",
+                    help="ignore images larger than WIDTHxHEIGHT during "
+                         "catalog scan (for huge source or GIS images)")
     ap.add_argument("--zoom", type=int, default=160)
     ap.add_argument("--screenshot", type=Path, default=None,
                     help="save a PNG once the viewport is fully decoded, "
@@ -791,13 +818,18 @@ def main() -> int:
     if root is None:
         return 2
 
+    min_w, min_h = args.min_image_size or (0, 0)
+    max_w, max_h = args.max_image_size or (0, 0)
+    scan_filter = ScanFilter(min_width=min_w, min_height=min_h,
+                             max_width=max_w, max_height=max_h)
+
     # Data prep. Try a WARM start first: load the persisted catalog (no
     # walk) and bind it to the thumbnail cache. Else fall back to a COLD
     # walk + build (or adopt an external --thumbs cache). The cache dir is
     # always derived from the library root, so even an adopted-cache run
     # persists its catalog and warm-starts next time.
     adopt = args.thumbs is not None
-    cache_dir = cache_dir_for(root, args.cache_root)
+    cache_dir = cache_dir_for(root, args.cache_root, scan_filter.cache_key())
     cat_path = cache_dir / "catalog.json"
     thumbs_path = args.thumbs if adopt else cache_dir / "thumbs.fcache"
 
@@ -818,7 +850,7 @@ def main() -> int:
                 log.warning("persisted cache unusable (%s); rescanning", e)
 
     if catalog is None:  # cold path
-        catalog = scan_library(root)
+        catalog = scan_library(root, scan_filter)
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
@@ -847,8 +879,8 @@ def main() -> int:
     # A frozen first-run picker may already have created the app.
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
-    win = MainWindow(catalog, thumbs, cache_dir, build_dir, warm=warm,
-                     adopt=adopt)
+    win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
+                     warm=warm, adopt=adopt)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)

@@ -105,8 +105,11 @@ def bind(cache: ThumbCache, catalog: Catalog) -> None:
         )
 
 
-def cache_dir_for(library: Path, cache_root: Path) -> Path:
-    digest = hashlib.sha256(str(library.resolve()).encode()).hexdigest()[:16]
+def cache_dir_for(library: Path, cache_root: Path, variant: str = "") -> Path:
+    key = str(library.resolve()).encode()
+    if variant:
+        key += b"\0" + variant.encode()
+    digest = hashlib.sha256(key).hexdigest()[:16]
     return cache_root / digest
 
 
