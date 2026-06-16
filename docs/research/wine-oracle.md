@@ -131,8 +131,10 @@ mouse+keyboard work natively (exact 1:1 px).
   or (b) a stale **drag-preview overlay** (a ~370×93 child window of Picasa)
   gets stuck over the grid — `getmouselocation` over a photo then returns the
   overlay's id, not the main window. Recover with
-  `xdotool mouseup 1; mouseup 3; keyup ctrl shift alt; windowactivate --sync
-  <id>; windowfocus <id>`. If that fails, **restart Picasa** — the prefix
+  `xdotool mouseup 1; xdotool mouseup 3; xdotool keyup ctrl shift alt;
+  xdotool windowactivate --sync <id>; xdotool windowfocus <id>` (each a
+  separate `xdotool` call — `mouseup 1 3` in one invocation errors). If that
+  fails, **restart Picasa** — the prefix
   state (and any user album you built) persists on disk, so you lose only the
   in-memory selection/hold. Avoid drag gestures (slider drags, photo drags),
   which are what leave the overlay stuck.
@@ -192,10 +194,11 @@ Fixture pairs are synthetic → committable; the accumulated
 `fixtures/oracle/` corpus is the ground truth for the Fauxcasa parser/writer
 test suite. Session log: bead `fauxcasa-dcc`.
 
-## Differential findings (2026-06-11/12 sessions, fixtures 001–021)
+## Differential findings (2026-06-11/12 sessions, fixtures 001–021; + 033 cross-folder 2026-06-16)
 
-Harvested corpus: `fixtures/oracle/001-star-photo` … `021-album-description`
-(each has `diff.md` with decoded deltas). Action→storage map:
+Harvested corpus: `fixtures/oracle/001-star-photo` … `021-album-description`,
+plus `033-cross-folder-batch-star` (each has `diff.md` with decoded deltas).
+Action→storage map:
 
 | Action | Synchronous (at action time) | Lazy flush (~2–6 min cycle) |
 |---|---|---|
@@ -236,7 +239,6 @@ General write model:
   each member's source-folder ini (fixture 033). So two `.picasa.ini` files
   *are* written atomically by one action, but only through the album+`Ctrl+A`
   vehicle. (bead `fauxcasa-ezn`)
-
 
 - **Two-phase**: `.picasa.ini` + the photo file (XMP/IPTC) are written
   synchronously at action time; pmp mirrors arrive on a lazy flush cycle
