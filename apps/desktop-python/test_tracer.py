@@ -1204,6 +1204,22 @@ def test_remember_library_roundtrip(tmp_path: Path) -> None:
     assert main._remembered_library(cache_root) is None
 
 
+def test_remembered_library_ignores_filesystem_root(tmp_path: Path, capsys) -> None:
+    """A frozen first-run mistake can persist '/' as the last library. Treat
+    that as no remembered library so the next launch re-prompts instead of
+    scanning the whole filesystem before any main window exists."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    cache_root = tmp_path / "cr"
+    main._config_path(cache_root).parent.mkdir(parents=True)
+    main._config_path(cache_root).write_text(json.dumps({"library": str(Path("/"))}))
+
+    assert main._remembered_library(cache_root) is None
+    assert "ignoring remembered filesystem root" in capsys.readouterr().err
+
+
 def test_resolve_library_order(monkeypatch, tmp_path: Path) -> None:
     """_resolve_library precedence: explicit arg → checkout default →
     (frozen) remembered → prompt; a frozen explicit arg is remembered."""
@@ -1239,6 +1255,46 @@ def test_resolve_library_order(monkeypatch, tmp_path: Path) -> None:
 
     # frozen, no arg → recall the remembered library WITHOUT prompting
     assert main._resolve_library(None, cache_root) == explicit.resolve()
+
+
+def test_resolve_library_rejects_filesystem_root(
+        monkeypatch, tmp_path: Path, capsys) -> None:
+    """An explicit filesystem root must fail before scan_library() can walk
+    the OS tree. Frozen mode must not remember the bad choice."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    monkeypatch.setattr(main, "FROZEN", True)
+    cache_root = tmp_path / "cr"
+
+    assert main._resolve_library(str(Path("/")), cache_root) is None
+    err = capsys.readouterr().err
+    assert "refusing to scan filesystem root" in err
+    assert main._remembered_library(cache_root) is None
+
+
+def test_restart_command_source_vs_frozen(monkeypatch, tmp_path: Path) -> None:
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    library = tmp_path / "lib"
+    cache_root = tmp_path / "cr"
+
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(main.sys, "executable", "/tmp/fauxcasa-tracer")
+    assert main._restart_command(library, cache_root) == (
+        "/tmp/fauxcasa-tracer",
+        [str(library), "--cache-root", str(cache_root)],
+    )
+
+    monkeypatch.setattr(main, "FROZEN", False)
+    assert main._restart_command(library, cache_root) == (
+        "/tmp/fauxcasa-tracer",
+        [str(main.APP_DIR / "main.py"), str(library),
+         "--cache-root", str(cache_root)],
+    )
 
 
 def test_resolve_library_frozen_first_run(monkeypatch, tmp_path: Path) -> None:
@@ -1388,7 +1444,7 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
     cancelled (empty) picker still yields None."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtWidgets import QApplication, QFileDialog
+    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
     import main
 
     app = QApplication.instance() or QApplication([])
@@ -1397,21 +1453,120 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
     chosen = tmp_path / "MyPhotos"
     chosen.mkdir()
     cache_root = tmp_path / "cr"
+    warnings: list[str] = []
 
     monkeypatch.setattr(main, "_gui_unavailable", lambda: False)
     monkeypatch.setattr(QApplication, "platformName", lambda self: "xcb")
     monkeypatch.setattr(QFileDialog, "getExistingDirectory",
                         staticmethod(lambda *a, **k: str(chosen)))
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, _title, msg: warnings.append(msg)),
+    )
 
     got = main._prompt_for_library(cache_root)
     assert got == chosen.resolve()
     # the choice is persisted so the next double-click reopens it
     assert main._remembered_library(cache_root) == chosen.resolve()
+    assert warnings == []
 
     # a cancelled picker (empty string) returns None
     monkeypatch.setattr(QFileDialog, "getExistingDirectory",
                         staticmethod(lambda *a, **k: ""))
     assert main._prompt_for_library(tmp_path / "cr2") is None
+
+    # choosing the filesystem root warns and loops back to the picker; the
+    # eventual real folder is what gets persisted.
+    choices = iter([str(Path("/")), str(chosen)])
+    cache_root_3 = tmp_path / "cr3"
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: next(choices)))
+    assert main._prompt_for_library(cache_root_3) == chosen.resolve()
+    assert main._remembered_library(cache_root_3) == chosen.resolve()
+    assert len(warnings) == 1
+    assert "not the filesystem root" in warnings[0]
+
+
+def test_mainwindow_open_action_relaunches_with_selected_library(
+        monkeypatch, tmp_path: Path) -> None:
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication, QFileDialog
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    current = tmp_path / "Current"
+    chosen = tmp_path / "Chosen"
+    make_jpeg(current / "a.jpg")
+    make_jpeg(chosen / "b.jpg")
+    cache_root = tmp_path / "cr"
+    cat = scan_library(current)
+    win = main.MainWindow(cat, None, cache_root / "old-cache", None,
+                          cache_root=cache_root)
+
+    started: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(chosen)))
+    monkeypatch.setattr(
+        QProcess,
+        "startDetached",
+        staticmethod(lambda program, args: started.append((program, args))
+                     or True),
+    )
+    monkeypatch.setattr(main, "_restart_command",
+                        lambda root, cr: ("prog", [str(root), str(cr)]))
+
+    win._change_library()
+
+    assert started == [("prog", [str(chosen.resolve()), str(cache_root)])]
+    assert main._remembered_library(cache_root) == chosen.resolve()
+
+
+def test_mainwindow_open_action_warns_when_relaunch_fails(
+        monkeypatch, tmp_path: Path) -> None:
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    current = tmp_path / "Current"
+    chosen = tmp_path / "Chosen"
+    make_jpeg(current / "a.jpg")
+    make_jpeg(chosen / "b.jpg")
+    cache_root = tmp_path / "cr"
+    cat = scan_library(current)
+    win = main.MainWindow(cat, None, cache_root / "old-cache", None,
+                          cache_root=cache_root)
+
+    warnings: list[str] = []
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(chosen)))
+    monkeypatch.setattr(
+        QProcess,
+        "startDetached",
+        staticmethod(lambda _program, _args: (False, 0)),
+    )
+    monkeypatch.setattr(main, "_restart_command",
+                        lambda root, cr: ("prog", [str(root), str(cr)]))
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, _title, msg: warnings.append(msg)),
+    )
+
+    win._change_library()
+
+    assert warnings == [f"Could not open the selected folder:\n"
+                        f"{chosen.resolve()}"]
+    assert main._remembered_library(cache_root) is None
 
 
 def test_main_bad_library_exits_2(tmp_path: Path) -> None:
