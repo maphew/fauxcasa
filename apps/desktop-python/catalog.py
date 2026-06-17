@@ -50,6 +50,26 @@ EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
 INI_NAMES = (".picasa.ini", "Picasa.ini", "picasa.ini")
 
 
+@dataclass(frozen=True)
+class ScanFilter:
+    min_width: int = 0
+    min_height: int = 0
+    max_width: int = 0
+    max_height: int = 0
+
+    @property
+    def active(self) -> bool:
+        return bool(self.min_width or self.min_height
+                    or self.max_width or self.max_height)
+
+    def cache_key(self) -> str:
+        if not self.active:
+            return ""
+        return ("scan:"
+                f"min={self.min_width}x{self.min_height};"
+                f"max={self.max_width}x{self.max_height}")
+
+
 @dataclass
 class Photo:
     rel: str  # library-relative POSIX path
@@ -107,13 +127,51 @@ class Catalog:
         return sum(1 for p in self.photos if p.visible)
 
 
-def walk_library(root: Path) -> list[Path]:
+def _image_size(path: Path) -> tuple[int, int] | None:
+    """Read dimensions without decoding pixels. None means unreadable/unknown,
+    and callers should keep the file so the indexer can surface its error."""
+    try:
+        from PySide6.QtGui import QImageReader
+    except ImportError:
+        return None
+    try:
+        size = QImageReader(str(path)).size()
+    except OSError:
+        return None
+    if not size.isValid():
+        return None
+    return size.width(), size.height()
+
+
+def _passes_scan_filter(path: Path, scan_filter: ScanFilter | None) -> bool:
+    if scan_filter is None or not scan_filter.active:
+        return True
+    dims = _image_size(path)
+    if dims is None:
+        return True
+    w, h = dims
+    if scan_filter.min_width and w < scan_filter.min_width:
+        return False
+    if scan_filter.min_height and h < scan_filter.min_height:
+        return False
+    if scan_filter.max_width and w > scan_filter.max_width:
+        return False
+    if scan_filter.max_height and h > scan_filter.max_height:
+        return False
+    return True
+
+
+def walk_library(root: Path,
+                 scan_filter: ScanFilter | None = None) -> list[Path]:
     """The shared walk rule: sorted(Path) = path-component order. Any
     change here must also land in scripts/make-thumbcache.py or caches
     stop binding (the shipped benchmark cache uses this order)."""
-    return sorted(
+    files = sorted(
         p for p in root.rglob("*") if p.suffix.lower() in EXTS and p.is_file()
     )
+    if scan_filter is None or not scan_filter.active:
+        return files
+    return [p for p in files if _passes_scan_filter(p, scan_filter)]
 
 
 def _read_folder_ini(folder: Path) -> picasa_db.PicasaIni | None:
@@ -202,9 +260,10 @@ def rel_paths(root: Path, files: list[Path]) -> list[str]:
     return [fast(p) for p in files]
 
 
-def scan_library(root: Path) -> Catalog:
+def scan_library(root: Path,
+                 scan_filter: ScanFilter | None = None) -> Catalog:
     root = root.resolve()
-    files = walk_library(root)
+    files = walk_library(root, scan_filter)
 
     photos: list[Photo] = []
     folders: dict[str, Folder] = {}
@@ -471,6 +530,7 @@ class Drift:
 
 
 def reconcile_walk(catalog: Catalog, root: Path,
+                   scan_filter: ScanFilter | None = None,
                    cancel=None) -> Drift | None:
     """Fresh walk + stat, compared to the catalog's stored signals.
     Photos whose stored signal is absent (-1) can't be compared and are
@@ -479,7 +539,7 @@ def reconcile_walk(catalog: Catalog, root: Path,
     reap the background thread promptly instead of waiting out a 100k
     stat-walk on the join timeout."""
     root = root.resolve()
-    files = walk_library(root)
+    files = walk_library(root, scan_filter)
     fresh: dict[str, tuple[int, int]] = {}
     for i, (p, rel) in enumerate(zip(files, rel_paths(root, files))):
         if cancel is not None and i % 512 == 0 and cancel.is_set():
