@@ -57,6 +57,8 @@ def _normalize_levels(levels: Sequence[int] | None) -> list[int]:
         raise ValueError("levels must contain at least one positive edge")
     if out[0] > 0xFFFF:
         raise ValueError("a level edge must fit in a u16 (<= 65535)")
+    if len(out) > 64:  # fail fast at build: load_cache caps nlevels at 64
+        raise ValueError("at most 64 levels")
     return out
 
 
@@ -361,8 +363,9 @@ def build_cache(
     the measured throughput, or None if cancelled.
 
     `levels` is the set of thumbnail long-edges to cache (default: the single
-    256 px level, i.e. a v1 cache byte-identical to the legacy format). Pass
-    e.g. (512, 256, 128) for a multi-resolution v2 cache.
+    256 px level, i.e. a v1 cache byte-identical to the legacy format). Pass a
+    set such as RECOMMENDED_LEVELS = (512, 256, 128) for a multi-resolution v2
+    cache (include 256 so the grid's primary level is unaffected).
 
     A thread pool runs the per-photo index work; `progress(i, total,
     qimage_or_None)` fires as each completes (out of order) so the grid

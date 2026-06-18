@@ -100,11 +100,18 @@ policy and stays valid.
   fcache — fine for fixture/medium libraries; huge libraries adopt a
   pre-built fcache (`--thumbs`). Throughput itself is no longer the
   limit (see above).
-- Single thumbnail resolution (~256 px native): each tile is decoded
-  **once** at the cache's native size and **scaled in paint** to the
-  current tile size, so zoom is pure relayout + re-anchor and never
-  re-decodes the JPEG (fauxcasa-z1e). The spec calls for a
-  multi-resolution cache.
+- Grid renders a single thumbnail resolution (~256 px native): each tile
+  is decoded **once** at that size and **scaled in paint** to the current
+  tile size, so zoom is pure relayout + re-anchor and never re-decodes the
+  JPEG (fauxcasa-z1e). The fcache format is now **dual-version** (fauxcasa-gtr):
+  v1 (the default, and the shipped benchmark cache) is a single 256 level;
+  v2 (`make-thumbcache.py --levels 512,256,128` or `--levels recommended`,
+  `build_cache(levels=...)`) declares a level set in its header and stores a
+  photo-major per-level index. One reader loads both. The grid still reads
+  the **primary** (256) level, so a v2 cache leaves grid/zoom behaviour
+  unchanged; **consuming** the larger levels for a hi-DPI display or a loupe
+  larger than 256 (the viewer still reads originals, N4) is the remaining
+  product work.
 - Persistent catalog is JSON (readable, language-neutral per N3), not the
   spec's compact ~50 B/photo binary catalog. Reconcile rebuilds the
   whole cache on drift rather than patching incrementally, and does not

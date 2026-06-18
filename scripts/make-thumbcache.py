@@ -72,6 +72,9 @@ CACHE = Path(__file__).resolve().parent.parent / "cache"
 MAGIC = b"FCTC"
 THUMB_EDGE = 256
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
+# Mirror of apps/desktop-python/thumbcache.py.RECOMMENDED_LEVELS — 512 is the
+# hi-DPI/loupe payload, 256 is the grid's primary, 128 a cheap low-DPI level.
+RECOMMENDED_LEVELS = (512, THUMB_EDGE, 128)
 
 
 def _normalize_levels(levels) -> list[int]:
@@ -85,6 +88,8 @@ def _normalize_levels(levels) -> list[int]:
         raise ValueError("levels must contain at least one positive edge")
     if out[0] > 0xFFFF:
         raise ValueError("a level edge must fit in a u16 (<= 65535)")
+    if len(out) > 64:  # fail fast: load_cache caps nlevels at 64
+        raise ValueError("at most 64 levels")
     return out
 
 
@@ -103,6 +108,8 @@ def _primary_level(levels: list[int]) -> int:
 def _parse_levels(spec: str | None) -> list[int]:
     if not spec:
         return [THUMB_EDGE]
+    if spec.strip().lower() == "recommended":
+        return _normalize_levels(RECOMMENDED_LEVELS)
     try:
         raw = [int(p) for p in spec.replace(" ", "").split(",") if p]
     except ValueError:
@@ -148,9 +155,10 @@ def main(argv: list[str] | None = None) -> int:
         type=str,
         default=None,
         help="comma-separated thumbnail long-edges for a multi-resolution "
-        "(v2) cache, e.g. 512,256,128. Omit for the single-level v1 cache "
-        "(256 px) that is byte-identical to the legacy format. A level set "
-        "should include 256 so the tracer grid is unaffected.",
+        "(v2) cache, e.g. 512,256,128, or the word 'recommended' "
+        f"({','.join(map(str, RECOMMENDED_LEVELS))}). Omit for the single-level "
+        "v1 cache (256 px) that is byte-identical to the legacy format. A "
+        "level set should include 256 so the tracer grid is unaffected.",
     )
     ap.add_argument(
         "--sidecar-only",

@@ -954,6 +954,102 @@ def test_v2_canonical_builder_thumbs_match_inapp(tmp_path: Path) -> None:
             assert abs((cw / ch) - (iw / ih)) < 0.03  # aspect agrees
 
 
+def test_v2_error_tile_is_zero_length_at_every_level(tmp_path: Path) -> None:
+    """A corrupt source yields a zero-length blob for EVERY level (the error
+    tile the grid/load path keys on), while a good photo's levels are all
+    non-zero."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "ok.jpg", 600, 400)
+    (root / "f" / "bad.jpg").write_bytes(b"not a jpeg at all")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(thumbcache.build_cache(
+        cat, tmp_path / "c", levels=[512, 256, 128]).path)
+    by_rel = {f: i for i, f in enumerate(cache.files)}
+    bad, ok = by_rel["f/bad.jpg"], by_rel["f/ok.jpg"]
+    for li in range(len(cache.levels)):
+        assert cache.entry(bad, li)[1] == 0   # zero-length = error tile
+        assert cache.entry(ok, li)[1] > 0
+
+
+def test_v2_never_upscales_small_source(tmp_path: Path) -> None:
+    """A source smaller than the largest level is NOT upscaled: the top level
+    holds the photo's native dims, and the per-level long edges are
+    non-increasing (contract item 5)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "small.jpg", 200, 150)  # < 512 and < 256
+    cache = thumbcache.load_cache(thumbcache.build_cache(
+        scan_library(root), tmp_path / "c", levels=[512, 256, 128]).path)
+    _o, _l, w0, h0 = cache.entry(0, 0)        # top (512) level
+    assert (w0, h0) == (200, 150)             # native — never upscaled
+    assert max(cache.entry(0, 2)[2:]) <= 128  # 128 level downscaled to fit
+    longs = [max(cache.entry(0, li)[2:]) for li in range(3)]
+    assert longs == sorted(longs, reverse=True)
+
+
+def test_normalize_levels_caps_at_64() -> None:
+    """A level set the v2 reader would reject (>64 levels, nlevels is a u16
+    the reader bounds to 64) fails fast at build time; 64 is accepted."""
+    assert len(thumbcache._normalize_levels(list(range(1, 65)))) == 64
+    with pytest.raises(ValueError, match="64 levels"):
+        thumbcache._normalize_levels(list(range(1, 66)))
+
+
+def test_sidecar_only_rewrites_v1_and_v2(tmp_path: Path) -> None:
+    """make-thumbcache --sidecar-only regenerates the sidecar from a fresh
+    walk + the cache HEADER (authoritative on a rewrite): a v1 cache gets no
+    'levels' key, a v2 cache gets its real level set even when --levels says
+    otherwise. The rewrite path uses no process pool, so build the cache
+    in-app (threads) and drive the script's main() directly."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+    assert mtc._parse_levels("recommended") == list(mtc.RECOMMENDED_LEVELS)
+
+    lib = tmp_path / "lib"
+    _big_library(lib)
+
+    v1 = thumbcache.build_cache(scan_library(lib), tmp_path / "c1").path
+    assert mtc.main(["--library", str(lib), "--out", str(v1),
+                     "--sidecar-only"]) == 0
+    m1 = json.loads(v1.with_suffix(".fcache.json").read_text())
+    assert "levels" not in m1 and m1["thumb_edge"] == 256 and len(m1["files"]) == 2
+
+    v2 = thumbcache.build_cache(scan_library(lib), tmp_path / "c2",
+                                levels=[512, 256, 128]).path
+    # a DIFFERENT --levels proves the cache header, not the flag, wins
+    assert mtc.main(["--library", str(lib), "--out", str(v2),
+                     "--sidecar-only", "--levels", "256"]) == 0
+    m2 = json.loads(v2.with_suffix(".fcache.json").read_text())
+    assert m2["levels"] == [512, 256, 128] and m2["thumb_edge"] == 256
+
+
+def test_v2_cache_drives_grid_consumer(tmp_path: Path) -> None:
+    """The --thumbs adopt path (load_cache -> bind -> grid.set_data) takes a
+    v2 cache unchanged: the grid reads entries[idx] = the PRIMARY 256 level
+    (never the 512 top), so grid / z1e need no v2 awareness."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from grid import GridView
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(thumbcache.build_cache(
+        cat, tmp_path / "c", levels=[512, 256, 128]).path)
+    thumbcache.bind(cache, cat)   # the adopt bind
+    grid = GridView()
+    grid.set_data(cat, cache)     # consumer takes the v2 cache
+    for idx in range(cache.count):
+        off, length, w, h = cache.entries[idx]
+        assert length > 0 and max(w, h) <= 256   # primary 256, not the 512 top
+
+
 def test_index_empty_infile_caption_keeps_ini(tmp_path: Path) -> None:
     """An empty/whitespace in-file caption is 'no caption', not "" — it must
     not clobber the ini caption (§4 precedence), and the catalog must still
