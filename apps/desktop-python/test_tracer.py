@@ -1000,6 +1000,22 @@ def test_v2_canonical_builder_thumbs_match_inapp(tmp_path: Path) -> None:
             assert abs((cw / ch) - (iw / ih)) < 0.03  # aspect agrees
 
 
+def test_canonical_builder_corrupt_source_is_error_tile(tmp_path: Path) -> None:
+    """A corrupt source in the CLI builder yields a zero-length blob at every
+    level — the same error tile the in-app builder emits — so one bad file can't
+    abort the whole batch build by raising out of _make_thumb."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+    bad = tmp_path / "bad.jpg"
+    bad.write_bytes(b"not a jpeg at all")
+    out = mtc._make_thumb(bad, [512, 256, 128])
+    assert out == [(b"", 0, 0)] * 3
+
+
 def test_v2_error_tile_is_zero_length_at_every_level(tmp_path: Path) -> None:
     """A corrupt source yields a zero-length blob for EVERY level (the error
     tile the grid/load path keys on), while a good photo's levels are all

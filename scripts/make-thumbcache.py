@@ -128,29 +128,36 @@ def _parse_levels(spec: str | None) -> list[int]:
 def _make_thumb(path: Path, levels: list[int]) -> list[tuple[bytes, int, int]]:
     from PIL import Image, ImageOps
 
-    with Image.open(path) as img:
-        # Bake EXIF orientation (all 8 cases, mirrors too) so this builder
-        # agrees with the in-app one (apps/desktop-python/thumbcache.py) and the viewer;
-        # the Picasa rotate= user turns are composed live at display, never
-        # baked. No-op for images without an Orientation tag.
-        img = ImageOps.exif_transpose(img)
-        img = img.convert("RGB")
-        # Decode once to the top (largest) level, then downscale to each lower
-        # level — never upscale (PIL.thumbnail caps at the source size, as the
-        # legacy single-256 path did). A single level reproduces that path
-        # byte-for-byte.
-        img.thumbnail((levels[0], levels[0]))
-        out: list[tuple[bytes, int, int]] = []
-        for edge in levels:
-            if img.width <= edge and img.height <= edge:
-                lvl = img
-            else:
-                lvl = img.copy()
-                lvl.thumbnail((edge, edge))
-            buf = io.BytesIO()
-            lvl.save(buf, "JPEG", quality=80)
-            out.append((buf.getvalue(), lvl.width, lvl.height))
-        return out
+    try:
+        with Image.open(path) as img:
+            # Bake EXIF orientation (all 8 cases, mirrors too) so this builder
+            # agrees with the in-app one (apps/desktop-python/thumbcache.py) and the viewer;
+            # the Picasa rotate= user turns are composed live at display, never
+            # baked. No-op for images without an Orientation tag.
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB")
+            # Decode once to the top (largest) level, then downscale to each lower
+            # level — never upscale (PIL.thumbnail caps at the source size, as the
+            # legacy single-256 path did). A single level reproduces that path
+            # byte-for-byte.
+            img.thumbnail((levels[0], levels[0]))
+            out: list[tuple[bytes, int, int]] = []
+            for edge in levels:
+                if img.width <= edge and img.height <= edge:
+                    lvl = img
+                else:
+                    lvl = img.copy()
+                    lvl.thumbnail((edge, edge))
+                buf = io.BytesIO()
+                lvl.save(buf, "JPEG", quality=80)
+                out.append((buf.getvalue(), lvl.width, lvl.height))
+            return out
+    except Exception:
+        # A corrupt/unreadable source yields a zero-length blob at every level —
+        # the same error tile the in-app builder emits when its decode returns a
+        # null image (thumbcache._index_one) — so one bad file never aborts the
+        # whole batch build.
+        return [(b"", 0, 0) for _ in levels]
 
 
 def main(argv: list[str] | None = None) -> int:
