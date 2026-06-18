@@ -105,6 +105,14 @@ def _primary_level(levels: list[int]) -> int:
     return len(levels) - 1
 
 
+def _is_v1(levels: list[int]) -> bool:
+    """The legacy v1 layout (no level table; readers assume [256]) is reserved
+    for the default single 256 px level ONLY. Any other set — including a lone
+    non-256 level such as [512] — is written as v2 so the header's level table
+    records the true resolution. Mirrors thumbcache._is_v1."""
+    return levels == [THUMB_EDGE]
+
+
 def _parse_levels(spec: str | None) -> list[int]:
     if not spec:
         return [THUMB_EDGE]
@@ -282,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     nlevels = len(levels)
-    single = nlevels == 1
+    single = _is_v1(levels)
     header_len = 16 if single else 16 + 2 * nlevels
     index = bytearray()
     offset = header_len + 16 * len(files) * nlevels

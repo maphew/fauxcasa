@@ -76,6 +76,14 @@ def _primary_level(levels: list[int]) -> int:
     return len(levels) - 1
 
 
+def _is_v1(levels: list[int]) -> bool:
+    """The legacy v1 layout (no level table; readers assume [256]) is reserved
+    for the default single 256 px level ONLY. Any other set — including a lone
+    non-256 level such as [512] — is written as v2 so the header's level table
+    records the true resolution; a v1 file is always read back as [256]."""
+    return levels == [THUMB_EDGE]
+
+
 @dataclass
 class ThumbCache:
     path: Path
@@ -328,7 +336,7 @@ def _write_fcache(out: Path, levels: list[int],
     photo-major (a photo's levels are contiguous)."""
     count = len(photo_levels)
     nlevels = len(levels)
-    single = nlevels == 1
+    single = _is_v1(levels)
     header_len = 16 if single else 16 + 2 * nlevels
     index = bytearray()
     offset = header_len + 16 * count * nlevels

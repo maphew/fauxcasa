@@ -909,6 +909,52 @@ def test_v2_levels_normalized_largest_first(tmp_path: Path) -> None:
     assert cache.levels == [512, 256, 128]
 
 
+def test_v1_layout_reserved_for_default_256_only() -> None:
+    """The v1 layout (no level table; the reader hard-codes [256]) must be
+    chosen ONLY for the default single 256 px set. A lone non-256 level has to
+    go to v2 or it gets silently mislabeled 256. The predicate is mirrored in
+    both builders, so assert both modules agree."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+    for mod in (thumbcache, mtc):
+        assert mod._is_v1([256]) is True       # the legacy default stays v1
+        assert mod._is_v1([512]) is False      # a lone non-256 level -> v2
+        assert mod._is_v1([128]) is False
+        assert mod._is_v1([512, 256]) is False
+        assert mod._is_v1([512, 256, 128]) is False
+
+
+def test_v2_single_nondefault_level_not_mislabeled(tmp_path: Path) -> None:
+    """build_cache(levels=[512]) — a single NON-256 level — must emit v2 with a
+    level table so the read-back level is 512, not the v1-hardcoded 256, and the
+    sidecar's thumb_edge agrees with the header. Guards the regression where any
+    single level wrote a v1 header and silently became 256."""
+    root = tmp_path / "lib"
+    _big_library(root)            # 600x400 / 400x600 -> a real 512 px downscale
+    result = thumbcache.build_cache(scan_library(root), tmp_path / "c",
+                                    levels=[512])
+    with open(result.path, "rb") as f:
+        hdr = f.read(16)
+        version, count, word3 = struct.unpack("<III", hdr[4:16])
+        nlevels = word3 & 0xFFFF
+        ltbl = f.read(2 * nlevels)
+    assert version == 2 and count == 2 and nlevels == 1
+    assert list(struct.unpack("<1H", ltbl)) == [512]
+
+    cache = thumbcache.load_cache(result.path)
+    assert cache.levels == [512] and cache.primary == 0
+    assert cache.levels[cache.primary] == 512        # NOT mislabeled 256
+    assert cache.entries == cache.level_entries[0]
+    assert len(cache.files) == 2                      # one record per photo
+    meta = json.loads(result.path.with_suffix(".fcache.json").read_text())
+    assert meta["thumb_edge"] == 512                  # sidecar agrees with header
+    assert "levels" not in meta                       # single level: no list key
+
+
 def test_load_rejects_unsupported_version_and_truncated_v2(tmp_path: Path) -> None:
     bad_ver = tmp_path / "v3.fcache"
     bad_ver.write_bytes(thumbcache.MAGIC + struct.pack("<III", 3, 0, 0))
