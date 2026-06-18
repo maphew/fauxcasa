@@ -57,6 +57,12 @@ QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/main.py cache/benchmark-lib
 
 # cold-start probe
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/main.py --quit-after-ready
+
+# skip icon-sized files during catalog/index
+uv run apps/desktop-python/main.py ~/Pictures --min-image-size 100x100
+
+# skip extremely large originals/source rasters
+uv run apps/desktop-python/main.py ~/Pictures --max-image-size 12000x12000
 ```
 
 From a **frozen bundle** there is no bundled synthetic library, so a

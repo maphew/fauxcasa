@@ -44,7 +44,7 @@ from pathlib import Path
 
 T0 = time.perf_counter()
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -67,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from catalog import (  # noqa: E402
     Catalog,
+    ScanFilter,
     load_catalog,
     reconcile_walk,
     save_catalog,
@@ -145,7 +146,25 @@ def _remembered_library(cache_root: Path) -> Path | None:
     if not isinstance(lib, str) or not lib:
         return None
     p = Path(lib)
-    return p if p.is_dir() else None
+    if not p.is_dir():
+        return None
+    if _is_filesystem_root(p):
+        log.warning("ignoring remembered filesystem root library: %s", p)
+        return None
+    return p
+
+
+def _is_filesystem_root(path: Path) -> bool:
+    """True for anchors such as '/', 'C:\\', and UNC share roots.
+
+    Opening a whole volume as a photo library makes the first-run picker vanish
+    while startup recursively scans the OS tree before the main window exists.
+    """
+    try:
+        p = path.resolve()
+    except OSError:
+        p = path.absolute()
+    return p.parent == p
 
 
 def _remember_library(cache_root: Path, library: Path) -> None:
@@ -196,7 +215,7 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     if _gui_unavailable():
         return None
 
-    from PySide6.QtWidgets import QApplication, QFileDialog
+    from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
@@ -205,13 +224,49 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     # guard too.
     if app.platformName() in ("offscreen", "minimal", ""):
         return None
-    chosen = QFileDialog.getExistingDirectory(
-        None, f"{APP_NAME} — choose your photo library folder")
-    if not chosen:
-        return None
-    library = Path(chosen).expanduser().resolve()
-    _remember_library(cache_root, library)
+    library = _choose_library_from_dialog(cache_root)
+    if library is not None:
+        _remember_library(cache_root, library)
     return library
+
+
+def _choose_library_from_dialog(cache_root: Path, parent=None,
+                                start: Path | None = None) -> Path | None:
+    """Prompt for a library folder and validate choices that would be harmful.
+
+    `cache_root` is accepted so callers share one signature around the
+    library-choice helpers; the dialog itself does not write config.
+    """
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+    start_dir = str(start) if start is not None and start.is_dir() else ""
+    while True:
+        chosen = QFileDialog.getExistingDirectory(
+            parent, f"{APP_NAME} — choose your photo library folder", start_dir)
+        if not chosen:
+            return None
+        library = Path(chosen).expanduser().resolve()
+        if _is_filesystem_root(library):
+            QMessageBox.warning(
+                parent,
+                APP_NAME,
+                "Choose a photo-library folder inside this filesystem, "
+                "not the filesystem root.",
+            )
+            continue
+        return library
+
+
+def _restart_command(library: Path, cache_root: Path) -> tuple[str, list[str]]:
+    """Command used by the in-app Open action to switch libraries.
+
+    Relaunching keeps startup's warm/cold/adopt logic single-sourced in main().
+    """
+    if FROZEN:
+        return sys.executable, [str(library), "--cache-root", str(cache_root)]
+    return sys.executable, [
+        str(APP_DIR / "main.py"), str(library), "--cache-root", str(cache_root)
+    ]
 
 
 def _explain_not_a_library(root: Path) -> None:
@@ -223,6 +278,11 @@ def _explain_not_a_library(root: Path) -> None:
         log.error("not a folder — a library must be a directory: %s", root)
     else:
         log.error("library not found: %s", root)
+
+
+def _explain_filesystem_root(root: Path) -> None:
+    log.error("refusing to scan filesystem root as a photo library: %s; "
+              "choose a folder inside it", root)
 
 
 def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
@@ -237,6 +297,9 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
         if not root.is_dir():
             _explain_not_a_library(root)
             return None
+        if _is_filesystem_root(root):
+            _explain_filesystem_root(root)
+            return None
         if FROZEN:
             _remember_library(cache_root, root)
         return root
@@ -246,6 +309,9 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
         root = default.expanduser().resolve()
         if not root.is_dir():
             _explain_not_a_library(root)
+            return None
+        if _is_filesystem_root(root):
+            _explain_filesystem_root(root)
             return None
         return root
 
@@ -259,6 +325,21 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
                   "when prompted")
         return None
     return root
+
+
+def _parse_image_size_arg(value: str) -> tuple[int, int]:
+    raw = value.strip().lower()
+    sep = "x" if "x" in raw else ","
+    parts = raw.split(sep, 1)
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("expected WIDTHxHEIGHT")
+    try:
+        width, height = (int(parts[0]), int(parts[1]))
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("expected WIDTHxHEIGHT") from e
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("WIDTH and HEIGHT must be positive")
+    return width, height
 
 
 def read_rss_mb() -> tuple[float, float]:
@@ -295,10 +376,16 @@ class _BuildBridge(QObject):
 class MainWindow(QMainWindow):
     def __init__(self, catalog: Catalog, thumbs: ThumbCache | None,
                  cache_dir: Path | None, build_dir: Path | None,
-                 warm: bool = False, adopt: bool = False):
+                 scan_filter: ScanFilter | None = None,
+                 warm: bool = False, adopt: bool = False,
+                 cache_root: Path | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
+        self.scan_filter = scan_filter
+        self.cache_root = cache_root or (
+            cache_dir.parent if cache_dir is not None else _default_cache_root()
+        )
         self.adopt = adopt
         self.ready_reported = False
         self.build_failed = False
@@ -319,6 +406,10 @@ class MainWindow(QMainWindow):
         bar = QToolBar()
         bar.setMovable(False)
         self.addToolBar(bar)
+        self.open_action = bar.addAction("Open...")
+        self.open_action.setToolTip("Choose a different photo library folder")
+        self.open_action.triggered.connect(self._change_library)
+        bar.addSeparator()
         self.search = QLineEdit()
         self.search.setPlaceholderText(
             "search filename, caption, keywords…")
@@ -438,7 +529,8 @@ class MainWindow(QMainWindow):
 
         def work() -> None:
             try:
-                drift = reconcile_walk(old, old.root, cancel=self.build_cancel)
+                drift = reconcile_walk(old, old.root, self.scan_filter,
+                                       cancel=self.build_cancel)
             except Exception as e:
                 log.error("reconcile walk failed: %s", e)
                 return
@@ -455,7 +547,7 @@ class MainWindow(QMainWindow):
                   f"library changed ({drift.summary()}) — reindexing…")
             fresh = None
             try:
-                fresh = scan_library(old.root)
+                fresh = scan_library(old.root, self.scan_filter)
                 result = build_cache(fresh, cache_dir, None,
                                      cancel=self.build_cancel)
                 if result is None:
@@ -532,6 +624,25 @@ class MainWindow(QMainWindow):
         for t in (self._build_thread, self._reconcile_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=5.0)
+
+    def _change_library(self) -> None:
+        root = _choose_library_from_dialog(
+            self.cache_root, self, self.catalog.root)
+        if root is None:
+            return
+        program, args = _restart_command(root, self.cache_root)
+        started = QProcess.startDetached(program, args)
+        ok = started[0] if isinstance(started, tuple) else started
+        if not ok:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, APP_NAME, f"Could not open the selected folder:\n{root}")
+            return
+        _remember_library(self.cache_root, root)
+        self.shutdown()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def closeEvent(self, event) -> None:
         self.build_cancel.set()
@@ -760,6 +871,14 @@ def main() -> int:
                          "a per-user cache dir when run as a frozen bundle)")
     ap.add_argument("--rebuild", action="store_true",
                     help="ignore any existing tracer cache and rebuild")
+    ap.add_argument("--min-image-size", type=_parse_image_size_arg,
+                    metavar="WIDTHxHEIGHT",
+                    help="ignore images smaller than WIDTHxHEIGHT during "
+                         "catalog scan (for icons and thumbnails)")
+    ap.add_argument("--max-image-size", type=_parse_image_size_arg,
+                    metavar="WIDTHxHEIGHT",
+                    help="ignore images larger than WIDTHxHEIGHT during "
+                         "catalog scan (for huge source or GIS images)")
     ap.add_argument("--zoom", type=int, default=160)
     ap.add_argument("--screenshot", type=Path, default=None,
                     help="save a PNG once the viewport is fully decoded, "
@@ -791,13 +910,18 @@ def main() -> int:
     if root is None:
         return 2
 
+    min_w, min_h = args.min_image_size or (0, 0)
+    max_w, max_h = args.max_image_size or (0, 0)
+    scan_filter = ScanFilter(min_width=min_w, min_height=min_h,
+                             max_width=max_w, max_height=max_h)
+
     # Data prep. Try a WARM start first: load the persisted catalog (no
     # walk) and bind it to the thumbnail cache. Else fall back to a COLD
     # walk + build (or adopt an external --thumbs cache). The cache dir is
     # always derived from the library root, so even an adopted-cache run
     # persists its catalog and warm-starts next time.
     adopt = args.thumbs is not None
-    cache_dir = cache_dir_for(root, args.cache_root)
+    cache_dir = cache_dir_for(root, args.cache_root, scan_filter.cache_key())
     cat_path = cache_dir / "catalog.json"
     thumbs_path = args.thumbs if adopt else cache_dir / "thumbs.fcache"
 
@@ -818,7 +942,7 @@ def main() -> int:
                 log.warning("persisted cache unusable (%s); rescanning", e)
 
     if catalog is None:  # cold path
-        catalog = scan_library(root)
+        catalog = scan_library(root, scan_filter)
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
@@ -847,8 +971,8 @@ def main() -> int:
     # A frozen first-run picker may already have created the app.
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
-    win = MainWindow(catalog, thumbs, cache_dir, build_dir, warm=warm,
-                     adopt=adopt)
+    win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
+                     warm=warm, adopt=adopt, cache_root=args.cache_root)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
