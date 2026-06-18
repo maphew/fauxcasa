@@ -16,7 +16,11 @@ Built by `scripts/make-synthetic-library.py --benchmark 100000` and
 - `cache/benchmark-thumbs.fcache` — packed thumbnails. Header 16 bytes:
   magic `FCTC`, u32 version=1, u32 count, u32 reserved (little-endian).
   Then `count` 16-byte index records: u64 blob offset, u32 blob length,
-  u16 width, u16 height. Then JPEG blobs (256 px long edge, q80).
+  u16 width, u16 height. Then JPEG blobs (256 px long edge, q80). The
+  shipped benchmark cache is v1; **check the version word before parsing** —
+  v2 (multi-resolution) packs `u16 nlevels | u16 0` in the reserved word,
+  followed by an `nlevels`-entry u16 level table and a photo-major
+  `count*nlevels` index (see `scripts/make-thumbcache.py` for the layout).
 - `cache/benchmark-thumbs.fcache.json` — count + folder groups (unused by
   balloons today; reserved for group headers later).
 
