@@ -786,10 +786,172 @@ def test_make_thumbcache_bakes_orientation_like_indexer(tmp_path: Path) -> None:
     write_jpeg_meta(rot, w=600, h=300, exif_orientation=6)
     flat = tmp_path / "flat.jpg"
     write_jpeg_meta(flat, w=600, h=300)
-    _b, rw, rh = mtc._make_thumb(rot)
-    _b, fw, fh = mtc._make_thumb(flat)
+    (_b, rw, rh), = mtc._make_thumb(rot, [256])   # one level -> one record
+    (_b, fw, fh), = mtc._make_thumb(flat, [256])
     assert rw < rh   # rotated -> portrait, matching the Qt indexer
     assert fw > fh   # untouched -> landscape
+
+
+# ---- fcache v2: multi-resolution cache format (fauxcasa-gtr) --------------
+#
+# v2 stores several long-edge levels per photo, declared in the header
+# (largest first); v1 (single 256 level) and v2 share ONE reader keyed on the
+# version field, so the shipped v1 benchmark cache keeps loading. The grid
+# reads the PRIMARY level (256), so a v2 cache that includes 256 leaves the
+# grid and §7 behaviour unchanged and only adds larger levels for a future
+# hi-DPI / loupe consumer (the viewer still reads originals, N4).
+
+
+def _big_library(root: Path) -> None:
+    """Sources larger than every test level so each level carries real,
+    distinct pixels (a downscale, never an upscale)."""
+    make_jpeg(root / "f" / "land.jpg", 600, 400)   # landscape
+    make_jpeg(root / "f" / "port.jpg", 400, 600)   # portrait
+
+
+def test_v1_build_keeps_legacy_header(library: Path, tmp_path: Path) -> None:
+    """The single-level default still emits a v1 header (version=1, reserved
+    word 0) — the multi-level refactor must not perturb the legacy format the
+    shipped benchmark cache depends on."""
+    result = thumbcache.build_cache(scan_library(library), tmp_path / "c")
+    with open(result.path, "rb") as f:
+        hdr = f.read(16)
+    assert hdr[:4] == thumbcache.MAGIC
+    version, count, reserved = struct.unpack("<III", hdr[4:16])
+    assert version == 1 and reserved == 0 and count == 4
+    cache = thumbcache.load_cache(result.path)
+    assert cache.levels == [256] and cache.primary == 0
+    assert cache.level_entries == [cache.entries]  # single level == entries
+    # the v1 sidecar gains no "levels" key (byte-stable for old caches)
+    meta = json.loads(result.path.with_suffix(".fcache.json").read_text())
+    assert "levels" not in meta and meta["thumb_edge"] == 256
+
+
+def test_v2_multilevel_roundtrip(tmp_path: Path) -> None:
+    """A v2 build writes a level table + count*nlevels photo-major index; the
+    dual reader recovers the levels, each (photo,level) blob is a real JPEG
+    that fits its box, a photo's per-level long edges are non-increasing, the
+    primary is 256, and files[] stays one-per-photo (so bind works)."""
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat = scan_library(root)
+    result = thumbcache.build_cache(cat, tmp_path / "c", levels=[512, 256, 128])
+
+    with open(result.path, "rb") as f:
+        hdr = f.read(16)
+        version, count, word3 = struct.unpack("<III", hdr[4:16])
+        nlevels = word3 & 0xFFFF
+        ltbl = f.read(2 * nlevels)
+    assert version == 2 and count == 2 and nlevels == 3
+    assert list(struct.unpack("<3H", ltbl)) == [512, 256, 128]
+
+    cache = thumbcache.load_cache(result.path)
+    assert cache.levels == [512, 256, 128] and cache.count == 2
+    assert cache.primary == 1 and cache.levels[cache.primary] == 256
+    assert cache.entries == cache.level_entries[1]  # entries mirrors primary
+    assert len(cache.level_entries) == 3
+    assert all(len(le) == 2 for le in cache.level_entries)
+    assert len(cache.files) == 2  # ONE per photo, not count*nlevels
+    thumbcache.bind(cache, cat)   # must not raise
+    # sidecar records the levels (informational)
+    meta = json.loads(result.path.with_suffix(".fcache.json").read_text())
+    assert meta["levels"] == [512, 256, 128] and meta["thumb_edge"] == 256
+
+    with open(result.path, "rb") as f:
+        for p in range(cache.count):
+            longs = []
+            for li, edge in enumerate(cache.levels):
+                off, length, w, h = cache.entry(p, li)
+                assert length > 0 and 0 < max(w, h) <= edge
+                f.seek(off)
+                assert f.read(3) == b"\xff\xd8\xff"  # real JPEG SOI
+                longs.append(max(w, h))
+            assert longs == sorted(longs, reverse=True)  # 512 >= 256 >= 128 caps
+
+
+def test_best_level_picks_smallest_sufficient(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    _big_library(root)
+    cache = thumbcache.load_cache(thumbcache.build_cache(
+        scan_library(root), tmp_path / "c", levels=[512, 256, 128]).path)
+    assert cache.best_level(512) == 0
+    assert cache.best_level(300) == 0     # only 512 is big enough
+    assert cache.best_level(256) == 1
+    assert cache.best_level(130) == 1
+    assert cache.best_level(128) == 2
+    assert cache.best_level(1) == 2       # cheapest sufficient
+    assert cache.best_level(99999) == 0   # nothing big enough -> largest
+
+
+def test_dual_version_both_load_and_bind(library: Path, tmp_path: Path) -> None:
+    """A v1 and a v2 cache from the same library both load and bind; the
+    levels differ but files[] (one per photo, walk order) is identical."""
+    cat1 = scan_library(library)
+    v1 = thumbcache.build_cache(cat1, tmp_path / "v1")
+    cat2 = scan_library(library)
+    v2 = thumbcache.build_cache(cat2, tmp_path / "v2", levels=[512, 256])
+    c1 = thumbcache.load_cache(v1.path)
+    c2 = thumbcache.load_cache(v2.path)
+    assert c1.levels == [256] and c2.levels == [512, 256]
+    assert c1.files == c2.files            # identical one-per-photo walk
+    thumbcache.bind(c1, cat1)
+    thumbcache.bind(c2, cat2)
+
+
+def test_v2_levels_normalized_largest_first(tmp_path: Path) -> None:
+    """Levels are de-duped and sorted largest-first regardless of input order,
+    so the on-disk table, the primary, and bind are deterministic."""
+    root = tmp_path / "lib"
+    _big_library(root)
+    cache = thumbcache.load_cache(thumbcache.build_cache(
+        scan_library(root), tmp_path / "c",
+        levels=[128, 256, 128, 512]).path)  # unsorted + duplicate
+    assert cache.levels == [512, 256, 128]
+
+
+def test_load_rejects_unsupported_version_and_truncated_v2(tmp_path: Path) -> None:
+    bad_ver = tmp_path / "v3.fcache"
+    bad_ver.write_bytes(thumbcache.MAGIC + struct.pack("<III", 3, 0, 0))
+    with pytest.raises(thumbcache.CacheError, match="unsupported"):
+        thumbcache.load_cache(bad_ver)
+    # a v2 header promising 3 levels with no level-table bytes following
+    trunc = tmp_path / "trunc.fcache"
+    trunc.write_bytes(thumbcache.MAGIC + struct.pack("<IIHH", 2, 1, 3, 0))
+    with pytest.raises(thumbcache.CacheError, match="level table"):
+        thumbcache.load_cache(trunc)
+
+
+def test_v2_canonical_builder_thumbs_match_inapp(tmp_path: Path) -> None:
+    """scripts/make-thumbcache.py and the in-app builder produce the SAME v2
+    levels and per-level geometry for the same input. JPEG blob BYTES differ
+    between PIL and Qt (as they do in v1), so we assert the level set, the
+    fit-the-box invariant, the orientation, and the aspect ratio agree — the
+    structure, not the encoder output."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+    assert mtc._normalize_levels([128, 512, 256]) == [512, 256, 128]
+    assert mtc._primary_level([512, 256, 128]) == 1  # mirrors thumbcache
+
+    root = tmp_path / "lib"
+    _big_library(root)
+    levels = [512, 256, 128]
+    inapp = thumbcache.load_cache(thumbcache.build_cache(
+        scan_library(root), tmp_path / "c", levels=levels).path)
+    files = sorted(root.rglob("*.jpg"))
+    assert [f.name for f in files] == ["land.jpg", "port.jpg"]
+    for p, f in enumerate(files):
+        canon = mtc._make_thumb(f, levels)   # PIL builder, direct (no pool)
+        assert len(canon) == len(levels)
+        for li, edge in enumerate(levels):
+            cb, cw, ch = canon[li]
+            assert cb[:3] == b"\xff\xd8\xff" and 0 < max(cw, ch) <= edge
+            _o, _l, iw, ih = inapp.entry(p, li)
+            assert (cw < ch) == (iw < ih)            # same orientation
+            assert abs((cw / ch) - (iw / ih)) < 0.03  # aspect agrees
 
 
 def test_index_empty_infile_caption_keeps_ini(tmp_path: Path) -> None:

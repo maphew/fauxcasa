@@ -22,9 +22,9 @@ import os
 import struct
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from catalog import Catalog
 from inmeta import read_jpeg_metadata
@@ -33,36 +33,129 @@ MAGIC = b"FCTC"
 THUMB_EDGE = 256
 JPEG_QUALITY = 80
 
+# A multi-resolution (fcache v2) cache stores several long-edge levels per
+# photo, declared in the header (largest first). The single-level default is
+# byte-identical to the legacy v1 layout; pass an explicit level set to build
+# v2. The grid reads the PRIMARY level — the 256 px tile it scales in paint —
+# so a v2 cache that includes 256 leaves the grid and §7 behaviour unchanged
+# and only adds larger levels for a future hi-DPI / loupe consumer (the
+# product requirement behind fauxcasa-gtr; the viewer still reads originals).
+RECOMMENDED_LEVELS = (512, THUMB_EDGE, 128)
+
 
 class CacheError(Exception):
     pass
+
+
+def _normalize_levels(levels: Sequence[int] | None) -> list[int]:
+    """Canonical level set: unique positive long-edges, largest first. None or
+    empty -> the single 256 px level, i.e. a v1 cache."""
+    if not levels:
+        return [THUMB_EDGE]
+    out = sorted({int(e) for e in levels if int(e) > 0}, reverse=True)
+    if not out:
+        raise ValueError("levels must contain at least one positive edge")
+    if out[0] > 0xFFFF:
+        raise ValueError("a level edge must fit in a u16 (<= 65535)")
+    return out
+
+
+def _primary_level(levels: list[int]) -> int:
+    """Index of the level the grid reads: exactly 256 px if present, else the
+    largest level <= 256 (never hand the grid an oversized tile it just
+    shrinks), else — every level is > 256 — the smallest. Levels are largest
+    first, so the first <= 256 is the largest such."""
+    for i, edge in enumerate(levels):
+        if edge == THUMB_EDGE:
+            return i
+    for i, edge in enumerate(levels):
+        if edge <= THUMB_EDGE:
+            return i
+    return len(levels) - 1
 
 
 @dataclass
 class ThumbCache:
     path: Path
     count: int
-    # per entry: (blob offset, blob length, thumb width, thumb height);
-    # length 0 = the original failed to decode at build time (error tile)
+    # PRIMARY level, ONE record per photo: (blob offset, blob length, thumb
+    # width, thumb height); length 0 = the original failed to decode at build
+    # time (error tile). A v1 cache has one level so this is the only level; a
+    # v2 cache exposes every level via `level_entries` / `entry()`.
     entries: list[tuple[int, int, int, int]]
-    files: list[str]  # library-relative POSIX paths, entry order
+    files: list[str]  # library-relative POSIX paths, ONE per photo (entry order)
     library: str
+    # Long-edge of each cached level, largest first (a v1 cache -> [256]).
+    levels: list[int] = field(default_factory=lambda: [THUMB_EDGE])
+    primary: int = 0  # index into `levels` that `entries` mirrors
+    # Full per-level index: level_entries[level_idx][photo_idx]. Defaults to
+    # the single primary level so v1 constructors need not supply it.
+    level_entries: list[list[tuple[int, int, int, int]]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.level_entries is None:
+            self.level_entries = [self.entries]
+
+    def best_level(self, min_edge: int) -> int:
+        """Index of the cheapest cached level whose long edge is >= min_edge
+        (the smallest sufficient level), or the largest level (index 0) when
+        none is big enough. Lets a hi-DPI / loupe consumer ask for "at least
+        N px" without knowing the level set."""
+        best = 0
+        for i, edge in enumerate(self.levels):
+            if edge >= min_edge:
+                best = i  # descending order: keep the smallest sufficient one
+        return best
+
+    def entry(self, photo_idx: int,
+              level_idx: int | None = None) -> tuple[int, int, int, int]:
+        """The (offset, length, w, h) record for a photo at a level (default:
+        the primary level, == entries[photo_idx])."""
+        li = self.primary if level_idx is None else level_idx
+        return self.level_entries[li][photo_idx]
 
 
 def load_cache(path: Path) -> ThumbCache:
+    """Read a packed fcache. v1 (single 256 level) and v2 (multi-resolution,
+    levels declared in the header) both load through here — the version field
+    selects the layout, so the shipped v1 benchmark cache keeps loading with
+    no rebuild."""
     with open(path, "rb") as f:
         hdr = f.read(16)
     if len(hdr) < 16 or hdr[:4] != MAGIC:
         raise CacheError(f"{path}: not an fcache file")
-    version, count, _ = struct.unpack("<III", hdr[4:16])
-    if version != 1:
+    # Word 3 is reserved (0) in v1 and packs nlevels in its low u16 in v2; the
+    # version field disambiguates, so the same <III> read serves both.
+    version, count, word3 = struct.unpack("<III", hdr[4:16])
+    if version == 1:
+        levels = [THUMB_EDGE]
+        index_off = 16
+    elif version == 2:
+        nlevels = word3 & 0xFFFF
+        if not 1 <= nlevels <= 64:
+            raise CacheError(f"{path}: v2 header declares {nlevels} levels")
+        with open(path, "rb") as f:
+            f.seek(16)
+            ltbl = f.read(2 * nlevels)
+        if len(ltbl) != 2 * nlevels:
+            raise CacheError(f"{path}: truncated level table")
+        levels = list(struct.unpack(f"<{nlevels}H", ltbl))
+        index_off = 16 + 2 * nlevels
+    else:
         raise CacheError(f"{path}: unsupported fcache version {version}")
+
+    nlevels = len(levels)
     with open(path, "rb") as f:
-        f.seek(16)
-        raw = f.read(count * 16)
-    if len(raw) != count * 16:
+        f.seek(index_off)
+        raw = f.read(count * nlevels * 16)
+    if len(raw) != count * nlevels * 16:
         raise CacheError(f"{path}: truncated index")
-    entries = [struct.unpack_from("<QIHH", raw, i * 16) for i in range(count)]
+    recs = [struct.unpack_from("<QIHH", raw, i * 16)
+            for i in range(count * nlevels)]
+    # Photo-major on disk: level l of photo p is record p*nlevels + l.
+    level_entries = [[recs[p * nlevels + li] for p in range(count)]
+                     for li in range(nlevels)]
+    primary = _primary_level(levels)
 
     sidecar = path.with_suffix(".fcache.json")
     try:
@@ -72,6 +165,8 @@ def load_cache(path: Path) -> ThumbCache:
     if not isinstance(meta, dict):
         raise CacheError(f"{sidecar}: sidecar is not a JSON object")
     files = meta.get("files")
+    # files[] is ONE per photo (levels never multiply it), so a v2 cache binds
+    # to the catalog exactly like a v1 one.
     if not isinstance(files, list) or len(files) != count:
         raise CacheError(
             f"{sidecar}: no per-entry 'files' array (old sidecar?) — "
@@ -80,9 +175,12 @@ def load_cache(path: Path) -> ThumbCache:
     return ThumbCache(
         path=path,
         count=count,
-        entries=entries,
+        entries=level_entries[primary],
         files=[str(f) for f in files],
         library=str(meta.get("library", "")),
+        levels=levels,
+        primary=primary,
+        level_entries=level_entries,
     )
 
 
@@ -138,13 +236,15 @@ class IndexResult:
         return self.photos / self.elapsed_s if self.elapsed_s > 0 else 0.0
 
 
-def _index_one(root: Path, photo, idx: int):
-    """One photo: read bytes, sha256 (N6 identity), SCALED-decode to the
-    256 px thumb box (libjpeg DCT decode — see INDEX_WORKERS), JPEG-encode,
-    and read in-file caption/keywords (XMP/IPTC) from the bytes already in
-    hand. Returns everything the fcache and the persisted catalog need, plus
-    the QImage for the live grid feed. A null/corrupt image yields a
-    zero-length blob (error tile).
+def _index_one(root: Path, photo, idx: int, levels: list[int]):
+    """One photo: read bytes, sha256 (N6 identity), SCALED-decode ONCE to the
+    top (largest) level's box (libjpeg DCT decode — see INDEX_WORKERS), then
+    downscale that decoded image to each lower level and JPEG-encode every
+    level. Also reads in-file caption/keywords (XMP/IPTC) from the bytes
+    already in hand. Returns the per-level (blob, w, h) records the fcache
+    needs, the catalog signals, and the PRIMARY-level QImage for the live grid
+    feed. A null/corrupt image yields a zero-length blob per level (error
+    tile). With a single 256 level this is byte-identical to the legacy path.
 
     EXIF orientation IS applied here (setAutoTransform): the thumbnail is
     baked display-upright, so the grid, the viewer (which auto-transforms the
@@ -153,6 +253,9 @@ def _index_one(root: Path, photo, idx: int):
     grid/viewer); a rotate change never invalidates the cache."""
     from PySide6.QtCore import QBuffer, QIODevice, QSize, Qt
     from PySide6.QtGui import QImageReader
+
+    top = levels[0]  # largest edge (levels are descending)
+    primary_li = _primary_level(levels)
 
     src = root / photo.rel
     try:
@@ -174,29 +277,75 @@ def _index_one(root: Path, photo, idx: int):
     # Apply EXIF orientation at decode (handles all 8 cases, mirrors too);
     # the thumbnail is stored display-upright. setScaledSize is in pre-
     # transform pixels — for a 90/270 image the box edges swap but both stay
-    # <= THUMB_EDGE, and the post-read clamp below covers any header that
-    # couldn't be pre-sized.
+    # <= top, and the post-read clamp below covers any header that couldn't
+    # be pre-sized.
     reader.setAutoTransform(True)
     sz = reader.size()  # header-only; full pixels not decoded yet
-    if sz.isValid() and (sz.width() > THUMB_EDGE or sz.height() > THUMB_EDGE):
-        s = min(THUMB_EDGE / sz.width(), THUMB_EDGE / sz.height())
+    if sz.isValid() and (sz.width() > top or sz.height() > top):
+        s = min(top / sz.width(), top / sz.height())
         reader.setScaledSize(QSize(max(1, round(sz.width() * s)),
                                    max(1, round(sz.height() * s))))
     img = reader.read()
     if img.isNull():
-        return idx, b"", 0, 0, size, mtime, sha, meta, None
+        return idx, [(b"", 0, 0) for _ in levels], size, mtime, sha, meta, None
     # formats whose header size was unreadable skip the scaled decode above
-    if img.width() > THUMB_EDGE or img.height() > THUMB_EDGE:
+    if img.width() > top or img.height() > top:
         img = img.scaled(
-            THUMB_EDGE, THUMB_EDGE,
+            top, top,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-    out = QBuffer()
-    out.open(QIODevice.OpenModeFlag.WriteOnly)
-    img.save(out, "JPEG", JPEG_QUALITY)
-    return idx, bytes(out.data()), img.width(), img.height(), size, mtime, \
-        sha, meta, img
+    level_blobs: list[tuple[bytes, int, int]] = []
+    primary_img = None
+    for li, edge in enumerate(levels):
+        # Downscale the top image to each level; never upscale (a small
+        # source caps every level at its native size, as v1 did at 256).
+        if img.width() <= edge and img.height() <= edge:
+            lvl = img
+        else:
+            lvl = img.scaled(
+                edge, edge,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        out = QBuffer()
+        out.open(QIODevice.OpenModeFlag.WriteOnly)
+        lvl.save(out, "JPEG", JPEG_QUALITY)
+        level_blobs.append((bytes(out.data()), lvl.width(), lvl.height()))
+        if li == primary_li:
+            primary_img = lvl
+    return idx, level_blobs, size, mtime, sha, meta, primary_img
+
+
+def _write_fcache(out: Path, levels: list[int],
+                  photo_levels: list[list[tuple[bytes, int, int]]]) -> None:
+    """Atomically write a packed fcache. `photo_levels[i]` is photo i's list
+    of (blob, w, h), one per level in `levels` order. A single level emits the
+    legacy v1 layout byte-for-byte; multiple levels emit v2: a level table
+    after the header, then a photo-major count*nlevels index, then the blobs
+    photo-major (a photo's levels are contiguous)."""
+    count = len(photo_levels)
+    nlevels = len(levels)
+    single = nlevels == 1
+    header_len = 16 if single else 16 + 2 * nlevels
+    index = bytearray()
+    offset = header_len + 16 * count * nlevels
+    for plist in photo_levels:
+        for blob, w, h in plist:
+            index += struct.pack("<QIHH", offset, len(blob), w, h)
+            offset += len(blob)
+    tmp = out.with_suffix(".tmp")
+    with tmp.open("wb") as f:
+        if single:
+            f.write(MAGIC + struct.pack("<III", 1, count, 0))
+        else:
+            f.write(MAGIC + struct.pack("<IIHH", 2, count, nlevels, 0))
+            f.write(struct.pack(f"<{nlevels}H", *levels))
+        f.write(index)
+        for plist in photo_levels:
+            for blob, _w, _h in plist:
+                f.write(blob)
+    tmp.replace(out)
 
 
 def build_cache(
@@ -204,11 +353,16 @@ def build_cache(
     cache_dir: Path,
     progress: Callable[[int, int, object], None] | None = None,
     cancel: threading.Event | None = None,
+    levels: Sequence[int] | None = None,
 ) -> IndexResult | None:
     """Build thumbs.fcache for a (small) library and fill each photo's
     identity/staleness signals (size, mtime, sha256) into the catalog in
     place; the caller persists the catalog. Returns an IndexResult with
     the measured throughput, or None if cancelled.
+
+    `levels` is the set of thumbnail long-edges to cache (default: the single
+    256 px level, i.e. a v1 cache byte-identical to the legacy format). Pass
+    e.g. (512, 256, 128) for a multi-resolution v2 cache.
 
     A thread pool runs the per-photo index work; `progress(i, total,
     qimage_or_None)` fires as each completes (out of order) so the grid
@@ -217,23 +371,24 @@ def build_cache(
     cleanly (nothing written)."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    levels = _normalize_levels(levels)
+    primary = _primary_level(levels)
     cache_dir.mkdir(parents=True, exist_ok=True)
     out = cache_dir / "thumbs.fcache"
     total = len(catalog.photos)
-    blobs: list[bytes] = [b""] * total
-    dims: list[tuple[int, int]] = [(0, 0)] * total
+    photo_levels: list[list[tuple[bytes, int, int]]] = \
+        [[(b"", 0, 0)] * len(levels) for _ in range(total)]
 
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=INDEX_WORKERS) as pool:
-        futs = [pool.submit(_index_one, catalog.root, p, i)
+        futs = [pool.submit(_index_one, catalog.root, p, i, levels)
                 for i, p in enumerate(catalog.photos)]
         for fut in as_completed(futs):
             if cancel is not None and cancel.is_set():
                 pool.shutdown(wait=False, cancel_futures=True)
                 return None
-            idx, blob, w, h, size, mtime, sha, meta, img = fut.result()
-            blobs[idx] = blob
-            dims[idx] = (w, h)
+            idx, level_blobs, size, mtime, sha, meta, img = fut.result()
+            photo_levels[idx] = level_blobs
             photo = catalog.photos[idx]
             photo.size, photo.mtime, photo.sha256 = size, mtime, sha
             # §4 precedence: in-file metadata wins over the ini for tier-1
@@ -251,24 +406,16 @@ def build_cache(
 
     if cancel is not None and cancel.is_set():
         return None
-    index = bytearray()
-    offset = 16 + 16 * total
-    tmp = out.with_suffix(".tmp")
-    with tmp.open("wb") as f:
-        f.write(MAGIC + struct.pack("<III", 1, total, 0))
-        for blob, (w, h) in zip(blobs, dims):
-            index += struct.pack("<QIHH", offset, len(blob), w, h)
-            offset += len(blob)
-        f.write(index)
-        for blob in blobs:
-            f.write(blob)
-    tmp.replace(out)
+    _write_fcache(out, levels, photo_levels)
 
-    out.with_suffix(".fcache.json").write_text(json.dumps({
+    sidecar = {
         "count": total,
         "library": str(catalog.root),
-        "thumb_edge": THUMB_EDGE,
+        "thumb_edge": levels[primary],
         "files": [p.rel for p in catalog.photos],
-    }, indent=1))
+    }
+    if len(levels) > 1:  # informational; the header is authoritative
+        sidecar["levels"] = levels
+    out.with_suffix(".fcache.json").write_text(json.dumps(sidecar, indent=1))
     return IndexResult(path=out, photos=total, elapsed_s=elapsed,
                        workers=INDEX_WORKERS)

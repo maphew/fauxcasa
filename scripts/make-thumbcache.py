@@ -11,13 +11,32 @@ this one file; the format is deliberately trivial so any candidate
 language reads it in a few lines.
 
     uv run scripts/make-thumbcache.py [--library DIR] [--out FILE]
+                                      [--levels 512,256,128]
 
-Format (fcthumbs v1, all little-endian):
+Format (fcthumbs, all little-endian). Two versions share one reader; the
+version field selects the layout, so the shipped v1 benchmark cache keeps
+loading with no rebuild.
 
+  v1 (single level — the default; byte-identical to the legacy format):
     header, 16 bytes:  magic b"FCTC" | u32 version=1 | u32 count | u32 0
     index, count * 16: u64 blob offset (from file start) | u32 blob length
                        | u16 thumb width | u16 thumb height
     blobs:             JPEG bytes, quality 80, 256 px long edge
+
+  v2 (multi-resolution — built with --levels):
+    header, 16 bytes:  magic b"FCTC" | u32 version=2 | u32 count
+                       | u16 nlevels | u16 0
+    level table:       nlevels * u16  long-edge per level, LARGEST FIRST
+                       (e.g. 512, 256, 128)
+    index, count*nlevels * 16: the same record, PHOTO-MAJOR — level l of
+                       photo i is record i*nlevels + l
+    blobs:             JPEG q80, photo-major (a photo's levels are contiguous)
+
+The level set is declared in the header, so a reader locates any level without
+the sidecar. Every photo carries exactly nlevels blobs; each lower level is
+the top level decoded once and downscaled (never upscaled — a small source
+caps every level at its native size). The "files" array stays ONE per photo so
+a v2 cache binds to a catalog exactly like a v1 one.
 
 Entry order = sorted(Path) over the library walk, i.e. path COMPONENT
 order — NOT a sort of the joined POSIX string (the two differ when one
@@ -46,6 +65,7 @@ import json
 import struct
 import sys
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from pathlib import Path
 
 CACHE = Path(__file__).resolve().parent.parent / "cache"
@@ -54,7 +74,43 @@ THUMB_EDGE = 256
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
 
 
-def _make_thumb(path: Path) -> tuple[bytes, int, int]:
+def _normalize_levels(levels) -> list[int]:
+    """Canonical level set: unique positive long-edges, largest first. None or
+    empty -> the single 256 px level (a v1 cache). Mirrors
+    apps/desktop-python/thumbcache.py._normalize_levels so both builders agree."""
+    if not levels:
+        return [THUMB_EDGE]
+    out = sorted({int(e) for e in levels if int(e) > 0}, reverse=True)
+    if not out:
+        raise ValueError("levels must contain at least one positive edge")
+    if out[0] > 0xFFFF:
+        raise ValueError("a level edge must fit in a u16 (<= 65535)")
+    return out
+
+
+def _primary_level(levels: list[int]) -> int:
+    """Index of the level the grid reads (exactly 256 if present, else the
+    largest <= 256, else the smallest). Mirrors thumbcache._primary_level."""
+    for i, edge in enumerate(levels):
+        if edge == THUMB_EDGE:
+            return i
+    for i, edge in enumerate(levels):
+        if edge <= THUMB_EDGE:
+            return i
+    return len(levels) - 1
+
+
+def _parse_levels(spec: str | None) -> list[int]:
+    if not spec:
+        return [THUMB_EDGE]
+    try:
+        raw = [int(p) for p in spec.replace(" ", "").split(",") if p]
+    except ValueError:
+        raise SystemExit(f"--levels: not a comma-separated int list: {spec!r}")
+    return _normalize_levels(raw)
+
+
+def _make_thumb(path: Path, levels: list[int]) -> list[tuple[bytes, int, int]]:
     from PIL import Image, ImageOps
 
     with Image.open(path) as img:
@@ -64,10 +120,22 @@ def _make_thumb(path: Path) -> tuple[bytes, int, int]:
         # baked. No-op for images without an Orientation tag.
         img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
-        img.thumbnail((THUMB_EDGE, THUMB_EDGE))
-        buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=80)
-        return buf.getvalue(), img.width, img.height
+        # Decode once to the top (largest) level, then downscale to each lower
+        # level — never upscale (PIL.thumbnail caps at the source size, as the
+        # legacy single-256 path did). A single level reproduces that path
+        # byte-for-byte.
+        img.thumbnail((levels[0], levels[0]))
+        out: list[tuple[bytes, int, int]] = []
+        for edge in levels:
+            if img.width <= edge and img.height <= edge:
+                lvl = img
+            else:
+                lvl = img.copy()
+                lvl.thumbnail((edge, edge))
+            buf = io.BytesIO()
+            lvl.save(buf, "JPEG", quality=80)
+            out.append((buf.getvalue(), lvl.width, lvl.height))
+        return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,6 +143,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--library", type=Path, default=CACHE / "benchmark-library")
     ap.add_argument("--out", type=Path, default=CACHE / "benchmark-thumbs.fcache")
     ap.add_argument("--jobs", type=int, default=None)
+    ap.add_argument(
+        "--levels",
+        type=str,
+        default=None,
+        help="comma-separated thumbnail long-edges for a multi-resolution "
+        "(v2) cache, e.g. 512,256,128. Omit for the single-level v1 cache "
+        "(256 px) that is byte-identical to the legacy format. A level set "
+        "should include 256 so the tracer grid is unaffected.",
+    )
     ap.add_argument(
         "--sidecar-only",
         action="store_true",
@@ -88,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         "sidecar's files array disagrees with the fresh walk",
     )
     args = ap.parse_args(argv)
+    levels = _parse_levels(args.levels)
+    primary = _primary_level(levels)
     if not args.library.is_dir():
         print(f"library not found: {args.library}", file=sys.stderr)
         return 2
@@ -112,10 +191,12 @@ def main(argv: list[str] | None = None) -> int:
         # resolved, so consumers comparing against their own resolved
         # library root don't get CWD-dependent spurious mismatches
         "library": str(args.library.resolve()),
-        "thumb_edge": THUMB_EDGE,
+        "thumb_edge": levels[primary],
         "groups": groups,
         "files": [p.relative_to(args.library).as_posix() for p in files],
     }
+    if len(levels) > 1:  # informational; the header is authoritative
+        sidecar["levels"] = levels
 
     if args.sidecar_only:
         if not args.out.is_file():
@@ -125,12 +206,29 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with args.out.open("rb") as f:
                 hdr = f.read(16)
-            if len(hdr) < 16 or hdr[:4] != MAGIC:
-                raise ValueError("not an fcache file")
-            cached = struct.unpack("<III", hdr[4:16])[1]
+                if len(hdr) < 16 or hdr[:4] != MAGIC:
+                    raise ValueError("not an fcache file")
+                version, cached, word3 = struct.unpack("<III", hdr[4:16])
+                if version == 1:
+                    cache_levels = [THUMB_EDGE]
+                elif version == 2:
+                    nlevels = word3 & 0xFFFF
+                    ltbl = f.read(2 * nlevels)
+                    if len(ltbl) != 2 * nlevels:
+                        raise ValueError("truncated level table")
+                    cache_levels = list(struct.unpack(f"<{nlevels}H", ltbl))
+                else:
+                    raise ValueError(f"unsupported fcache version {version}")
         except (OSError, ValueError) as e:
             print(f"cannot read {args.out}: {e}", file=sys.stderr)
             return 2
+        # The cache header is authoritative on a rewrite — reflect ITS levels
+        # in the sidecar, not whatever --levels says (which builds a new cache).
+        sidecar["thumb_edge"] = cache_levels[_primary_level(cache_levels)]
+        if len(cache_levels) > 1:
+            sidecar["levels"] = cache_levels
+        else:
+            sidecar.pop("levels", None)
         if cached != len(files):
             print(
                 f"library walk found {len(files)} files but {args.out} holds "
@@ -175,27 +273,35 @@ def main(argv: list[str] | None = None) -> int:
         print(f"sidecar rewritten for {len(files)} thumbs ({len(groups)} groups)")
         return 0
 
+    nlevels = len(levels)
+    single = nlevels == 1
+    header_len = 16 if single else 16 + 2 * nlevels
     index = bytearray()
-    offset = 16 + 16 * len(files)
+    offset = header_len + 16 * len(files) * nlevels
+    worker = partial(_make_thumb, levels=levels)
     tmp = args.out.with_suffix(".tmp")
     with tmp.open("wb") as f:
-        f.write(b"\x00" * offset)  # header+index placeholder
+        f.write(b"\x00" * offset)  # header (+ level table) + index placeholder
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
-            for n, (blob, w, h) in enumerate(
-                pool.map(_make_thumb, files, chunksize=32)
-            ):
-                index += struct.pack("<QIHH", offset, len(blob), w, h)
-                f.write(blob)
-                offset += len(blob)
+            for n, plist in enumerate(pool.map(worker, files, chunksize=32)):
+                for blob, w, h in plist:  # photo-major: every level of photo n
+                    index += struct.pack("<QIHH", offset, len(blob), w, h)
+                    f.write(blob)
+                    offset += len(blob)
                 if n % 10000 == 0:
                     print(f"  {n}/{len(files)}", file=sys.stderr)
         f.seek(0)
-        f.write(MAGIC + struct.pack("<III", 1, len(files), 0))
+        if single:
+            f.write(MAGIC + struct.pack("<III", 1, len(files), 0))
+        else:
+            f.write(MAGIC + struct.pack("<IIHH", 2, len(files), nlevels, 0))
+            f.write(struct.pack(f"<{nlevels}H", *levels))
         f.write(index)
     tmp.replace(args.out)
     args.out.with_suffix(".fcache.json").write_text(json.dumps(sidecar, indent=1))
+    lvl_note = "" if single else f", levels {','.join(map(str, levels))}"
     print(f"{len(files)} thumbs -> {args.out} "
-          f"({args.out.stat().st_size / 1e6:.0f} MB, {len(groups)} groups)")
+          f"({args.out.stat().st_size / 1e6:.0f} MB, {len(groups)} groups{lvl_note})")
     return 0
 
 
