@@ -1112,6 +1112,143 @@ def test_v2_cache_drives_grid_consumer(tmp_path: Path) -> None:
         assert length > 0 and max(w, h) <= 256   # primary 256, not the 512 top
 
 
+# --- the fcache v2 loupe / hi-DPI consumer (fauxcasa-9pp): the viewer paints
+# an instant cached preview — the nearest level >= the viewport's device
+# pixels, read via best_level()/entry() — while the full original decodes
+# off-thread. A v2 cache hands it the >256 (512) level; a v1 cache its 256
+# level; no cache or an error tile -> no preview, just the loading text. This
+# is the first consumer of the larger levels gtr shipped.
+
+
+def _offscreen_app():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def _bound_cache(tmp_path: Path, root: Path, levels=None):
+    """Build + load + bind a cache for `root`; returns (catalog, cache)."""
+    cat = scan_library(root)
+    built = thumbcache.build_cache(cat, tmp_path / "c", levels=levels)
+    cache = thumbcache.load_cache(built.path)
+    thumbcache.bind(cache, cat)
+    return cat, cache
+
+
+def test_viewer_preview_reads_larger_v2_level(tmp_path: Path) -> None:
+    """A large window makes best_level() pick the v2 512 top — the >256 level
+    nothing consumed before gtr — and the painted preview IS that level's
+    image (its long edge matches entry(idx, level))."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)                          # 600x400 + 400x600 -> real 512
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)                     # large window -> min_edge > 512
+    min_edge = viewer._preview_min_edge()
+    level = cache.best_level(min_edge)
+    viewer.show_photo(list(range(cache.count)), 0)
+    assert viewer.preview is not None and not viewer.preview.isNull()
+    _o, _l, w0, h0 = cache.entry(0, level)       # land.jpg @ 512: 512x341
+    assert max(viewer.preview.width(), viewer.preview.height()) == max(w0, h0)
+    # the whole point: a window this large clears 256 and reads the >256 level
+    assert min_edge >= 512 and level == 0 and max(w0, h0) == 512
+
+
+def test_viewer_preview_v1_falls_back_to_256(tmp_path: Path) -> None:
+    """A single-level v1 cache has only 256; the viewer still shows an instant
+    256 preview rather than a blank window (graceful, no v2 required)."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root)    # default -> v1 [256]
+    assert cache.levels == [256]
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)
+    viewer.show_photo(list(range(cache.count)), 0)
+    assert viewer.preview is not None
+    assert max(viewer.preview.width(), viewer.preview.height()) <= 256
+
+
+def test_viewer_no_preview_without_cache(tmp_path: Path) -> None:
+    """No cache yet (cold start before the build lands) -> no preview and no
+    crash; the viewer shows its loading text and still loads the original."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat = scan_library(root)
+    viewer = ViewerPage(cat, None)
+    viewer.resize(1280, 800)
+    viewer.show_photo(list(range(len(cat.photos))), 0)
+    assert viewer.preview is None
+
+
+def test_viewer_error_tile_yields_no_preview(tmp_path: Path) -> None:
+    """An error-tile entry (zero-length blob, original undecodable at build)
+    yields no preview; a good neighbour in the same cache still previews."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "ok.jpg", 600, 400)
+    (root / "f" / "bad.jpg").write_bytes(b"not a jpeg at all")
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    by_rel = {f: i for i, f in enumerate(cache.files)}
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)
+    assert viewer._load_preview(by_rel["f/bad.jpg"], 0) is None   # error tile
+    assert viewer._load_preview(by_rel["f/ok.jpg"], 0) is not None
+
+
+def test_viewer_original_supersedes_preview_then_falls_back(
+        tmp_path: Path) -> None:
+    """The decoded original replaces (and frees) the preview; but if the
+    original FAILS to decode, the cached preview keeps painting rather than
+    dropping straight to 'could not decode'."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256])
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)
+    viewer.show_photo(list(range(cache.count)), 0)
+    assert viewer.preview is not None
+    orig = QImage(800, 600, QImage.Format.Format_RGB32)
+    orig.fill(0)
+    viewer._on_loaded(viewer._serial, orig)         # the real original lands
+    assert viewer.image is orig and viewer.preview is None
+    viewer.show_photo(list(range(cache.count)), 1)  # next photo: preview again
+    assert viewer.preview is not None
+    viewer._on_loaded(viewer._serial, QImage())     # original failed to decode
+    assert viewer.image is None and viewer.preview is not None
+
+
+def test_viewer_preview_composes_picasa_rotate(tmp_path: Path) -> None:
+    """The preview composes the Picasa rotate= quarter-turns on top of the
+    EXIF-upright cached thumb, exactly as the grid and the original path do —
+    a 90 deg turn makes a landscape thumb paint portrait."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    make_jpeg(root / "land.jpg", 600, 400)          # landscape thumb (w > h)
+    (root / ".picasa.ini").write_text(
+        "[land.jpg]\r\nrotate=rotate(1)\r\n")       # one quarter-turn CW
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    p = next(p for p in cat.photos if p.rel == "land.jpg")
+    assert p.rotate == 1
+    _o, _l, w0, h0 = cache.entry(0, 0)
+    assert w0 > h0                                   # cached thumb is landscape
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)
+    rotated = viewer._load_preview(0, p.rotate)
+    assert rotated is not None and rotated.height() > rotated.width()  # portrait
+
+
 def test_index_empty_infile_caption_keeps_ini(tmp_path: Path) -> None:
     """An empty/whitespace in-file caption is 'no caption', not "" — it must
     not clobber the ini caption (§4 precedence), and the catalog must still

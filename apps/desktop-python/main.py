@@ -394,7 +394,10 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
 
         self.grid = GridView()
-        self.viewer = ViewerPage(catalog)
+        # The viewer shares the grid's cache pair: it paints an instant cached
+        # preview (the nearest v2 level) while the full original loads
+        # (fauxcasa-9pp). thumbs is None on a cold start until the build lands.
+        self.viewer = ViewerPage(catalog, thumbs)
 
         # --- sidebar: All / Starred / Folders / Albums ---
         self.tree = QTreeWidget()
@@ -592,6 +595,7 @@ class MainWindow(QMainWindow):
             return
         if catalog is self.catalog:
             self.grid.set_thumbs(cache)        # cold build: same catalog
+            self.viewer.set_thumbs(cache)      # ...so the viewer previews too
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
         self.statusBar().showMessage(
@@ -603,6 +607,7 @@ class MainWindow(QMainWindow):
         browser (a viewer index may no longer be valid)."""
         self.catalog = catalog
         self.viewer.catalog = catalog
+        self.viewer.set_thumbs(thumbs)         # reconciled cache for previews
         self.pages.setCurrentWidget(self.pages.widget(0))
         self.search.blockSignals(True)
         self.search.clear()
