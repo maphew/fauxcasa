@@ -319,8 +319,16 @@ def main() -> int:
     print(f"loaded {len(catalog.photos)} photos, {len(catalog.folders)} "
           f"folders in {prep_ms:.0f} ms; decoration={deco}", file=sys.stderr)
 
-    os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
-    os.environ.setdefault("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1")
+    # The Wayland defaults below are for the Linux dev box this harness was
+    # written on (Mutter/GNOME). On Windows/macOS, forcing
+    # QT_QPA_PLATFORM=wayland aborts startup with "no Qt platform plugin
+    # could be initialized" (there is no wayland plugin), so let Qt pick its
+    # native plugin there — "windows"/"cocoa". The benchmark needs a real
+    # display; the native plugin provides one. QT_IM_MODULE is harmless
+    # everywhere.
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
+        os.environ.setdefault("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1")
     os.environ["QT_IM_MODULE"] = ""
     app = QApplication([])
 
