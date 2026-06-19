@@ -8,12 +8,15 @@ volume. Navigation walks the grid's current display order.
 While that original decodes off-thread, the viewer paints an INSTANT
 stand-in read from the same thumbnail-cache pair the grid uses — the
 fcache v2 hi-DPI / loupe consumer (fauxcasa-9pp). On a large or hi-DPI
-window it pulls the nearest cached level >= the viewport's device pixels
-via ThumbCache.best_level()/entry() (the 512 px level of a v2 cache); a
-single-level v1 cache yields its 256 px level. The preview fills the box
-the original will occupy, so the hand-off is a sharpen-in-place, never a
-size pop. Reading the cache is well within the grid budget (N4) — it is
-the originals the grid must never touch, not the cache it owns.
+window it pulls — via ThumbCache.best_level()/entry() — the smallest
+cached level that covers the viewport's device pixels, or the largest
+level available when none is big enough (the 512 px level of a v2 cache
+on a typical window); a single-level v1 cache yields its 256 px level.
+The preview fills the box the original will occupy, so for the common
+case — a photo larger than the window — the hand-off is a pure
+sharpen-in-place (see _display_rect for the small-original caveat).
+Reading the cache is well within the grid budget (N4) — it is the
+originals the grid must never touch, not the cache it owns.
 """
 
 from __future__ import annotations
@@ -143,22 +146,28 @@ class ViewerPage(QWidget):
         offset, length, _w, _h = cache.entry(idx, level)
         if length <= 0:
             return None  # error tile: the original failed to decode at build
+        # Read + decode + rotate under ONE broad guard, exactly as the grid's
+        # decode worker does (grid.py): a corrupt index can hand us a 4 GiB
+        # `length` (os.pread then raises MemoryError, not an OSError), a dying
+        # volume an EIO, a bad blob a null decode. ANY of these must degrade to
+        # "no preview" (the loading text) — never an exception escaping into the
+        # synchronous Qt event handler that called us and aborting the UI.
         try:
             fd = os.open(cache.path, os.O_RDONLY)
             try:
                 buf = os.pread(fd, length, offset)
             finally:
                 os.close(fd)
-        except OSError:
-            return None  # cache vanished / EIO: just skip the preview
-        img = QImage.fromData(buf, "JPEG")
-        if img.isNull():
-            return None
-        if rotate:
-            from PySide6.QtGui import QTransform
+            img = QImage.fromData(buf, "JPEG")
+            if img.isNull():
+                return None
+            if rotate:
+                from PySide6.QtGui import QTransform
 
-            img = img.transformed(QTransform().rotate(90 * rotate))
-        return img
+                img = img.transformed(QTransform().rotate(90 * rotate))
+            return img
+        except Exception:  # noqa: BLE001 — match grid.py: degrade, never crash
+            return None
 
     def _on_loaded(self, serial: int, img: QImage) -> None:
         if serial != self._serial:
@@ -191,6 +200,25 @@ class ViewerPage(QWidget):
     def mouseDoubleClickEvent(self, _event) -> None:
         self.closed.emit(self.current_index())
 
+    @staticmethod
+    def _display_rect(box_w: int, box_h: int, src_w: int, src_h: int,
+                      cap: bool) -> QRect:
+        """Centered, aspect-fit rect for `src` painted in a `box`. `cap=True`
+        clamps the scale to 1:1 — the ORIGINAL never upscales past native, so a
+        small photo stays crisp. The preview passes `cap=False`, filling the box
+        the original will occupy: when the original is at least window-sized
+        (the common photo case) both compute the SAME rect, so the hand-off is a
+        pure sharpen-in-place. (An original SMALLER than the window draws capped
+        at native, smaller than the filled preview — a one-off downward pop we
+        accept: the cache stores thumb dims, not the original's, so the preview
+        cannot predict that fit.)"""
+        fit = min(box_w / src_w, box_h / src_h)
+        if cap:
+            fit = min(fit, 1.0)
+        dw = max(1, round(src_w * fit))
+        dh = max(1, round(src_h * fit))
+        return QRect((box_w - dw) // 2, (box_h - dh) // 2, dw, dh)
+
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), BACKGROUND)
@@ -203,17 +231,11 @@ class ViewerPage(QWidget):
         # preview; only when neither exists do we fall back to text.
         shown = self.image if self.image is not None else self.preview
         if shown is not None:
-            fit = min(w / shown.width(), h / shown.height())
-            # The original never upscales past 1:1 (a small photo stays crisp at
-            # native size); the low-res preview DOES fill the box the original
-            # will occupy, so the swap is a sharpen-in-place, not a size pop.
-            if self.image is not None:
-                fit = min(fit, 1.0)
-            dw = max(1, round(shown.width() * fit))
-            dh = max(1, round(shown.height() * fit))
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.drawImage(
-                QRect((w - dw) // 2, (h - dh) // 2, dw, dh), shown)
+                self._display_rect(w, h, shown.width(), shown.height(),
+                                   cap=self.image is not None),
+                shown)
         else:
             painter.setPen(QColor(150, 150, 150))
             msg = "loading…" if self.loading else "could not decode this file"

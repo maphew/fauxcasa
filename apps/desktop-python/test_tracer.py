@@ -1249,6 +1249,106 @@ def test_viewer_preview_composes_picasa_rotate(tmp_path: Path) -> None:
     assert rotated is not None and rotated.height() > rotated.width()  # portrait
 
 
+def test_viewer_display_rect_preview_fills_original_caps() -> None:
+    """The pure paint geometry: the preview (cap=False) fills the viewport box;
+    a window-sized original (cap=True) lands on the SAME rect, so the hand-off
+    is a sharpen-in-place. A small ORIGINAL caps at native (never upscaled),
+    while the same small source as a PREVIEW fills the box (the accepted one-off
+    pop). Degenerate 1x1 never yields a zero-size rect."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    big = ViewerPage._display_rect(1280, 800, 4000, 3000, cap=True)   # original
+    prev = ViewerPage._display_rect(1280, 800, 512, 384, cap=False)   # preview
+    assert big == prev                                   # identical 4:3 fit
+    assert big.height() == 800 and 0 < big.width() <= 1280   # fills the box
+    small_orig = ViewerPage._display_rect(1280, 800, 800, 600, cap=True)
+    assert (small_orig.width(), small_orig.height()) == (800, 600)    # native
+    small_prev = ViewerPage._display_rect(1280, 800, 800, 600, cap=False)
+    assert small_prev.width() > 800 and small_prev.height() > 600     # filled
+    assert ViewerPage._display_rect(1280, 800, 1, 1, cap=True).width() == 1
+
+
+def test_viewer_stale_original_is_dropped(tmp_path: Path) -> None:
+    """A late original carrying a superseded serial (user navigated on before it
+    decoded) is dropped by the secondary guard in _on_loaded — it must not
+    overwrite the current photo's freshly-decoded preview."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256])
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)
+    viewer.show_photo(list(range(cache.count)), 0)
+    stale = viewer._serial
+    viewer.show_photo(list(range(cache.count)), 1)   # serial advances; new preview
+    p1 = viewer.preview
+    assert p1 is not None
+    viewer._on_loaded(stale, QImage(800, 600, QImage.Format.Format_RGB32))
+    assert viewer.image is None and viewer.preview is p1   # untouched
+
+
+def test_viewer_preview_min_edge_floors_at_grid_tile(tmp_path: Path) -> None:
+    """A tiny window floors min_edge at the grid's 256 px tile, so the preview
+    never drops below the grid — best_level picks the 256 level, not the 128."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(120, 120)
+    assert viewer._preview_min_edge() == 256
+    assert cache.best_level(viewer._preview_min_edge()) == 1   # 256, not 128
+
+
+def test_viewer_preview_dpr_selects_larger_level(
+        tmp_path: Path, monkeypatch) -> None:
+    """The hi-DPI path: device-pixel-ratio multiplies the logical viewport, so
+    the SAME small window selects the 256 level at DPR 1 but the larger 512
+    level at DPR 2 — best_level() reads a >256 level only because of the DPR
+    scaling, which offscreen (DPR 1.0) alone could never exercise."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(200, 200)
+    monkeypatch.setattr(viewer, "devicePixelRatioF", lambda: 1.0)
+    assert viewer._preview_min_edge() == 256                  # 200 floored to 256
+    assert cache.best_level(viewer._preview_min_edge()) == 1  # the 256 level
+    monkeypatch.setattr(viewer, "devicePixelRatioF", lambda: 2.0)
+    assert viewer._preview_min_edge() == 400                  # 200 * 2 device px
+    assert cache.best_level(viewer._preview_min_edge()) == 0  # the >256 512 level
+
+
+def test_mainwindow_wires_viewer_cache_on_build_and_reconcile(
+        tmp_path: Path) -> None:
+    """The integration this bead adds: MainWindow hands the viewer the cache
+    pair on a cold-build finish (_on_index_finished) and on a reconcile swap
+    (reload_data) — the same cache the grid gets, so both consume v2."""
+    _offscreen_app()
+    import main
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat = scan_library(root)
+    win = main.MainWindow(cat, None, cache_dir=None, build_dir=None)
+    assert win.viewer.thumbs is None                  # cold start: no cache yet
+    built = thumbcache.build_cache(cat, tmp_path / "c", levels=[512, 256])
+    win._on_index_finished(built, win.catalog, False)  # cold-build finish
+    assert win.viewer.thumbs is not None
+    assert win.viewer.thumbs.levels == [512, 256]
+    assert win.grid.thumbs is win.viewer.thumbs        # one cache, both consumers
+    cat2 = scan_library(root)
+    cache2 = thumbcache.load_cache(thumbcache.build_cache(
+        cat2, tmp_path / "c2").path)                   # a fresh (v1) cache object
+    thumbcache.bind(cache2, cat2)
+    win.reload_data(cat2, cache2)                      # reconcile swap
+    assert win.viewer.catalog is cat2 and win.viewer.thumbs is cache2
+
+
 def test_index_empty_infile_caption_keeps_ini(tmp_path: Path) -> None:
     """An empty/whitespace in-file caption is 'no caption', not "" — it must
     not clobber the ini caption (§4 precedence), and the catalog must still
