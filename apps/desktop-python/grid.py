@@ -64,6 +64,12 @@ _STOP = object()
 # ~13 ms < 32 ms) but total process RSS peaks ~590 MB: under the ~600 MB
 # working target, above the old 512 MB figure. Reclaiming that headroom
 # (lower CACHE_BYTES, or zoom-aware tile sizing) is tracked separately.
+# NOTE: the px/byte figures above reason at devicePixelRatio 1 (256 px / 256 KB
+# tiles). The hi-DPI consumer (fauxcasa-q7m) decodes up to TILE_NATIVE*d, so at
+# d==2 tiles are ~512 px / ~1 MB and the want-band's byte footprint is ~d^2
+# larger; the budget still binds correctly (eviction sums img.sizeInBytes(), not
+# entries), but the worked example is dpr-1 and the d>1 RSS re-measurement is
+# owed with the §7 re-baseline (fauxcasa-q7m / fauxcasa-k5p).
 CACHE_BYTES = 256 * 1024 * 1024
 CACHE_MAX_ENTRIES = 4096
 # Native decoded-tile edge at devicePixelRatio 1: the cache's own thumb size
@@ -81,7 +87,11 @@ CACHE_MAX_ENTRIES = 4096
 # every zoom; zoom never re-decodes). The bead's "tile*devicePixelRatio" is
 # read as max-tile*dpr for that reason. At d==1 best_level(256) selects the
 # same 256 level the grid read before, so this is a no-op and the §7 numbers
-# (measured at d==1) are unchanged by construction; d>1 reads the 512 level of
+# (measured at d==1) are unchanged by construction — this no-op holds for any cache that CONTAINS
+# a 256 level (v1 [256] and RECOMMENDED_LEVELS both do; a hand-built set
+# lacking 256, e.g. [512,128], would instead read the 512 blob capped to 256,
+# not the old primary, but no shipped config builds such a set); d>1 reads the
+# 512 level of
 # a v2 cache (or falls back to the largest level a v1 cache offers) at ~d^2 the
 # decoded bytes -> its own RSS/scroll-fps re-measurement is owed (fauxcasa-q7m,
 # pairs with the §7 v2 re-baseline fauxcasa-k5p).
