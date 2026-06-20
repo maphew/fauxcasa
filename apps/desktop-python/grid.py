@@ -343,11 +343,23 @@ class GridView(QAbstractScrollArea):
                     if fd >= 0:
                         os.close(fd)
                     fd, fd_thumbs = -1, None
-                    fd = os.open(thumbs.path, os.O_RDONLY)
+                    # O_BINARY (Windows) keeps text-mode translation from
+                    # corrupting JPEG bytes; it is 0/absent on POSIX, so the
+                    # getattr keeps this portable (fauxcasa-uix).
+                    fd = os.open(
+                        thumbs.path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                    )
                     fd_thumbs = thumbs
                 offset, length, _w, _h = thumbs.entries[idx]
                 if length > 0:
-                    buf = os.pread(fd, length, offset)
+                    # os.pread is Unix-only (it raises AttributeError on
+                    # Windows, which the broad except below would turn into an
+                    # error tile for EVERY thumb). This fd is single-owner and
+                    # read single-threaded per worker, so seek+read is the
+                    # portable equivalent with no concurrent-fd race
+                    # (fauxcasa-uix).
+                    os.lseek(fd, offset, 0)
+                    buf = os.read(fd, length)
                     img = QImage.fromData(buf, "JPEG")
                     if img.isNull():
                         img = None
