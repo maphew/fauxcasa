@@ -1,0 +1,310 @@
+{
+ "fixture": "034-edit-enhance-oneclick-unsaved",
+ "note": "I'm Feeling Lucky (auto-enhance one-click) on Garden Project/photo04.jpg (pristine, no prior ini section). Agent-driven headless :2. UI: double-click photo04 -> Edit room -> Basic Fixes tab -> 'I'm Feeling Lucky' (button is row2-col1 of the fixes grid, ~y193 in the 1016x734 window \u2014 NOT the tab row at y73) -> 'Back to Library' (NO File->Save). Undo button changed to 'Undo I'm Feeling Lucky' confirming the edit registered; image visibly deepened + histogram shifted, so auto-enhance is NOT a no-op even on a synthetic linear gradient. SYNCHRONOUS (ini-only, mirrors crop-unsaved 004): new [photo04.jpg] section gains filters=enhance=1; + backuphash=39773. KEY: 'enhance' is the FIRST non-crop filters= token captured in the corpus (001-033 only ever had crop64) \u2014 it is the bare '<op>=1;' flag form (no comma params), vs crop64's parametrized 'crop64=1,<hex>;'. enhance=1 = the I'm-Feeling-Lucky auto-contrast+auto-color one-click recipe marker (validates parse_filters in scripts/picasa_db.py). EXPECTED LAZY FLUSH (~2-6 min, NOT waited/captured here \u2014 synchronous fixture): imagedata_filters ''->'enhance=1;', imagedata_edited->1, imagedata_backuphash mirror. SESSION NOISE in this diff (NOT the edit): the recurring 'Search results' albumdata row reshuffle \u2014 row[19] 'Search results'/']search'/uid tombstoned to the 4501-01-01 date sentinel, re-appended as blank row[20] (description '16 results: No matches'); albumdata_* grew 20->21 rows. Documented wine-oracle.md session-activity gotcha.",
+ "captured": "2026-06-20T22:54:05+00:00",
+ "baseline": {
+  "label": "manual",
+  "created": "2026-06-20T22:40:47+00:00"
+ },
+ "files": {
+  "db3/albumdata_category.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "c7fa08d14bd37c3a551d1b88fcce7a78122a56461c44455d3a16a24c25129adc",
+    "size": 100
+   },
+   "after": {
+    "sha256": "9b2fa01d4a2998f30dce629668c2cb3c1bcf10a0ad766fd82fc15523190f6625",
+    "size": 104
+   }
+  },
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "3807a9b99229e1cee6a82e915910a7b2d778361f051fa1de2e3cab75c54f57cf",
+    "size": 180
+   },
+   "after": {
+    "sha256": "95719c2738b82954ff569994f40920478d0e92186fbc950a4f90a76d80e34df4",
+    "size": 188
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "8082b5e55d00e5eaa0484874108c9af6c1a9fee5e5fa243ed61fef58ab4c0cfd",
+    "size": 288
+   },
+   "after": {
+    "sha256": "d605284d6bbb35be793cb83276f012ed3e5a1804b7bc595fbbb95cb1d14bd7dd",
+    "size": 311
+   }
+  },
+  "db3/albumdata_filename.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d0828ba122a928b13e9045f9cb1e67a3ffdab93af2df0c6757d889bf0dbd76bd",
+    "size": 199
+   },
+   "after": {
+    "sha256": "61a9528f8e816ca9fb434f3146511e0a3b85ce71651db96412a835af16a5e255",
+    "size": 201
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "ae6501555852f95d04e195b0de62faccb8a4e470f04ce78732ced1a1aee45da1",
+    "size": 172
+   },
+   "after": {
+    "sha256": "03ab0e619479151763cb4eb3b70ed739ef5160d16c9a6b8be838f778e6ecc242",
+    "size": 172
+   }
+  },
+  "db3/albumdata_location.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "c41f9ea437a4edbfe1305030c5671d018f33fe6435e0a244a910359ca1774023",
+    "size": 40
+   },
+   "after": {
+    "sha256": "479ecdab5dc9d8572244e08468cd2c83f2cdd4ca211d21e68b3c2382e2b8c77f",
+    "size": 41
+   }
+  },
+  "db3/albumdata_music.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "c41f9ea437a4edbfe1305030c5671d018f33fe6435e0a244a910359ca1774023",
+    "size": 40
+   },
+   "after": {
+    "sha256": "479ecdab5dc9d8572244e08468cd2c83f2cdd4ca211d21e68b3c2382e2b8c77f",
+    "size": 41
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "277367d72f79057bc867d6748865049ecb62c158d8907851ae074581f7a47fa0",
+    "size": 189
+   },
+   "after": {
+    "sha256": "947b5bedf246ef535ab4e358dda2ee5b4d3416b3787c65c5acf1d202f07d613e",
+    "size": 176
+   }
+  },
+  "db3/albumdata_token.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "6d9f366c97e172486f021dbab730649cc79945ab9e1af11d29cace566e7da704",
+    "size": 204
+   },
+   "after": {
+    "sha256": "035b09ec5e1ed8a964293bcb648bb02a3ef9afffb6bab43df5a4d54d2ffb2f67",
+    "size": 198
+   }
+  },
+  "db3/albumdata_uid.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "aca75b661a8eabe5787374fd53a063401851122a4282185f9507d98f13ea2c7a",
+    "size": 360
+   },
+   "after": {
+    "sha256": "cd3342176eef3cb0f6668d3399bc931d144e17f98916f5d2ae9d5b750e047475",
+    "size": 329
+   }
+  },
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "84b1ff9920e149d4be4f758a032cb129d88e357be5bf6594dd5e43c2e5bede6c",
+    "size": 160493
+   },
+   "after": {
+    "sha256": "4c398a5a82fd50cc89707bd08ac7be8ecb155bc83235cf721b4d330efa1632fa",
+    "size": 166348
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "16c82c99719067dcc932d818600dc77014a68814e6541b3e3dd979cb40ef889a",
+    "size": 368
+   },
+   "after": {
+    "sha256": "9c7b1268c7244e093e5e70f1f01c5fcdb3043959eac9aa2eb7f507aad4ca23c9",
+    "size": 368
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "7f368d032971cc95ad0cb9faa33a915b371937b3863d78c39c2f3f80bbab2eee",
+    "size": 70
+   },
+   "after": {
+    "sha256": "30ac9f5f4a3e62ab15627e0c8b00fd9ee0ce21e994ef05272efb61247b2c25b9",
+    "size": 70
+   }
+  },
+  "db3/imagedata_edited.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "cfa88d8b7238d382f904d53dae63e8410bf065073bd136608c6595a1fda2cfe4",
+    "size": 44
+   },
+   "after": {
+    "sha256": "bce9a9dea1f5be1e385f2fb9f991f8897674a9625d9f2a77ebd3393b16ec5a0f",
+    "size": 44
+   }
+  },
+  "db3/imagedata_filters.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "bf6e4a99177ef8c8e1b9f9ed1d4ae9d5cceb11727f5da81cff2a86fd6057fe08",
+    "size": 44
+   },
+   "after": {
+    "sha256": "a6cfe0d464c05508c28518c87b2437fc21f9102c8eb0e320a4e6a57913685e17",
+    "size": 54
+   }
+  },
+  "db3/previews_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "f8c3fc03121d53b91e5f8913c31dc5d5eaccef370e2daed3e899f8eb0d52e73c",
+    "size": 439513
+   },
+   "after": {
+    "sha256": "16aac458520e5793550acda911b4c0fc687e1158d499ecc145ad68267f629179",
+    "size": 458656
+   }
+  },
+  "db3/previews_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "597c2f1149dcb6a6fee6efb89786822b001e995ea375d8c10d23f954c0e1fbf3",
+    "size": 356
+   },
+   "after": {
+    "sha256": "1e8ac6e6d91d51083e61e20a8b162cd6ede21d802c0c8128d387e61d1e579f2f",
+    "size": 356
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "b1c56a727313fe7cfb62b2a8671708ece6a264cde1eb98df56960c4a40d5ee2a",
+    "size": 35344
+   },
+   "after": {
+    "sha256": "91c2e7954b4db60b5bb1b0b282734737bb12260d351bd4a41120e5a464e180d0",
+    "size": 36376
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "3a19a488f16cd198512bb8163bb63e3e44f3c85b998e70b8c7956fc1c738a51f",
+    "size": 368
+   },
+   "after": {
+    "sha256": "3e223d116d9107cb982b528bb6995ecba6aed2b11a4057280d1c01095d2f3f93",
+    "size": 368
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "db3f9dbdb3c414ceba4dcbcb8783a77877875238b964e659362d4e352aa0b258",
+    "size": 96886
+   },
+   "after": {
+    "sha256": "22e4f47e4f07bc4a7ad0b677d3c64f40e24416238ea87d936f964eb78cf8f7b0",
+    "size": 99629
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "eb3e4f56512a8ad8472fb661eadc9da7fe61e7f9435ef0bb64a6671750ec0a31",
+    "size": 368
+   },
+   "after": {
+    "sha256": "113383aa1934f8b3c3e6e0db8722587489fbe8bb889578cadaf8c43da1d8bde3",
+    "size": 368
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "1cfd8f05d3d140acb89cc222f127c2fe1a874074108529b9477b6039d2e65c9a",
+    "size": 66912
+   },
+   "after": {
+    "sha256": "a5e5ec3df379cf32b572d911fe703ecc9b5a6579ced7842ce7bb4ce690be3db8",
+    "size": 66916
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "275682014d1dde73fa58cda3834c807884307da5a73052aec6685b5185439609",
+    "size": 447
+   },
+   "after": {
+    "sha256": "4faeb2d68615f6872f5fd62b3b190398498b147f923a2397b39a0ba49b325cd2",
+    "size": 500
+   }
+  }
+ }
+}
