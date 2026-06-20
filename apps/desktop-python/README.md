@@ -49,8 +49,13 @@ source of truth.
   100k warm load **511 ms** / cold-walk **2.1 s** (Windows dev box,
   offscreen), on par with the Linux/v1 reference above. The grid still renders the 256 level, so
   scroll perf is unchanged until a hi-DPI consumer (`fauxcasa-q7m`) reads
-  the 512 level. RSS is not re-measured here (the probe reads Linux
-  `/proc`); the index rate is unchanged (the cache build, not startup).
+  the 512 level. RSS at ready for the 100k grid is **~199 MB (329 MB
+  peak)** on the Windows box, via the cross-platform probe added in
+  `fauxcasa-61e`. The **in-app** index rate above is unchanged — adopting
+  a pre-built `--thumbs` cache skips in-app thumbnailing entirely — but the
+  **offline cache build** does ~3× the per-photo work for v2 (decode to
+  512, then JPEG-encode all three levels), so v2 build throughput is lower
+  than v1; that offline rate was not separately benchmarked.
 
 ## Run it
 
