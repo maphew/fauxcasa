@@ -33,6 +33,29 @@ from catalog import (
 REPO = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def _retire_grid_workers():
+    """Stop every GridView's decode-worker pool after each test and drain the
+    event queue. Each GridView starts 4 daemon decode threads that block
+    forever on jobs.get(); with no teardown they leak and accumulate across
+    the whole session, racing the main thread on Qt state — which on Windows
+    surfaces as a native access violation inside a *later*, unrelated test
+    (e.g. test_reveal_*'s grid repaint). Retiring them per-test keeps each
+    test's Qt state isolated, the way it already is on main (fauxcasa-gfz)."""
+    yield
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        return
+    from grid import GridView
+
+    for w in app.allWidgets():
+        if isinstance(w, GridView):
+            w.stop()
+    app.processEvents()  # drain queued tile_ready -> update() now workers are idle
+
+
 def make_jpeg(path: Path, w: int = 64, h: int = 48) -> None:
     from PySide6.QtGui import QColor, QImage
 
@@ -1347,6 +1370,24 @@ def test_mainwindow_wires_viewer_cache_on_build_and_reconcile(
     thumbcache.bind(cache2, cat2)
     win.reload_data(cat2, cache2)                      # reconcile swap
     assert win.viewer.catalog is cat2 and win.viewer.thumbs is cache2
+
+
+def test_grid_stop_retires_decode_workers() -> None:
+    """GridView.stop() retires its decode-worker pool so the daemons don't
+    leak and accumulate across a process (fauxcasa-gfz). After stop() no worker
+    of this grid is still alive, and stop() is idempotent (closeEvent + the
+    autouse teardown may both call it). The immortal pool was what raced the
+    main thread on Qt state and crashed a later test on Windows."""
+    _offscreen_app()
+    from grid import GridView, WORKERS
+
+    g = GridView()
+    workers = list(g._workers)
+    assert len(workers) == WORKERS and all(t.is_alive() for t in workers)
+    g.stop()
+    for t in workers:
+        assert not t.is_alive()   # joined and exited on the sentinel
+    g.stop()                      # idempotent, no error, no re-stop
 
 
 def test_index_empty_infile_caption_keeps_ini(tmp_path: Path) -> None:

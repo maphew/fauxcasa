@@ -31,6 +31,11 @@ HEADER_H = 26
 GROUP_GAP = 10
 PAD = 8
 WORKERS = 4
+# Sentinel pushed onto the job queue to retire a decode worker cleanly
+# (fauxcasa-gfz). Workers otherwise block forever on jobs.get(); without a
+# way out they outlive the widget as immortal daemons that accumulate across
+# a process and race the main thread on Qt state during teardown.
+_STOP = object()
 # Decoded-tile RAM bound. The real cost is BYTES, not entries. Tiles are
 # kept at native cache resolution (~256 px, TILE_NATIVE) and SCALED IN
 # PAINT to the current zoom, so ONE decode serves every zoom level — zoom
@@ -144,8 +149,14 @@ class GridView(QAbstractScrollArea):
         self.wanted: frozenset[int] = frozenset()
         self._notifier = _Notifier()
         self._notifier.tile_ready.connect(self.viewport().update)
-        for _ in range(WORKERS):
-            threading.Thread(target=self._decode_worker, daemon=True).start()
+        self._stopping = False
+        self._workers = [
+            threading.Thread(target=self._decode_worker, daemon=True,
+                             name=f"grid-decode-{i}")
+            for i in range(WORKERS)
+        ]
+        for t in self._workers:
+            t.start()
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.verticalScrollBar().valueChanged.connect(
@@ -311,7 +322,10 @@ class GridView(QAbstractScrollArea):
         fd = -1
         fd_thumbs = None  # the ThumbCache OBJECT the fd was opened for
         while True:
-            gen, idx = self.jobs.get()
+            job = self.jobs.get()
+            if job is _STOP:
+                break  # clean retirement (fauxcasa-gfz); fd closed below
+            gen, idx = job
             thumbs = self.thumbs
             with self.pending_lock:
                 self.pending.discard(idx)
@@ -364,7 +378,27 @@ class GridView(QAbstractScrollArea):
                 self.done.put((gen, idx, img))
                 self._notifier.tile_ready.emit()
             except RuntimeError:
-                return  # Qt objects torn down at shutdown
+                break  # Qt objects torn down at shutdown; close fd below
+        if fd >= 0:
+            os.close(fd)
+
+    def stop(self) -> None:
+        """Retire the decode workers and join them. Idempotent. Called from
+        closeEvent (and test teardown) so the daemon pool does not outlive the
+        widget — immortal workers accumulate across a process and race the main
+        thread on Qt state during teardown, which on Windows surfaces as an
+        access violation in an unrelated later test (fauxcasa-gfz)."""
+        if self._stopping:
+            return
+        self._stopping = True
+        for _ in self._workers:
+            self.jobs.put(_STOP)  # one sentinel retires one worker
+        for t in self._workers:
+            t.join(timeout=1.0)
+
+    def closeEvent(self, event) -> None:
+        self.stop()
+        super().closeEvent(event)
 
     def _pump_decoded(self) -> None:
         while True:
