@@ -34,15 +34,23 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(autouse=True)
-def _retire_grid_workers():
-    """Stop every GridView's decode-worker pool after each test and drain the
-    event queue. Each GridView starts 4 daemon decode threads that block
-    forever on jobs.get(); with no teardown they leak and accumulate across
-    the whole session, racing the main thread on Qt state — which on Windows
-    surfaces as a native access violation inside a *later*, unrelated test
-    (e.g. test_reveal_*'s grid repaint). Retiring them per-test keeps each
-    test's Qt state isolated, the way it already is on main (fauxcasa-gfz)."""
+def _isolate_qt_per_test():
+    """Per-test Qt isolation. Two things otherwise accumulate across the whole
+    session and, on Windows offscreen, surface as a flaky native access
+    violation in a later paint-heavy test (test_reveal_*'s _toggle_reveal),
+    with this test's own decode workers merely parked at jobs.get() in the
+    dump — i.e. the crash is cumulative state, not an active worker race
+    (fauxcasa-gfz):
+
+    1. Each GridView starts 4 daemon decode threads that block forever on
+       jobs.get(). stop() retires them — and must run BEFORE widget deletion,
+       so a worker can never emit tile_ready into a half-deleted notifier.
+    2. QWidgets created in a test are never destroyed; they pile up as live
+       Qt objects. Delete every top-level widget and flush the deferred
+       deletions so each test starts from a clean widget tree — the way the
+       suite behaved before the loupe tests added this much widget churn."""
     yield
+    from PySide6.QtCore import QEvent
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance()
@@ -52,8 +60,12 @@ def _retire_grid_workers():
 
     for w in app.allWidgets():
         if isinstance(w, GridView):
-            w.stop()
-    app.processEvents()  # drain queued tile_ready -> update() now workers are idle
+            w.stop()                       # retire pools before any deletion
+    app.processEvents()                    # drain queued tile_ready -> update()
+    for w in app.topLevelWidgets():
+        w.deleteLater()
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # actually free them
+    app.processEvents()
 
 
 def make_jpeg(path: Path, w: int = 64, h: int = 48) -> None:
