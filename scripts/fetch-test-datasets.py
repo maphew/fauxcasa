@@ -36,7 +36,9 @@ Usage (uv only; on Windows: `uv run scripts/fetch-test-datasets.py`):
   fetch-test-datasets.py exif-samples    # fetch one named set
   fetch-test-datasets.py --all           # fetch everything auto-fetchable
 
-Idempotent: an already-populated dataset dir is skipped.
+Idempotent: a dataset is skipped only once a .fetch-complete marker is
+written (after its fetcher succeeds). An interrupted/partial fetch has no
+marker, so the next run re-fetches it instead of treating it as whole.
 """
 
 import argparse
@@ -76,6 +78,10 @@ def _extract_zip_stripped(data: bytes, dest: Path) -> int:
             if not rel:
                 continue
             target = dest / rel
+            # Zip-slip guard: a crafted member ("../../x") must not write
+            # outside dest. Trusted GitHub source, but the check is ~free.
+            if not target.resolve().is_relative_to(dest.resolve()):
+                continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(name) as src, open(target, "wb") as out:
                 shutil.copyfileobj(src, out)
@@ -136,23 +142,41 @@ DATASETS = {
 }
 
 
-def is_populated(dest: Path) -> bool:
-    return dest.is_dir() and any(dest.iterdir())
+COMPLETE_MARKER = ".fetch-complete"
+
+
+def is_complete(dest: Path) -> bool:
+    """A dataset counts as present only when its completion marker exists —
+    written after the fetcher returns. A dir with files but no marker is a
+    partial/interrupted fetch (a dropped download, a half-extracted zip) and
+    must be re-fetched, not silently skipped as if it were whole."""
+    return (dest / COMPLETE_MARKER).exists()
+
+
+def _mark_complete(dest: Path) -> None:
+    (dest / COMPLETE_MARKER).write_text("ok\n")
+
+
+def _status(dest: Path) -> str:
+    if is_complete(dest):
+        return "present"
+    return "partial" if dest.is_dir() and any(dest.iterdir()) else "missing"
 
 
 def do_list() -> None:
     print(f"Datasets (cache root: {CACHE})\n")
     for name, (layer, default, _) in DATASETS.items():
         dest = CACHE / name
-        status = "present" if is_populated(dest) else "missing"
         tag = "default" if default else "opt-in"
-        print(f"  {name:<20} [{tag:<7}] {layer:<22} {status}")
+        print(f"  {name:<20} [{tag:<7}] {layer:<22} {_status(dest)}")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("names", nargs="*", help="dataset names to fetch (default: core set)")
-    ap.add_argument("--all", action="store_true", help="fetch every auto-fetchable set")
+    ap.add_argument("--all", action="store_true",
+                    help="fetch every auto-fetchable set (incl. the ~2.5 GB "
+                         "metadata-extractor corpus)")
     ap.add_argument("--list", action="store_true", help="list datasets and exit")
     ap.add_argument("--force", action="store_true", help="re-fetch even if present")
     args = ap.parse_args()
@@ -170,6 +194,8 @@ def main() -> int:
         selected = args.names
     elif args.all:
         selected = list(DATASETS)
+        print("--all includes the ~2.5 GB metadata-extractor corpus.",
+              file=sys.stderr)
     else:
         selected = [n for n, (_, default, _) in DATASETS.items() if default]
 
@@ -177,11 +203,12 @@ def main() -> int:
     for name in selected:
         _layer, _default, fetcher = DATASETS[name]
         dest = CACHE / name
-        if is_populated(dest) and not args.force:
+        if is_complete(dest) and not args.force:
             print(f"{name}: already present ({dest}) -- skipping")
             continue
         try:
             result = fetcher(dest)
+            _mark_complete(dest)   # only now is the set whole; partial -> re-fetch
             print(f"{name}: {result} -> {dest}")
         except ManualFetch as e:
             print(f"{name}: manual step required\n{e}")
