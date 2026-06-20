@@ -98,7 +98,13 @@ def fetch_iptc(dest: Path) -> str:
         if target.exists():
             got += 1
             continue
-        target.write_bytes(_get(IPTC_BASE + fname))
+        # Atomic write: a kill mid-download must never leave a truncated JPEG.
+        # Otherwise the next run would see it (target.exists()), skip it, finish
+        # the loop, and write the .fetch-complete marker — certifying a partial
+        # set as whole, the exact footgun the marker is meant to prevent.
+        tmp = target.with_name(target.name + ".part")
+        tmp.write_bytes(_get(IPTC_BASE + fname))
+        tmp.replace(target)
         got += 1
     return f"{got} reference JPEGs"
 
@@ -206,6 +212,11 @@ def main() -> int:
         if is_complete(dest) and not args.force:
             print(f"{name}: already present ({dest}) -- skipping")
             continue
+        if args.force and dest.exists():
+            # A true re-fetch, not a resume: wipe first so every fetcher
+            # actually re-downloads. (fetch_iptc otherwise skips files that
+            # already exist, which would make --force a silent no-op for it.)
+            shutil.rmtree(dest)
         try:
             result = fetcher(dest)
             _mark_complete(dest)   # only now is the set whole; partial -> re-fetch
