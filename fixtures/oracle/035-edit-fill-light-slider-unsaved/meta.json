@@ -1,0 +1,128 @@
+{
+ "fixture": "035-edit-fill-light-slider-unsaved",
+ "note": "Fill Light slider (Basic Fixes) on Garden Project/photo03.jpg (pristine). Agent-driven headless :2. UI: select photo03 -> Edit room -> Basic Fixes -> set Fill Light via a SINGLE CLICK on the slider track (window-rel ~128,329, right of the thumb) -> Back to Library (NO File->Save). Undo button -> 'Undo Fill Light' confirmed. SYNCHRONOUS (ini-only): new [photo03.jpg] filters=fill=1,0.186916; + backuphash=4142. KEY: 'fill' = the Fill Light token; param shape pins the FIRST parametrized non-crop filter -> 'fill=1,<f>' where the leading 1 is the enabled-flag (same slot as crop64=1,...) and f=0.186916 is the normalized fill amount as a %f 6-decimal float (the single track-click landed ~0.19). Contrast 034 enhance=1 (bare flag, no comma params). DRAG-GESTURE MITIGATION VALIDATED: a single click on the slider track jumps the thumb and sets the value with NO drag -> no stuck drag-overlay (the wine-oracle.md hazard for sliders/pucks); this is the technique for all slider/puck FLAG items (035/036/037/043/048). EXPECTED LAZY FLUSH (~2-6min, not waited): imagedata_filters ''->'fill=1,0.186916;', imagedata_edited->1, imagedata_backuphash mirror. SESSION NOISE (not the edit): albumdata Search-results reshuffle rows 21->22 (4501 date sentinel tombstone+append). HARNESS GOTCHAS this session: (a) clicks need throwaway-focus-click-then-real (first click after a gap is swallowed because weston keyboard focus stays on its internal window; mouse XTEST still hits window-under-pointer); (b) the 'Back to Library' button center is window-rel ~y33 (between the y16 menu bar and the panel) -- y22 lands in a dead strip; (c) the .picasa.ini write can lag the click by several seconds -- re-diff.",
+ "captured": "2026-06-20T23:02:11+00:00",
+ "baseline": {
+  "label": "after 034-edit-enhance-oneclick-unsaved",
+  "created": "2026-06-20T22:54:05+00:00"
+ },
+ "files": {
+  "db3/albumdata_category.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9b2fa01d4a2998f30dce629668c2cb3c1bcf10a0ad766fd82fc15523190f6625",
+    "size": 104
+   },
+   "after": {
+    "sha256": "9376a15242d8b62865310df77060c9469b6274e433a2a19d90a4d9e0551f3c46",
+    "size": 108
+   }
+  },
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "95719c2738b82954ff569994f40920478d0e92186fbc950a4f90a76d80e34df4",
+    "size": 188
+   },
+   "after": {
+    "sha256": "645f4997ed8c36c1ae6f27be098d919041699f6e11f46a0619832eed8b7bef81",
+    "size": 196
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "d605284d6bbb35be793cb83276f012ed3e5a1804b7bc595fbbb95cb1d14bd7dd",
+    "size": 311
+   },
+   "after": {
+    "sha256": "28af9a250f8cd9a9e5133c2c3e22ec413044c2f9a8e934c950d5dce850e1b5bc",
+    "size": 334
+   }
+  },
+  "db3/albumdata_location.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "479ecdab5dc9d8572244e08468cd2c83f2cdd4ca211d21e68b3c2382e2b8c77f",
+    "size": 41
+   },
+   "after": {
+    "sha256": "597ded966e777bddf2cc10948ed8385a78270e4db3ac28e03a64f80d60c58964",
+    "size": 42
+   }
+  },
+  "db3/albumdata_music.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "479ecdab5dc9d8572244e08468cd2c83f2cdd4ca211d21e68b3c2382e2b8c77f",
+    "size": 41
+   },
+   "after": {
+    "sha256": "597ded966e777bddf2cc10948ed8385a78270e4db3ac28e03a64f80d60c58964",
+    "size": 42
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "947b5bedf246ef535ab4e358dda2ee5b4d3416b3787c65c5acf1d202f07d613e",
+    "size": 176
+   },
+   "after": {
+    "sha256": "05461a935786d57626d4f93e4b66c908cfdbbeed595f09b68ea95e4e81e8f484",
+    "size": 191
+   }
+  },
+  "db3/albumdata_token.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "035b09ec5e1ed8a964293bcb648bb02a3ef9afffb6bab43df5a4d54d2ffb2f67",
+    "size": 198
+   },
+   "after": {
+    "sha256": "81ee9adc19242a2764cc955a4bf728d10ac14b442d0566012bd35db1fb680e6d",
+    "size": 206
+   }
+  },
+  "db3/thumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "22e4f47e4f07bc4a7ad0b677d3c64f40e24416238ea87d936f964eb78cf8f7b0",
+    "size": 99629
+   },
+   "after": {
+    "sha256": "f1d7ee04fac95d6321263b6aa4e02a114c7ab750f220920b707a0f78bce778f7",
+    "size": 99629
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "4faeb2d68615f6872f5fd62b3b190398498b147f923a2397b39a0ba49b325cd2",
+    "size": 500
+   },
+   "after": {
+    "sha256": "b93e748f8d3e01b9c12972006fce1b499529bad738097b3432129e67530b74e3",
+    "size": 558
+   }
+  }
+ }
+}
