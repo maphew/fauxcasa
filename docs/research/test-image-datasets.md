@@ -38,10 +38,33 @@ others") is best served by the IPTC interoperability tests plus
 Exiv2/metadata-extractor as reference implementations — that's how DAM/editor
 vendors compare metadata behaviour.
 
-**Next step (tracked in beads):** evaluate these external sets against the
-synthetic generator and wire the adopted ones into the test suite as
-read-only, local-fetch sources. Face datasets are deferred until a
-face-matching algorithm is chosen.
+## Adopted (decision 2026-06-19, fauxcasa-lj1)
+
+Evaluated the short list against the synthetic generator and adopted the sets
+below as **read-only, local-fetch** corpora. None are committed: a fetch helper
+(`scripts/fetch-test-datasets.py`, uv/PEP-723) downloads them into the
+gitignored `cache/test-datasets/`, because real photos and third-party corpora
+are not redistributable (privacy rule in `CLAUDE.md` / `bd` memory
+`privacy-real-picasa-data`).
+
+| Dataset | Layer | Fetch | How it complements the synthetic generator |
+|---|---|---|---|
+| **IPTC Reference Images** (2010..2025.1) | correctness | auto, default | Ground truth for *field-level* read correctness — every EXIF/IPTC/XMP field is self-describing, which the synthetic generator can't supply (it knows *its own* values, not the cross-standard canonical ones). |
+| **ianare/exif-samples** | edge cases / fuzzing | auto, default | Real-world tricky/odd JPG/TIFF/HEIC + a GPS folder. The generator emits *valid* metadata; this supplies the malformed/quirky inputs a parser must survive. |
+| **drewnoakes/metadata-extractor-images** | heavy fuzzing (~2.5 GB) | auto, opt-in | The corpus the reference parser is validated against — deepest malformed-file coverage. Opt-in only because of size. |
+| **Unsplash Lite** (25k) | volume & realism | manual (terms-gated) | Bulk real photos with messy real metadata for thumbnail/scroll/scale stress at scale. The generator gives *structured* libraries; this gives *unstructured volume*. The helper prints the manual download steps (the download is now click-through, not a clean URL). |
+| **our synthetic generator** | library structure, albums, faces, sidecars, privacy | `scripts/make-synthetic-library.py` | The only source for nested folders + albums + ratings + captions + face regions + `.picasa.ini`/`.pal`/`contacts.xml` + mixed RAW/JPEG/HEIC/video + skewed timestamps. Nothing off-the-shelf models a personal library, so committed fixtures stay synthetic. |
+
+**Interoperability oracle:** Exiv2 / metadata-extractor remain the reference
+read/write implementations to diff Fauxcasa's output against (see the existing
+Wine/Picasa oracle in `docs/research/wine-oracle.md` for the same diff pattern).
+
+**Deferred:** YFCC100M metadata (~12.5 GB, an alternative volume source if
+Unsplash's terms gate becomes a problem) and all face datasets (LFW / WIDER
+FACE) until a face-matching algorithm is chosen.
+
+Fetch the core set with `uv run scripts/fetch-test-datasets.py`; see
+`--list` / `--all` for the rest.
 
 ## 1. Metadata & interoperability test sets (most relevant)
 
