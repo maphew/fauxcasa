@@ -4,6 +4,19 @@ Loading the original file here is the deliberate, explicit exception to
 N4 (the grid itself never reads originals): the user asked to see this
 one photo, and it loads asynchronously so the UI never blocks on a slow
 volume. Navigation walks the grid's current display order.
+
+While that original decodes off-thread, the viewer paints an INSTANT
+stand-in read from the same thumbnail-cache pair the grid uses — the
+fcache v2 hi-DPI / loupe consumer (fauxcasa-9pp). On a large or hi-DPI
+window it pulls — via ThumbCache.best_level()/entry() — the smallest
+cached level that covers the viewport's device pixels, or the largest
+level available when none is big enough (the 512 px level of a v2 cache
+on a typical window); a single-level v1 cache yields its 256 px level.
+The preview fills the box the original will occupy, so for the common
+case — a photo larger than the window — the hand-off is a pure
+sharpen-in-place (see _display_rect for the small-original caveat).
+Reading the cache is well within the grid budget (N4) — it is the
+originals the grid must never touch, not the cache it owns.
 """
 
 from __future__ import annotations
@@ -15,6 +28,7 @@ from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QWidget
 
 from catalog import Catalog
+from thumbcache import THUMB_EDGE, ThumbCache
 
 BACKGROUND = QColor(12, 12, 12)
 CAPTION_BG = QColor(0, 0, 0, 170)
@@ -28,17 +42,29 @@ class ViewerPage(QWidget):
     closed = Signal(int)  # catalog index in view when closed
     photo_shown = Signal(int)
 
-    def __init__(self, catalog: Catalog, parent=None):
+    def __init__(self, catalog: Catalog, thumbs: ThumbCache | None = None,
+                 parent=None):
         super().__init__(parent)
         self.catalog = catalog
+        self.thumbs = thumbs
         self.display: list[int] = []
         self.pos = 0
         self.image: QImage | None = None
+        # Instant low-res stand-in from the thumb cache, painted while the
+        # full original decodes off-thread (loupe preview, fauxcasa-9pp).
+        self.preview: QImage | None = None
         self.loading = False
         self._serial = 0
         self._loader = _Loader()
         self._loader.loaded.connect(self._on_loaded)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def set_thumbs(self, thumbs: ThumbCache | None) -> None:
+        """Adopt a freshly built or reconciled cache (cold-build finish or the
+        reconcile swap in main), so the next photo shown gets an instant
+        preview. Previews are decoded per-show, so there is no stale tile state
+        to invalidate — just re-point at the new cache."""
+        self.thumbs = thumbs
 
     def show_photo(self, display: list[int], pos: int) -> None:
         self.display = display
@@ -60,6 +86,15 @@ class ViewerPage(QWidget):
         serial = self._serial
         path = str(self.catalog.root / self.catalog.photos[idx].rel)
         rotate = self.catalog.photos[idx].rotate
+        # Show a cached stand-in NOW — synchronous, but cheap (a <= 512 px
+        # JPEG decodes in a couple of ms) — so the viewport is never blank
+        # while the worker below decodes the full original. This is the
+        # fcache v2 loupe consumer: best_level() reads the >256 level on a
+        # large/hi-DPI window, the 256 level from a v1 cache (fauxcasa-9pp).
+        # Holding an arrow key pays this once per step inline, but it is bounded
+        # by the key-repeat rate (one cheap decode per shown photo), not a
+        # growing backlog — unlike the original, which needs the stale guards.
+        self.preview = self._load_preview(idx, rotate)
 
         def work() -> None:
             # Stale checks bound the decode backlog when the user holds
@@ -91,11 +126,62 @@ class ViewerPage(QWidget):
         self.photo_shown.emit(idx)
         self.update()
 
+    def _preview_min_edge(self) -> int:
+        """Long edge, in DEVICE pixels, the preview should cover so best_level()
+        picks a level that is sharp at this window's DPI. Floored at the grid's
+        256 px tile (never preview below the grid); a large or hi-DPI window
+        clears 256 and selects a larger v2 level."""
+        longest = max(self.width(), self.height())
+        return max(THUMB_EDGE, round(longest * self.devicePixelRatioF()))
+
+    def _load_preview(self, idx: int, rotate: int) -> QImage | None:
+        """Decode the nearest cached level for `idx` as an instant stand-in, or
+        None when there is no usable cached pixel: no cache, an out-of-range
+        index, an error-tile entry (zero-length blob), or an unreadable/corrupt
+        blob — the caller then falls back to the loading text. The cached thumb
+        is EXIF-upright; the Picasa rotate= quarter-turns compose on top exactly
+        as the grid and the original path do, so every display path agrees."""
+        cache = self.thumbs
+        if cache is None or not (0 <= idx < cache.count):
+            return None
+        level = cache.best_level(self._preview_min_edge())
+        offset, length, _w, _h = cache.entry(idx, level)
+        if length <= 0:
+            return None  # error tile: the original failed to decode at build
+        # Read + decode + rotate under ONE broad guard, exactly as the grid's
+        # decode worker does (grid.py): a corrupt index can hand us a multi-GiB
+        # `length` (the read then raises MemoryError, not an OSError), a dying
+        # volume an EIO, a bad blob a null decode. ANY of these must degrade to
+        # "no preview" (the loading text) — never an exception escaping into the
+        # synchronous Qt event handler that called us and aborting the UI.
+        # A plain buffered "rb" + seek + read (NOT os.pread) keeps this portable:
+        # os.pread is Unix-only — absent on Windows — and os.open there defaults
+        # to text mode, which would mangle the JPEG bytes. One synchronous read,
+        # so the atomic-offset reason the threaded grid uses os.pread for is moot.
+        try:
+            with open(cache.path, "rb") as f:
+                f.seek(offset)
+                buf = f.read(length)
+            img = QImage.fromData(buf, "JPEG")
+            if img.isNull():
+                return None
+            if rotate:
+                from PySide6.QtGui import QTransform
+
+                img = img.transformed(QTransform().rotate(90 * rotate))
+            return img
+        except Exception:  # noqa: BLE001 — match grid.py: degrade, never crash
+            return None
+
     def _on_loaded(self, serial: int, img: QImage) -> None:
         if serial != self._serial:
             return  # user already moved on
         self.loading = False
-        self.image = None if img.isNull() else img
+        if img.isNull():
+            self.image = None     # keep painting the preview, if we have one
+        else:
+            self.image = img
+            self.preview = None   # the full original supersedes the preview
         self.update()
 
     def _step(self, delta: int) -> None:
@@ -118,6 +204,25 @@ class ViewerPage(QWidget):
     def mouseDoubleClickEvent(self, _event) -> None:
         self.closed.emit(self.current_index())
 
+    @staticmethod
+    def _display_rect(box_w: int, box_h: int, src_w: int, src_h: int,
+                      cap: bool) -> QRect:
+        """Centered, aspect-fit rect for `src` painted in a `box`. `cap=True`
+        clamps the scale to 1:1 — the ORIGINAL never upscales past native, so a
+        small photo stays crisp. The preview passes `cap=False`, filling the box
+        the original will occupy: when the original is at least window-sized
+        (the common photo case) both compute the SAME rect, so the hand-off is a
+        pure sharpen-in-place. (An original SMALLER than the window draws capped
+        at native, smaller than the filled preview — a one-off downward pop we
+        accept: the cache stores thumb dims, not the original's, so the preview
+        cannot predict that fit.)"""
+        fit = min(box_w / src_w, box_h / src_h)
+        if cap:
+            fit = min(fit, 1.0)
+        dw = max(1, round(src_w * fit))
+        dh = max(1, round(src_h * fit))
+        return QRect((box_w - dw) // 2, (box_h - dh) // 2, dw, dh)
+
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), BACKGROUND)
@@ -126,13 +231,15 @@ class ViewerPage(QWidget):
         if idx < 0:
             painter.end()
             return
-        if self.image is not None:
-            img = self.image
-            scale = min(w / img.width(), h / img.height(), 1.0)
-            dw, dh = int(img.width() * scale), int(img.height() * scale)
+        # The full original once it has arrived, else the instant cached
+        # preview; only when neither exists do we fall back to text.
+        shown = self.image if self.image is not None else self.preview
+        if shown is not None:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.drawImage(
-                QRect((w - dw) // 2, (h - dh) // 2, dw, dh), img)
+                self._display_rect(w, h, shown.width(), shown.height(),
+                                   cap=self.image is not None),
+                shown)
         else:
             painter.setPen(QColor(150, 150, 150))
             msg = "loading…" if self.loading else "could not decode this file"

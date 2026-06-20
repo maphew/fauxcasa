@@ -23,7 +23,7 @@ source of truth.
 | Virtualized grid | `grid.py` | balloon lineage: threaded fcache decode, bounded LRU — plus event-driven repaint, real scrollbar, group headers w/ pinned current folder, selection, star badges, error tiles. Never reads originals (N4) |
 | Sidebar | `main.py` | All / Starred / folder tree (filesystem truth) / albums (pure references resolved from `albums=` tokens) |
 | Search | `main.py` | substring over filename + caption + keywords, live filter |
-| Viewer | `viewer.py` | double-click / Enter; async original load (the explicit N4 exception); ←/→ or J/K; Esc back |
+| Viewer | `viewer.py` | double-click / Enter; **instant cached preview** (the fcache v2 hi-DPI / loupe consumer — the nearest cached level ≥ the viewport's device pixels via `ThumbCache.best_level()`: 512 on a hi-DPI/large window, 256 from a v1 cache) painted while the async original loads (the explicit N4 exception); ←/→ or J/K; Esc back |
 | Instrumentation | `main.py` | `READY` line + JSON: cold-start ms, prep ms, `warm`, RSS, and an `indexed` event with photos/s — the §7 numbers |
 
 ## The §7 numbers (dev machine, offscreen; overshoots reference HW)

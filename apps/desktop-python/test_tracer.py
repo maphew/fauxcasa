@@ -33,6 +33,29 @@ from catalog import (
 REPO = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def _retire_grid_workers():
+    """Stop every GridView's decode-worker pool after each test and drain the
+    event queue. Each GridView starts 4 daemon decode threads that block
+    forever on jobs.get(); with no teardown they leak and accumulate across
+    the whole session, racing the main thread on Qt state — which on Windows
+    surfaces as a native access violation inside a *later*, unrelated test
+    (e.g. test_reveal_*'s grid repaint). Retiring them per-test keeps each
+    test's Qt state isolated, the way it already is on main (fauxcasa-gfz)."""
+    yield
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        return
+    from grid import GridView
+
+    for w in app.allWidgets():
+        if isinstance(w, GridView):
+            w.stop()
+    app.processEvents()  # drain queued tile_ready -> update() now workers are idle
+
+
 def make_jpeg(path: Path, w: int = 64, h: int = 48) -> None:
     from PySide6.QtGui import QColor, QImage
 
@@ -1110,6 +1133,261 @@ def test_v2_cache_drives_grid_consumer(tmp_path: Path) -> None:
     for idx in range(cache.count):
         off, length, w, h = cache.entries[idx]
         assert length > 0 and max(w, h) <= 256   # primary 256, not the 512 top
+
+
+# --- the fcache v2 loupe / hi-DPI consumer (fauxcasa-9pp): the viewer paints
+# an instant cached preview — the nearest level >= the viewport's device
+# pixels, read via best_level()/entry() — while the full original decodes
+# off-thread. A v2 cache hands it the >256 (512) level; a v1 cache its 256
+# level; no cache or an error tile -> no preview, just the loading text. This
+# is the first consumer of the larger levels gtr shipped.
+
+
+def _offscreen_app():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def _bound_cache(tmp_path: Path, root: Path, levels=None):
+    """Build + load + bind a cache for `root`; returns (catalog, cache)."""
+    cat = scan_library(root)
+    built = thumbcache.build_cache(cat, tmp_path / "c", levels=levels)
+    cache = thumbcache.load_cache(built.path)
+    thumbcache.bind(cache, cat)
+    return cat, cache
+
+
+def test_viewer_preview_reads_larger_v2_level(tmp_path: Path) -> None:
+    """A large window makes best_level() pick the v2 512 top — the >256 level
+    nothing consumed before gtr — and the painted preview IS that level's
+    image (its long edge matches entry(idx, level))."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)                          # 600x400 + 400x600 -> real 512
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)                     # large window -> min_edge > 512
+    min_edge = viewer._preview_min_edge()
+    level = cache.best_level(min_edge)
+    viewer.show_photo(list(range(cache.count)), 0)
+    assert viewer.preview is not None and not viewer.preview.isNull()
+    _o, _l, w0, h0 = cache.entry(0, level)       # land.jpg @ 512: 512x341
+    assert max(viewer.preview.width(), viewer.preview.height()) == max(w0, h0)
+    # the whole point: a window this large clears 256 and reads the >256 level
+    assert min_edge >= 512 and level == 0 and max(w0, h0) == 512
+
+
+def test_viewer_preview_v1_falls_back_to_256(tmp_path: Path) -> None:
+    """A single-level v1 cache has only 256; the viewer still shows an instant
+    256 preview rather than a blank window (graceful, no v2 required)."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root)    # default -> v1 [256]
+    assert cache.levels == [256]
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)
+    viewer.show_photo(list(range(cache.count)), 0)
+    assert viewer.preview is not None
+    assert max(viewer.preview.width(), viewer.preview.height()) <= 256
+
+
+def test_viewer_no_preview_without_cache(tmp_path: Path) -> None:
+    """No cache yet (cold start before the build lands) -> no preview and no
+    crash; the viewer shows its loading text and still loads the original."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat = scan_library(root)
+    viewer = ViewerPage(cat, None)
+    viewer.resize(1280, 800)
+    viewer.show_photo(list(range(len(cat.photos))), 0)
+    assert viewer.preview is None
+
+
+def test_viewer_error_tile_yields_no_preview(tmp_path: Path) -> None:
+    """An error-tile entry (zero-length blob, original undecodable at build)
+    yields no preview; a good neighbour in the same cache still previews."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "ok.jpg", 600, 400)
+    (root / "f" / "bad.jpg").write_bytes(b"not a jpeg at all")
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    by_rel = {f: i for i, f in enumerate(cache.files)}
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)
+    assert viewer._load_preview(by_rel["f/bad.jpg"], 0) is None   # error tile
+    assert viewer._load_preview(by_rel["f/ok.jpg"], 0) is not None
+
+
+def test_viewer_original_supersedes_preview_then_falls_back(
+        tmp_path: Path) -> None:
+    """The decoded original replaces (and frees) the preview; but if the
+    original FAILS to decode, the cached preview keeps painting rather than
+    dropping straight to 'could not decode'."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256])
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)
+    viewer.show_photo(list(range(cache.count)), 0)
+    assert viewer.preview is not None
+    orig = QImage(800, 600, QImage.Format.Format_RGB32)
+    orig.fill(0)
+    viewer._on_loaded(viewer._serial, orig)         # the real original lands
+    assert viewer.image is orig and viewer.preview is None
+    viewer.show_photo(list(range(cache.count)), 1)  # next photo: preview again
+    assert viewer.preview is not None
+    viewer._on_loaded(viewer._serial, QImage())     # original failed to decode
+    assert viewer.image is None and viewer.preview is not None
+
+
+def test_viewer_preview_composes_picasa_rotate(tmp_path: Path) -> None:
+    """The preview composes the Picasa rotate= quarter-turns on top of the
+    EXIF-upright cached thumb, exactly as the grid and the original path do —
+    a 90 deg turn makes a landscape thumb paint portrait."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    make_jpeg(root / "land.jpg", 600, 400)          # landscape thumb (w > h)
+    (root / ".picasa.ini").write_text(
+        "[land.jpg]\r\nrotate=rotate(1)\r\n")       # one quarter-turn CW
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    p = next(p for p in cat.photos if p.rel == "land.jpg")
+    assert p.rotate == 1
+    _o, _l, w0, h0 = cache.entry(0, 0)
+    assert w0 > h0                                   # cached thumb is landscape
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)
+    rotated = viewer._load_preview(0, p.rotate)
+    assert rotated is not None and rotated.height() > rotated.width()  # portrait
+
+
+def test_viewer_display_rect_preview_fills_original_caps() -> None:
+    """The pure paint geometry: the preview (cap=False) fills the viewport box;
+    a window-sized original (cap=True) lands on the SAME rect, so the hand-off
+    is a sharpen-in-place. A small ORIGINAL caps at native (never upscaled),
+    while the same small source as a PREVIEW fills the box (the accepted one-off
+    pop). Degenerate 1x1 never yields a zero-size rect."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    big = ViewerPage._display_rect(1280, 800, 4000, 3000, cap=True)   # original
+    prev = ViewerPage._display_rect(1280, 800, 512, 384, cap=False)   # preview
+    assert big == prev                                   # identical 4:3 fit
+    assert big.height() == 800 and 0 < big.width() <= 1280   # fills the box
+    small_orig = ViewerPage._display_rect(1280, 800, 800, 600, cap=True)
+    assert (small_orig.width(), small_orig.height()) == (800, 600)    # native
+    small_prev = ViewerPage._display_rect(1280, 800, 800, 600, cap=False)
+    assert small_prev.width() > 800 and small_prev.height() > 600     # filled
+    assert ViewerPage._display_rect(1280, 800, 1, 1, cap=True).width() == 1
+
+
+def test_viewer_stale_original_is_dropped(tmp_path: Path) -> None:
+    """A late original carrying a superseded serial (user navigated on before it
+    decoded) is dropped by the secondary guard in _on_loaded — it must not
+    overwrite the current photo's freshly-decoded preview."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256])
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(1280, 800)
+    viewer.show_photo(list(range(cache.count)), 0)
+    stale = viewer._serial
+    viewer.show_photo(list(range(cache.count)), 1)   # serial advances; new preview
+    p1 = viewer.preview
+    assert p1 is not None
+    viewer._on_loaded(stale, QImage(800, 600, QImage.Format.Format_RGB32))
+    assert viewer.image is None and viewer.preview is p1   # untouched
+
+
+def test_viewer_preview_min_edge_floors_at_grid_tile(tmp_path: Path) -> None:
+    """A tiny window floors min_edge at the grid's 256 px tile, so the preview
+    never drops below the grid — best_level picks the 256 level, not the 128."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(120, 120)
+    assert viewer._preview_min_edge() == 256
+    assert cache.best_level(viewer._preview_min_edge()) == 1   # 256, not 128
+
+
+def test_viewer_preview_dpr_selects_larger_level(
+        tmp_path: Path, monkeypatch) -> None:
+    """The hi-DPI path: device-pixel-ratio multiplies the logical viewport, so
+    the SAME small window selects the 256 level at DPR 1 but the larger 512
+    level at DPR 2 — best_level() reads a >256 level only because of the DPR
+    scaling, which offscreen (DPR 1.0) alone could never exercise."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    viewer = ViewerPage(cat, cache)
+    viewer.resize(200, 200)
+    monkeypatch.setattr(viewer, "devicePixelRatioF", lambda: 1.0)
+    assert viewer._preview_min_edge() == 256                  # 200 floored to 256
+    assert cache.best_level(viewer._preview_min_edge()) == 1  # the 256 level
+    monkeypatch.setattr(viewer, "devicePixelRatioF", lambda: 2.0)
+    assert viewer._preview_min_edge() == 400                  # 200 * 2 device px
+    assert cache.best_level(viewer._preview_min_edge()) == 0  # the >256 512 level
+
+
+def test_mainwindow_wires_viewer_cache_on_build_and_reconcile(
+        tmp_path: Path) -> None:
+    """The integration this bead adds: MainWindow hands the viewer the cache
+    pair on a cold-build finish (_on_index_finished) and on a reconcile swap
+    (reload_data) — the same cache the grid gets, so both consume v2."""
+    _offscreen_app()
+    import main
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat = scan_library(root)
+    win = main.MainWindow(cat, None, cache_dir=None, build_dir=None)
+    assert win.viewer.thumbs is None                  # cold start: no cache yet
+    built = thumbcache.build_cache(cat, tmp_path / "c", levels=[512, 256])
+    win._on_index_finished(built, win.catalog, False)  # cold-build finish
+    assert win.viewer.thumbs is not None
+    assert win.viewer.thumbs.levels == [512, 256]
+    assert win.grid.thumbs is win.viewer.thumbs        # one cache, both consumers
+    cat2 = scan_library(root)
+    cache2 = thumbcache.load_cache(thumbcache.build_cache(
+        cat2, tmp_path / "c2").path)                   # a fresh (v1) cache object
+    thumbcache.bind(cache2, cat2)
+    win.reload_data(cat2, cache2)                      # reconcile swap
+    assert win.viewer.catalog is cat2 and win.viewer.thumbs is cache2
+
+
+def test_grid_stop_retires_decode_workers() -> None:
+    """GridView.stop() retires its decode-worker pool so the daemons don't
+    leak and accumulate across a process (fauxcasa-gfz). After stop() no worker
+    of this grid is still alive, and stop() is idempotent (closeEvent + the
+    autouse teardown may both call it). The immortal pool was what raced the
+    main thread on Qt state and crashed a later test on Windows."""
+    _offscreen_app()
+    from grid import GridView, WORKERS
+
+    g = GridView()
+    workers = list(g._workers)
+    assert len(workers) == WORKERS and all(t.is_alive() for t in workers)
+    g.stop()
+    for t in workers:
+        assert not t.is_alive()   # joined and exited on the sentinel
+    g.stop()                      # idempotent, no error, no re-stop
 
 
 def test_index_empty_infile_caption_keeps_ini(tmp_path: Path) -> None:
