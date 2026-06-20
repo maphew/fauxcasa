@@ -21,7 +21,6 @@ originals the grid must never touch, not the cache it owns.
 
 from __future__ import annotations
 
-import os
 import threading
 
 from PySide6.QtCore import QObject, QRect, Qt, Signal
@@ -92,6 +91,9 @@ class ViewerPage(QWidget):
         # while the worker below decodes the full original. This is the
         # fcache v2 loupe consumer: best_level() reads the >256 level on a
         # large/hi-DPI window, the 256 level from a v1 cache (fauxcasa-9pp).
+        # Holding an arrow key pays this once per step inline, but it is bounded
+        # by the key-repeat rate (one cheap decode per shown photo), not a
+        # growing backlog — unlike the original, which needs the stale guards.
         self.preview = self._load_preview(idx, rotate)
 
         def work() -> None:
@@ -147,17 +149,19 @@ class ViewerPage(QWidget):
         if length <= 0:
             return None  # error tile: the original failed to decode at build
         # Read + decode + rotate under ONE broad guard, exactly as the grid's
-        # decode worker does (grid.py): a corrupt index can hand us a 4 GiB
-        # `length` (os.pread then raises MemoryError, not an OSError), a dying
+        # decode worker does (grid.py): a corrupt index can hand us a multi-GiB
+        # `length` (the read then raises MemoryError, not an OSError), a dying
         # volume an EIO, a bad blob a null decode. ANY of these must degrade to
         # "no preview" (the loading text) — never an exception escaping into the
         # synchronous Qt event handler that called us and aborting the UI.
+        # A plain buffered "rb" + seek + read (NOT os.pread) keeps this portable:
+        # os.pread is Unix-only — absent on Windows — and os.open there defaults
+        # to text mode, which would mangle the JPEG bytes. One synchronous read,
+        # so the atomic-offset reason the threaded grid uses os.pread for is moot.
         try:
-            fd = os.open(cache.path, os.O_RDONLY)
-            try:
-                buf = os.pread(fd, length, offset)
-            finally:
-                os.close(fd)
+            with open(cache.path, "rb") as f:
+                f.seek(offset)
+                buf = f.read(length)
             img = QImage.fromData(buf, "JPEG")
             if img.isNull():
                 return None
