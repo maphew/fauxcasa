@@ -26,7 +26,7 @@ source of truth.
 | Viewer | `viewer.py` | double-click / Enter; async original load (the explicit N4 exception); ←/→ or J/K; Esc back |
 | Instrumentation | `main.py` | `READY` line + JSON: cold-start ms, prep ms, `warm`, RSS, and an `indexed` event with photos/s — the §7 numbers |
 
-## The §7 numbers (dev machine, offscreen; overshoots reference HW)
+## The §7 numbers (Linux dev machine, offscreen; overshoots reference HW)
 
 - **Cold start, already-indexed (warm load, no walk):** 100k photos in
   **467 ms** (`prep` 221 ms to load the 5 MB catalog), vs 1893 ms when a
@@ -43,9 +43,11 @@ source of truth.
   377 MB → 1.5 GB) — the 512 hi-DPI level dominates, the 128 level is
   cheap; this is *not* the "~30 %" a single small added level would cost.
   **Startup is unaffected** — cold/warm load are catalog-bound and the
-  larger fcache is seeked, not read: re-measured 100k warm load **511 ms**
-  / cold-walk **2.1 s** (Windows dev box, offscreen), on par with the
-  Linux/v1 reference above. The grid still renders the 256 level, so
+  larger fcache's thumbnail blobs are seeked per-tile, not read at load
+  (only the level table and the ~3× larger v2 offset index are read, which
+  likely accounts for part of the 467 → 511 ms warm-load delta): re-measured
+  100k warm load **511 ms** / cold-walk **2.1 s** (Windows dev box,
+  offscreen), on par with the Linux/v1 reference above. The grid still renders the 256 level, so
   scroll perf is unchanged until a hi-DPI consumer (`fauxcasa-q7m`) reads
   the 512 level. RSS is not re-measured here (the probe reads Linux
   `/proc`); the index rate is unchanged (the cache build, not startup).
