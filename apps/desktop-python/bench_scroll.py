@@ -222,6 +222,13 @@ def read_power() -> dict:
 
 
 def read_rss_mb() -> tuple[float, float]:
+    """(rss_mb, hwm_mb) for the current process.
+
+    Linux reads /proc/self/status (VmRSS/VmHWM) — the fast path. Windows uses
+    GetProcessMemoryInfo (WorkingSetSize/PeakWorkingSetSize) via ctypes. macOS
+    is not yet covered and returns zeros. Any probe failure returns (0.0, 0.0)
+    rather than raising — callers use this for instrumentation only.
+    """
     rss = hwm = 0.0
     try:
         with open("/proc/self/status") as f:
@@ -230,8 +237,48 @@ def read_rss_mb() -> tuple[float, float]:
                     rss = float(line.split()[1]) / 1024.0
                 elif line.startswith("VmHWM:"):
                     hwm = float(line.split()[1]) / 1024.0
+        if rss or hwm:
+            return rss, hwm
     except OSError:
         pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            # GetCurrentProcess returns the pseudo-handle (HANDLE)-1; without an
+            # explicit HANDLE restype ctypes truncates it to 32 bits on 64-bit
+            # Python and GetProcessMemoryInfo fails with ERROR_INVALID_HANDLE.
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            handle = kernel32.GetCurrentProcess()
+            if psapi.GetProcessMemoryInfo(
+                    handle, ctypes.byref(counters), counters.cb):
+                rss = counters.WorkingSetSize / 1024.0 / 1024.0
+                hwm = counters.PeakWorkingSetSize / 1024.0 / 1024.0
+        except Exception:
+            pass
+    # macOS (darwin) is not yet covered; returns zeros.
     return rss, hwm
 
 
