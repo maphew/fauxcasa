@@ -447,10 +447,8 @@ class MainWindow(QMainWindow):
         self.viewer = ViewerPage(catalog, thumbs)
 
         # --- sidebar: All / Starred / Folders / Albums ---
-        self.tree = QTreeWidget()
-        self.tree.setHeaderHidden(True)
+        self.tree = self._new_sidebar_tree()
         self._build_sidebar()
-        self.tree.itemClicked.connect(self._sidebar_clicked)
 
         # --- toolbar: search + zoom ---
         bar = QToolBar()
@@ -660,8 +658,7 @@ class MainWindow(QMainWindow):
         self.search.clear()
         self.search.blockSignals(False)
         self.grid.set_data(catalog, thumbs)
-        self.tree.clear()
-        self._build_sidebar()
+        self._rebuild_sidebar()
         self._show_counts("All photos", self._shown_count())
         self.meta_label.setText("")
 
@@ -722,8 +719,7 @@ class MainWindow(QMainWindow):
         frac = sb.value() / sb.maximum() if sb.maximum() > 0 else 0.0
 
         self.grid.reveal = on
-        self.tree.clear()
-        self._build_sidebar()
+        self._rebuild_sidebar()
         self._reselect_view(kind, key)
 
         if search_text.strip():
@@ -758,6 +754,35 @@ class MainWindow(QMainWindow):
             it += 1
 
     # ---------- sidebar ----------
+
+    def _new_sidebar_tree(self) -> QTreeWidget:
+        """Create and wire a fresh sidebar tree. Factored out so a rebuild can
+        swap in a brand-new widget rather than clear() the live one."""
+        tree = QTreeWidget()
+        tree.setHeaderHidden(True)
+        tree.itemClicked.connect(self._sidebar_clicked)
+        return tree
+
+    def _rebuild_sidebar(self) -> None:
+        """Repopulate the sidebar after a reveal toggle or reconcile reload.
+
+        Swaps in a freshly built QTreeWidget and defers the old one's
+        destruction via deleteLater(), instead of self.tree.clear()+repopulate.
+        On the real Windows Qt platform, clear()-ing a QTreeWidget that has a
+        current item set intermittently aborts with a native access violation
+        in the in-place item teardown (fauxcasa-gfz) — reproducible in a single
+        shown window with a running event loop, so it can crash the real app on
+        a Show-hidden toggle or a post-reconcile reload, not just the tests.
+        Building a new tree and letting the event loop free the old one at a
+        safe point sidesteps that teardown path entirely."""
+        old = self.tree
+        split = old.parentWidget()
+        new = self._new_sidebar_tree()
+        idx = split.indexOf(old)
+        self.tree = new
+        split.replaceWidget(idx, new)
+        self._build_sidebar()
+        old.deleteLater()
 
     def _build_sidebar(self) -> None:
         cat = self.catalog
