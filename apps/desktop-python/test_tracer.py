@@ -1540,16 +1540,6 @@ def reveal_library(tmp_path: Path) -> Path:
     return root
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32" and os.environ.get("QT_QPA_PLATFORM") == "offscreen",
-    reason="Flaky native access violation in MainWindow._toggle_reveal under the "
-    "offscreen Windows Qt plugin: it fires intermittently here (the heaviest "
-    "reveal_library + a grid repaint) once the suite has built up enough Qt "
-    "widget state, with this test's own decode workers merely parked. The "
-    "reveal toggle, sidebar counts, and starred tallies are still exercised on "
-    "Linux (and on the lighter reveal tests). Quarantined pending a real "
-    "(non-offscreen) Windows repro — tracked in fauxcasa-gfz.",
-)
 def test_reveal_sidebar_counts_and_starred(reveal_library: Path) -> None:
     """Reveal mode updates the rendered per-folder count TEXT in the sidebar
     AND the Starred tally (the hidden-starred path), and a Show-hidden toggle
@@ -1606,6 +1596,46 @@ def test_reveal_sidebar_counts_and_starred(reveal_library: Path) -> None:
     assert item_for(win, "folder", "Trip").text(0).endswith("(1)")
     assert "(1)" in item_for(win, "starred", "").text(0)
     assert "Starred: 1 photos" in win.counts_label.text()
+
+
+def test_sidebar_rebuild_survives_repeated_toggles(reveal_library: Path) -> None:
+    """Regression for fauxcasa-gfz: rebuilding the sidebar while a tree item is
+    current must not corrupt Qt state. The old clear()-in-place rebuild
+    intermittently access-violated on the real Windows Qt platform (a single
+    window, a handful of rebuilds was enough); _rebuild_sidebar() swaps in a
+    fresh tree and deleteLater()s the old one instead. Loop the Show-hidden
+    toggle (each toggle = one rebuild with Starred as the current item) far past
+    the pre-fix crash threshold; a revert segfaults the whole run here."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    def item_for(win, kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    cat = scan_library(reveal_library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._sidebar_clicked(item_for(win, "starred", ""), 0)  # a live current item
+
+    for _ in range(30):
+        win.reveal_box.setChecked(True)
+        win.reveal_box.setChecked(False)
+        app.processEvents()  # let the deferred old-tree deletions run
+
+    # Still coherent after all the swaps: Starred view preserved, counts sane.
+    assert win.grid.filter_label == "Starred"
+    assert item_for(win, "starred", "") is not None
+    assert win.tree.currentItem() is item_for(win, "starred", "")
 
 
 def test_reveal_preserves_search_view(library: Path) -> None:
