@@ -39,3 +39,35 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: M1 gate — survey/tracer ingest-parity cross-check
         run: uv run scripts/check-ingest-parity.py
+
+  # perf-canary is the §7 CI slice (fauxcasa-ed5.3): cold-start assert,
+  # search-latency probe, catalog-size report, parsed from the tracer's
+  # READY/JSON stdout protocol on the 24-photo deterministic corpus.
+  #
+  # HONEST SCOPE: these thresholds are CANARIES, not the §7 budgets. The
+  # budgets (cold start < 2 s, search < 50 ms) are defined at 100k photos
+  # on reference hardware; shared CI runners at 24 photos can only catch
+  # order-of-magnitude regressions (a synchronous rescan on the warm path,
+  # per-keystroke IO, a quadratic filter scan). The definitive 100k numbers
+  # stay dev-box measurements recorded in beads fauxcasa-ed5.4/.3. The
+  # catalog-size row is REPORTED, not asserted at ~50 B/photo — that row
+  # has a known tension (sha256-bearing JSON rows; fauxcasa-1jb); only a
+  # generous runaway-growth ceiling fails. Thresholds + contract live in
+  # scripts/perf-canary.py. Windows runs per §8 (§7 gates run in Windows CI).
+  perf-canary:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Qt offscreen system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 \
+            libfontconfig1 libdbus-1-3
+      - name: §7 perf canaries — cold start, search latency, catalog size
+        run: uv run scripts/perf-canary.py
