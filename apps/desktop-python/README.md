@@ -23,7 +23,8 @@ source of truth.
 | Virtualized grid | `grid.py` | balloon lineage: threaded fcache decode, bounded LRU — plus event-driven repaint, real scrollbar, group headers w/ pinned current folder, selection, star badges, error tiles. Never reads originals (N4) |
 | Sidebar | `main.py` | All / Starred / folder tree (filesystem truth) / albums (pure references resolved from `albums=` tokens) |
 | Search | `main.py` | substring over filename + caption + keywords, live filter |
-| Viewer | `viewer.py` | double-click / Enter; **instant cached preview** (the fcache v2 hi-DPI / loupe consumer — the nearest cached level ≥ the viewport's device pixels via `ThumbCache.best_level()`: 512 on a hi-DPI/large window, 256 from a v1 cache) painted while the async original loads (the explicit N4 exception); ←/→ or J/K; Esc back |
+| Viewer | `viewer.py` | double-click / Enter; **instant cached preview** (the fcache v2 hi-DPI / loupe consumer — the nearest cached level ≥ the viewport's device pixels via `ThumbCache.best_level()`: 512 on a hi-DPI/large window, 256 from a v1 cache) painted while the async original loads (the explicit N4 exception); ←/→ or J/K; Esc back. **Explicit 1:1 zoom** (the other N4 exception, fauxcasa-q6l.4): `1` (Picasa Photo Viewer's toggle) / `Ctrl+Alt+0` / click (anchored at the click point), one image pixel per **device** pixel; drag or Ctrl+arrows pan, plain arrows stay next/prev; resets to fit on photo change |
+| Hover peek | `peek.py` + grid trigger | Picasa's **Ctrl+Alt while hovering** a grid photo (the shortcut corpus, verbatim): frameless full-screen preview on the cursor's screen, riding the viewer's preview + async-original machinery; input-transparent and non-activating so the grid keeps focus and the event stream; dismisses on hover-out, modifier release, click, or Esc (fauxcasa-q6l.5) |
 | Instrumentation | `main.py` | `READY` line + JSON: cold-start ms, prep ms, `warm`, RSS, and an `indexed` event with photos/s — the §7 numbers |
 
 ## The §7 numbers (Linux dev machine, offscreen; overshoots reference HW)
@@ -127,6 +128,11 @@ policy and stays valid.
 
 ## Deliberate tracer shortcuts (not product decisions)
 
+- The viewer's 1:1 toggle binds **both** `1` (Picasa Photo Viewer's own
+  "Toggle 100% zoom") and `Ctrl+Alt+0`. The M2 triage loop will claim bare
+  digits 0–5 as star-**set** keys (spec §5), at which point `1` cedes to
+  star-set and `Ctrl+Alt+0` remains — a key-priority decision deferred
+  until those keys land.
 - In-app cache builder holds all thumb blobs in memory while writing the
   fcache — fine for fixture/medium libraries; huge libraries adopt a
   pre-built fcache (`--thumbs`). Throughput itself is no longer the

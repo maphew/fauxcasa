@@ -85,6 +85,7 @@ from thumbcache import (  # noqa: E402
     cache_dir_for,
     load_cache,
 )
+from peek import PeekPage  # noqa: E402
 from slideshow import SlideshowPage  # noqa: E402
 from viewer import ViewerPage  # noqa: E402
 
@@ -490,6 +491,10 @@ class MainWindow(QMainWindow):
         # each start) — never deleted mid-run, so its decode threads can
         # never race a widget teardown (fauxcasa-gfz).
         self._slideshow: SlideshowPage | None = None
+        # Ctrl+Alt hover peek surface (fauxcasa-q6l.5): same lifecycle
+        # discipline — lazily created on the first trigger, then reused and
+        # re-pointed, never deleted mid-run.
+        self._peek_page: PeekPage | None = None
 
         # --- sidebar: All / Starred / Folders / Albums ---
         self.tree = self._new_sidebar_tree()
@@ -573,6 +578,8 @@ class MainWindow(QMainWindow):
         # and keeps feeding _photo_selected directly (fauxcasa-q6l.1).
         self.grid.selection_changed.connect(self._selection_changed)
         self.grid.photo_activated.connect(self._open_viewer)
+        self.grid.peek_requested.connect(self._show_peek)
+        self.grid.peek_released.connect(self._hide_peek)
         self.viewer.closed.connect(self._close_viewer)
         self.viewer.photo_shown.connect(self._photo_selected)
 
@@ -718,6 +725,9 @@ class MainWindow(QMainWindow):
             # indices belong to the old catalog. (An idle surface is fine —
             # _start_slideshow re-points it before the next show.)
             self._slideshow._exit()
+        # A peeked index belongs to the old catalog too (peek_released
+        # -> _hide_peek; idle no-op otherwise).
+        self.grid._end_peek()
         self.pages.setCurrentWidget(self.pages.widget(0))
         self.search.blockSignals(True)
         self.search.clear()
@@ -1156,6 +1166,27 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         current = self.pages.currentWidget()
         (self.viewer if current is self.viewer else self.grid).setFocus()
+
+    # ---------- hover peek (fauxcasa-q6l.5) ----------
+
+    def _show_peek(self, idx: int) -> None:
+        """Ctrl+Alt hover on a grid photo (the grid's trigger machine):
+        full-screen peek on the screen containing the cursor. The surface
+        is input-transparent and non-activating (peek.py), so the grid
+        keeps the focus and the whole event stream — no focus juggling to
+        undo on dismissal."""
+        if self._peek_page is None:
+            self._peek_page = PeekPage(self.catalog, self.grid.thumbs)
+        else:
+            # Reused surface: re-point at the live catalog/cache pair (the
+            # slideshow discipline — a reconcile may have swapped both).
+            self._peek_page.catalog = self.catalog
+            self._peek_page.set_thumbs(self.grid.thumbs)
+        self._peek_page.peek(idx)
+
+    def _hide_peek(self) -> None:
+        if self._peek_page is not None:
+            self._peek_page.dismiss()
 
 
 def main() -> int:
