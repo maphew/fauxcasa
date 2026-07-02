@@ -67,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from catalog import (  # noqa: E402
     Catalog,
+    Photo,
     ScanFilter,
     load_catalog,
     reconcile_walk,
@@ -460,7 +461,7 @@ class MainWindow(QMainWindow):
         bar.addSeparator()
         self.search = QLineEdit()
         self.search.setPlaceholderText(
-            "search filename, caption, keywords…")
+            "search filename, caption, keywords, folder…  -term excludes")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(360)
         self.search.textChanged.connect(self._search_changed)
@@ -870,23 +871,62 @@ class MainWindow(QMainWindow):
 
     # ---------- search ----------
 
+    @staticmethod
+    def _parse_query(text: str) -> tuple[list[str], list[str]]:
+        """Whitespace-tokenized query -> (positive, negative) lowercase
+        terms. Positive terms AND together; a '-'-prefixed token excludes
+        any photo it matches (§5 negation — a negation-only query is valid:
+        Picasa users' all-photos hack was exactly that). A lone '-' — a
+        negation still being typed — contributes nothing rather than
+        blanking the grid."""
+        pos: list[str] = []
+        neg: list[str] = []
+        for tok in text.lower().split():
+            if tok.startswith("-"):
+                if len(tok) > 1:
+                    neg.append(tok[1:])
+            else:
+                pos.append(tok)
+        return pos, neg
+
     def _search_changed(self, text: str) -> None:
-        text = text.strip().lower()
-        cat = self.catalog
-        if not text:
+        pos, neg = self._parse_query(text)
+        if not pos and not neg:
             self.grid.set_filter(None, "")
             self._show_counts("All photos", self._shown_count())
             return
-        idxs = [
-            i for i, p in enumerate(cat.photos)
-            if (p.visible or self.grid.reveal) and (
-                text in p.name.lower()
-                or (p.caption and text in p.caption.lower())
-                or any(text in k.lower() for k in p.keywords)
-            )
-        ]
-        self.grid.set_filter(idxs, f"search: {text}")
-        self._show_counts(f"Search “{text}”", len(idxs))
+        cat = self.catalog
+        # Folder text is shared by every photo in a folder: precompute ONE
+        # lowercase haystack per folder — display title + rel path, so a hit
+        # on any path segment (a parent folder's name included) pulls that
+        # folder's photos into the flat result set — instead of rebuilding
+        # it per photo per term.
+        folder_hay = {rel: f"{f.title}\n{rel}".lower()
+                      for rel, f in cat.folders.items()}
+
+        def haystack(p: Photo) -> str:
+            # Every searchable field of one photo, newline-joined: terms are
+            # whitespace-free (split() above), so no term can straddle two
+            # fields. A future field (e.g. people names, once faces land)
+            # slots in as one more part here.
+            return "\n".join((
+                p.name,
+                p.caption or "",
+                " ".join(p.keywords),
+                folder_hay[p.folder],
+            )).lower()
+
+        reveal = self.grid.reveal
+        idxs = []
+        for i, p in enumerate(cat.photos):
+            if not (p.visible or reveal):
+                continue
+            hay = haystack(p)
+            if all(t in hay for t in pos) and not any(t in hay for t in neg):
+                idxs.append(i)
+        q = text.strip().lower()
+        self.grid.set_filter(idxs, f"search: {q}")
+        self._show_counts(f"Search “{q}”", len(idxs))
 
     # ---------- status ----------
 
