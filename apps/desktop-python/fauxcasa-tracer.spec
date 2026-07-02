@@ -5,8 +5,11 @@
 # PyInstaller-class, ~100-150 MB is expected and acceptable — §7 anchors
 # austerity on resident memory + cold start, not installer megabytes.
 #
-# Build from the repo root (ONE invocation produces BOTH variants below):
+# Build from the repo root (ONE invocation produces BOTH variants below;
+# rawpy MUST be in the build env or the artifact silently ships without
+# RAW decode — rawload.py imports it lazily, so nothing fails at build):
 #   uv run --with "PySide6-Essentials==6.11.1" --with "pyinstaller==6.20.0" \
+#       --with "rawpy==0.27.0" \
 #       pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 #
 # Decisions (see the synthesis in the §7-validation report):
