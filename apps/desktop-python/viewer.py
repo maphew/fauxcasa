@@ -21,6 +21,7 @@ originals the grid must never touch, not the cache it owns.
 
 from __future__ import annotations
 
+import queue
 import threading
 
 from PySide6.QtCore import QObject, QRect, Qt, Signal
@@ -32,6 +33,27 @@ from thumbcache import THUMB_EDGE, ThumbCache
 
 BACKGROUND = QColor(12, 12, 12)
 CAPTION_BG = QColor(0, 0, 0, 170)
+
+
+def load_original(path: str, rotate: int) -> QImage:
+    """Decode a full original: EXIF auto-orientation on read (so it matches
+    the EXIF-baked grid thumbnails), then the Picasa rotate= user
+    quarter-turns composed on top — see apps/desktop-python/README.md
+    "EXIF orientation". The ONE full-image decode path, shared by the
+    viewer's async load and the slideshow's dwell prefetch (slideshow.py),
+    so every consumer orients identically. Returns a null QImage on
+    failure. Thread-safe: QImage (unlike QPixmap) may be built off the GUI
+    thread, and callers do call this from worker threads."""
+    from PySide6.QtGui import QImageReader
+
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    img = reader.read()
+    if not img.isNull() and rotate:
+        from PySide6.QtGui import QTransform
+
+        img = img.transformed(QTransform().rotate(90 * rotate))
+    return img
 
 
 class _Loader(QObject):
@@ -55,9 +77,51 @@ class ViewerPage(QWidget):
         self.preview: QImage | None = None
         self.loading = False
         self._serial = 0
+        # ONE persistent, lazily started decode worker fed by a job queue —
+        # NOT a thread per navigation. Short-lived Qt-touching threads exit
+        # through Qt's per-thread native cleanup, and on offscreen Windows
+        # that churn is exactly the cumulative state that tips the
+        # fauxcasa-gfz access violations; the grid's long-lived pool is the
+        # same discipline. Stale jobs cost one queue hop and bail on the
+        # serial guard, so the queue stays bounded under key-repeat.
+        self._jobs: queue.Queue = queue.Queue()
+        self._decoder: threading.Thread | None = None
         self._loader = _Loader()
         self._loader.loaded.connect(self._on_loaded)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _submit(self, job) -> None:
+        """Queue a decode job on the persistent worker (started on first
+        use, so a viewer that never shows a photo never owns a thread)."""
+        if self._decoder is None or not self._decoder.is_alive():
+            self._decoder = threading.Thread(
+                target=self._decode_loop, daemon=True)
+            self._decoder.start()
+        self._jobs.put(job)
+
+    def _decode_loop(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return  # quiesce() sentinel: retire the worker
+            job()
+
+    def quiesce(self, timeout: float = 5.0) -> None:
+        """Retire the decode worker BEFORE this widget is destroyed: bump
+        the stale-guard serial so any queued job bails instead of emitting,
+        then send the sentinel and join. A job that already passed its final
+        serial check could otherwise emit into a receiver being torn down
+        concurrently — the fauxcasa-gfz Windows access-violation family
+        (grid.stop() is the same discipline for the grid's pool).
+        Deliberately NOT called on ordinary navigation or viewer close: the
+        serial guards handle staleness there, and joining a decode mid-read
+        could stall the UI on a slow volume — this is for teardown paths
+        (tests delete widgets aggressively)."""
+        self._serial += 1
+        t = self._decoder
+        if t is not None and t.is_alive():
+            self._jobs.put(None)
+            t.join(timeout)
 
     def set_thumbs(self, thumbs: ThumbCache | None) -> None:
         """Adopt a freshly built or reconciled cache (cold-build finish or the
@@ -76,14 +140,33 @@ class ViewerPage(QWidget):
             return -1
         return self.display[self.pos]
 
+    def _take_prefetched(self, idx: int) -> QImage | None:
+        """Subclass hook: hand back an already-decoded original for `idx`,
+        or None. The base viewer never prefetches; the slideshow decodes the
+        NEXT photo's original during the current dwell and surrenders it
+        here, making a timed advance a pure swap (slideshow.py)."""
+        return None
+
     def _load_current(self) -> None:
         idx = self.current_index()
         if idx < 0:
             return
-        self.image = None
-        self.loading = True
         self._serial += 1
         serial = self._serial
+        ready = self._take_prefetched(idx)
+        if ready is not None:
+            # A prefetcher already decoded this original during the previous
+            # dwell: show it NOW — no preview flash, no redundant decode. The
+            # serial bump above stales any in-flight load (_on_loaded guard),
+            # exactly as a normal navigation would.
+            self.loading = False
+            self.image = ready
+            self.preview = None
+            self.photo_shown.emit(idx)
+            self.update()
+            return
+        self.image = None
+        self.loading = True
         path = str(self.catalog.root / self.catalog.photos[idx].rel)
         rotate = self.catalog.photos[idx].rotate
         # Show a cached stand-in NOW — synchronous, but cheap (a <= 512 px
@@ -102,27 +185,15 @@ class ViewerPage(QWidget):
             # decode, and the emit is guarded against Qt teardown.
             if serial != self._serial:
                 return
-            # Apply EXIF orientation on read (setAutoTransform), so the
-            # viewer matches the EXIF-baked grid thumbnails; the Picasa
-            # rotate= user quarter-turns compose on top. See
-            # apps/desktop-python/README.md "EXIF orientation".
-            from PySide6.QtGui import QImageReader
-
-            reader = QImageReader(path)
-            reader.setAutoTransform(True)
-            img = reader.read()
+            img = load_original(path, rotate)
             if serial != self._serial:
                 return
-            if not img.isNull() and rotate:
-                from PySide6.QtGui import QTransform
-
-                img = img.transformed(QTransform().rotate(90 * rotate))
             try:
                 self._loader.loaded.emit(serial, img)
             except RuntimeError:
                 pass  # loader deleted at shutdown
 
-        threading.Thread(target=work, daemon=True).start()
+        self._submit(work)
         self.photo_shown.emit(idx)
         self.update()
 

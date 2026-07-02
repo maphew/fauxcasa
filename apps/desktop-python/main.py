@@ -85,6 +85,7 @@ from thumbcache import (  # noqa: E402
     cache_dir_for,
     load_cache,
 )
+from slideshow import SlideshowPage  # noqa: E402
 from viewer import ViewerPage  # noqa: E402
 
 import applog  # noqa: E402
@@ -452,6 +453,11 @@ class MainWindow(QMainWindow):
         # preview (the nearest v2 level) while the full original loads
         # (fauxcasa-9pp). thumbs is None on a cold start until the build lands.
         self.viewer = ViewerPage(catalog, thumbs)
+        # Full-screen slideshow surface (fauxcasa-q6l.3): created lazily on
+        # first Play, then REUSED (re-pointed at the current catalog/cache
+        # each start) — never deleted mid-run, so its decode threads can
+        # never race a widget teardown (fauxcasa-gfz).
+        self._slideshow: SlideshowPage | None = None
 
         # --- sidebar: All / Starred / Folders / Albums ---
         self.tree = self._new_sidebar_tree()
@@ -464,6 +470,15 @@ class MainWindow(QMainWindow):
         self.open_action = bar.addAction("Open...")
         self.open_action.setToolTip("Choose a different photo library folder")
         self.open_action.triggered.connect(self._change_library)
+        bar.addSeparator()
+        # Picasa's green Play (folder/album headers + toolbar) distilled to
+        # one toolbar affordance acting on the CURRENT view; F11 is the
+        # Picasa-heritage shortcut (fauxcasa-q6l.3).
+        self.play_action = bar.addAction("▶ Play")
+        self.play_action.setToolTip(
+            "Slideshow of the current view (F11) — Space pauses, Esc exits")
+        self.play_action.setShortcut("F11")
+        self.play_action.triggered.connect(self._start_slideshow)
         bar.addSeparator()
         self.search = QLineEdit()
         self.search.setPlaceholderText(
@@ -665,6 +680,11 @@ class MainWindow(QMainWindow):
         self.catalog = catalog
         self.viewer.catalog = catalog
         self.viewer.set_thumbs(thumbs)         # reconciled cache for previews
+        if self._slideshow is not None and self._slideshow.isVisible():
+            # Same reason the viewer page is left: the show's display
+            # indices belong to the old catalog. (An idle surface is fine —
+            # _start_slideshow re-points it before the next show.)
+            self._slideshow._exit()
         self.pages.setCurrentWidget(self.pages.widget(0))
         self.search.blockSignals(True)
         self.search.clear()
@@ -1040,6 +1060,41 @@ class MainWindow(QMainWindow):
             self.grid._select(idx)
             self.grid._ensure_visible(idx)
         self.grid.setFocus()
+
+    # ---------- slideshow (fauxcasa-q6l.3) ----------
+
+    def _start_slideshow(self) -> None:
+        """Play the CURRENT display set — whatever the grid is showing
+        (folder view, album, All, Starred, search results) — full-screen,
+        from the current photo (or the first when none is selected).
+        Read-only playback; the overlay star/reject controls are M2. The
+        show is a separate top-level surface, so the grid/viewer beneath
+        keeps its exact state for the Esc return trip."""
+        display = list(self.grid.display)
+        if not display:
+            return
+        if self.pages.currentWidget() is self.viewer:
+            current = self.viewer.current_index()
+        else:
+            current = self.grid.current  # catalog index, -1 = none (#36)
+        pos = self.grid.display_pos.get(current, 0)
+        if self._slideshow is None:
+            self._slideshow = SlideshowPage(self.catalog, self.grid.thumbs)
+            self._slideshow.closed.connect(self._slideshow_closed)
+        else:
+            # Reused surface: re-point at the live catalog/cache pair (a
+            # reconcile may have swapped both since the last show).
+            self._slideshow.catalog = self.catalog
+            self._slideshow.set_thumbs(self.grid.thumbs)
+        self._slideshow.start(display, pos)
+
+    def _slideshow_closed(self, _idx: int) -> None:
+        # The surface hid itself; the pages beneath were never touched —
+        # "back to exactly the prior state" is just re-taking focus on
+        # whichever page is current.
+        self.activateWindow()
+        current = self.pages.currentWidget()
+        (self.viewer if current is self.viewer else self.grid).setFocus()
 
 
 def main() -> int:
