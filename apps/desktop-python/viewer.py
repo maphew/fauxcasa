@@ -70,12 +70,22 @@ def load_original(path: str, rotate: int) -> QImage:
     the TIFF-based container (rawload module doc): embedded JPEG preview
     first — usually full-size, so the viewer stays responsive — else a
     full demosaic; orientation lands exactly once on either path, and the
-    rotate= turns compose on top exactly as for any other format."""
+    rotate= turns compose on top exactly as for any other format.
+
+    Video files route by extension to the videoload poster seam
+    (fauxcasa-v46.2): the poster frame IS the M1 "original" for a video —
+    an honest still, painted with the "playback pending (v46.3)" note in
+    the info bar; no playback is attempted (v46.3 is gated on the
+    decode-service §3c sandbox-valve ruling). PyAV opens the path
+    seekably, so a multi-GB video is never read whole here."""
     from PySide6.QtGui import QImageReader
 
     from rawload import is_raw_suffix, load_raw_qimage
+    from videoload import is_video_suffix, poster_qimage
 
-    if is_raw_suffix(path):
+    if is_video_suffix(path):
+        img = poster_qimage(path)  # null on any failure (error text)
+    elif is_raw_suffix(path):
         try:
             data = Path(path).read_bytes()
         except OSError:
@@ -534,6 +544,12 @@ class ViewerPage(QWidget):
 
         photo = self.catalog.photos[idx]
         parts = [f"{self.pos + 1}/{len(self.display)}", photo.rel]
+        if photo.media == "video":
+            # M1 honest placeholder (fauxcasa-v46.2): what is painted above
+            # is the POSTER frame; playback is v46.3 (gated on the decode-
+            # service §3c sandbox-valve ruling), so say so rather than
+            # pretending the still is the video.
+            parts.append("video — playback pending (v46.3)")
         if self.zoomed:
             # The mode chip doubles as the binding hint (drag pans;
             # 1 / Ctrl+Alt+0 / click return to fit).

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "PySide6", "pillow", "exiv2", "rawpy"]
+# dependencies = ["pytest", "PySide6", "pillow", "exiv2", "rawpy", "av"]
 # ///
 """Tests for the tracer's non-GUI layers: catalog scan + metadata,
 thumbnail-cache build/load/bind, and walk-rule parity with
@@ -4430,8 +4430,10 @@ def test_metadata_catalog_roundtrip_and_version_gate(
     assert a.star == 3 and a.geotag == pytest.approx(WHITEHORSE)
     assert a.date_taken == "1899-03-02T14:00:00"
 
-    # the version gate: a v4 (pre-metadata) catalog cold-rebuilds
-    assert catmod.CATALOG_VERSION == 5
+    # the version gate: a v4 (pre-metadata) catalog cold-rebuilds. >= not
+    # ==: later features keep bumping the version (v6 = video walk,
+    # fauxcasa-v46.2) and this test only cares that pre-v5 is rejected.
+    assert catmod.CATALOG_VERSION >= 5
     data = json.loads(path.read_text())
     data["version"] = 4
     path.write_text(json.dumps(data))

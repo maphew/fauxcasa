@@ -4,6 +4,7 @@
 # dependencies = [
 #   "pillow",
 #   "rawpy",
+#   "av",
 # ]
 # ///
 """Pre-build the packed thumbnail cache for the stack trial balloons
@@ -81,9 +82,20 @@ RAW_EXTS = frozenset({
     ".nef", ".nrw", ".orf", ".pef", ".raf", ".raw", ".rw2", ".sr2",
     ".srf", ".x3f",
 })
+# Picasa's documented video list. Mirror of apps/desktop-python/
+# videoload.py VIDEO_EXTS (fauxcasa-v46.2) — must match exactly, like
+# RAW_EXTS above, or cache-order parity breaks (test_tracer.py asserts
+# the sets are equal).
+VIDEO_EXTS = frozenset({
+    ".3g2", ".3gp", ".asf", ".avi", ".divx", ".m2t", ".m2ts", ".m4v",
+    ".mkv", ".mmv", ".mod", ".mov", ".mp4", ".mpeg", ".mpg", ".mts",
+    ".tod", ".wmv",
+})
+# Poster grab point, seconds — mirror of videoload.POSTER_SEEK_S.
+POSTER_SEEK_S = 1.0
 # Must match apps/desktop-python/catalog.py EXTS exactly (cache-order parity).
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
-        ".webp"} | RAW_EXTS
+        ".webp"} | RAW_EXTS | VIDEO_EXTS
 # Mirror of apps/desktop-python/thumbcache.py.RECOMMENDED_LEVELS — 512 is the
 # hi-DPI/loupe payload, 256 is the grid's primary, 128 a cheap low-DPI level.
 RECOMMENDED_LEVELS = (512, THUMB_EDGE, 128)
@@ -137,6 +149,28 @@ def _parse_levels(spec: str | None) -> list[int]:
     return _normalize_levels(raw)
 
 
+def _video_poster(path: Path):
+    """PIL mirror of apps/desktop-python/videoload.py poster_frame
+    (fauxcasa-v46.2): PyAV over the file BYTES via a seekable BytesIO
+    (moov-at-end MP4s need seekable input — decode-service §3c), first
+    decodable frame at ~POSTER_SEEK_S in, fallback the first frame.
+    Raises on failure; _make_thumb's broad except is the error tile.
+    Video frames carry no EXIF Orientation, so no transpose runs."""
+    import av
+
+    with av.open(io.BytesIO(path.read_bytes())) as container:
+        stream = next(s for s in container.streams if s.type == "video")
+        try:
+            container.seek(int(POSTER_SEEK_S * av.time_base))
+            frame = next(container.decode(stream), None)
+        except Exception:
+            frame = None
+        if frame is None:
+            container.seek(0)
+            frame = next(container.decode(stream))
+        return frame.to_image().convert("RGB")
+
+
 def _open_source(path: Path):
     """Decoded, orientation-applied RGB image for `path`. RAW files route
     BY EXTENSION to rawpy before PIL can content-sniff the TIFF-based
@@ -145,9 +179,12 @@ def _open_source(path: Path):
     JPEG, its own EXIF tag applied by exif_transpose, once — else a
     half-size demosaic whose flip LibRaw already baked (so NO
     exif_transpose on that branch: orientation lands exactly once).
+    Video files route BY EXTENSION to the PyAV poster path (never PIL).
     Raises on failure; _make_thumb's broad except is the error tile."""
     from PIL import Image, ImageOps
 
+    if path.suffix.lower() in VIDEO_EXTS:
+        return _video_poster(path)
     if path.suffix.lower() in RAW_EXTS:
         import rawpy
 
