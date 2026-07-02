@@ -45,9 +45,11 @@ PAUSED_TEXT = "paused — Space resumes"
 class SlideshowPage(ViewerPage):
     """A ViewerPage that plays itself. start() takes the same
     (display, pos) contract as ViewerPage.show_photo and goes full-screen;
-    the `closed` signal (inherited) fires on exit so the owner can tear
-    the surface down. Construct one per show — it is cheap, and a fresh
-    instance can never point at a stale catalog/cache pair."""
+    the `closed` signal (inherited) fires on exit so the owner can restore
+    focus. The owner keeps ONE instance for the window's life and re-points
+    catalog/thumbs before each start (as MainWindow.reload_data does for
+    the viewer) — never deleting a live surface means its decode threads
+    can never race a widget teardown (the fauxcasa-gfz crash family)."""
 
     def __init__(self, catalog, thumbs=None, delay_ms: int = SLIDE_DELAY_MS,
                  parent=None):
@@ -64,13 +66,22 @@ class SlideshowPage(ViewerPage):
         self._hint_timer.setInterval(HINT_MS)
         self._hint_timer.timeout.connect(self._hide_hint)
         # Next-photo prefetch: (catalog idx, decoded original | None-for-
-        # failed). Written by a worker thread, consumed on the GUI thread
-        # via _take_prefetched — hence the lock; the serial ages out
-        # workers superseded by a newer kick (same pattern as the
+        # failed). Decoded on the viewer's ONE persistent decode worker
+        # (ViewerPage._submit) — queued after the current photo's own
+        # decode, which is exactly the right order — and consumed on the
+        # GUI thread via _take_prefetched; hence the lock. The serial ages
+        # out jobs superseded by a newer kick (same pattern as the
         # viewer's own stale-load guard).
         self._prefetch_lock = threading.Lock()
         self._prefetched: tuple[int, QImage | None] | None = None
         self._prefetch_serial = 0
+
+    def quiesce(self, timeout: float = 5.0) -> None:
+        """Teardown discipline (see ViewerPage.quiesce): also age out any
+        queued dwell-prefetch job, then retire the shared decode worker."""
+        with self._prefetch_lock:
+            self._prefetch_serial += 1
+        super().quiesce(timeout)
 
     # ---------- lifecycle ----------
 
@@ -167,13 +178,16 @@ class SlideshowPage(ViewerPage):
         rotate = photo.rotate
 
         def work() -> None:
+            with self._prefetch_lock:
+                if serial != self._prefetch_serial:
+                    return             # superseded before it even started
             img = load_original(path, rotate)
             with self._prefetch_lock:
                 if serial != self._prefetch_serial:
                     return             # superseded by a newer kick
                 self._prefetched = (nxt, None if img.isNull() else img)
 
-        threading.Thread(target=work, daemon=True).start()
+        self._submit(work)
 
     def _take_prefetched(self, idx: int) -> QImage | None:
         with self._prefetch_lock:

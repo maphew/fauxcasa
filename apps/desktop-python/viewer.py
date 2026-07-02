@@ -21,6 +21,7 @@ originals the grid must never touch, not the cache it owns.
 
 from __future__ import annotations
 
+import queue
 import threading
 
 from PySide6.QtCore import QObject, QRect, Qt, Signal
@@ -76,9 +77,51 @@ class ViewerPage(QWidget):
         self.preview: QImage | None = None
         self.loading = False
         self._serial = 0
+        # ONE persistent, lazily started decode worker fed by a job queue —
+        # NOT a thread per navigation. Short-lived Qt-touching threads exit
+        # through Qt's per-thread native cleanup, and on offscreen Windows
+        # that churn is exactly the cumulative state that tips the
+        # fauxcasa-gfz access violations; the grid's long-lived pool is the
+        # same discipline. Stale jobs cost one queue hop and bail on the
+        # serial guard, so the queue stays bounded under key-repeat.
+        self._jobs: queue.Queue = queue.Queue()
+        self._decoder: threading.Thread | None = None
         self._loader = _Loader()
         self._loader.loaded.connect(self._on_loaded)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _submit(self, job) -> None:
+        """Queue a decode job on the persistent worker (started on first
+        use, so a viewer that never shows a photo never owns a thread)."""
+        if self._decoder is None or not self._decoder.is_alive():
+            self._decoder = threading.Thread(
+                target=self._decode_loop, daemon=True)
+            self._decoder.start()
+        self._jobs.put(job)
+
+    def _decode_loop(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return  # quiesce() sentinel: retire the worker
+            job()
+
+    def quiesce(self, timeout: float = 5.0) -> None:
+        """Retire the decode worker BEFORE this widget is destroyed: bump
+        the stale-guard serial so any queued job bails instead of emitting,
+        then send the sentinel and join. A job that already passed its final
+        serial check could otherwise emit into a receiver being torn down
+        concurrently — the fauxcasa-gfz Windows access-violation family
+        (grid.stop() is the same discipline for the grid's pool).
+        Deliberately NOT called on ordinary navigation or viewer close: the
+        serial guards handle staleness there, and joining a decode mid-read
+        could stall the UI on a slow volume — this is for teardown paths
+        (tests delete widgets aggressively)."""
+        self._serial += 1
+        t = self._decoder
+        if t is not None and t.is_alive():
+            self._jobs.put(None)
+            t.join(timeout)
 
     def set_thumbs(self, thumbs: ThumbCache | None) -> None:
         """Adopt a freshly built or reconciled cache (cold-build finish or the
@@ -150,7 +193,7 @@ class ViewerPage(QWidget):
             except RuntimeError:
                 pass  # loader deleted at shutdown
 
-        threading.Thread(target=work, daemon=True).start()
+        self._submit(work)
         self.photo_shown.emit(idx)
         self.update()
 

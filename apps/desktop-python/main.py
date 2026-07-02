@@ -446,8 +446,10 @@ class MainWindow(QMainWindow):
         # preview (the nearest v2 level) while the full original loads
         # (fauxcasa-9pp). thumbs is None on a cold start until the build lands.
         self.viewer = ViewerPage(catalog, thumbs)
-        # Full-screen slideshow surface (fauxcasa-q6l.3): created per show
-        # in _start_slideshow so it can never hold a stale catalog/cache.
+        # Full-screen slideshow surface (fauxcasa-q6l.3): created lazily on
+        # first Play, then REUSED (re-pointed at the current catalog/cache
+        # each start) — never deleted mid-run, so its decode threads can
+        # never race a widget teardown (fauxcasa-gfz).
         self._slideshow: SlideshowPage | None = None
 
         # --- sidebar: All / Starred / Folders / Albums ---
@@ -666,6 +668,11 @@ class MainWindow(QMainWindow):
         self.catalog = catalog
         self.viewer.catalog = catalog
         self.viewer.set_thumbs(thumbs)         # reconciled cache for previews
+        if self._slideshow is not None and self._slideshow.isVisible():
+            # Same reason the viewer page is left: the show's display
+            # indices belong to the old catalog. (An idle surface is fine —
+            # _start_slideshow re-points it before the next show.)
+            self._slideshow._exit()
         self.pages.setCurrentWidget(self.pages.widget(0))
         self.search.blockSignals(True)
         self.search.clear()
@@ -959,19 +966,20 @@ class MainWindow(QMainWindow):
         else:
             current = self.grid.selected
         pos = self.grid.display_pos.get(current, 0)
-        show = SlideshowPage(self.catalog, self.grid.thumbs)
-        show.closed.connect(self._slideshow_closed)
-        self._slideshow = show
-        show.start(display, pos)
+        if self._slideshow is None:
+            self._slideshow = SlideshowPage(self.catalog, self.grid.thumbs)
+            self._slideshow.closed.connect(self._slideshow_closed)
+        else:
+            # Reused surface: re-point at the live catalog/cache pair (a
+            # reconcile may have swapped both since the last show).
+            self._slideshow.catalog = self.catalog
+            self._slideshow.set_thumbs(self.grid.thumbs)
+        self._slideshow.start(display, pos)
 
     def _slideshow_closed(self, _idx: int) -> None:
-        show, self._slideshow = self._slideshow, None
-        if show is None:
-            return  # already torn down (Esc exit + a window close both fired)
-        show.hide()
-        show.deleteLater()
-        # The pages beneath were never touched — "back to exactly the prior
-        # state" is just re-taking focus on whichever page is current.
+        # The surface hid itself; the pages beneath were never touched —
+        # "back to exactly the prior state" is just re-taking focus on
+        # whichever page is current.
         self.activateWindow()
         current = self.pages.currentWidget()
         (self.viewer if current is self.viewer else self.grid).setFocus()
