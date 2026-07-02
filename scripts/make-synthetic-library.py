@@ -4,6 +4,7 @@
 # dependencies = [
 #   "pillow",
 #   "piexif",
+#   "av",
 # ]
 # ///
 """Generate a synthetic photo library at cache/synthetic-library/ for
@@ -37,8 +38,12 @@ faces=/[Contacts2] (conflicting and orphaned contact ids), a synthetic
 contacts.xml, .pal album files (agreeing / divergent / orphaned vs the ini),
 geotag= keys, unknown-album-UID references (the placeholder-album case),
 plus the already-ingested classes (stars, captions, keywords, hidden,
-rotate, album defs/memberships, folder descriptions, Hidden Folders).
-The corpus ships a manifest.json of ground-truth expected counts.
+rotate, album defs/memberships, folder descriptions, Hidden Folders),
+plus two tiny deterministic video clips (PyAV, solid-color frames, ~1 s,
+a few KB each — fauxcasa-v46.2/ed5.11) whose ini sections exercise
+star/caption/album-membership attachment and width=/height= dim seeds
+for video files. The corpus ships a manifest.json of ground-truth
+expected counts.
 The default / --scale / --benchmark outputs are byte-for-byte unchanged
 by this profile (existing benchmark caches bind to library digests).
 """
@@ -118,6 +123,37 @@ def make_photo_fast(path: Path, label: str, idx: int, date: tuple[int, int, int]
         },
     })
     img.save(path, "JPEG", quality=70, exif=exif)
+
+
+CLIP_SIZE = (64, 48)
+
+
+def make_clip_fast(path: Path, idx: int, nframes: int = 8,
+                   rate: int = 8) -> None:
+    """Tiny deterministic video clip via PyAV (fauxcasa-v46.2/ed5.11):
+    solid-color frames — golden-angle hue like the photos, a subtle
+    per-frame brightness ramp so it is a real moving picture — 8 frames
+    at 8 fps (~1 s), mpeg4 in whatever container the extension names
+    (.avi/.mp4 both stock libav), a few KB each. Same content every run;
+    PyAV in-process, never an ffmpeg subprocess (decode-service §3c)."""
+    from colorsys import hsv_to_rgb
+
+    import av
+
+    w, h = CLIP_SIZE
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("mpeg4", rate=rate)
+        stream.width, stream.height = w, h
+        stream.pix_fmt = "yuv420p"
+        hue = (idx * 137) % 360
+        for i in range(nframes):
+            r, g, b = hsv_to_rgb(hue / 360, 0.6, 0.35 + 0.05 * i)
+            img = Image.new(
+                "RGB", (w, h), (int(r * 255), int(g * 255), int(b * 255)))
+            for pkt in stream.encode(av.VideoFrame.from_image(img)):
+                container.mux(pkt)
+        for pkt in stream.encode():   # flush the encoder
+            container.mux(pkt)
 
 
 def make_scale_library(n_photos: int) -> None:
@@ -403,6 +439,14 @@ _EXTRAS_FOLDERS: list[tuple[str, tuple[int, int, int], int, list[str] | None]] =
             f"faces=rect64(51c39e4b7a2d80),{CONTACT_PAD.lstrip('0')}",
             "[photo05.jpg]",
             "rotate=rotate(3)",
+            # video clip (fauxcasa-v46.2): star + album membership attach
+            # by filename exactly like a photo section; width=/height=
+            # record the source dims (Picasa writes them for movies).
+            "[clip00.avi]",
+            "star=yes",
+            f"albums={ALBUM_AGREE}",
+            "width=64",
+            "height=48",
         ],
     ),
     (
@@ -428,6 +472,12 @@ _EXTRAS_FOLDERS: list[tuple[str, tuple[int, int, int], int, list[str] | None]] =
             "BKTag Family Set-backuphash=29250",
             "[photo04.jpg]",
             "hidden=yes",
+            # captioned video clip (fauxcasa-v46.2), moov-at-end MP4 (the
+            # PyAV default mux — exactly the shape pipes would defeat)
+            "[clip00.mp4]",
+            "caption=Snowfall clip",
+            "width=64",
+            "height=48",
         ],
     ),
     (
@@ -477,6 +527,15 @@ _EXTRAS_FOLDERS: list[tuple[str, tuple[int, int, int], int, list[str] | None]] =
     ("Unsorted Box", (2018, 9, 9), 2, None),
 ]
 
+# --picasa-extras video clips (fauxcasa-v46.2 / ed5.11): (folder, file
+# name, hue idx for make_clip_fast). Their ini sections live in the
+# folder plans above; one starred + album-member .avi, one captioned
+# .mp4. Extras-only — no other profile writes video.
+_EXTRAS_VIDEOS: list[tuple[str, str, int]] = [
+    ("2009-07-04 Beach Day", "clip00.avi", 40),
+    ("2010-12-25 Winter Holiday", "clip00.mp4", 41),
+]
+
 _EXTRAS_CONTACTS_XML = (
     "<contacts>\n"
     f' <contact id="{CONTACT_ALICE}" name="Alice Example"'
@@ -492,9 +551,11 @@ _EXTRAS_CONTACTS_XML = (
 # in Picasa's "[C]\..." volume-token form.
 _EXTRAS_PALS: dict[str, tuple[str, list[str]]] = {
     # agrees with the ini: same members the albums= tokens produce
+    # (incl. the clip00.avi video member, fauxcasa-v46.2)
     ALBUM_AGREE: (
         "Best Of",
         [
+            "2009-07-04 Beach Day/clip00.avi",
             "2009-07-04 Beach Day/photo00.jpg",
             "2009-07-04 Beach Day/photo01.jpg",
             "2010-12-25 Winter Holiday/photo00.jpg",
@@ -549,17 +610,23 @@ def _pal_xml(uid: str, name: str, members: list[str]) -> str:
 # the counts below are derived by hand from the plan above and asserted
 # against the survey reader in the harness, so drift fails loudly.
 _EXTRAS_EXPECTED = {
-    "photos": 20,
+    "photos": 22,            # every walked media file: 20 stills + 2 videos
+    "videos": 2,             # the walked VIDEO_EXTS subset (fauxcasa-v46.2)
+    "video_starred": 1,      # clip00.avi star=yes
+    "video_captioned": 1,    # clip00.mp4 caption=
+    "video_album_memberships": 1,  # clip00.avi albums= token
     "folders": 5,
     "ini_files": 4,
-    "starred": 5,
-    "captioned": 3,          # the empty caption= line does not count
+    "starred": 6,            # 5 stills + the starred clip
+    "captioned": 4,          # 3 stills + the captioned clip (empty
+                             # caption= still does not count)
     "keyworded": 3,
     "hidden_photos": 2,      # per-photo hidden=yes
     "hidden_folders": 1,     # [Picasa] P2category=Hidden Folders
     "rotated": 2,
     "album_definitions": 2,  # [.album:] sections (AGREE, DIVERGE)
-    "album_memberships": 7,  # albums= tokens incl. the unknown-uid refs
+    "album_memberships": 8,  # albums= tokens incl. the unknown-uid refs
+                             # and the clip00.avi membership
     "folder_descriptions": 2,
     "face_tags": 7,
     # named after the §4 merge ([Contacts2] ∪ contacts.xml): unnamed are the
@@ -603,6 +670,10 @@ def make_extras_library(root: Path | None = None) -> Path:
             (d / ".picasa.ini").write_bytes(
                 ("\r\n".join(ini_lines) + "\r\n").encode("utf-8")
             )
+    for folder, name, hue_idx in _EXTRAS_VIDEOS:
+        f = library / folder / name
+        if not f.exists():
+            make_clip_fast(f, hue_idx)
     contacts = root / "contacts"
     contacts.mkdir(parents=True, exist_ok=True)
     (contacts / "contacts.xml").write_text(_EXTRAS_CONTACTS_XML, encoding="utf-8")
@@ -629,7 +700,9 @@ def make_extras_library(root: Path | None = None) -> Path:
         json.dumps(manifest, indent=1), encoding="utf-8"
     )
     print(
-        f"{_EXTRAS_EXPECTED['photos']} photos in {_EXTRAS_EXPECTED['folders']} "
+        f"{_EXTRAS_EXPECTED['photos']} media files (incl. "
+        f"{_EXTRAS_EXPECTED['videos']} videos) in "
+        f"{_EXTRAS_EXPECTED['folders']} "
         f"folders, {_EXTRAS_EXPECTED['ini_files']} inis, "
         f"{_EXTRAS_EXPECTED['pal_albums']} .pal, contacts.xml at {root}"
     )

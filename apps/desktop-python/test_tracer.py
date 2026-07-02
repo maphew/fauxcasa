@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "PySide6", "pillow", "exiv2", "rawpy"]
+# dependencies = ["pytest", "PySide6", "pillow", "exiv2", "rawpy", "av"]
 # ///
 """Tests for the tracer's non-GUI layers: catalog scan + metadata,
 thumbnail-cache build/load/bind, and walk-rule parity with
@@ -5372,13 +5372,14 @@ def test_import_report_persistence_and_warm_status(
 
 def test_catalog_v6_roundtrips_album_flags(
         album_library: Path, tmp_path: Path) -> None:
-    """CATALOG_VERSION is 6: placeholder and pal-sourced albums survive the
-    persisted catalog — flags, names, members — and a v5 catalog (which
+    """From CATALOG_VERSION 6 on: placeholder and pal-sourced albums survive
+    the persisted catalog — flags, names, members — and a v5 catalog (which
     silently dropped both classes) is rejected so a warm start cold-rebuilds
-    instead of hiding them again."""
+    instead of hiding them again. (>= 6: the exact current value is pinned
+    by the newest version-gate test.)"""
     import catalog as catmod
 
-    assert catmod.CATALOG_VERSION == 6
+    assert catmod.CATALOG_VERSION >= 6
     pal_dir = tmp_path / "albums"
     _write_pal(pal_dir, UID_PAL, "Pal Only", ["Trip/c.jpg"])
     cat = scan_library(album_library, pal_dir=pal_dir)
@@ -5780,3 +5781,317 @@ def test_tray_overflow_paints_plus_n_tail(tmp_path: Path) -> None:
     assert bar._shown() == (2, 2)                # geometry held through paint
 
 
+# ---------------------------------------------------------------------------
+# Video support (fauxcasa-v46.2): Picasa's documented video extension list in
+# BOTH walkers (lockstep, or caches stop binding), PyAV poster-frame decode
+# routed by extension ahead of any content sniff (per the merged decode-
+# service design §3c: PyAV in-process, never an ffmpeg subprocess), ini
+# attachment to video files (star/caption/albums/geotag + width=/height= dim
+# seeds), corrupt-video fail-soft, media kind through the catalog round-trip,
+# the grid's play badge, and the viewer's honest playback-pending note.
+# Playback itself is fauxcasa-v46.3 (gated on the §3c sandbox-valve ruling).
+#
+# Fixture provenance (privacy rule: NEVER real family data): _make_clip
+# encodes a tiny solid-color mpeg4 clip from scratch with PyAV — the same
+# engine the poster seam decodes with — so every video fixture is synthetic
+# and generated in-test.
+# ---------------------------------------------------------------------------
+
+
+def _make_clip(path: Path, color=(200, 60, 40), w: int = 64, h: int = 48,
+               nframes: int = 8, rate: int = 8) -> Path:
+    """A tiny real video: solid-`color` frames, mpeg4, in whatever
+    container the extension names (.mp4 muxes moov-at-end by default —
+    exactly the shape that defeats pipe input and needs seekable reads).
+    8 frames at 8 fps = 1 s; pass nframes=2 for a sub-second clip that
+    forces the poster's seek-past-the-end fallback."""
+    import av
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("mpeg4", rate=rate)
+        stream.width, stream.height = w, h
+        stream.pix_fmt = "yuv420p"
+        img = Image.new("RGB", (w, h), color)
+        for _ in range(nframes):
+            for pkt in stream.encode(av.VideoFrame.from_image(img)):
+                container.mux(pkt)
+        for pkt in stream.encode():   # flush the encoder
+            container.mux(pkt)
+    return path
+
+
+def test_video_extensions_in_both_walkers(tmp_path: Path) -> None:
+    """Picasa's documented video list (files-supported-by-picasa3.md "For
+    playback in Picasa": 17 extensions, plus .mpeg as the four-letter
+    alias of .mpg — the .jpeg/.jpg precedent) is in BOTH EXTS sets, in
+    lockstep; audio-only .wma/.mp3 stay excluded; both walks pick video
+    files up case-insensitively; and the size scan-filter always KEEPS
+    videos (their dims are unknowable without a decode)."""
+    import importlib.util
+
+    import catalog
+    import videoload
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+
+    documented = {".mpg", ".mpeg", ".mod", ".mmv", ".tod", ".wmv", ".asf",
+                  ".avi", ".divx", ".mov", ".m4v", ".3gp", ".3g2", ".mp4",
+                  ".m2t", ".m2ts", ".mts", ".mkv"}
+    assert videoload.VIDEO_EXTS == documented
+    assert mtc.VIDEO_EXTS == videoload.VIDEO_EXTS  # the script's mirror
+    assert catalog.EXTS == mtc.EXTS                # the whole lockstep set
+    assert documented <= catalog.EXTS
+    assert not (catalog.EXTS & {".wma", ".mp3"})   # audio is not walked
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    for name in ("a.MP4", "b.avi", "c.MoV", "d.m2ts"):
+        (root / name).write_bytes(b"stub")         # walk checks suffix only
+    make_jpeg(root / "e.jpg")
+    walked = [p.name for p in walk_library(root)]
+    assert sorted(walked) == ["a.MP4", "b.avi", "c.MoV", "d.m2ts", "e.jpg"]
+    script_walk = sorted(p for p in root.rglob("*")
+                         if p.suffix.lower() in mtc.EXTS and p.is_file())
+    assert [p.name for p in script_walk] == walked
+
+    # the size filter judges video dims unknowable and keeps every video
+    # (QImageReader must never sniff video bytes — videoload module doc)
+    kept = {p.name for p in walk_library(root, ScanFilter(min_width=10000))}
+    assert kept == {"a.MP4", "b.avi", "c.MoV", "d.m2ts"}
+
+
+def test_video_poster_thumb_media_kind_and_duration(tmp_path: Path) -> None:
+    """A real clip indexes to a poster-frame thumbnail via PyAV: the cached
+    thumb has the clip's dimensions (64x48 < 256: never upscaled) and its
+    solid frame color; a sub-second clip exercises the seek-past-the-end
+    fallback to the first decodable frame; media kind is set by extension;
+    sha256/size/mtime identity fills as usual; and the videoload seam's
+    poster_frame returns the packed fixed-shape RGB buffer plus a sane
+    probe_duration."""
+    import videoload
+
+    root = tmp_path / "lib"
+    _make_clip(root / "clip.mp4", color=(200, 60, 40))            # 1 s
+    _make_clip(root / "short.avi", color=(40, 60, 200), nframes=2)  # 0.25 s
+    make_jpeg(root / "still.jpg")
+    cat = scan_library(root)
+    assert {p.rel: p.media for p in cat.photos} == {
+        "clip.mp4": "video", "short.avi": "video", "still.jpg": "image"}
+
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    by = dict(zip(cache.files, cache.entries))
+    _o, length, w, h = by["clip.mp4"]
+    assert length > 0 and (w, h) == (64, 48)
+    img = _thumb_qimage(cache, cache.files.index("clip.mp4"))
+    px = img.pixelColor(32, 24)
+    # solid (200, 60, 40) through yuv420p + JPEG q80; allow codec drift
+    assert abs(px.red() - 200) < 40 and px.red() > px.blue()
+
+    _o, length, w, h = by["short.avi"]                 # fallback path
+    assert length > 0 and (w, h) == (64, 48)
+    px = _thumb_qimage(cache, cache.files.index("short.avi")) \
+        .pixelColor(32, 24)
+    assert px.blue() > px.red()                        # the blue clip
+
+    for p in cat.photos:                               # N6 identity as usual
+        assert p.sha256 and p.size > 0 and p.mtime > 0
+
+    # the seam's raw shape: packed RGB888, exactly w*3*h bytes (the fixed-
+    # shape pixel contract the sandboxed decode service will validate)
+    data = (root / "clip.mp4").read_bytes()
+    buf, w, h = videoload.poster_frame(data)
+    assert (w, h) == (64, 48) and len(buf) == w * 3 * h
+    dur = videoload.probe_duration(data)
+    assert dur is not None and 0.5 <= dur <= 2.0
+    assert videoload.poster_frame(b"not a video") is None
+    assert videoload.probe_duration(b"not a video") is None
+
+
+def test_video_corrupt_is_error_tile(tmp_path: Path) -> None:
+    """Corrupt videos — outright garbage bytes under two video extensions —
+    yield the existing zero-length error tile and never abort the build;
+    the good neighbors (a still AND a decodable clip) still index."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    (root / "garbage.mp4").write_bytes(b"\x00\x01 not a video" * 64)
+    (root / "noise.wmv").write_bytes(b"\xff\xd8 also not one" * 64)
+    _make_clip(root / "ok.avi")
+    make_jpeg(root / "ok.jpg")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    lengths = {rel: length for rel, (_o, length, _w, _h) in
+               zip(cache.files, cache.entries)}
+    assert lengths["garbage.mp4"] == 0         # error tile
+    assert lengths["noise.wmv"] == 0           # error tile
+    assert lengths["ok.avi"] > 0               # neighbors unharmed
+    assert lengths["ok.jpg"] > 0
+
+
+def test_video_ini_attachment_and_dim_seed(tmp_path: Path) -> None:
+    """ini sections for video files flow through the existing parse:
+    star/caption/albums/geotag attach by filename exactly like a photo's,
+    width=/height= seed Photo.dims (malformed values fail soft to None) —
+    and the indexer's SKIPPED in-file metadata pass (exiv2 video support
+    is patchy) leaves the ini values in force after a build."""
+    root = tmp_path / "lib"
+    _make_clip(root / "clip00.avi")
+    _make_clip(root / "clip01.mp4")
+    make_jpeg(root / "p.jpg")
+    uid = "d4e5f60718293a4b5c6d7e8f90a1b2c3"
+    (root / ".picasa.ini").write_text(
+        f"[.album:{uid}]\r\nname=Movies\r\n"
+        "[clip00.avi]\r\nstar=yes\r\ncaption=First swim\r\n"
+        f"albums={uid}\r\ngeotag=48.858844,2.294351\r\n"
+        "width=640\r\nheight=480\r\n"
+        "[clip01.mp4]\r\nwidth=banana\r\nheight=480\r\n")
+    cat = scan_library(root)
+    a = next(p for p in cat.photos if p.rel == "clip00.avi")
+    assert a.media == "video" and a.star == 1
+    assert a.caption == "First swim"
+    assert a.albums == (uid,)
+    assert a.geotag == pytest.approx((48.858844, 2.294351))
+    assert a.dims == (640, 480)
+    assert cat.albums[uid].members == [cat.photos.index(a)]
+    b = next(p for p in cat.photos if p.rel == "clip01.mp4")
+    assert b.dims is None                      # malformed width= fails soft
+
+    assert thumbcache.build_cache(cat, tmp_path / "c") is not None
+    assert a.caption == "First swim" and a.star == 1  # ini stays in force
+
+
+def test_video_catalog_roundtrip_media_and_dims(tmp_path: Path) -> None:
+    """media kind and ini-seeded dims survive save_catalog/load_catalog:
+    dims persist (`wh` rows — the warm path never re-reads inis) while
+    media is DERIVED from the extension on load, never stored; and a
+    pre-v6 catalog (walked without videos) is rejected so a warm start
+    can never silently hide every video in the library."""
+    import catalog as catmod
+
+    root = tmp_path / "lib"
+    _make_clip(root / "c.mp4")
+    make_jpeg(root / "p.jpg")
+    (root / ".picasa.ini").write_text("[c.mp4]\r\nwidth=64\r\nheight=48\r\n")
+    cat = scan_library(root)
+    assert thumbcache.build_cache(cat, tmp_path / "cc") is not None
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, root)
+    assert loaded is not None
+    v = next(p for p in loaded.photos if p.rel == "c.mp4")
+    assert v.media == "video" and v.dims == (64, 48)
+    assert v.sha256 == next(p for p in cat.photos
+                            if p.rel == "c.mp4").sha256
+    s = next(p for p in loaded.photos if p.rel == "p.jpg")
+    assert s.media == "image" and s.dims is None
+    rows = json.loads(path.read_text())["photos"]
+    assert all("media" not in r for r in rows)  # derived, never persisted
+
+    data = json.loads(path.read_text())
+    data["version"] = catmod.CATALOG_VERSION - 1
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, root) is None     # pre-video: cold-rebuild
+
+
+def test_grid_video_play_badge_paint_smoke(tmp_path: Path) -> None:
+    """The video play badge paints in its OWN corner (bottom-left; star
+    owns top-right, geotag pin bottom-right) without incident alongside
+    both other badges: the badge-center pixel of a video tile is the play
+    glyph's white, the same spot on a non-video neighbor is not."""
+    from PySide6.QtGui import QImage
+
+    from grid import _play_polygon
+
+    g = _selection_grid(tmp_path)
+    cat = g.catalog
+    d = g.display
+    cat.photos[d[0]].media = "video"
+    cat.photos[d[0]].star = 2                       # all three corners at once
+    cat.photos[d[0]].geotag = (60.72125, -135.05685)
+    shot = g.viewport().grab().toImage().convertToFormat(
+        QImage.Format.Format_RGB32)
+    assert not shot.isNull()
+
+    s = max(7.0, g.tile / 14.0)
+
+    def badge_px(n: int):
+        r = g._item_rect(g.groups[0], n)            # scroll is 0: same coords
+        c = shot.pixelColor(int(r.x() + s + 2), int(r.bottom() - s - 2))
+        return (c.red(), c.green(), c.blue())
+
+    assert all(abs(v - 235) < 25 for v in badge_px(0))      # the play glyph
+    assert not all(abs(v - 235) < 25 for v in badge_px(1))  # plain neighbor
+
+    # shape sanity: a right-pointing triangle — apex at the vertical center
+    poly = _play_polygon(10.0, 10.0, 8.0)
+    assert poly.size() == 3
+    assert poly.at(1).x() > poly.at(0).x() and poly.at(1).y() == 10.0
+
+
+def test_viewer_video_poster_and_pending_note(tmp_path: Path) -> None:
+    """viewer.load_original routes video by extension to the poster seam:
+    a clip's poster decodes at native size (proven by dimensions AND the
+    frame color), the Picasa rotate= turns compose on top exactly like any
+    format, a corrupt video returns a null QImage (fail-soft), and the
+    viewer's info line carries the honest M1 placeholder — the poster is
+    shown, playback is named as pending v46.3, never attempted."""
+    _offscreen_app()
+    from viewer import ViewerPage, load_original
+
+    root = tmp_path / "lib"
+    clip = _make_clip(root / "clip.mp4", color=(200, 60, 40))
+    make_jpeg(root / "p.jpg")
+    img = load_original(str(clip), 0)
+    assert (img.width(), img.height()) == (64, 48)
+    px = img.pixelColor(32, 24)
+    assert abs(px.red() - 200) < 40 and px.red() > px.blue()
+    img = load_original(str(clip), 1)          # rotate= composes on top
+    assert (img.width(), img.height()) == (48, 64)
+
+    bad = root / "bad.avi"
+    bad.write_bytes(b"garbage" * 100)
+    assert load_original(str(bad), 0).isNull()
+
+    cat = scan_library(root)
+    v = ViewerPage(cat, None)
+    v.resize(320, 240)
+    v.show()
+    idx = next(i for i, p in enumerate(cat.photos) if p.rel == "clip.mp4")
+    v.show_photo([idx], 0)
+    assert "video — playback pending (v46.3)" in v._info_text(cat.photos[idx])
+    still = next(p for p in cat.photos if p.rel == "p.jpg")
+    assert "playback pending" not in v._info_text(still)
+    assert not v.grab().isNull()               # the note paints w/o incident
+    v.quiesce()
+
+
+def test_make_thumbcache_video_paths(tmp_path: Path) -> None:
+    """The standalone PIL builder mirrors the same routing (in PyAV+PIL
+    terms): a real clip thumbs to its poster frame at native size with the
+    frame's color; corrupt video bytes are the error tile."""
+    import importlib.util
+    import io
+
+    from PIL import Image
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+
+    clip = _make_clip(tmp_path / "c.mp4", color=(200, 60, 40))
+    (blob, w, h), = mtc._make_thumb(clip, [256])
+    assert blob and (w, h) == (64, 48)
+    px = Image.open(io.BytesIO(blob)).getpixel((32, 24))
+    assert abs(px[0] - 200) < 40 and px[0] > px[2]
+
+    bad = tmp_path / "bad.wmv"
+    bad.write_bytes(b"not a movie")
+    assert mtc._make_thumb(bad, [256]) == [(b"", 0, 0)]

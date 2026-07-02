@@ -4,6 +4,7 @@
 # dependencies = [
 #   "pillow",
 #   "piexif",
+#   "av",
 # ]
 # ///
 """M1 ingest-loss gate (fauxcasa-ed5.1): survey/tracer cross-check.
@@ -62,9 +63,11 @@ sys.path.insert(0, str(REPO / "apps" / "desktop-python"))
 import picasa_db  # noqa: E402
 from catalog import Catalog, Photo, load_contacts_xml, scan_library  # noqa: E402
 
-# Image extensions the tracer walks (catalog.EXTS is the tracer's rule;
-# imported, not copied, so the photo count follows the tracer's walk).
+# Media extensions the tracer walks (catalog.EXTS is the tracer's rule;
+# imported, not copied, so the photo count follows the tracer's walk) and
+# the video subset (fauxcasa-v46.2 — the 'videos' class counts against it).
 from catalog import EXTS  # noqa: E402
+from videoload import VIDEO_EXTS  # noqa: E402
 
 
 def _load_generator():
@@ -85,8 +88,9 @@ def _load_generator():
 @dataclass
 class Reference:
     survey: dict[str, Any]        # picasa_db._survey_ini_tree(library)
-    photos_fs: int                # image files under library/ (tracer walk rule)
-    folders_fs: int               # dirs containing >=1 image file
+    photos_fs: int                # media files under library/ (tracer walk rule)
+    videos_fs: int                # the VIDEO_EXTS subset (fauxcasa-v46.2)
+    folders_fs: int               # dirs containing >=1 media file
     pal_files: int                # albums/*.pal
     contacts_xml: int             # <contact> entries in contacts/contacts.xml
     manifest: dict[str, Any]      # generator ground truth
@@ -107,6 +111,7 @@ def build_reference(corpus: Path) -> Reference:
     return Reference(
         survey=survey,
         photos_fs=len(images),
+        videos_fs=sum(1 for p in images if p.suffix.lower() in VIDEO_EXTS),
         folders_fs=len({p.parent for p in images}),
         pal_files=len(list((corpus / "albums").glob("*.pal"))),
         contacts_xml=contacts_xml,
@@ -193,6 +198,15 @@ CLASSES: list[ParityClass] = [
     ParityClass(
         "folders", lambda r: r.folders_fs,
         lambda c, r: len(c.folders), manifest_key="folders"),
+    ParityClass(
+        # video files walked + kinded (fauxcasa-v46.2): the fs count of
+        # VIDEO_EXTS suffixes vs the catalog's media=='video' photos —
+        # losing one silently is exactly the ingest-loss this gate exists
+        # to catch. Their ini star/caption/albums attach by filename like
+        # any photo, so those flow through the classes below untouched.
+        "videos", lambda r: r.videos_fs,
+        lambda c, r: sum(1 for p in c.photos if p.media == "video"),
+        manifest_key="videos"),
     ParityClass(
         "starred", _feat("starred"),
         lambda c, r: sum(1 for p in c.photos if p.star),

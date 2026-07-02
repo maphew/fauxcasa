@@ -6,7 +6,7 @@ LRU of decoded tiles) with the benchmark hacks replaced by product
 behavior: event-driven repaints instead of a 240 Hz timer, a real
 scrollbar via QAbstractScrollArea, resize handling, group headers with
 a pinned current-folder header, multi-selection (set + current/anchor,
-Ctrl/Shift semantics) and activation, star + geotag corner badges, and
+Ctrl/Shift semantics) and activation, star + geotag + video-play corner badges, and
 error tiles for undecodable entries. Scrolling reads ONLY the cache
 pair, never originals (N4).
 """
@@ -122,6 +122,7 @@ HEADER_FG = QColor(200, 200, 200)
 SELECT = QColor(64, 140, 255)
 STAR_GOLD = QColor(255, 200, 40)
 GEO_TEAL = QColor(64, 205, 175)  # geotag badge (fauxcasa-cam.10)
+PLAY_WHITE = QColor(235, 235, 235)  # video play badge (fauxcasa-v46.2)
 HIDDEN_VEIL = QColor(0, 0, 0, 110)  # reveal mode: dim hidden/stash tiles
 # Selection pens, hoisted out of the paint loop (fauxcasa-q6l.1): every
 # member of the selection set gets the thin rect; the CURRENT item gets the
@@ -145,6 +146,19 @@ def _star_polygon(cx: float, cy: float, r: float) -> QPolygonF:
         rad = r if i % 2 == 0 else r * 0.42
         ang = -math.pi / 2 + i * math.pi / 5
         poly.append(QPointF(cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+    return poly
+
+
+def _play_polygon(cx: float, cy: float, r: float) -> QPolygonF:
+    """Right-pointing play triangle for the video corner badge
+    (fauxcasa-v46.2): (cx, cy) is the shape center, r the half-height —
+    the same size convention as _star_polygon/_pin_polygon so the three
+    badges read as a set. Width is trimmed (0.75r each way) so the
+    triangle's visual weight matches the other glyphs'."""
+    poly = QPolygonF()
+    poly.append(QPointF(cx - r * 0.75, cy - r))
+    poly.append(QPointF(cx + r * 0.75, cy))
+    poly.append(QPointF(cx - r * 0.75, cy + r))
     return poly
 
 
@@ -818,6 +832,16 @@ class GridView(QAbstractScrollArea):
                 painter.setBrush(GEO_TEAL)
                 painter.drawPolygon(_pin_polygon(
                     r.right() - s - 2, r.bottom() - s - 2, s))
+            if photo.media == "video":
+                # Play-glyph corner badge (fauxcasa-v46.2): a video tile is
+                # a poster frame, indistinguishable from a still without a
+                # mark. BOTTOM-LEFT, its own corner — star owns top-right,
+                # geotag pin bottom-right.
+                s = max(7.0, self.tile / 14.0)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(PLAY_WHITE)
+                painter.drawPolygon(_play_polygon(
+                    r.x() + s + 2, r.bottom() - s - 2, s))
             # Multi-select paint (fauxcasa-q6l.1): every selected tile
             # shows the selection rect; the current item is distinct via
             # the stronger border (dashed focus cue if Ctrl-toggled out of
