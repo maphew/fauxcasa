@@ -64,10 +64,37 @@ _STOP = object()
 # ~13 ms < 32 ms) but total process RSS peaks ~590 MB: under the ~600 MB
 # working target, above the old 512 MB figure. Reclaiming that headroom
 # (lower CACHE_BYTES, or zoom-aware tile sizing) is tracked separately.
+# NOTE: the px/byte figures above reason at devicePixelRatio 1 (256 px / 256 KB
+# tiles). The hi-DPI consumer (fauxcasa-q7m) decodes up to TILE_NATIVE*d, so at
+# d==2 tiles are ~512 px / ~1 MB and the want-band's byte footprint is ~d^2
+# larger; the budget still binds correctly (eviction sums img.sizeInBytes(), not
+# entries), but the worked example is dpr-1 and the d>1 RSS re-measurement is
+# owed with the §7 re-baseline (fauxcasa-q7m / fauxcasa-k5p).
 CACHE_BYTES = 256 * 1024 * 1024
 CACHE_MAX_ENTRIES = 4096
-# Native decoded-tile edge: the cache's own thumb size. Tiles are decoded
-# at (or capped to) this and scaled to self.tile in paint.
+# Native decoded-tile edge at devicePixelRatio 1: the cache's own thumb size
+# and the max zoom tile (set_zoom caps self.tile at 256 == THUMB_EDGE). Tiles
+# are decoded at (or capped to) the DPR-scaled native edge and scaled to
+# self.tile in paint.
+#
+# fcache v2 hi-DPI consumer (fauxcasa-q7m): on a display with
+# devicePixelRatio d, a tile drawn at self.tile LOGICAL px covers self.tile*d
+# DEVICE px, so a 256 native tile is upscaled (soft) once d>1. The grid now
+# decodes the nearest v2 level >= TILE_NATIVE*d (best_level/entry) and caps to
+# TILE_NATIVE*d, so the device footprint is filled at native resolution. The
+# base is the MAX tile (TILE_NATIVE), NOT the current self.tile: keeping it
+# zoom-independent preserves the z1e invariant (one decode per photo serves
+# every zoom; zoom never re-decodes). The bead's "tile*devicePixelRatio" is
+# read as max-tile*dpr for that reason. At d==1 best_level(256) selects the
+# same 256 level the grid read before, so this is a no-op and the §7 numbers
+# (measured at d==1) are unchanged by construction — this no-op holds for any cache that CONTAINS
+# a 256 level (v1 [256] and RECOMMENDED_LEVELS both do; a hand-built set
+# lacking 256, e.g. [512,128], would instead read the 512 blob capped to 256,
+# not the old primary, but no shipped config builds such a set); d>1 reads the
+# 512 level of
+# a v2 cache (or falls back to the largest level a v1 cache offers) at ~d^2 the
+# decoded bytes -> its own RSS/scroll-fps re-measurement is owed (fauxcasa-q7m,
+# pairs with the §7 v2 re-baseline fauxcasa-k5p).
 TILE_NATIVE = THUMB_EDGE
 PREFETCH_SCREENS = 1.0
 
@@ -136,6 +163,11 @@ class GridView(QAbstractScrollArea):
         self.pending_lock = threading.Lock()
         self.tiles: dict[int, list] = {}  # idx -> [QImage|None(error), frame, nbytes]
         self._cache_bytes = 0  # running sum of tiles' decoded bytes (CACHE_BYTES)
+        # DPR-scaled native decode edge (fauxcasa-q7m). Read on the GUI thread
+        # in paintEvent (devicePixelRatioF needs a screen) and stashed for the
+        # decode workers; TILE_NATIVE until the first paint resolves the real
+        # ratio. A plain int — workers only read it.
+        self._tile_native = TILE_NATIVE
         self.frame_no = 0
         # Optional bench hook: callable(t_start, t_end, blank). Set by the
         # scroll benchmark (apps/desktop-python/bench_scroll.py) to time frame
@@ -350,7 +382,12 @@ class GridView(QAbstractScrollArea):
                         thumbs.path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
                     )
                     fd_thumbs = thumbs
-                offset, length, _w, _h = thumbs.entries[idx]
+                # fcache v2 hi-DPI consumer (fauxcasa-q7m): read the cheapest
+                # level that covers the DPR-scaled native edge. v1 / d==1 ->
+                # the 256 level the grid always read (no-op); a hi-DPI display
+                # reads the 512 v2 level, or the largest level a v1 cache has.
+                native = self._tile_native
+                offset, length, _w, _h = thumbs.entry(idx, thumbs.best_level(native))
                 if length > 0:
                     # os.pread is Unix-only (it raises AttributeError on
                     # Windows, which the broad except below would turn into an
@@ -366,12 +403,14 @@ class GridView(QAbstractScrollArea):
                 if img is not None:
                     # Keep the tile at native cache resolution; paint scales
                     # it to the current tile size, so zoom never re-decodes.
-                    # Cache blobs are already <= TILE_NATIVE; the cap is a
-                    # defensive guard against an oversized blob, not a
-                    # per-zoom pre-scale.
-                    if img.width() > TILE_NATIVE or img.height() > TILE_NATIVE:
+                    # Cache blobs are already <= the chosen level; the cap is a
+                    # defensive guard against an oversized blob and trims a
+                    # larger level down to the device footprint we actually
+                    # paint (best_level returns the smallest SUFFICIENT level,
+                    # which may exceed `native` when no exact match exists).
+                    if img.width() > native or img.height() > native:
                         img = img.scaled(
-                            TILE_NATIVE, TILE_NATIVE,
+                            native, native,
                             Qt.AspectRatioMode.KeepAspectRatio,
                             Qt.TransformationMode.SmoothTransformation,
                         )
@@ -532,12 +571,27 @@ class GridView(QAbstractScrollArea):
                 return False
         return True
 
+    def _refresh_tile_native(self) -> None:
+        """Recompute the DPR-scaled native decode edge on the GUI thread
+        (fauxcasa-q7m). devicePixelRatioF() needs a live screen, so this runs
+        in paintEvent, not the worker. The base is TILE_NATIVE (the max zoom
+        tile), not self.tile, so the native size is zoom-independent (z1e: one
+        decode per photo serves every zoom). On a change — first real paint, or
+        the window dragged to a monitor with a different ratio — invalidate so
+        in-flight and cached tiles re-decode at the new level; unchanged is the
+        common case and costs one int compare."""
+        want = max(TILE_NATIVE, round(TILE_NATIVE * self.devicePixelRatioF()))
+        if want != self._tile_native:
+            self._tile_native = want
+            self._invalidate_tiles()
+
     # ---------- painting ----------
 
     def paintEvent(self, _event) -> None:
         probe = self._frame_probe
         t_start = perf_counter() if probe is not None else 0.0
         self.frame_no += 1
+        self._refresh_tile_native()
         self._pump_decoded()
         vp = self.viewport()
         top = self.verticalScrollBar().value()
