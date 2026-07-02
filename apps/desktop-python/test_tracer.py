@@ -4431,7 +4431,7 @@ def test_metadata_catalog_roundtrip_and_version_gate(
     assert a.date_taken == "1899-03-02T14:00:00"
 
     # the version gate: a v4 (pre-metadata) catalog cold-rebuilds
-    assert catmod.CATALOG_VERSION == 5
+    assert catmod.CATALOG_VERSION >= 5   # exact value pinned by the v6 test
     data = json.loads(path.read_text())
     data["version"] = 4
     path.write_text(json.dumps(data))
