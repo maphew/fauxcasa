@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "PySide6", "pillow"]
+# dependencies = ["pytest", "PySide6", "pillow", "rawpy"]
 # ///
 """Tests for the tracer's non-GUI layers: catalog scan + metadata,
 thumbnail-cache build/load/bind, and walk-rule parity with

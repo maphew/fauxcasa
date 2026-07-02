@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter
@@ -43,12 +44,27 @@ def load_original(path: str, rotate: int) -> QImage:
     viewer's async load and the slideshow's dwell prefetch (slideshow.py),
     so every consumer orients identically. Returns a null QImage on
     failure. Thread-safe: QImage (unlike QPixmap) may be built off the GUI
-    thread, and callers do call this from worker threads."""
+    thread, and callers do call this from worker threads.
+
+    RAW files route by extension to rawload BEFORE QImageReader can sniff
+    the TIFF-based container (rawload module doc): embedded JPEG preview
+    first — usually full-size, so the viewer stays responsive — else a
+    full demosaic; orientation lands exactly once on either path, and the
+    rotate= turns compose on top exactly as for any other format."""
     from PySide6.QtGui import QImageReader
 
-    reader = QImageReader(path)
-    reader.setAutoTransform(True)
-    img = reader.read()
+    from rawload import is_raw_suffix, load_raw_qimage
+
+    if is_raw_suffix(path):
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return QImage()
+        img = load_raw_qimage(data)
+    else:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        img = reader.read()
     if not img.isNull() and rotate:
         from PySide6.QtGui import QTransform
 

@@ -47,8 +47,12 @@ _repo = os.path.dirname(os.path.dirname(_here))
 
 # apps/desktop-python/main.py imports its siblings (catalog/grid/thumbcache/viewer) as
 # top-level modules after sys.path.insert(parent) — they are NOT a package,
-# so PyInstaller's module graph needs them named explicitly.
-_hidden = ["catalog", "grid", "thumbcache", "viewer", "picasa_db", "applog"]
+# so PyInstaller's module graph needs them named explicitly. rawpy (the
+# LibRaw wheel behind the sibling rawload seam, fauxcasa-v46.1) is named
+# too because rawload imports it lazily inside functions — its compiled
+# _rawpy extension bundles libraw, no system install (wheels only).
+_hidden = ["catalog", "grid", "thumbcache", "viewer", "rawload",
+           "picasa_db", "applog", "rawpy"]
 
 # Qt modules the tracer never touches (QtCore/QtGui/QtWidgets only). Mostly
 # no-ops under PySide6-Essentials, but they make the build self-documenting

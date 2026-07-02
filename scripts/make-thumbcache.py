@@ -3,6 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "pillow",
+#   "rawpy",
 # ]
 # ///
 """Pre-build the packed thumbnail cache for the stack trial balloons
@@ -71,7 +72,18 @@ from pathlib import Path
 CACHE = Path(__file__).resolve().parent.parent / "cache"
 MAGIC = b"FCTC"
 THUMB_EDGE = 256
-EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
+# Picasa's documented 16-vendor RAW extension list. Mirror of
+# apps/desktop-python/rawload.py RAW_EXTS (fauxcasa-v46.1) — must match
+# exactly, like EXTS below, or cache-order parity breaks (test_tracer.py
+# asserts the sets are equal).
+RAW_EXTS = frozenset({
+    ".3fr", ".arw", ".cr2", ".crw", ".dcr", ".dng", ".kdc", ".mrw",
+    ".nef", ".nrw", ".orf", ".pef", ".raf", ".raw", ".rw2", ".sr2",
+    ".srf", ".x3f",
+})
+# Must match apps/desktop-python/catalog.py EXTS exactly (cache-order parity).
+EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
+        ".webp"} | RAW_EXTS
 # Mirror of apps/desktop-python/thumbcache.py.RECOMMENDED_LEVELS — 512 is the
 # hi-DPI/loupe payload, 256 is the grid's primary, 128 a cheap low-DPI level.
 RECOMMENDED_LEVELS = (512, THUMB_EDGE, 128)
@@ -125,33 +137,60 @@ def _parse_levels(spec: str | None) -> list[int]:
     return _normalize_levels(raw)
 
 
-def _make_thumb(path: Path, levels: list[int]) -> list[tuple[bytes, int, int]]:
+def _open_source(path: Path):
+    """Decoded, orientation-applied RGB image for `path`. RAW files route
+    BY EXTENSION to rawpy before PIL can content-sniff the TIFF-based
+    container (mirror of apps/desktop-python/rawload.py, same strategy as
+    thumbcache._index_one): embedded JPEG preview first — decoded like any
+    JPEG, its own EXIF tag applied by exif_transpose, once — else a
+    half-size demosaic whose flip LibRaw already baked (so NO
+    exif_transpose on that branch: orientation lands exactly once).
+    Raises on failure; _make_thumb's broad except is the error tile."""
     from PIL import Image, ImageOps
 
+    if path.suffix.lower() in RAW_EXTS:
+        import rawpy
+
+        # Bytes in, pixels out (like rawload): sidesteps libraw-vs-Windows
+        # path-encoding differences and matches the future sandbox seam.
+        with rawpy.imread(io.BytesIO(path.read_bytes())) as raw:
+            try:
+                thumb = raw.extract_thumb()
+                jpeg = (thumb.data
+                        if thumb.format == rawpy.ThumbFormat.JPEG else None)
+            except rawpy.LibRawError:
+                jpeg = None  # no/unsupported preview -> demosaic below
+            if jpeg is None:
+                return Image.fromarray(raw.postprocess(half_size=True))
+        with Image.open(io.BytesIO(jpeg)) as img:
+            return ImageOps.exif_transpose(img).convert("RGB")
+    with Image.open(path) as img:
+        # Bake EXIF orientation (all 8 cases, mirrors too) so this builder
+        # agrees with the in-app one (apps/desktop-python/thumbcache.py) and
+        # the viewer; the Picasa rotate= user turns are composed live at
+        # display, never baked. No-op without an Orientation tag.
+        return ImageOps.exif_transpose(img).convert("RGB")
+
+
+def _make_thumb(path: Path, levels: list[int]) -> list[tuple[bytes, int, int]]:
     try:
-        with Image.open(path) as img:
-            # Bake EXIF orientation (all 8 cases, mirrors too) so this builder
-            # agrees with the in-app one (apps/desktop-python/thumbcache.py) and the viewer;
-            # the Picasa rotate= user turns are composed live at display, never
-            # baked. No-op for images without an Orientation tag.
-            img = ImageOps.exif_transpose(img)
-            img = img.convert("RGB")
-            # Decode once to the top (largest) level, then downscale to each lower
-            # level — never upscale (PIL.thumbnail caps at the source size, as the
-            # legacy single-256 path did). A single level reproduces that path
-            # byte-for-byte.
-            img.thumbnail((levels[0], levels[0]))
-            out: list[tuple[bytes, int, int]] = []
-            for edge in levels:
-                if img.width <= edge and img.height <= edge:
-                    lvl = img
-                else:
-                    lvl = img.copy()
-                    lvl.thumbnail((edge, edge))
-                buf = io.BytesIO()
-                lvl.save(buf, "JPEG", quality=80)
-                out.append((buf.getvalue(), lvl.width, lvl.height))
-            return out
+        img = _open_source(path)
+        # Decode once to the top (largest) level, then downscale to each lower
+        # level — never upscale (PIL.thumbnail caps at the source size, as the
+        # legacy single-256 path did). A single level reproduces that path
+        # byte-for-byte.
+        img.thumbnail((levels[0], levels[0]))
+        out: list[tuple[bytes, int, int]] = []
+        for edge in levels:
+            if img.width <= edge and img.height <= edge:
+                lvl = img
+            else:
+                lvl = img.copy()
+                lvl.thumbnail((edge, edge))
+            buf = io.BytesIO()
+            lvl.save(buf, "JPEG", quality=80)
+            out.append((buf.getvalue(), lvl.width, lvl.height))
+        return out
     except Exception:
         # A corrupt/unreadable source yields a zero-length blob at every level —
         # the same error tile the in-app builder emits when its decode returns a
