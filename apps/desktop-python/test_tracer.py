@@ -3855,3 +3855,59 @@ def test_grid_jump_top_end_and_buttons(tmp_path: Path) -> None:
         assert b.focusPolicy() == _Qt.FocusPolicy.NoFocus
 
 
+# ---------------------------------------------------------------------------
+# §7 performance gates (fauxcasa-ed5.4/.3): the --search-probe latency
+# harness and the per-catalog search-haystack index behind it. The probe
+# emits one machine-readable {"event":"search","query","ms","hits"} line
+# per comma-separated query (scripts/perf-canary.py parses these in CI);
+# the haystack list is a MainWindow-owned parallel structure — NOT Photo
+# fields — rebuilt on reload_data and on cold-index finish, because
+# build_cache merges in-file captions/keywords into photos in place.
+# ---------------------------------------------------------------------------
+
+
+def test_search_probe_emits_wellformed_events(search_library: Path,
+                                              capsys) -> None:
+    """run_search_probe drives each query through the real search box (the
+    same setText -> _search_changed path a keystroke takes), prints one JSON
+    line per query with the documented keys, skips blank segments, and
+    leaves the box empty. Repeated identical queries re-fire (the probe
+    clears the box between queries)."""
+    from main import run_search_probe
+
+    win = _search_win(search_library)
+    events = run_search_probe(
+        win, "beach, beach -dunes ,nosuchterm,-city, ,beach")
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    assert [json.loads(ln) for ln in lines] == events
+
+    assert [e["query"] for e in events] == [
+        "beach", "beach -dunes", "nosuchterm", "-city", "beach"]
+    by_q = {e["query"]: e for e in events}
+    assert by_q["beach"]["hits"] == 2           # sunset.jpg + dunes.jpg
+    assert by_q["beach -dunes"]["hits"] == 1    # negation applies
+    assert by_q["nosuchterm"]["hits"] == 0
+    assert by_q["-city"]["hits"] == 2           # negation-only query
+    for e in events:
+        assert e["event"] == "search"
+        assert isinstance(e["ms"], float) and e["ms"] >= 0.0
+        assert isinstance(e["hits"], int)
+    assert win.search.text() == ""              # box left clean
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg", "market.jpg",
+                          "street.jpg"}         # ...and the filter reset
+
+
+def test_search_changed_records_latency_and_hits(search_library: Path
+                                                 ) -> None:
+    """Every _search_changed run — including the empty-query reset path —
+    records last_search_ms/last_search_hits for the probe to read."""
+    win = _search_win(search_library)
+
+    win.search.setText("beach")
+    assert win.last_search_hits == 2
+    assert win.last_search_ms >= 0.0
+    win.search.setText("")                      # reset path records too
+    assert win.last_search_hits == 4            # the unfiltered view
+    assert win.last_search_ms >= 0.0
+
+

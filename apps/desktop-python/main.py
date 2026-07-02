@@ -477,6 +477,11 @@ class MainWindow(QMainWindow):
         self.ready_reported = False
         self.build_failed = False
         self.last_index_rate = 0.0
+        # §7 search-latency instrumentation (fauxcasa-ed5.4): _search_changed
+        # records its own end-to-end latency + hit count here; the
+        # --search-probe harness (run_search_probe) reads them per query.
+        self.last_search_ms = 0.0
+        self.last_search_hits = 0
         self.setWindowTitle(f"{APP_NAME} tracer — {catalog.root.name}")
         self.resize(1280, 800)
 
@@ -1032,10 +1037,17 @@ class MainWindow(QMainWindow):
         return pos, neg
 
     def _search_changed(self, text: str) -> None:
+        # Timed end to end — parse + filter scan + grid.set_filter + status
+        # label — because §7's budget is "search keystroke -> filtered grid
+        # < 50 ms". The repaint after set_filter is the grid's normal async
+        # frame and is not included (fauxcasa-ed5.4).
+        t0 = time.perf_counter()
         pos, neg = self._parse_query(text)
         if not pos and not neg:
             self.grid.set_filter(None, "")
             self._show_counts("All photos", self._shown_count())
+            self.last_search_hits = self._shown_count()
+            self.last_search_ms = (time.perf_counter() - t0) * 1000.0
             return
         cat = self.catalog
         # Folder text is shared by every photo in a folder: precompute ONE
@@ -1069,6 +1081,8 @@ class MainWindow(QMainWindow):
         q = text.strip().lower()
         self.grid.set_filter(idxs, f"search: {q}")
         self._show_counts(f"Search “{q}”", len(idxs))
+        self.last_search_hits = len(idxs)
+        self.last_search_ms = (time.perf_counter() - t0) * 1000.0
 
     # ---------- status ----------
 
@@ -1158,6 +1172,31 @@ class MainWindow(QMainWindow):
         (self.viewer if current is self.viewer else self.grid).setFocus()
 
 
+def run_search_probe(win: MainWindow, spec: str) -> list[dict]:
+    """§7 search-latency probe (fauxcasa-ed5.4): drive each comma-separated
+    query through the live search box exactly as its final keystroke would
+    (setText -> textChanged -> _search_changed, synchronously) and print one
+    machine-readable {"event": "search", "query", "ms", "hits"} line per
+    query for the CI/dev harness. `ms` is _search_changed end to end (see
+    its docstring comment for what that covers). The box is cleared between
+    queries — a repeated identical query would otherwise not re-fire
+    textChanged — and left empty afterwards. Blank segments are skipped, so
+    a trailing comma is harmless."""
+    events: list[dict] = []
+    for q in (t.strip() for t in spec.split(",")):
+        if not q:
+            continue
+        win.search.setText("")
+        win.search.setText(q)
+        ev = {"event": "search", "query": q,
+              "ms": round(win.last_search_ms, 3),
+              "hits": win.last_search_hits}
+        print(json.dumps(ev), flush=True)
+        events.append(ev)
+    win.search.setText("")
+    return events
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -1199,6 +1238,12 @@ def main() -> int:
                          "of the current view (screenshot testing)")
     ap.add_argument("--quit-after-ready", action="store_true",
                     help="exit right after the READY line (perf probe)")
+    ap.add_argument("--search-probe", type=str, default=None, metavar="TERMS",
+                    help="after READY, run each comma-separated query "
+                         "through the search box, print a machine-readable "
+                         '{"event":"search",...} line per query, then quit '
+                         "(§7 latency probe; offscreen-safe; a query may "
+                         "contain spaces and -negations)")
     ap.add_argument("--finish-build", action="store_true",
                     help="scripted runs: wait for an in-flight cache "
                          "build before quitting (warm-run scripting)")
@@ -1304,7 +1349,8 @@ def main() -> int:
 
     # READY instrumentation (§7 cold start): poll until every visible
     # tile is decoded, then report cold start + RSS on stdout.
-    state = {"scrolled": False, "shot": False, "opened": False}
+    state = {"scrolled": False, "shot": False, "opened": False,
+             "probed": False}
 
     def may_quit() -> bool:
         if not args.finish_build:
@@ -1326,6 +1372,17 @@ def main() -> int:
             win.ready_reported = True
             cold_ms = (time.perf_counter() - T0) * 1000.0
             rss, hwm = read_rss_mb()
+            # §7 catalog-size row (fauxcasa-ed5.3): the persisted
+            # catalog.json's on-disk bytes, normalized per photo. 0 = not
+            # yet persisted (a cold build writes it when the index lands).
+            # KNOWN TENSION (fauxcasa-1jb): the ~50 B/photo budget is
+            # oracle-derived, and the tracer's JSON rows (rel + sha256
+            # alone are ~100 chars) do not meet it — this field MEASURES
+            # the row honestly; it does not claim the budget.
+            try:
+                cat_bytes = cat_path.stat().st_size
+            except OSError:
+                cat_bytes = 0
             print("READY", flush=True)
             print(json.dumps({
                 "event": "ready",
@@ -1336,14 +1393,23 @@ def main() -> int:
                 "visible_photos": catalog.visible_count,
                 "folders": len(catalog.folders),
                 "albums": len(catalog.albums),
+                "catalog_bytes": cat_bytes,
+                "catalog_bytes_per_photo": round(
+                    cat_bytes / max(1, len(catalog.photos)), 1),
                 "vm_rss_mb": round(rss, 1),
                 "vm_hwm_mb": round(hwm, 1),
             }), flush=True)
             if args.quit_after_ready and args.screenshot is None \
                     and args.scroll_to is None and args.open is None \
-                    and may_quit():
+                    and args.search_probe is None and may_quit():
                 app.quit()
                 return
+        if args.search_probe is not None and not state["probed"]:
+            # §7 search probe (fauxcasa-ed5.4): run once, right after READY,
+            # then fall through to the normal scripted-quit path below —
+            # --search-probe implies quit (see the bottom of check_ready).
+            state["probed"] = True
+            run_search_probe(win, args.search_probe)
         if args.scroll_to is not None and not state["scrolled"]:
             state["scrolled"] = True
             win.grid.scroll_to_fraction(args.scroll_to)
@@ -1368,7 +1434,7 @@ def main() -> int:
                 app.exit(1)
                 return
             app.quit()
-        elif args.quit_after_ready:
+        elif args.quit_after_ready or args.search_probe is not None:
             app.quit()
         else:
             poll.stop()  # interactive run: instrumentation is done
@@ -1379,7 +1445,8 @@ def main() -> int:
     poll.start()
     # Hard stop for scripted runs: a stuck decode must fail loudly, not
     # hang CI or masquerade as success.
-    if args.screenshot is not None or args.quit_after_ready:
+    if args.screenshot is not None or args.quit_after_ready \
+            or args.search_probe is not None:
         def on_timeout() -> None:
             log.error("TIMEOUT after %ss — ready=%s state=%s",
                       args.timeout, win.ready_reported, state)
