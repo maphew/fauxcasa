@@ -48,7 +48,8 @@ _repo = os.path.dirname(os.path.dirname(_here))
 # apps/desktop-python/main.py imports its siblings (catalog/grid/thumbcache/viewer) as
 # top-level modules after sys.path.insert(parent) — they are NOT a package,
 # so PyInstaller's module graph needs them named explicitly.
-_hidden = ["catalog", "grid", "thumbcache", "viewer", "picasa_db", "applog"]
+_hidden = ["catalog", "grid", "thumbcache", "viewer", "slideshow", "peek",
+           "picasa_db", "applog"]
 
 # Qt modules the tracer never touches (QtCore/QtGui/QtWidgets only). Mostly
 # no-ops under PySide6-Essentials, but they make the build self-documenting
