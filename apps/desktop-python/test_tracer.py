@@ -3911,3 +3911,80 @@ def test_search_changed_records_latency_and_hits(search_library: Path
     assert win.last_search_ms >= 0.0
 
 
+def test_search_haystack_rebuilt_on_reload_data(search_library: Path,
+                                                tmp_path: Path) -> None:
+    """reload_data (the reconcile swap) rebuilds the haystack index for the
+    NEW catalog: photos and metadata that only exist in the swapped-in
+    library are searchable, vanished ones are not."""
+    win = _search_win(search_library)
+    win.search.setText("sunset")
+    assert _hits(win) == {"sunset.jpg"}
+    n_pairs = len(win._search_pairs)
+    assert n_pairs == len(win.catalog.photos)
+
+    other = tmp_path / "other-lib"
+    make_jpeg(other / "2022 Aurora" / "borealis.jpg")
+    (other / "2022 Aurora" / ".picasa.ini").write_text(
+        "[borealis.jpg]\r\ncaption=green curtain\r\nkeywords=night\r\n")
+    win.reload_data(scan_library(other), None)
+
+    assert len(win._search_pairs) == 1          # parallel to the new catalog
+    win.search.setText("curtain")               # new caption is indexed
+    assert _hits(win) == {"borealis.jpg"}
+    win.search.setText("sunset")                # the old library is gone
+    assert _hits(win) == set()
+
+
+def test_search_haystack_rebuilt_on_cold_index_finish(
+        search_library: Path, tmp_path: Path, capsys) -> None:
+    """The cold-build finish path re-indexes: build_cache merges in-file
+    captions/keywords into the SAME Photo objects in place, so
+    _on_index_finished must rebuild the haystacks — an in-place caption
+    change is invisible to the stale index (that staleness is exactly why
+    the sync point exists) and searchable after."""
+    win = _search_win(search_library)
+    result = thumbcache.build_cache(win.catalog, tmp_path / "cache")
+    assert result is not None
+
+    # In-place mutation, as the indexer does. The prebuilt index is stale
+    # by design until a sync point runs:
+    dunes = next(p for p in win.catalog.photos if p.name == "dunes.jpg")
+    dunes.caption = "windswept ripples"
+    win.search.setText("windswept")
+    assert _hits(win) == set()                  # stale: not re-indexed yet
+
+    win._on_index_finished(result, win.catalog, False)  # cold-build finish
+    win.search.setText("")                      # identical text would not
+    win.search.setText("windswept")             # re-fire textChanged
+    assert _hits(win) == {"dunes.jpg"}          # fresh haystacks
+    capsys.readouterr()                         # swallow the indexed event
+
+
+def test_search_haystack_visible_subset_and_reveal(tmp_path: Path) -> None:
+    """The precomputed visible-only pair list serves off-reveal searches
+    (hidden photos excluded); reveal searches scan the full list. Semantics
+    identical to the per-keystroke scan it replaced."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "shown.jpg")
+    make_jpeg(root / "Trip" / "secret.jpg")
+    (root / "Trip" / ".picasa.ini").write_text(
+        "[secret.jpg]\r\nhidden=yes\r\n")
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+
+    assert len(win._search_pairs) == 2
+    assert len(win._search_pairs_vis) == 1      # the hidden photo is out
+
+    win.search.setText("trip")                  # folder term, off-reveal
+    assert _hits(win) == {"shown.jpg"}
+    win.reveal_box.setChecked(True)             # reveal re-runs the search
+    assert _hits(win) == {"shown.jpg", "secret.jpg"}
+    win.reveal_box.setChecked(False)
+    assert _hits(win) == {"shown.jpg"}
+
+

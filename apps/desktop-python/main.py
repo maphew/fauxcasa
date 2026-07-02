@@ -482,6 +482,13 @@ class MainWindow(QMainWindow):
         # --search-probe harness (run_search_probe) reads them per query.
         self.last_search_ms = 0.0
         self.last_search_hits = 0
+        # §7 search index (fauxcasa-ed5.4): (catalog index, lowercase
+        # haystack) pairs parallel to catalog.photos, owned by the WINDOW —
+        # deliberately not Photo fields — and rebuilt at every
+        # filter-relevant mutation point (see _rebuild_search_index).
+        self._search_pairs: list[tuple[int, str]] = []
+        self._search_pairs_vis: list[tuple[int, str]] = []
+        self._rebuild_search_index()
         self.setWindowTitle(f"{APP_NAME} tracer — {catalog.root.name}")
         self.resize(1280, 800)
 
@@ -706,6 +713,9 @@ class MainWindow(QMainWindow):
             self.grid.set_thumbs(cache)        # cold build: same catalog
             self.viewer.set_thumbs(cache)      # ...so the viewer previews too
             self._refresh_recent_count()       # mtimes just landed (q6l.7)
+            # build_cache merged in-file captions/keywords into these SAME
+            # Photo objects in place — the prebuilt haystacks are stale.
+            self._rebuild_search_index()
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
         self.statusBar().showMessage(
@@ -716,6 +726,7 @@ class MainWindow(QMainWindow):
         re-point grid + viewer, rebuild the sidebar, return to the
         browser (a viewer index may no longer be valid)."""
         self.catalog = catalog
+        self._rebuild_search_index()           # new photos -> new haystacks
         self.viewer.catalog = catalog
         self.viewer.set_thumbs(thumbs)         # reconciled cache for previews
         if self._slideshow is not None and self._slideshow.isVisible():
@@ -1018,6 +1029,50 @@ class MainWindow(QMainWindow):
 
     # ---------- search ----------
 
+    def _rebuild_search_index(self) -> None:
+        """Precompute every photo's lowercase search haystack ONCE per
+        catalog load / filter-relevant mutation, instead of rebuilding the
+        strings per photo per keystroke — at 100k that string-building
+        dominated _search_changed at ~58-95 ms/keystroke, over the §7
+        50 ms budget; scanning these prebuilt pairs is single-digit ms
+        (fauxcasa-ed5.4, before/after numbers in the bead/PR).
+
+        Sync points (photos are otherwise immutable in this read-only app):
+        construction, reload_data (reconcile swapped in a new catalog), and
+        the cold-build finish (build_cache merges in-file captions/keywords
+        into the SAME Photo objects in place). _search_changed also rebuilds
+        as a backstop if the pair count no longer matches the catalog.
+
+        The haystack text is exactly what the per-keystroke scan built:
+        every searchable field newline-joined (terms are whitespace-free, so
+        no term can straddle two fields), folder title + rel path shared per
+        folder. The visible-only subset is precomputed too (same string
+        objects, so the memory cost is one extra list of references) because
+        off-reveal searches — the common case — then skip the per-photo
+        visibility test entirely."""
+        cat = self.catalog
+        t0 = time.perf_counter()
+        folder_hay = {rel: f"{f.title}\n{rel}".lower()
+                      for rel, f in cat.folders.items()}
+        pairs: list[tuple[int, str]] = []
+        append = pairs.append
+        for i, p in enumerate(cat.photos):
+            append((i, "\n".join((
+                p.name,
+                p.caption or "",
+                " ".join(p.keywords),
+                " ".join(n for _rect, _cid, n in p.faces if n),  # people (§5)
+                folder_hay[p.folder],
+            )).lower()))
+        self._search_pairs = pairs
+        if cat.visible_count == len(cat.photos):
+            self._search_pairs_vis = pairs  # nothing hidden: share the list
+        else:
+            self._search_pairs_vis = [
+                ih for ih, p in zip(pairs, cat.photos) if p.visible]
+        log.info("search index: %d haystacks in %.0f ms",
+                 len(pairs), (time.perf_counter() - t0) * 1000.0)
+
     @staticmethod
     def _parse_query(text: str) -> tuple[list[str], list[str]]:
         """Whitespace-tokenized query -> (positive, negative) lowercase
@@ -1049,35 +1104,21 @@ class MainWindow(QMainWindow):
             self.last_search_hits = self._shown_count()
             self.last_search_ms = (time.perf_counter() - t0) * 1000.0
             return
-        cat = self.catalog
-        # Folder text is shared by every photo in a folder: precompute ONE
-        # lowercase haystack per folder — display title + rel path, so a hit
-        # on any path segment (a parent folder's name included) pulls that
-        # folder's photos into the flat result set — instead of rebuilding
-        # it per photo per term.
-        folder_hay = {rel: f"{f.title}\n{rel}".lower()
-                      for rel, f in cat.folders.items()}
-
-        def haystack(p: Photo) -> str:
-            # Every searchable field of one photo, newline-joined: terms are
-            # whitespace-free (split() above), so no term can straddle two
-            # fields.
-            return "\n".join((
-                p.name,
-                p.caption or "",
-                " ".join(p.keywords),
-                " ".join(n for _rect, _cid, n in p.faces if n),  # people (§5)
-                folder_hay[p.folder],
-            )).lower()
-
-        reveal = self.grid.reveal
-        idxs = []
-        for i, p in enumerate(cat.photos):
-            if not (p.visible or reveal):
-                continue
-            hay = haystack(p)
-            if all(t in hay for t in pos) and not any(t in hay for t in neg):
-                idxs.append(i)
+        # Scan the PREBUILT haystack pairs (_rebuild_search_index) as a term
+        # cascade — each positive pass keeps its matches (AND: survivors
+        # matched every earlier term), each negative pass drops its matches
+        # — list comprehensions per term measure ~3-4x faster at 100k than
+        # one pass with all()/any() generator predicates per photo, and
+        # order (catalog order) is preserved throughout.
+        if len(self._search_pairs) != len(self.catalog.photos):
+            self._rebuild_search_index()  # backstop; the sync points above
+        cur = (self._search_pairs if self.grid.reveal
+               else self._search_pairs_vis)
+        for term in pos:
+            cur = [ih for ih in cur if term in ih[1]]
+        for term in neg:
+            cur = [ih for ih in cur if term not in ih[1]]
+        idxs = [ih[0] for ih in cur]
         q = text.strip().lower()
         self.grid.set_filter(idxs, f"search: {q}")
         self._show_counts(f"Search “{q}”", len(idxs))
