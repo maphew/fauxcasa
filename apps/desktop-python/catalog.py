@@ -22,6 +22,17 @@ an external thumbnail cache without running the indexer, so its catalog
 stays ini-only (the in-file read piggybacks on the index's file reads,
 which adopt mode skips by design — N4). See apps/desktop-python/README.md.
 
+Faces/people (§3 People first-class, read-only slice): scan_library parses
+per-photo ini `faces=` regions via picasa_db.parse_faces, harvests
+[Contacts2] id->name tables with the documented downward-inheritance rule
+(an ancestor folder's ini names contacts for its whole subtree; the nearest
+definition wins), and resolves each face to a display name. A machine-local
+contacts.xml (see load_contacts_xml / default_contacts_xml) wins over
+[Contacts2] on name conflicts per §4. A face whose contact id is
+UNKNOWN_CONTACT (unconfirmed suggestion) or that no source names stays
+unnamed (name None) — the suggested-vs-confirmed distinction this
+read-only slice carries.
+
 Remaining tracer-scope gaps (see apps/desktop-python/README.md): EXIF orientation is
 applied at decode (Qt/PIL auto-transform, composed with the rotate= user
 turns), but faces-in-XMP, geotags, and in-file dates are not ingested.
@@ -35,7 +46,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,6 +61,12 @@ import picasa_db  # noqa: E402
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
 
 INI_NAMES = (".picasa.ini", "Picasa.ini", "picasa.ini")
+
+# One ini face tag: (rect, contact id, display name or None). rect =
+# (left, top, right, bottom) fractions of the STORED pixels — rotate= does
+# NOT transform them and EXIF orientation is the consumer's job
+# (picasa-ini-format.md "faces="); name None = suggested/unnamed.
+FaceTag = tuple[tuple[float, float, float, float], str, str | None]
 
 
 @dataclass(frozen=True)
@@ -81,6 +100,7 @@ class Photo:
     rotate: int = 0  # quarter-turns clockwise, from rotate=rotate(N)
     hidden: bool = False
     albums: tuple[str, ...] = ()
+    faces: tuple[FaceTag, ...] = ()
     # Picasa stashes pre-edit originals in .picasaoriginals/; those files
     # are catalog entries (cache-order parity) but never shown in the grid.
     visible: bool = True
@@ -121,6 +141,13 @@ class Catalog:
     photos: list[Photo]
     folders: dict[str, Folder]  # insertion order = display order
     albums: dict[str, Album]
+    # Merged contact registry, 16-hex id -> display name: every folder's
+    # [Contacts2] (first-wins across folders, like duplicate album defs)
+    # overridden by the machine-local contacts.xml (§4: xml wins on name
+    # conflicts). Per-face names on Photo.faces are resolved through the
+    # folder inheritance chain instead, so they stay right even where
+    # folders disagree; this registry is the flat, persistable union.
+    contacts: dict[str, str] = field(default_factory=dict)
 
     @property
     def visible_count(self) -> int:
@@ -238,6 +265,75 @@ def _is_folder_hidden(psec: picasa_db.IniSection | None) -> bool:
         == _HIDDEN_FOLDERS_CATEGORY
 
 
+# ---- faces/people: contacts.xml + [Contacts2] harvest --------------------
+
+_CONTACT_ID_RE = re.compile(r"[0-9a-fA-F]{1,16}")
+
+
+def load_contacts_xml(path: Path) -> dict[str, str]:
+    """Parse Picasa's machine-local contacts.xml -> {16-hex id: name}.
+
+    Format per oracle fixture 014: <contacts><contact id="<16-hex>"
+    name="..." modified_time="..." local_contact="1"/></contacts>. Ids are
+    zero-padded to 16 so they join ini faces= ids (padded by parse_faces)
+    and [Contacts2] keys. Defensive fail-soft: a missing, unreadable, or
+    malformed file yields {}, and a defective entry (no usable id/name)
+    skips that entry only — the machine-local contacts file is an
+    enrichment, never a gate, and it is strictly read-only here."""
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return {}
+    out: dict[str, str] = {}
+    for el in root.iter("contact"):
+        cid = (el.get("id") or "").strip().lower()
+        name = (el.get("name") or "").strip()
+        if not name or not _CONTACT_ID_RE.fullmatch(cid):
+            continue
+        out[cid.zfill(16)] = name
+    return out
+
+
+def default_contacts_xml() -> Path | None:
+    """The machine-local Picasa 3.9 contacts.xml, if this machine has one:
+    %LocalAppData%\\Google\\Picasa2\\contacts\\contacts.xml (the observed
+    Windows location; a Wine prefix maps the same path). None when the env
+    var or the file is absent — discovery is best-effort by design."""
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return None
+    p = Path(base) / "Google" / "Picasa2" / "contacts" / "contacts.xml"
+    return p if p.is_file() else None
+
+
+def _harvest_contacts2(secmap: dict, out: dict[str, str]) -> None:
+    """Merge one folder's [Contacts2] id->name entries into `out` (callers
+    pass the ancestor merge in, so this folder's entries override — the
+    nearest definition wins under the downward-inheritance rule). Value
+    grammar: `<Display Name>;;` — split on ';', field 0. Duplicate keys
+    keep the first, matching IniSection.get. Legacy [Contacts] values
+    (`<account>_lh,<web id hex>`) carry NO display name — the format doc
+    is explicit ("no names; need contacts.xml") — so that section is
+    deliberately not read: its ids resolve through contacts.xml, and its
+    web-id values must never surface as person names. Fail-soft per line:
+    a malformed id or empty name skips that entry only."""
+    sec = secmap.get("contacts2")
+    if sec is None:
+        return
+    seen: set[str] = set()
+    for key, value in sec.items:
+        cid = key.strip().lower()
+        if not _CONTACT_ID_RE.fullmatch(cid):
+            continue
+        cid = cid.zfill(16)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        name = value.split(";", 1)[0].strip()
+        if name:
+            out[cid] = name
+
+
 def rel_paths(root: Path, files: list[Path]) -> list[str]:
     """Library-relative POSIX paths — exactly relative_to().as_posix(),
     but via string-slicing the constant root prefix: two relative_to()
@@ -261,15 +357,51 @@ def rel_paths(root: Path, files: list[Path]) -> list[str]:
 
 
 def scan_library(root: Path,
-                 scan_filter: ScanFilter | None = None) -> Catalog:
+                 scan_filter: ScanFilter | None = None,
+                 contacts: dict[str, str] | None = None) -> Catalog:
+    """Walk `root` and build the catalog. `contacts` is the machine-local
+    contacts.xml id->name map (load_contacts_xml); per §4 it wins over the
+    ini [Contacts2] tables when both name a contact."""
     root = root.resolve()
     files = walk_library(root, scan_filter)
+    contacts = contacts or {}
 
     photos: list[Photo] = []
     folders: dict[str, Folder] = {}
     albums: dict[str, Album] = {}
     # folder_rel -> (ini, name.lower() -> merged section) or None
     ini_by_folder: dict[str, tuple | None] = {}
+    # folder_rel -> merged [Contacts2] id->name for that folder's subtree
+    contacts_by_folder: dict[str, dict[str, str]] = {}
+
+    def folder_ini(folder_rel: str) -> tuple | None:
+        entry = ini_by_folder.get(folder_rel, False)
+        if entry is False:
+            ini = _read_folder_ini(root / folder_rel if folder_rel else root)
+            entry = (ini, _section_map(ini)) if ini is not None else None
+            ini_by_folder[folder_rel] = entry
+        return entry
+
+    def folder_contacts(folder_rel: str) -> dict[str, str]:
+        """The [Contacts2] id->name table in effect for `folder_rel`:
+        ancestors' entries inherited downward (picasa-ini-format.md — ids
+        are 'inherited downward from ancestor folders' inis'), the nearest
+        definition winning. Ancestor inis are read on demand — a root-level
+        ini with only a [Contacts2] table names faces in photo-bearing
+        subfolders even though the walk never visits the root itself."""
+        got = contacts_by_folder.get(folder_rel)
+        if got is not None:
+            return got
+        if folder_rel:
+            parent = folder_rel.rsplit("/", 1)[0] if "/" in folder_rel else ""
+            merged = dict(folder_contacts(parent))
+        else:
+            merged = {}
+        entry = folder_ini(folder_rel)
+        if entry is not None:
+            _harvest_contacts2(entry[1], merged)
+        contacts_by_folder[folder_rel] = merged
+        return merged
 
     for p, rel in zip(files, rel_paths(root, files)):
         folder_rel, _, name = rel.rpartition("/")
@@ -277,11 +409,7 @@ def scan_library(root: Path,
         if _is_stashed(folder_rel):
             photo.visible = False
 
-        entry = ini_by_folder.get(folder_rel, False)
-        if entry is False:
-            ini = _read_folder_ini(p.parent)
-            entry = (ini, _section_map(ini)) if ini is not None else None
-            ini_by_folder[folder_rel] = entry
+        entry = folder_ini(folder_rel)
         secmap = entry[1] if entry is not None else {}
 
         if folder_rel not in folders:
@@ -319,6 +447,23 @@ def scan_library(root: Path,
                 photo.albums = tuple(
                     a.strip().lower() for a in al.split(",") if a.strip()
                 )
+            fv = sec.get("faces")
+            if fv:
+                try:
+                    parsed = picasa_db.parse_faces(fv)
+                except ValueError:
+                    parsed = []  # fail-soft per-line: skip a bad faces= line
+                if parsed:
+                    local = folder_contacts(folder_rel)
+                    # contacts.xml wins over [Contacts2] (§4); an
+                    # UNKNOWN_CONTACT id (unconfirmed suggestion) or an id
+                    # no source names stays unnamed (None).
+                    photo.faces = tuple(
+                        (rect, cid,
+                         None if cid == picasa_db.UNKNOWN_CONTACT
+                         else contacts.get(cid) or local.get(cid))
+                        for rect, cid in parsed
+                    )
 
         # A whole folder in the "Hidden Folders" collection hides every
         # photo under it, exactly like per-photo hidden=yes or a stash dir.
@@ -355,7 +500,17 @@ def scan_library(root: Path,
             if uid in albums:
                 albums[uid].members.append(i)
 
-    return Catalog(root=root, photos=photos, folders=folders, albums=albums)
+    # Flat contact registry: every walked folder's effective [Contacts2]
+    # table (first-wins across folders, like duplicate album definitions),
+    # with contacts.xml names overriding on conflict (§4).
+    registry: dict[str, str] = {}
+    for folder_rel in folders:
+        for cid, cname in folder_contacts(folder_rel).items():
+            registry.setdefault(cid, cname)
+    registry.update(contacts)
+
+    return Catalog(root=root, photos=photos, folders=folders, albums=albums,
+                   contacts=registry)
 
 
 # ---- persistent catalog (load-without-walking, §7 cold start) ------------
@@ -385,7 +540,11 @@ def scan_library(root: Path,
 # P2category=Hidden Folders) now forces its photos invisible and is
 # persisted as a `hidden_folders` list — a v2 catalog has neither, so it
 # would wrongly show a hidden folder's photos; reject it and cold-rebuild.
-CATALOG_VERSION = 3
+# v4: ini faces= regions + resolved contact names (fauxcasa-cam.1/.2) are
+# ingested and persisted (per-photo `f` rows + a `contacts` registry) — a
+# v3 catalog has neither, so a warm start would silently show an empty
+# People surface; reject it and cold-rebuild.
+CATALOG_VERSION = 4
 
 
 def _photo_to_row(p: Photo) -> dict:
@@ -402,6 +561,10 @@ def _photo_to_row(p: Photo) -> dict:
         row["h"] = 1
     if p.albums:
         row["a"] = list(p.albums)
+    if p.faces:
+        # rect fractions are n/65536 — exact binary fractions, so they
+        # round-trip through JSON floats byte-identically.
+        row["f"] = [[list(rect), cid, name] for rect, cid, name in p.faces]
     if p.size >= 0:
         row["z"] = p.size
     if p.mtime >= 0:
@@ -425,6 +588,9 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
         # — it drives both per-photo visibility and Folder.folder_hidden.
         "hidden_folders": [f.rel for f in catalog.folders.values()
                            if f.folder_hidden],
+        # contact id -> display name registry (already contacts.xml-merged
+        # at scan time; the warm path never re-reads inis or contacts.xml)
+        "contacts": catalog.contacts,
         "albums": [
             {"uid": a.uid, "name": a.name, "date": a.date,
              "description": a.description, "members": a.members}
@@ -476,6 +642,8 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
                 star=bool(row.get("s")), caption=row.get("c"),
                 keywords=tuple(row.get("k", ())), rotate=row.get("o", 0),
                 hidden=bool(row.get("h")), albums=tuple(row.get("a", ())),
+                faces=tuple((tuple(rect), cid, fname)
+                            for rect, cid, fname in row.get("f", ())),
                 size=row.get("z", -1), mtime=row.get("m", -1),
                 sha256=row.get("x"),
             )
@@ -506,10 +674,15 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
                 description=a.get("description"),
                 members=list(a.get("members", [])),
             )
+
+        contacts = data.get("contacts", {})
+        if not isinstance(contacts, dict):
+            contacts = {}
     except (KeyError, TypeError, AttributeError, ValueError):
         return None
 
-    return Catalog(root=root, photos=photos, folders=folders, albums=albums)
+    return Catalog(root=root, photos=photos, folders=folders, albums=albums,
+                   contacts=contacts)
 
 
 @dataclass
