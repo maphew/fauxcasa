@@ -2449,8 +2449,6 @@ def test_main_run_logs_and_keeps_stdout_protocol(
     assert "READY" not in log_text and '"event": "ready"' not in log_text
 
 
-@pytest.mark.skipif(not hasattr(os, "pread"),
-                    reason="grid decode worker uses os.pread (Unix-only)")
 def test_grid_decodes_dpr_scaled_v2_level(tmp_path: Path) -> None:
     """fauxcasa-q7m: the grid's decode worker reads the v2 level chosen by the
     DPR-scaled native edge, then caps the tile to that edge. At native 256
@@ -2502,8 +2500,6 @@ def test_grid_decodes_dpr_scaled_v2_level(tmp_path: Path) -> None:
     assert small is not None and max(small.width(), small.height()) == 256
 
 
-@pytest.mark.skipif(not hasattr(os, "pread"),
-                    reason="grid decode worker uses os.pread (Unix-only)")
 def test_grid_v1_cache_falls_back_to_only_level(tmp_path: Path) -> None:
     """fauxcasa-q7m: a v1 cache has only the 256 level, so even a hi-DPI native
     edge (512) reads it via best_level's largest-available fallback — the grid
