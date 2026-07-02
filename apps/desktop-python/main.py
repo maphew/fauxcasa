@@ -67,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from catalog import (  # noqa: E402
     Catalog,
+    Photo,
     ScanFilter,
     default_contacts_xml,
     load_catalog,
@@ -466,7 +467,8 @@ class MainWindow(QMainWindow):
         bar.addSeparator()
         self.search = QLineEdit()
         self.search.setPlaceholderText(
-            "search filename, caption, keywords, people…")
+            "search filename, caption, keywords, people, folder…"
+            "  -term excludes")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(360)
         self.search.textChanged.connect(self._search_changed)
@@ -519,7 +521,10 @@ class MainWindow(QMainWindow):
         self._show_counts("All photos", self._shown_count())
 
         # --- wiring ---
-        self.grid.photo_selected.connect(self._photo_selected)
+        # The grid's set-valued signal drives the status label (single
+        # metadata vs "N photos selected"); the viewer stays single-photo
+        # and keeps feeding _photo_selected directly (fauxcasa-q6l.1).
+        self.grid.selection_changed.connect(self._selection_changed)
         self.grid.photo_activated.connect(self._open_viewer)
         self.viewer.closed.connect(self._close_viewer)
         self.viewer.photo_shown.connect(self._photo_selected)
@@ -927,25 +932,62 @@ class MainWindow(QMainWindow):
 
     # ---------- search ----------
 
+    @staticmethod
+    def _parse_query(text: str) -> tuple[list[str], list[str]]:
+        """Whitespace-tokenized query -> (positive, negative) lowercase
+        terms. Positive terms AND together; a '-'-prefixed token excludes
+        any photo it matches (§5 negation — a negation-only query is valid:
+        Picasa users' all-photos hack was exactly that). A lone '-' — a
+        negation still being typed — contributes nothing rather than
+        blanking the grid."""
+        pos: list[str] = []
+        neg: list[str] = []
+        for tok in text.lower().split():
+            if tok.startswith("-"):
+                if len(tok) > 1:
+                    neg.append(tok[1:])
+            else:
+                pos.append(tok)
+        return pos, neg
+
     def _search_changed(self, text: str) -> None:
-        text = text.strip().lower()
-        cat = self.catalog
-        if not text:
+        pos, neg = self._parse_query(text)
+        if not pos and not neg:
             self.grid.set_filter(None, "")
             self._show_counts("All photos", self._shown_count())
             return
-        idxs = [
-            i for i, p in enumerate(cat.photos)
-            if (p.visible or self.grid.reveal) and (
-                text in p.name.lower()
-                or (p.caption and text in p.caption.lower())
-                or any(text in k.lower() for k in p.keywords)
-                or any(n and text in n.lower()
-                       for _rect, _cid, n in p.faces)  # person names (§5)
-            )
-        ]
-        self.grid.set_filter(idxs, f"search: {text}")
-        self._show_counts(f"Search “{text}”", len(idxs))
+        cat = self.catalog
+        # Folder text is shared by every photo in a folder: precompute ONE
+        # lowercase haystack per folder — display title + rel path, so a hit
+        # on any path segment (a parent folder's name included) pulls that
+        # folder's photos into the flat result set — instead of rebuilding
+        # it per photo per term.
+        folder_hay = {rel: f"{f.title}\n{rel}".lower()
+                      for rel, f in cat.folders.items()}
+
+        def haystack(p: Photo) -> str:
+            # Every searchable field of one photo, newline-joined: terms are
+            # whitespace-free (split() above), so no term can straddle two
+            # fields.
+            return "\n".join((
+                p.name,
+                p.caption or "",
+                " ".join(p.keywords),
+                " ".join(n for _rect, _cid, n in p.faces if n),  # people (§5)
+                folder_hay[p.folder],
+            )).lower()
+
+        reveal = self.grid.reveal
+        idxs = []
+        for i, p in enumerate(cat.photos):
+            if not (p.visible or reveal):
+                continue
+            hay = haystack(p)
+            if all(t in hay for t in pos) and not any(t in hay for t in neg):
+                idxs.append(i)
+        q = text.strip().lower()
+        self.grid.set_filter(idxs, f"search: {q}")
+        self._show_counts(f"Search “{q}”", len(idxs))
 
     # ---------- status ----------
 
@@ -956,6 +998,17 @@ class MainWindow(QMainWindow):
         self.counts_label.setText(
             f"  {label}: {n} photos · {folders} folders"
             f" · {len(self.catalog.albums)} albums")
+
+    def _selection_changed(self, selection: set) -> None:
+        """Grid multi-select -> status label (spec §5 dual mode): exactly
+        one selected shows that photo's metadata; several show the
+        aggregate count; none clears (fauxcasa-q6l.1)."""
+        if len(selection) == 1:
+            self._photo_selected(next(iter(selection)))
+        elif selection:
+            self.meta_label.setText(f"{len(selection)} photos selected  ")
+        else:
+            self.meta_label.setText("")
 
     def _photo_selected(self, idx: int) -> None:
         if idx < 0:
