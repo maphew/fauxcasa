@@ -2681,7 +2681,7 @@ def test_mainwindow_play_action_plays_current_view_and_esc_restores(
     assert show.isHidden() and not show._timer.isActive()    # stopped
     assert win.pages.currentWidget() is win.pages.widget(0)   # still browser
     assert list(win.grid.display) == display_before    # view untouched
-    assert win.grid.selected == display_before[1]      # selection untouched
+    assert win.grid.current == display_before[1]       # selection untouched
 
 
 def test_mainwindow_play_from_search_album_and_starred_views(
@@ -2781,7 +2781,851 @@ def test_mainwindow_slideshow_surface_reused_and_repointed(
     win.reload_data(cat3, cache2)
     assert first.isHidden()                            # ...closes the show
     assert not first._timer.isActive()
+# ---- search upgrades: multi-word AND, -term negation, folder names --------
+# (fauxcasa-q6l.6) §5: instant search over filenames, captions, keywords and
+# folder names, with '-term' negation. Positive terms AND together (each may
+# match a different field of the same photo); any '-term' hit excludes the
+# photo; a lone '-' (a negation still being typed) is ignored. People-name
+# search joins the same haystack once faces land (see the haystack() parts
+# list in main.MainWindow._search_changed).
+
+@pytest.fixture()
+def search_library(tmp_path: Path) -> Path:
+    """Distinct vocabulary per field so each test proves WHICH field matched:
+    'beach'/'city'/'osaka' appear only in folder names, 'ocean'/'sand'/'neon'
+    only in keywords, 'golden'/'stalls' only in captions, and
+    'sunset'/'dunes'/'market'/'street' only in filenames. Osaka is nested
+    under 2021 City to exercise rel-path-segment matching."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "2020 Beach Trip" / "sunset.jpg")
+    make_jpeg(root / "2020 Beach Trip" / "dunes.jpg")
+    make_jpeg(root / "2021 City" / "market.jpg")
+    make_jpeg(root / "2021 City" / "Osaka" / "street.jpg")
+    (root / "2020 Beach Trip" / ".picasa.ini").write_text(
+        "[sunset.jpg]\r\ncaption=Golden hour\r\nkeywords=sun, ocean\r\n"
+        "[dunes.jpg]\r\nkeywords=sand\r\n")
+    (root / "2021 City" / ".picasa.ini").write_text(
+        "[market.jpg]\r\ncaption=night stalls\r\nkeywords=food, neon\r\n")
+    return root
+
+
+def _search_win(library_root: Path):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    return MainWindow(scan_library(library_root), None,
+                      cache_dir=None, build_dir=None)
+
+
+def _hits(win) -> set:
+    return {win.catalog.photos[i].name for i in win.grid.display}
+
+
+def test_search_multi_word_and(search_library: Path) -> None:
+    """Multiple terms AND together — each must match somewhere on the same
+    photo, fields may differ per term — instead of the old single-substring
+    reading where 'sunset ocean' had to appear verbatim, space included."""
+    win = _search_win(search_library)
+
+    win.search.setText("sunset ocean")         # filename AND keyword
+    assert _hits(win) == {"sunset.jpg"}
+    win.search.setText("beach golden")         # folder AND caption
+    assert _hits(win) == {"sunset.jpg"}
+    assert "Search" in win.counts_label.text()
+    win.search.setText("sunset neon")          # terms hit different photos
+    assert _hits(win) == set()
+
+
+def test_search_negation(search_library: Path) -> None:
+    """'-term' excludes any photo it matches, whatever the field; a
+    negation-only query stands alone (Picasa's all-photos hack was exactly
+    a match-nothing negation search)."""
+    win = _search_win(search_library)
+
+    win.search.setText("beach -dunes")         # folder hits minus a filename
+    assert _hits(win) == {"sunset.jpg"}
+    win.search.setText("beach -ocean")         # ...minus a keyword hit
+    assert _hits(win) == {"dunes.jpg"}
+    win.search.setText("-city")                # negation-only: the rest
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg"}
+    win.search.setText("-nosuchterm")          # excludes nothing -> all
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg", "market.jpg",
+                          "street.jpg"}
+
+
+def test_search_folder_name(search_library: Path) -> None:
+    """A term matching a folder's display title or any rel-path segment
+    pulls that folder's photos into the flat result set — a nested folder's
+    photos are also reached through their parent's segment."""
+    win = _search_win(search_library)
+
+    win.search.setText("beach")
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg"}
+    win.search.setText("osaka")                # the nested folder's own name
+    assert _hits(win) == {"street.jpg"}
+    win.search.setText("city")                 # parent segment: nested too
+    assert _hits(win) == {"market.jpg", "street.jpg"}
+
+
+def test_search_negated_folder(search_library: Path) -> None:
+    win = _search_win(search_library)
+
+    win.search.setText("-beach")
+    assert _hits(win) == {"market.jpg", "street.jpg"}
+    win.search.setText(".jpg -city")           # everything minus a subtree
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg"}
+    win.search.setText("sun -beach")           # positive vetoed by folder
+    assert _hits(win) == set()
+
+
+def test_search_case_insensitive(search_library: Path) -> None:
+    """Both positive and negative terms match case-insensitively against
+    every field (filename, caption, keyword, folder)."""
+    win = _search_win(search_library)
+
+    win.search.setText("BEACH Golden")
+    assert _hits(win) == {"sunset.jpg"}
+    win.search.setText("OcEaN")
+    assert _hits(win) == {"sunset.jpg"}
+    win.search.setText("beach -DUNES")
+    assert _hits(win) == {"sunset.jpg"}
+    win.search.setText("OSAKA")
+    assert _hits(win) == {"street.jpg"}
+
+
+def test_search_degenerate_queries(search_library: Path) -> None:
+    """Empty/whitespace queries and a lone '-' (a negation still being
+    typed) fall back to the unfiltered All-photos view instead of blanking
+    the grid; a trailing lone '-' inside a real query is simply ignored."""
+    win = _search_win(search_library)
+    all_names = {"sunset.jpg", "dunes.jpg", "market.jpg", "street.jpg"}
+
+    for q in ("", "   ", "-", " - ", "- -"):
+        win.search.setText("beach")            # a real filter first...
+        win.search.setText(q)                  # ...then the degenerate query
+        assert _hits(win) == all_names, repr(q)
+        assert "All photos" in win.counts_label.text(), repr(q)
+
+    win.search.setText("beach -")              # half-typed negation: ignored
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg"}
+    assert "Search" in win.counts_label.text()
+def test_grid_decodes_dpr_scaled_v2_level(tmp_path: Path) -> None:
+    """fauxcasa-q7m: the grid's decode worker reads the v2 level chosen by the
+    DPR-scaled native edge, then caps the tile to that edge. At native 256
+    (devicePixelRatio 1) it reads the 256 level — the legacy primary, a no-op;
+    at native 512 (a 2x display) it reads the 512 level so a hi-DPI tile is
+    sharp. The cap holds the tile at exactly the device footprint."""
+    import queue as _queue
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from grid import GridView
+
+    root = tmp_path / "lib"
+    _big_library(root)               # land.jpg 600x400 (idx 0), port.jpg (idx 1)
+    cat = scan_library(root)
+    v2 = thumbcache.load_cache(thumbcache.build_cache(
+        cat, tmp_path / "c", levels=[512, 256, 128]).path)
+    assert v2.levels == [512, 256, 128]
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    g = GridView()
+    g.set_data(cat, v2)
+
+    def decode(idx: int, native: int):
+        g._tile_native = native
+        g.generation += 1
+        g.wanted = frozenset({idx})
+        with g.pending_lock:
+            g.pending.discard(idx)
+        g.tiles.pop(idx, None)
+        g._request(idx)              # a daemon worker decodes onto g.done
+        for _ in range(200):         # bounded wait (~10s worst case)
+            try:
+                gen, di, img = g.done.get(timeout=0.05)
+            except _queue.Empty:
+                continue
+            if gen == g.generation and di == idx:
+                return img
+        raise AssertionError("decode did not complete")
+
+    # idx 0 == land.jpg 600x400: 512 level caps the long edge to 512x341, the
+    # 256 level to 256x171. The long edge equals the chosen level -> proves
+    # which level the worker read. rotate=0, so dims are not transposed.
+    big = decode(0, 512)
+    assert big is not None and max(big.width(), big.height()) == 512
+    small = decode(0, 256)
+    assert small is not None and max(small.width(), small.height()) == 256
+
+
+def test_grid_v1_cache_falls_back_to_only_level(tmp_path: Path) -> None:
+    """fauxcasa-q7m: a v1 cache has only the 256 level, so even a hi-DPI native
+    edge (512) reads it via best_level's largest-available fallback — the grid
+    never asks a v1 cache for a level it doesn't have, it just stays soft."""
+    import queue as _queue
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from grid import GridView
+
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat = scan_library(root)
+    v1 = thumbcache.load_cache(thumbcache.build_cache(cat, tmp_path / "c").path)
+    assert v1.levels == [256]
+
+    app = QApplication.instance() or QApplication([])
+    g = GridView()
+    g.set_data(cat, v1)
+    g._tile_native = 512             # pretend a 2x display
+    g.generation += 1
+    g.wanted = frozenset({0})
+    with g.pending_lock:
+        g.pending.discard(0)
+    g.tiles.pop(0, None)
+    g._request(0)
+    img = None
+    for _ in range(200):
+        try:
+            gen, di, im = g.done.get(timeout=0.05)
+        except _queue.Empty:
+            continue
+        if gen == g.generation and di == 0:
+            img = im
+            break
+    assert img is not None and max(img.width(), img.height()) == 256
+
+
+def test_refresh_tile_native_dpr_and_invalidation(monkeypatch) -> None:
+    """fauxcasa-q7m: _refresh_tile_native scales the native edge by
+    devicePixelRatio, floors at TILE_NATIVE, and invalidates (forcing a
+    re-decode at the new level) ONLY when the edge changes — a steady ratio
+    costs an int compare, moving to a 2x monitor drops stale 256 tiles."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import grid as gridmod
+    from grid import GridView
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    g = GridView()
+
+    monkeypatch.setattr(g, "devicePixelRatioF", lambda: 1.0)
+    g._tile_native = 0               # force the first refresh to set it
+    g._refresh_tile_native()
+    assert g._tile_native == gridmod.TILE_NATIVE          # 256, the v1/dpr1 base
+
+    # steady DPR -> no invalidation: a seeded tile and generation survive
+    g.tiles[7] = [None, 0, 0]
+    gen = g.generation
+    g._refresh_tile_native()
+    assert g._tile_native == gridmod.TILE_NATIVE
+    assert g.generation == gen and 7 in g.tiles
+
+    # move to a 2x display -> native 512, tiles invalidated for re-decode
+    monkeypatch.setattr(g, "devicePixelRatioF", lambda: 2.0)
+    g._refresh_tile_native()
+    assert g._tile_native == 2 * gridmod.TILE_NATIVE      # 512
+    assert g.generation == gen + 1 and 7 not in g.tiles
+
+    # fractional ratio rounds; sub-1 (rare) stays floored at TILE_NATIVE
+    monkeypatch.setattr(g, "devicePixelRatioF", lambda: 1.5)
+    g._refresh_tile_native()
+    assert g._tile_native == round(gridmod.TILE_NATIVE * 1.5)   # 384
+    monkeypatch.setattr(g, "devicePixelRatioF", lambda: 0.5)
+    g._refresh_tile_native()
+    assert g._tile_native == gridmod.TILE_NATIVE          # never below the base
 
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Grid multi-select (fauxcasa-q6l.1): selection set + current/anchor model,
+# Ctrl/Shift click, Shift+arrow extension, Ctrl+A, Esc, signal payloads,
+# multi-rect paint, and the selection-vs-filter/zoom behavior. First
+# selection/keyboard coverage in the suite: mouse/key events are constructed
+# directly and delivered to the widget handlers — offscreen-safe, no window
+# activation or QTest focus dependence.
+# ---------------------------------------------------------------------------
+
+
+def _selection_grid(tmp_path: Path):
+    """A shown offscreen GridView over a synthetic two-folder library
+    (6 + 3 photos), no thumb cache (selection never needs decoded tiles),
+    sized to exactly 2 columns so row geometry is deterministic. Display
+    order is p00..p08 (sorted rel paths)."""
+    _offscreen_app()
+    from grid import GridView
+
+    root = tmp_path / "lib"
+    k = 0
+    for fi, count in ((0, 6), (1, 3)):
+        for _ in range(count):
+            make_jpeg(root / f"f{fi}" / f"p{k:02d}.jpg")
+            k += 1
+    cat = scan_library(root)
+    g = GridView()
+    g.resize(400, 640)   # viewport ~398 -> (398-8)//168 = 2 columns
+    g.show()             # hidden widgets keep a stale default viewport size
+    g.set_data(cat, None)
+    assert len(g.display) == 9 and g.cols == 2
+    return g
+
+
+def _click(g, idx: int, modifiers=None, double: bool = False) -> None:
+    """Deliver a left-button press (or double-click) at the center of the
+    tile for catalog index idx, in viewport coordinates."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    gi, n = g.loc[idx]
+    r = g._item_rect(g.groups[gi], n)
+    pos = QPointF(r.center().x(),
+                  r.center().y() - g.verticalScrollBar().value())
+    mods = (modifiers if modifiers is not None
+            else Qt.KeyboardModifier.NoModifier)
+    kind = (QEvent.Type.MouseButtonDblClick if double
+            else QEvent.Type.MouseButtonPress)
+    ev = QMouseEvent(kind, pos, pos, pos, Qt.MouseButton.LeftButton,
+                     Qt.MouseButton.LeftButton, mods)
+    (g.mouseDoubleClickEvent if double else g.mousePressEvent)(ev)
+
+
+def _key(g, key, modifiers=None) -> None:
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+
+    mods = (modifiers if modifiers is not None
+            else Qt.KeyboardModifier.NoModifier)
+    g.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, mods))
+
+
+def test_grid_click_selects_single(tmp_path: Path) -> None:
+    """Plain click: the set collapses to the clicked tile, which becomes
+    both current and anchor; a plain background click clears everything."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    _click(g, d[0])
+    assert g.selection == {d[0]} and g.current == d[0] and g.anchor == d[0]
+    _click(g, d[2])   # a second plain click REPLACES, never accumulates
+    assert g.selection == {d[2]} and g.current == d[2] and g.anchor == d[2]
+    # plain click on the header band (no photo there) clears
+    ev = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(5.0, 5.0),
+                     QPointF(5.0, 5.0), QPointF(5.0, 5.0),
+                     Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier)
+    g.mousePressEvent(ev)
+    assert g.selection == set() and g.current == -1
+
+
+def test_grid_ctrl_click_toggles(tmp_path: Path) -> None:
+    """Ctrl+click toggles membership without touching the rest; toggling a
+    tile OUT keeps it current (focus without selection); a Ctrl-modified
+    background click never clears an assembled selection; a modified
+    double-click is selection assembly, not a viewer open."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    _click(g, d[0])
+    _click(g, d[3], CTRL)
+    _click(g, d[6], CTRL)   # across the group seam
+    assert g.selection == {d[0], d[3], d[6]} and g.current == d[6]
+    _click(g, d[3], CTRL)   # toggle one back OFF
+    assert g.selection == {d[0], d[6]}
+    assert g.current == d[3]  # still current: keyboard focus stays visible
+    # Ctrl+click on the header band is a no-op, not a clear
+    ev = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(5.0, 5.0),
+                     QPointF(5.0, 5.0), QPointF(5.0, 5.0),
+                     Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                     CTRL)
+    g.mousePressEvent(ev)
+    assert g.selection == {d[0], d[6]}
+    # a Ctrl double-click neither activates nor collapses the set
+    acts = []
+    g.photo_activated.connect(lambda idx, disp, pos: acts.append(idx))
+    _click(g, d[0], CTRL, double=True)
+    assert acts == [] and g.selection == {d[0], d[6]}
+
+
+def test_grid_shift_click_range(tmp_path: Path) -> None:
+    """Shift+click selects the anchor..hit range in display order (spanning
+    group seams), replaces on re-range (both directions), and Ctrl+Shift
+    ADDS the range to the existing set."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[1])
+    _click(g, d[4], SHIFT)
+    assert g.selection == set(d[1:5])
+    assert g.current == d[4] and g.anchor == d[1]   # anchor holds
+    _click(g, d[7], SHIFT)   # re-range from the SAME anchor, across groups
+    assert g.selection == set(d[1:8]) and g.anchor == d[1]
+    _click(g, d[0], SHIFT)   # reverse direction from the same anchor
+    assert g.selection == {d[0], d[1]} and g.current == d[0]
+    # Ctrl+Shift adds a disjoint range without clearing the set
+    _click(g, d[6], CTRL)                  # scatter + move the anchor
+    _click(g, d[8], CTRL | SHIFT)
+    assert g.selection == {d[0], d[1], d[6], d[7], d[8]}
+    # Shift+click with no usable anchor degrades to a plain select
+    g._select(-1)
+    _click(g, d[5], SHIFT)
+    assert g.selection == {d[5]} and g.anchor == d[5]
+
+
+def test_grid_shift_arrow_extends(tmp_path: Path) -> None:
+    """Shift+arrows walk the current end of the anchor..current range:
+    extend, shrink back, extend by a visual row (Down), and an unmodified
+    arrow collapses back to single-select."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[2])
+    _key(g, Qt.Key.Key_Right, SHIFT)
+    assert g.selection == {d[2], d[3]} and g.current == d[3]
+    assert g.anchor == d[2]
+    _key(g, Qt.Key.Key_Right, SHIFT)
+    assert g.selection == set(d[2:5]) and g.current == d[4]
+    _key(g, Qt.Key.Key_Left, SHIFT)    # shrink back toward the anchor
+    assert g.selection == {d[2], d[3]} and g.current == d[3]
+    _key(g, Qt.Key.Key_Down, SHIFT)    # one visual row down (2 cols): d3->d5
+    assert g.selection == set(d[2:6]) and g.current == d[5]
+    _key(g, Qt.Key.Key_Right)          # no Shift: collapse to single
+    assert g.selection == {d[6]} and g.current == d[6] and g.anchor == d[6]
+
+
+def test_grid_select_all_and_escape(tmp_path: Path) -> None:
+    """Ctrl+A (QKeySequence.SelectAll — Cmd+A on macOS for free) selects
+    the whole display set; Esc collapses to the current item only; Esc
+    with no current item stays cleanly empty."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    _key(g, Qt.Key.Key_A, CTRL)   # nothing selected yet: current -> first
+    assert g.selection == set(d) and g.current == d[0]
+    _key(g, Qt.Key.Key_Escape)
+    assert g.selection == {d[0]} and g.current == d[0]
+    _click(g, d[3])
+    _key(g, Qt.Key.Key_A, CTRL)   # current/anchor keep their place
+    assert g.selection == set(d) and g.current == d[3] and g.anchor == d[3]
+    _key(g, Qt.Key.Key_Escape)
+    assert g.selection == {d[3]}
+    g._select(-1)
+    _key(g, Qt.Key.Key_Escape)    # no current: clears to empty, no crash
+    assert g.selection == set() and g.current == -1
+
+
+def test_grid_selection_signal_payloads(tmp_path: Path) -> None:
+    """selection_changed carries a set COPY of catalog indices and fires
+    only when the set changes; photo_selected keeps tracking the current
+    item; a pure no-op click re-emits nothing; Enter activates the
+    CURRENT item of a multi-selection."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    got_sel: list = []
+    got_cur: list = []
+    acts: list = []
+    g.selection_changed.connect(got_sel.append)
+    g.photo_selected.connect(got_cur.append)
+    g.photo_activated.connect(lambda idx, disp, pos: acts.append((idx, pos)))
+
+    _click(g, d[0])
+    assert got_sel[-1] == {d[0]} and got_cur[-1] == d[0]
+    n_sel, n_cur = len(got_sel), len(got_cur)
+    _click(g, d[0])                      # no-op: same single selection
+    assert len(got_sel) == n_sel and len(got_cur) == n_cur
+    _click(g, d[2], CTRL)
+    assert got_sel[-1] == {d[0], d[2]} and got_cur[-1] == d[2]
+    got_sel[-1].clear()                  # receivers get a copy, not the model
+    assert g.selection == {d[0], d[2]}
+    _key(g, Qt.Key.Key_Return)           # Enter opens the CURRENT item
+    assert acts[-1] == (d[2], 2)
+    g._select(-1)                        # clearing emits -1 / empty set
+    assert got_cur[-1] == -1 and got_sel[-1] == set()
+
+
+def test_grid_multiselect_paint_offscreen(tmp_path: Path) -> None:
+    """Painting a multi-selection offscreen must not crash: selected rects,
+    the stronger current border, the dashed focus-only cue (current toggled
+    out of the set), and a selection that extends beyond the viewport."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    _click(g, d[0])
+    _click(g, d[3], Qt.KeyboardModifier.ShiftModifier)
+    frames = g.frame_no
+    assert not g.grab().isNull()         # renders through paintEvent
+    assert g.frame_no > frames
+    _click(g, d[3], CTRL)                # current now OUTSIDE the set
+    assert g.current == d[3] and d[3] not in g.selection
+    g.grab()                             # exercises the focus-cue branch
+    g._set_selection(set(d), d[-1], d[0])  # spans past the viewport bottom
+    frames = g.frame_no
+    g.grab()
+    assert g.frame_no > frames
+
+
+def test_grid_selection_survives_zoom_and_relayout(tmp_path: Path) -> None:
+    """Zoom and resize are pure relayouts: the selection set, current item,
+    and anchor all survive them untouched."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    _click(g, d[1])
+    _click(g, d[4], Qt.KeyboardModifier.ShiftModifier)
+    sel = set(g.selection)
+    cols = g.cols
+    g.set_zoom(96)                       # row heights change ~2x
+    assert g.selection == sel and g.current == d[4] and g.anchor == d[1]
+    g.resize(560, 640)                   # wider window: column count changes
+    assert g.cols != cols                # ((558-8)//104 = 5 at zoom 96)
+    assert g.selection == sel and g.current == d[4] and g.anchor == d[1]
+
+
+def test_grid_set_filter_selection_policy(tmp_path: Path) -> None:
+    """set_filter collapses the selection to the current item if the new
+    view still shows it, else clears entirely (documented policy: the
+    grid's selection is per-view; cross-view persistence is the q6l.2
+    tray's job)."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    _click(g, d[1])
+    _click(g, d[4], Qt.KeyboardModifier.ShiftModifier)   # {d1..d4}, cur d4
+    g.set_filter(list(d[3:6]), "subset")   # current d4 still shown
+    assert g.selection == {d[4]} and g.current == d[4]
+    g._set_selection(set(d[3:6]), d[3], d[3])
+    g.set_filter([d[0], d[1]], "elsewhere")   # current d3 filtered away
+    assert g.selection == set() and g.current == -1 and g.anchor == -1
+
+
+def test_mainwindow_selection_status_label(library: Path) -> None:
+    """The status label's dual mode over the set-valued signal: exactly one
+    selected shows that photo's metadata line, several show the aggregate
+    'N photos selected', none clears — driven through the real Ctrl+A /
+    Esc / clear paths."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    assert len(win.grid.display) == 2      # a.jpg + c.jpg visible
+
+    win.grid._select(win.grid.display[0])  # the starred, captioned a.jpg
+    text = win.meta_label.text()
+    assert "a.jpg" in text and "★" in text and "the beach" in text
+    _key(win.grid, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    assert win.meta_label.text() == "2 photos selected  "
+    _key(win.grid, Qt.Key.Key_Escape)      # collapse to current -> metadata
+    assert "a.jpg" in win.meta_label.text()
+    win.grid._select(-1)
+    assert win.meta_label.text() == ""
+
+
+# ---- faces/people read-only ingest + People surface -----------------------
+# (fauxcasa-cam.1/.2/.3) Synthetic fixtures only (privacy rule): hand-authored
+# inis + a hand-authored contacts.xml matching the oracle-014 grammar + tiny
+# Qt-generated JPEGs — no real Picasa data.
+
+@pytest.fixture()
+def faces_library(tmp_path: Path) -> Path:
+    """Faces fixture exercising the whole ingest matrix: a photo-less ROOT
+    ini whose [Contacts2] flows downward; a Trip ini that re-names the
+    ancestor's contact (nearest definition wins), defines a zero-padded
+    short id and a name that conflicts with contacts.xml, and carries a
+    legacy [Contacts] entry (web ids, never display names); an UNKNOWN
+    (unconfirmed-suggestion) face; an orphan id nobody names; and a hidden
+    photo so People counts prove they are visible-set-aware."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "a.jpg")
+    make_jpeg(root / "Trip" / "b.jpg")
+    make_jpeg(root / "Picnic" / "c.jpg")
+    (root / ".picasa.ini").write_text(
+        "[Contacts2]\r\naaaaaaaaaaaaaaa1=Ada Ancestor;;\r\n")
+    (root / "Trip" / ".picasa.ini").write_text(
+        "[Contacts2]\r\n"
+        "0632e71e2ffd6c6d=Bob Short;;\r\n"
+        "cccccccccccccccc=Carol Ini;;\r\n"
+        "aaaaaaaaaaaaaaa1=Ada Local;;\r\n"   # overrides the root's name here
+        "[Contacts]\r\n"
+        "dddddddddddddddd=someone_lh,4af3\r\n"
+        "[a.jpg]\r\n"
+        # short (%llx-stripped) id + inherited-and-overridden id + an
+        # unconfirmed suggestion (UNKNOWN_CONTACT)
+        "faces=rect64(4a8e8e6b),632e71e2ffd6c6d;"
+        "rect64(3f845bcb59418507),aaaaaaaaaaaaaaa1;"
+        "rect64(ff),ffffffffffffffff\r\n"
+        "[b.jpg]\r\n"
+        "hidden=yes\r\n"
+        # xml-conflict id + an orphan nobody names + the legacy-[Contacts] id
+        "faces=rect64(1234),cccccccccccccccc;"
+        "rect64(5678),9999999999999999;"
+        "rect64(9abc),dddddddddddddddd\r\n"
+    )
+    (root / "Picnic" / ".picasa.ini").write_text(
+        "[c.jpg]\r\nfaces=rect64(2222),aaaaaaaaaaaaaaa1\r\n")
+    return root
+
+
+def _write_faces_contacts_xml(path: Path) -> Path:
+    """A synthetic machine-local contacts.xml (oracle-014 grammar): names
+    the ini-conflict contact (xml must win) and the legacy-[Contacts]-only
+    contact (nameable ONLY via contacts.xml)."""
+    path.write_text(
+        '<contacts>\n'
+        ' <contact id="cccccccccccccccc" name="Carol Xml" '
+        'modified_time="2026-01-01T00:00:00-07:00" local_contact="1"/>\n'
+        ' <contact id="dddddddddddddddd" name="Dave Legacy" '
+        'modified_time="2026-01-01T00:00:00-07:00" local_contact="1"/>\n'
+        '</contacts>\n')
+    return path
+
+
+def test_load_contacts_xml_defensive(tmp_path: Path) -> None:
+    """load_contacts_xml: ids are zero-padded to 16 to join faces= /
+    [Contacts2]; a nameless or bad-id entry skips that entry only; a
+    missing or malformed FILE yields {} (fail-soft, never a gate)."""
+    from catalog import load_contacts_xml
+
+    p = tmp_path / "contacts.xml"
+    p.write_text(
+        '<contacts>'
+        '<contact id="ca5c88ca60f42c0b" name="Pat One" local_contact="1"/>'
+        '<contact id="632e71e2ffd6c6d" name="Pat Short"/>'
+        '<contact id="ffffffffffffffff" name=""/>'
+        '<contact name="No Id"/>'
+        '<contact id="not-hex-at-all" name="Bad Id"/>'
+        '</contacts>')
+    assert load_contacts_xml(p) == {
+        "ca5c88ca60f42c0b": "Pat One",
+        "0632e71e2ffd6c6d": "Pat Short",   # short id joined padded
+    }
+    assert load_contacts_xml(tmp_path / "absent.xml") == {}
+    garbage = tmp_path / "garbage.xml"
+    garbage.write_bytes(b"\x00\x01 not xml at all")
+    assert load_contacts_xml(garbage) == {}
+
+
+def test_default_contacts_xml_discovery(monkeypatch, tmp_path: Path) -> None:
+    """default_contacts_xml finds %LocalAppData%\\Google\\Picasa2\\contacts\\
+    contacts.xml when it exists, and returns None (not a phantom path) when
+    the env var or the file is absent."""
+    from catalog import default_contacts_xml
+
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    assert default_contacts_xml() is None
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert default_contacts_xml() is None   # dir exists, file absent
+    p = tmp_path / "Google" / "Picasa2" / "contacts" / "contacts.xml"
+    p.parent.mkdir(parents=True)
+    p.write_text("<contacts/>")
+    assert default_contacts_xml() == p
+
+
+def test_scan_ingests_faces_regions_and_names(faces_library: Path) -> None:
+    """faces= regions land on Photo.faces as (rect, padded id, name):
+    rects decode per parse_rect64, short ids join [Contacts2] zero-padded,
+    the nearest [Contacts2] definition wins over an ancestor's, an
+    ancestor's table names faces in folders whose own ini has none
+    (downward inheritance — including a photo-less root), and
+    UNKNOWN_CONTACT / orphan ids stay unnamed (None). Legacy [Contacts]
+    web-id values must never surface as person names."""
+    import picasa_db
+
+    cat = scan_library(faces_library)
+    a = next(p for p in cat.photos if p.rel == "Trip/a.jpg")
+    assert [cid for _r, cid, _n in a.faces] == [
+        "0632e71e2ffd6c6d",       # zero-padded from the 15-char faces= id
+        "aaaaaaaaaaaaaaa1",
+        picasa_db.UNKNOWN_CONTACT,
+    ]
+    assert [n for _r, _c, n in a.faces] == ["Bob Short", "Ada Local", None]
+    assert a.faces[0][0] == picasa_db.parse_rect64("4a8e8e6b")
+    assert a.faces[1][0] == picasa_db.parse_rect64("3f845bcb59418507")
+
+    # hidden photos still carry their faces (reveal mode needs them)
+    b = next(p for p in cat.photos if p.rel == "Trip/b.jpg")
+    assert not b.visible
+    assert [n for _r, _c, n in b.faces] == ["Carol Ini", None, None]
+    assert "someone_lh,4af3" not in [n for _r, _c, n in b.faces]
+
+    # downward inheritance: Picnic's ini has no [Contacts2]; the ROOT ini
+    # (a folder the walk never visits — it holds no photos) names the face.
+    c = next(p for p in cat.photos if p.rel == "Picnic/c.jpg")
+    assert c.faces == (
+        (picasa_db.parse_rect64("2222"), "aaaaaaaaaaaaaaa1", "Ada Ancestor"),
+    )
+
+    # the flat registry carries the harvested names
+    assert cat.contacts["0632e71e2ffd6c6d"] == "Bob Short"
+    assert cat.contacts["cccccccccccccccc"] == "Carol Ini"
+    assert "dddddddddddddddd" not in cat.contacts  # [Contacts] has no names
+    assert picasa_db.UNKNOWN_CONTACT not in cat.contacts
+
+
+def test_contacts_xml_wins_name_conflicts(
+        faces_library: Path, tmp_path: Path) -> None:
+    """spec par.4 precedence: contacts.xml beats [Contacts2] on a name conflict,
+    and it is the ONLY namer of a legacy-[Contacts] id; ini-only names
+    survive untouched."""
+    from catalog import load_contacts_xml
+
+    contacts = load_contacts_xml(
+        _write_faces_contacts_xml(tmp_path / "contacts.xml"))
+    cat = scan_library(faces_library, None, contacts)
+
+    b = next(p for p in cat.photos if p.rel == "Trip/b.jpg")
+    assert [n for _r, _c, n in b.faces] == [
+        "Carol Xml",     # xml wins over the ini's 'Carol Ini'
+        None,            # orphan: no source names it
+        "Dave Legacy",   # nameable only via contacts.xml
+    ]
+    a = next(p for p in cat.photos if p.rel == "Trip/a.jpg")
+    assert a.faces[0][2] == "Bob Short"   # ini-only name unaffected
+
+    assert cat.contacts["cccccccccccccccc"] == "Carol Xml"
+    assert cat.contacts["dddddddddddddddd"] == "Dave Legacy"
+
+
+def test_faces_catalog_roundtrip(faces_library: Path, tmp_path: Path) -> None:
+    """Faces + the contact registry survive the persisted catalog
+    (CATALOG_VERSION 4): a warm load reproduces every Photo.faces tuple —
+    rect fractions are n/65536, exact in JSON — and Catalog.contacts."""
+    from catalog import load_contacts_xml
+
+    contacts = load_contacts_xml(
+        _write_faces_contacts_xml(tmp_path / "contacts.xml"))
+    cat = scan_library(faces_library, None, contacts)
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, faces_library)
+    assert loaded is not None
+    assert [p.faces for p in loaded.photos] == [p.faces for p in cat.photos]
+    assert loaded.contacts == cat.contacts
+    assert any(p.faces for p in loaded.photos)  # the fixture isn't vacuous
+
+
+def test_people_sidebar_filters_and_unnamed(faces_library: Path) -> None:
+    """The People sidebar section lists named people with live photo counts
+    (visible set only until reveal), clicking one filters the grid exactly
+    like an album, and the explicit 'Unnamed faces' affordance surfaces
+    photos with suggested/unresolved regions (N7 spirit)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    def item_for(win, kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    cat = scan_library(faces_library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    # named people with counts; hidden b.jpg's Carol is NOT listed yet
+    assert item_for(win, "person", "Ada Local").text(0).endswith("(1)")
+    assert item_for(win, "person", "Ada Ancestor").text(0).endswith("(1)")
+    assert item_for(win, "person", "Bob Short").text(0).endswith("(1)")
+    assert item_for(win, "person", "Carol Ini") is None
+
+    # clicking a person filters the grid like an album does
+    win._sidebar_clicked(item_for(win, "person", "Ada Ancestor"), 0)
+    assert win.grid.filter_label == "Ada Ancestor"
+    assert [cat.photos[i].rel for i in win.grid.display] == ["Picnic/c.jpg"]
+    assert "Person “Ada Ancestor”: 1 photos" in win.counts_label.text()
+
+    # unnamed-faces affordance: only visible a.jpg (its UNKNOWN face) so far
+    unnamed = item_for(win, "unnamed", "")
+    assert unnamed is not None and unnamed.text(0).endswith("(1)")
+    win._sidebar_clicked(unnamed, 0)
+    assert win.grid.filter_label == "Unnamed faces"
+    assert [cat.photos[i].rel for i in win.grid.display] == ["Trip/a.jpg"]
+
+    # live counts: reveal surfaces hidden b.jpg — Carol appears, the
+    # unnamed tally grows, and the preserved Unnamed view is recomputed
+    win.reveal_box.setChecked(True)
+    assert item_for(win, "person", "Carol Ini").text(0).endswith("(1)")
+    assert item_for(win, "unnamed", "").text(0).endswith("(2)")
+    assert win.grid.filter_label == "Unnamed faces"
+    assert sorted(cat.photos[i].rel for i in win.grid.display) == [
+        "Trip/a.jpg", "Trip/b.jpg"]
+
+    win.reveal_box.setChecked(False)
+    assert item_for(win, "person", "Carol Ini") is None
+    assert item_for(win, "unnamed", "").text(0).endswith("(1)")
+
+
+def test_search_matches_person_names(faces_library: Path) -> None:
+    """Person names join the search predicate (spec par.5): a name fragment
+    finds every visible photo with a matching named face; hidden photos'
+    faces stay out until reveal; no false hits."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    cat = scan_library(faces_library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    win.search.setText("ada")            # Ada Local (a.jpg) + Ada Ancestor (c)
+    assert sorted(cat.photos[i].rel for i in win.grid.display) == [
+        "Picnic/c.jpg", "Trip/a.jpg"]
+    win.search.setText("bob short")
+    assert [cat.photos[i].rel for i in win.grid.display] == ["Trip/a.jpg"]
+    win.search.setText("carol")          # only on hidden b.jpg
+    assert win.grid.display == []
+    win.reveal_box.setChecked(True)      # reveal recomputes the search view
+    assert [cat.photos[i].rel for i in win.grid.display] == ["Trip/b.jpg"]
+    win.reveal_box.setChecked(False)
+    win.search.setText("nobody-here")
+    assert win.grid.display == []
+
+

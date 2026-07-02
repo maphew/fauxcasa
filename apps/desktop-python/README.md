@@ -56,6 +56,19 @@ source of truth.
   **offline cache build** does ~3× the per-photo work for v2 (decode to
   512, then JPEG-encode all three levels), so v2 build throughput is lower
   than v1; that offline rate was not separately benchmarked.
+- **Grid hi-DPI consumer (`fauxcasa-q7m`), measured 2026-07-02** (Windows
+  dev box, 4K@60 Hz, real display, `QT_SCALE_FACTOR` for exact dpr —
+  same-box **relative** signal; the canonical Linux dpr-1 baselines are
+  untouched by construction): at **default zoom** dpr 2 is
+  indistinguishable from the dpr 1 control (p99 15.8 vs 18.3 ms, RSS peak
+  631 vs 611 MB, fullscreen) — the hi-DPI sharpness is free where people
+  scroll. At **min zoom** (64 px tiles, 1280×800 window) dpr 2 costs real
+  money: p99 8.6 → 22.4 ms (still in budget), max 46 → 193 ms, 3 blank
+  frames, RSS peak 555 → 764 MB — each tile paints 4× the device pixels
+  from a 4× source. Kept the DPR-aware, z1e-preserving design (zoom never
+  re-decodes); the min-zoom scaling issue is systemic (tile-count ×
+  device-area, present at dpr 1 on large viewports too) and tracked as
+  `fauxcasa-q6l.14`.
 
 ## Run it
 

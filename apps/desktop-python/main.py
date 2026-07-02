@@ -67,8 +67,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from catalog import (  # noqa: E402
     Catalog,
+    Photo,
     ScanFilter,
+    default_contacts_xml,
     load_catalog,
+    load_contacts_xml,
     reconcile_walk,
     save_catalog,
     scan_library,
@@ -426,11 +429,15 @@ class MainWindow(QMainWindow):
                  cache_dir: Path | None, build_dir: Path | None,
                  scan_filter: ScanFilter | None = None,
                  warm: bool = False, adopt: bool = False,
-                 cache_root: Path | None = None):
+                 cache_root: Path | None = None,
+                 contacts: dict[str, str] | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
         self.scan_filter = scan_filter
+        # machine-local contacts.xml names, kept so a reconcile rebuild's
+        # rescan resolves faces the same way the startup scan did
+        self.contacts = contacts or {}
         self.cache_root = cache_root or (
             cache_dir.parent if cache_dir is not None else _default_cache_root()
         )
@@ -475,7 +482,8 @@ class MainWindow(QMainWindow):
         bar.addSeparator()
         self.search = QLineEdit()
         self.search.setPlaceholderText(
-            "search filename, caption, keywords…")
+            "search filename, caption, keywords, people, folder…"
+            "  -term excludes")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(360)
         self.search.textChanged.connect(self._search_changed)
@@ -528,7 +536,10 @@ class MainWindow(QMainWindow):
         self._show_counts("All photos", self._shown_count())
 
         # --- wiring ---
-        self.grid.photo_selected.connect(self._photo_selected)
+        # The grid's set-valued signal drives the status label (single
+        # metadata vs "N photos selected"); the viewer stays single-photo
+        # and keeps feeding _photo_selected directly (fauxcasa-q6l.1).
+        self.grid.selection_changed.connect(self._selection_changed)
         self.grid.photo_activated.connect(self._open_viewer)
         self.viewer.closed.connect(self._close_viewer)
         self.viewer.photo_shown.connect(self._photo_selected)
@@ -610,7 +621,8 @@ class MainWindow(QMainWindow):
                   f"library changed ({drift.summary()}) — reindexing…")
             fresh = None
             try:
-                fresh = scan_library(old.root, self.scan_filter)
+                fresh = scan_library(old.root, self.scan_filter,
+                                     self.contacts)
                 result = build_cache(fresh, cache_dir, None,
                                      cancel=self.build_cancel)
                 if result is None:
@@ -853,6 +865,44 @@ class MainWindow(QMainWindow):
                 item.setData(0, Qt.ItemDataRole.UserRole, ("album", uid))
             albums_root.setExpanded(True)
 
+        # People (read-only v1 slice, fauxcasa-cam.3): named people with
+        # photo counts, clicking filters the grid like an album, plus an
+        # explicit "Unnamed faces" affordance for photos carrying
+        # suggested/unresolved face regions (N7: the gap is never silent).
+        # Counts are live: rebuilt with the sidebar on reveal/reconcile.
+        people, unnamed = self._people_counts()
+        if people or unnamed:
+            people_root = QTreeWidgetItem(t, ["People"])
+            people_root.setFlags(
+                people_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            for person in sorted(people, key=str.lower):
+                item = QTreeWidgetItem(
+                    people_root, [f"{person}  ({people[person]})"])
+                item.setData(0, Qt.ItemDataRole.UserRole, ("person", person))
+            if unnamed:
+                item = QTreeWidgetItem(
+                    people_root, [f"Unnamed faces  ({unnamed})"])
+                item.setData(0, Qt.ItemDataRole.UserRole, ("unnamed", ""))
+            people_root.setExpanded(True)
+
+    def _people_counts(self) -> tuple[dict[str, int], int]:
+        """Per-person photo tallies for the current reveal state: {name:
+        photo count} over named faces, plus how many photos carry at least
+        one unnamed (suggested/unresolved) face. Photo counts, not face
+        counts — a photo with the same person tagged twice counts once."""
+        reveal = self.grid.reveal
+        people: dict[str, int] = {}
+        unnamed = 0
+        for p in self.catalog.photos:
+            if not (p.visible or reveal) or not p.faces:
+                continue
+            names = {n for _rect, _cid, n in p.faces if n}
+            for n in names:
+                people[n] = people.get(n, 0) + 1
+            if any(n is None for _rect, _cid, n in p.faces):
+                unnamed += 1
+        return people, unnamed
+
     def _sidebar_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if data is None:
@@ -882,6 +932,18 @@ class MainWindow(QMainWindow):
             album = cat.albums[key]
             self.grid.set_filter(list(album.members), album.name)
             self._show_counts(f"Album “{album.name}”", len(album.members))
+        elif kind == "person":
+            idxs = [i for i, p in enumerate(cat.photos)
+                    if (p.visible or self.grid.reveal)
+                    and any(n == key for _rect, _cid, n in p.faces)]
+            self.grid.set_filter(idxs, key)
+            self._show_counts(f"Person “{key}”", len(idxs))
+        elif kind == "unnamed":
+            idxs = [i for i, p in enumerate(cat.photos)
+                    if (p.visible or self.grid.reveal)
+                    and any(n is None for _rect, _cid, n in p.faces)]
+            self.grid.set_filter(idxs, "Unnamed faces")
+            self._show_counts("Unnamed faces", len(idxs))
         else:  # "all", "folder", or an album that no longer exists
             self.grid.set_filter(None, "")
             if kind == "folder":
@@ -890,23 +952,62 @@ class MainWindow(QMainWindow):
 
     # ---------- search ----------
 
+    @staticmethod
+    def _parse_query(text: str) -> tuple[list[str], list[str]]:
+        """Whitespace-tokenized query -> (positive, negative) lowercase
+        terms. Positive terms AND together; a '-'-prefixed token excludes
+        any photo it matches (§5 negation — a negation-only query is valid:
+        Picasa users' all-photos hack was exactly that). A lone '-' — a
+        negation still being typed — contributes nothing rather than
+        blanking the grid."""
+        pos: list[str] = []
+        neg: list[str] = []
+        for tok in text.lower().split():
+            if tok.startswith("-"):
+                if len(tok) > 1:
+                    neg.append(tok[1:])
+            else:
+                pos.append(tok)
+        return pos, neg
+
     def _search_changed(self, text: str) -> None:
-        text = text.strip().lower()
-        cat = self.catalog
-        if not text:
+        pos, neg = self._parse_query(text)
+        if not pos and not neg:
             self.grid.set_filter(None, "")
             self._show_counts("All photos", self._shown_count())
             return
-        idxs = [
-            i for i, p in enumerate(cat.photos)
-            if (p.visible or self.grid.reveal) and (
-                text in p.name.lower()
-                or (p.caption and text in p.caption.lower())
-                or any(text in k.lower() for k in p.keywords)
-            )
-        ]
-        self.grid.set_filter(idxs, f"search: {text}")
-        self._show_counts(f"Search “{text}”", len(idxs))
+        cat = self.catalog
+        # Folder text is shared by every photo in a folder: precompute ONE
+        # lowercase haystack per folder — display title + rel path, so a hit
+        # on any path segment (a parent folder's name included) pulls that
+        # folder's photos into the flat result set — instead of rebuilding
+        # it per photo per term.
+        folder_hay = {rel: f"{f.title}\n{rel}".lower()
+                      for rel, f in cat.folders.items()}
+
+        def haystack(p: Photo) -> str:
+            # Every searchable field of one photo, newline-joined: terms are
+            # whitespace-free (split() above), so no term can straddle two
+            # fields.
+            return "\n".join((
+                p.name,
+                p.caption or "",
+                " ".join(p.keywords),
+                " ".join(n for _rect, _cid, n in p.faces if n),  # people (§5)
+                folder_hay[p.folder],
+            )).lower()
+
+        reveal = self.grid.reveal
+        idxs = []
+        for i, p in enumerate(cat.photos):
+            if not (p.visible or reveal):
+                continue
+            hay = haystack(p)
+            if all(t in hay for t in pos) and not any(t in hay for t in neg):
+                idxs.append(i)
+        q = text.strip().lower()
+        self.grid.set_filter(idxs, f"search: {q}")
+        self._show_counts(f"Search “{q}”", len(idxs))
 
     # ---------- status ----------
 
@@ -917,6 +1018,17 @@ class MainWindow(QMainWindow):
         self.counts_label.setText(
             f"  {label}: {n} photos · {folders} folders"
             f" · {len(self.catalog.albums)} albums")
+
+    def _selection_changed(self, selection: set) -> None:
+        """Grid multi-select -> status label (spec §5 dual mode): exactly
+        one selected shows that photo's metadata; several show the
+        aggregate count; none clears (fauxcasa-q6l.1)."""
+        if len(selection) == 1:
+            self._photo_selected(next(iter(selection)))
+        elif selection:
+            self.meta_label.setText(f"{len(selection)} photos selected  ")
+        else:
+            self.meta_label.setText("")
 
     def _photo_selected(self, idx: int) -> None:
         if idx < 0:
@@ -964,7 +1076,7 @@ class MainWindow(QMainWindow):
         if self.pages.currentWidget() is self.viewer:
             current = self.viewer.current_index()
         else:
-            current = self.grid.selected
+            current = self.grid.current  # catalog index, -1 = none (#36)
         pos = self.grid.display_pos.get(current, 0)
         if self._slideshow is None:
             self._slideshow = SlideshowPage(self.catalog, self.grid.thumbs)
@@ -1003,6 +1115,10 @@ def main() -> int:
                          "a per-user cache dir when run as a frozen bundle)")
     ap.add_argument("--rebuild", action="store_true",
                     help="ignore any existing tracer cache and rebuild")
+    ap.add_argument("--contacts", type=Path, default=None,
+                    help="Picasa contacts.xml for face names (read-only; "
+                         "default: the machine-local copy under "
+                         "%%LocalAppData%%\\Google\\Picasa2 when present)")
     ap.add_argument("--min-image-size", type=_parse_image_size_arg,
                     metavar="WIDTHxHEIGHT",
                     help="ignore images smaller than WIDTHxHEIGHT during "
@@ -1047,6 +1163,20 @@ def main() -> int:
     scan_filter = ScanFilter(min_width=min_w, min_height=min_h,
                              max_width=max_w, max_height=max_h)
 
+    # Face names from the machine-local contacts.xml (fauxcasa-cam.2):
+    # an explicit --contacts wins, else the Picasa AppData default when
+    # present. Read-only enrichment — absence or garbage is never fatal,
+    # but an explicitly named file that yields nothing is worth a warning.
+    contacts: dict[str, str] = {}
+    contacts_path = args.contacts or default_contacts_xml()
+    if contacts_path is not None:
+        contacts = load_contacts_xml(contacts_path)
+        if contacts:
+            log.info("contacts: %d names from %s", len(contacts),
+                     contacts_path)
+        elif args.contacts is not None:
+            log.warning("no contacts loaded from %s", contacts_path)
+
     # Data prep. Try a WARM start first: load the persisted catalog (no
     # walk) and bind it to the thumbnail cache. Else fall back to a COLD
     # walk + build (or adopt an external --thumbs cache). The cache dir is
@@ -1074,7 +1204,7 @@ def main() -> int:
                 log.warning("persisted cache unusable (%s); rescanning", e)
 
     if catalog is None:  # cold path
-        catalog = scan_library(root, scan_filter)
+        catalog = scan_library(root, scan_filter, contacts)
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
@@ -1104,7 +1234,8 @@ def main() -> int:
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
-                     warm=warm, adopt=adopt, cache_root=args.cache_root)
+                     warm=warm, adopt=adopt, cache_root=args.cache_root,
+                     contacts=contacts)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)

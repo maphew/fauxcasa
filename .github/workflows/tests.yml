@@ -2,6 +2,13 @@
 # tests self-skip when cache/ is absent; the committed differential
 # fixtures (fixtures/oracle/) DO run here — the golden-fixture fallback
 # posture of spec §4.
+#
+# ingest-parity is the M1 gate clause 2 (spec §9): the picasa_db survey
+# cross-check must show zero ingest loss vs the tracer's scan_library on
+# a synthetic picasa-extras corpus (fauxcasa-ed5.1/.2). It runs on every
+# push — unconditionally, not path-filtered — because it spans scripts/
+# AND apps/desktop-python/catalog.py, and the ratchet must fire the
+# moment fauxcasa-cam.* ingest work lands anywhere.
 name: tests
 
 on:
@@ -20,3 +27,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv run scripts/test_picasa_db.py -q
+
+  ingest-parity:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: M1 gate — survey/tracer ingest-parity cross-check
+        run: uv run scripts/check-ingest-parity.py
