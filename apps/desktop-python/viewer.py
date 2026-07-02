@@ -17,6 +17,23 @@ case — a photo larger than the window — the hand-off is a pure
 sharpen-in-place (see _display_rect for the small-original caveat).
 Reading the cache is well within the grid budget (N4) — it is the
 originals the grid must never touch, not the cache it owns.
+
+Explicit 1:1 zoom (fauxcasa-q6l.4), the OTHER named N4 exception: a
+fit <-> 1:1 toggle where 1:1 means one image pixel per DEVICE pixel
+(devicePixelRatio-correct, so a hi-DPI display shows native pixels, not
+a 2x blowup). Bindings: `1` — Picasa Photo Viewer's own "Toggle 100%
+zoom" (docs/research/sources/picasaresources/keyboard-shortcuts.md) —
+plus Ctrl+Alt+0 as the conflict-free spelling (the M2 triage loop will
+claim bare digits 0–5 for star-set keys, at which point `1` cedes and
+Ctrl+Alt+0 remains), plus a plain click, anchored so the clicked image
+point stays put under the cursor. While at 1:1, drag pans (and
+Ctrl+arrows pan a quarter-viewport) — PLAIN arrows keep meaning
+next/prev, the triage loop's key priority. Zoom state resets to fit on
+every photo change (Picasa's behavior; nothing in the evidence corpus
+documents zoom persisting across navigation). Until the original lands
+the cached preview stands in at ITS OWN native pixels (paint whatever
+is available — the pan anchor is fractional, so the view deepens in
+place around the same image point when the original arrives).
 """
 
 from __future__ import annotations
@@ -33,6 +50,9 @@ from thumbcache import THUMB_EDGE, ThumbCache
 
 BACKGROUND = QColor(12, 12, 12)
 CAPTION_BG = QColor(0, 0, 0, 170)
+# A press that travels less than this (logical px, Manhattan) before its
+# release is a CLICK (zoom toggle); at or past it, a DRAG (pan at 1:1).
+CLICK_SLOP = 6
 
 
 def load_original(path: str, rotate: int) -> QImage:
@@ -77,6 +97,20 @@ class ViewerPage(QWidget):
         self.preview: QImage | None = None
         self.loading = False
         self._serial = 0
+        # Explicit 1:1 zoom state (fauxcasa-q6l.4). The pan is a FRACTIONAL
+        # image point (0..1 of width/height) pinned at the viewport center,
+        # not a pixel offset: the stand-in preview and the original differ in
+        # pixel size, so a fractional anchor keeps the SAME image point
+        # centered when the async original replaces the preview — the zoom
+        # deepens in place instead of jumping. Clamping to the viewport
+        # happens per-paint in _zoom_rect against whatever is shown.
+        self.zoomed = False
+        self._zoom_cx = 0.5
+        self._zoom_cy = 0.5
+        # Click-vs-drag disambiguation: where the left press landed, and
+        # whether it traveled past CLICK_SLOP (then it pans, never toggles).
+        self._press_pos = None
+        self._dragging = False
         # ONE persistent, lazily started decode worker fed by a job queue —
         # NOT a thread per navigation. Short-lived Qt-touching threads exit
         # through Qt's per-thread native cleanup, and on offscreen Windows
@@ -151,6 +185,10 @@ class ViewerPage(QWidget):
         idx = self.current_index()
         if idx < 0:
             return
+        # Zoom state resets to fit on EVERY photo change (Picasa behavior) —
+        # this is the one funnel all changes pass through: show_photo, the
+        # viewer's _step, the slideshow's wrap _step and timed advance.
+        self._reset_zoom()
         self._serial += 1
         serial = self._serial
         ready = self._take_prefetched(idx)
@@ -255,6 +293,112 @@ class ViewerPage(QWidget):
             self.preview = None   # the full original supersedes the preview
         self.update()
 
+    # ---------- explicit 1:1 zoom + pan (fauxcasa-q6l.4) ----------
+
+    def _shown_now(self) -> QImage | None:
+        """Whatever paintEvent would draw right now: the full original once
+        it has arrived, else the instant cached preview, else None."""
+        return self.image if self.image is not None else self.preview
+
+    def _reset_zoom(self) -> None:
+        self.zoomed = False
+        self._zoom_cx = self._zoom_cy = 0.5
+        self.unsetCursor()
+
+    def toggle_zoom(self, anchor=None) -> None:
+        """Fit <-> 1:1. `anchor` (a QPointF in widget coords, e.g. the click
+        position) picks the image point that stays PUT under the cursor
+        across the toggle; None (the key toggle) anchors at the center.
+
+        The anchor solves for the fractional center: with the shown image
+        drawn dw x dh logical px at 1:1, pinning image fraction (u, v) at
+        widget point (ax, ay) means the drawn origin is ax - u*dw, and the
+        fractional center — the point at the viewport middle — is
+        cx = (w/2 - ax)/dw + u. Deliberately stored UNCLAMPED: against the
+        small stand-in preview the clamp would collapse to center and lose
+        the anchor the user meant for the original; _zoom_rect clamps
+        per-paint instead."""
+        if self.zoomed:
+            self._reset_zoom()
+            self.update()
+            return
+        self.zoomed = True
+        self._zoom_cx = self._zoom_cy = 0.5
+        shown = self._shown_now()
+        if anchor is not None and shown is not None:
+            w, h = self.width(), self.height()
+            r = self._display_rect(w, h, shown.width(), shown.height(),
+                                   cap=self.image is not None)
+            if r.width() > 0 and r.height() > 0:
+                u = max(0.0, min(1.0, (anchor.x() - r.x()) / r.width()))
+                v = max(0.0, min(1.0, (anchor.y() - r.y()) / r.height()))
+                dpr = self.devicePixelRatioF()
+                dw = max(1, round(shown.width() / dpr))
+                dh = max(1, round(shown.height() / dpr))
+                self._zoom_cx = (w / 2 - anchor.x()) / dw + u
+                self._zoom_cy = (h / 2 - anchor.y()) / dh + v
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update()
+
+    def _pan_by(self, dx: float, dy: float) -> None:
+        """Pan the 1:1 view by a widget-space delta (logical px): dragging
+        the photo right moves the fractional center left. Each axis snaps to
+        the RANGE the viewport can actually pan ([box/(2*drawn), 1 - that],
+        where _zoom_rect's edge clamp bites), so a fling past an edge leaves
+        no dead travel to wind back through. An axis with no pan freedom
+        (drawn <= box) is left alone — snapping it would erase a click
+        anchor meant for the original while only the small preview is up."""
+        shown = self._shown_now()
+        if shown is None or not self.zoomed:
+            return
+        dpr = self.devicePixelRatioF()
+        dw = max(1, round(shown.width() / dpr))
+        dh = max(1, round(shown.height() / dpr))
+        if dw > self.width():
+            lo = self.width() / (2 * dw)
+            self._zoom_cx = max(lo, min(1 - lo, self._zoom_cx - dx / dw))
+        if dh > self.height():
+            lo = self.height() / (2 * dh)
+            self._zoom_cy = max(lo, min(1 - lo, self._zoom_cy - dy / dh))
+        self.update()
+
+    @staticmethod
+    def _clamp_offset(off: int, drawn: int, box: int) -> int:
+        """One axis of the 1:1 pan clamp: an image smaller than the box
+        centers (no pan freedom); a larger one may never expose background
+        past either edge, so the origin stays within [box - drawn, 0]."""
+        if drawn <= box:
+            return (box - drawn) // 2
+        return max(box - drawn, min(0, off))
+
+    @staticmethod
+    def _zoom_rect(box_w: int, box_h: int, src_w: int, src_h: int,
+                   dpr: float, cx: float, cy: float) -> QRect:
+        """The 1:1 display rect for a `src` painted in a `box`: one image
+        pixel per DEVICE pixel, so the drawn size in LOGICAL px is src/dpr
+        (at dpr 1 the blit is pixel-exact; at dpr 2 the half-size logical
+        rect covers exactly src device pixels). (cx, cy) is the fractional
+        image point at the box center, clamped per axis."""
+        dw = max(1, round(src_w / dpr))
+        dh = max(1, round(src_h / dpr))
+        x = ViewerPage._clamp_offset(round(box_w / 2 - cx * dw), dw, box_w)
+        y = ViewerPage._clamp_offset(round(box_h / 2 - cy * dh), dh, box_h)
+        return QRect(x, y, dw, dh)
+
+    def _shown_rect(self, w: int, h: int, shown: QImage) -> QRect:
+        """Where the current stand-in paints: the centered aspect-fit rect
+        normally, the DPR-correct panned 1:1 rect while zoomed. At 1:1 the
+        rect comes from the SHOWN image's own pixels — until the original
+        lands that is the preview at its native (small) size, "paint
+        whatever is available"; the fractional pan then re-centers the same
+        image point when the original's pixels arrive."""
+        if self.zoomed:
+            return self._zoom_rect(w, h, shown.width(), shown.height(),
+                                   self.devicePixelRatioF(),
+                                   self._zoom_cx, self._zoom_cy)
+        return self._display_rect(w, h, shown.width(), shown.height(),
+                                  cap=self.image is not None)
+
     def _step(self, delta: int) -> None:
         if not self.display:
             return
@@ -263,8 +407,29 @@ class ViewerPage(QWidget):
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        arrows = (Qt.Key.Key_Left, Qt.Key.Key_Right,
+                  Qt.Key.Key_Up, Qt.Key.Key_Down)
         if key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace):
             self.closed.emit(self.current_index())
+        elif (ctrl and alt and key == Qt.Key.Key_0) or (
+                key == Qt.Key.Key_1
+                and mods in (Qt.KeyboardModifier.NoModifier,
+                             Qt.KeyboardModifier.KeypadModifier)):
+            # `1` = Picasa Photo Viewer's "Toggle 100% zoom"; Ctrl+Alt+0 is
+            # the conflict-free spelling that survives the M2 star-set keys
+            # claiming bare digits (module docstring).
+            self.toggle_zoom()
+        elif self.zoomed and ctrl and key in arrows:
+            # Ctrl+arrows pan a quarter-viewport at 1:1; PLAIN arrows keep
+            # meaning next/prev below (the triage loop owns them).
+            self._pan_by(
+                (self.width() // 4) * {Qt.Key.Key_Left: 1,
+                                       Qt.Key.Key_Right: -1}.get(key, 0),
+                (self.height() // 4) * {Qt.Key.Key_Up: 1,
+                                        Qt.Key.Key_Down: -1}.get(key, 0))
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_K):
             self._step(-1)
         elif key in (Qt.Key.Key_Right, Qt.Key.Key_J, Qt.Key.Key_Space):
@@ -272,7 +437,45 @@ class ViewerPage(QWidget):
         else:
             super().keyPressEvent(event)
 
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position()
+            self._dragging = False
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        # Only arrives while a button is held (no mouse tracking): past the
+        # click slop this press is a DRAG — pan at 1:1, and never toggle on
+        # the release. Incremental (press_pos walks with the cursor), so a
+        # long drag pans smoothly rather than jumping from the press point.
+        if self._press_pos is None:
+            super().mouseMoveEvent(event)
+            return
+        d = event.position() - self._press_pos
+        if not self._dragging and d.manhattanLength() < CLICK_SLOP:
+            return
+        self._dragging = True
+        if self.zoomed:
+            self._pan_by(d.x(), d.y())
+        self._press_pos = event.position()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton \
+                and self._press_pos is not None:
+            if not self._dragging:
+                # A clean click: toggle fit <-> 1:1 anchored at the click
+                # point (Picasa's click-to-zoom muscle memory).
+                self.toggle_zoom(event.position())
+            self._press_pos = None
+            self._dragging = False
+        else:
+            super().mouseReleaseEvent(event)
+
     def mouseDoubleClickEvent(self, _event) -> None:
+        # Note the first press/release of a double-click already toggled the
+        # zoom — a transient frame we accept: the viewer closes right here,
+        # and zoom state resets with the next photo shown anyway.
         self.closed.emit(self.current_index())
 
     @staticmethod
@@ -304,13 +507,10 @@ class ViewerPage(QWidget):
             return
         # The full original once it has arrived, else the instant cached
         # preview; only when neither exists do we fall back to text.
-        shown = self.image if self.image is not None else self.preview
+        shown = self._shown_now()
         if shown is not None:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            painter.drawImage(
-                self._display_rect(w, h, shown.width(), shown.height(),
-                                   cap=self.image is not None),
-                shown)
+            painter.drawImage(self._shown_rect(w, h, shown), shown)
         else:
             painter.setPen(QColor(150, 150, 150))
             msg = "loading…" if self.loading else "could not decode this file"
@@ -318,6 +518,10 @@ class ViewerPage(QWidget):
 
         photo = self.catalog.photos[idx]
         parts = [f"{self.pos + 1}/{len(self.display)}", photo.rel]
+        if self.zoomed:
+            # The mode chip doubles as the binding hint (drag pans;
+            # 1 / Ctrl+Alt+0 / click return to fit).
+            parts.append("1:1 — drag to pan, click/1 to fit")
         if photo.star:
             parts.append("★")
         if photo.caption:

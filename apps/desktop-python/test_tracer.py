@@ -3855,3 +3855,201 @@ def test_grid_jump_top_end_and_buttons(tmp_path: Path) -> None:
         assert b.focusPolicy() == _Qt.FocusPolicy.NoFocus
 
 
+# ---------------------------------------------------------------------------
+# The two N4 exceptions (fauxcasa-q6l.4/.5): the viewer's explicit fit <-> 1:1
+# zoom toggle + pan, and the grid's Ctrl+Alt hover full-screen peek. Bindings
+# follow the Picasa shortcut corpus (docs/research/sources/picasaresources/
+# keyboard-shortcuts.md): `1` toggles 100% zoom (plus conflict-free
+# Ctrl+Alt+0, plus click anchored at the click point); "Hover over a photo
+# and use Ctrl-Alt" shows the full-screen preview. All offscreen-safe: mouse
+# and key events are constructed and delivered to the widget handlers
+# directly; DPR paths force the ratio via monkeypatch.
+# ---------------------------------------------------------------------------
+
+
+def _viewer_with_original(tmp_path: Path, w: int = 2560, h: int = 1600):
+    """A 1280x800 ViewerPage showing photo 0 with a decoded `w`x`h` original
+    already landed (via _on_loaded, no thread) — the common zoom case."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    cat = scan_library(root)
+    v = ViewerPage(cat, None)
+    v.resize(1280, 800)
+    v.show_photo(list(range(len(cat.photos))), 0)
+    orig = QImage(w, h, QImage.Format.Format_RGB32)
+    orig.fill(0x336699)
+    v._on_loaded(v._serial, orig)
+    assert v.image is orig and not v.zoomed
+    return v, orig
+
+
+def _mouse(widget, kind, x: float, y: float,
+           button=None, modifiers=None) -> None:
+    """Deliver a synthetic left-button mouse event to the widget handlers
+    (press/move/release), offscreen-safe."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    pos = QPointF(x, y)
+    btn = button if button is not None else Qt.MouseButton.LeftButton
+    mods = (modifiers if modifiers is not None
+            else Qt.KeyboardModifier.NoModifier)
+    ev = QMouseEvent(kind, pos, pos, pos, btn, btn, mods)
+    if kind == QEvent.Type.MouseButtonPress:
+        widget.mousePressEvent(ev)
+    elif kind == QEvent.Type.MouseMove:
+        widget.mouseMoveEvent(ev)
+    else:
+        widget.mouseReleaseEvent(ev)
+
+
+def test_viewer_zoom_rect_dpr_and_pan_clamping() -> None:
+    """The pure 1:1 geometry: one image pixel per DEVICE pixel (logical size
+    = src/dpr, so dpr 2 halves the logical rect), pan clamped so background
+    never shows past an edge, and an image smaller than the box centers
+    regardless of the pan state."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    zr = ViewerPage._zoom_rect
+    from PySide6.QtCore import QRect
+    # dpr 1, centered: 2560x1600 in 1280x800 hangs half out on every side
+    assert zr(1280, 800, 2560, 1600, 1.0, 0.5, 0.5) == \
+        QRect(-640, -400, 2560, 1600)
+    # pan clamps: fractional centers past the ends pin the matching edge
+    assert zr(1280, 800, 2560, 1600, 1.0, 0.0, 0.0) == \
+        QRect(0, 0, 2560, 1600)               # top-left pinned
+    assert zr(1280, 800, 2560, 1600, 1.0, 1.0, 1.0) == \
+        QRect(-1280, -800, 2560, 1600)        # bottom-right pinned
+    assert zr(1280, 800, 2560, 1600, 1.0, -9.0, 99.0) == \
+        QRect(0, -800, 2560, 1600)            # wild pans still clamp
+    # dpr 2: the SAME source covers half the logical px (native device px)
+    assert zr(1280, 800, 2560, 1600, 2.0, 0.5, 0.5) == \
+        QRect(0, 0, 1280, 800)
+    # smaller than the box: centered, pan has no freedom
+    assert zr(1280, 800, 600, 400, 1.0, 0.9, 0.1) == QRect(340, 200, 600, 400)
+    # degenerate 1x1 never yields a zero-size rect
+    assert zr(1280, 800, 1, 1, 3.0, 0.5, 0.5).width() == 1
+
+
+def test_viewer_zoom_key_toggles_and_arrows_still_navigate(
+        tmp_path: Path) -> None:
+    """`1` (Picasa Photo Viewer's 100% toggle) and Ctrl+Alt+0 both toggle
+    fit <-> 1:1; PLAIN arrows keep meaning next/prev even while zoomed (the
+    triage loop owns them), and the photo change resets the zoom to fit."""
+    from PySide6.QtCore import Qt
+    v, _ = _viewer_with_original(tmp_path)
+    _press(v, Qt.Key.Key_1)
+    assert v.zoomed
+    _press(v, Qt.Key.Key_1)
+    assert not v.zoomed
+    _key(v, Qt.Key.Key_0, Qt.KeyboardModifier.ControlModifier
+         | Qt.KeyboardModifier.AltModifier)
+    assert v.zoomed
+    _press(v, Qt.Key.Key_Right)               # plain arrow: NAVIGATES
+    assert v.pos == 1
+    assert not v.zoomed                        # ...and the zoom reset to fit
+    # a modified 1 (future star-set chords etc.) does NOT toggle
+    _key(v, Qt.Key.Key_1, Qt.KeyboardModifier.ControlModifier)
+    assert not v.zoomed
+
+
+def test_viewer_zoom_click_anchor_stays_put(tmp_path: Path,
+                                            monkeypatch) -> None:
+    """Click-to-zoom keeps the clicked image point PUT under the cursor: the
+    image pixel under (ax, ay) at fit paints at (ax, ay) at 1:1. A second
+    click returns to fit."""
+    from PySide6.QtCore import QEvent
+    v, orig = _viewer_with_original(tmp_path)
+    monkeypatch.setattr(v, "devicePixelRatioF", lambda: 1.0)
+    ax, ay = 900.0, 300.0
+    _mouse(v, QEvent.Type.MouseButtonPress, ax, ay)
+    _mouse(v, QEvent.Type.MouseButtonRelease, ax, ay)
+    assert v.zoomed
+    fit = v._display_rect(1280, 800, orig.width(), orig.height(), cap=True)
+    u_img = (ax - fit.x()) / fit.width() * orig.width()
+    v_img = (ay - fit.y()) / fit.height() * orig.height()
+    z = v._shown_rect(1280, 800, orig)
+    assert z.size().width() == orig.width()      # 1:1 at dpr 1
+    assert abs(z.x() + u_img * z.width() / orig.width() - ax) <= 1.0
+    assert abs(z.y() + v_img * z.height() / orig.height() - ay) <= 1.0
+    _mouse(v, QEvent.Type.MouseButtonPress, ax, ay)
+    _mouse(v, QEvent.Type.MouseButtonRelease, ax, ay)
+    assert not v.zoomed                          # click toggles back to fit
+
+
+def test_viewer_zoom_drag_pans_and_release_does_not_toggle(
+        tmp_path: Path, monkeypatch) -> None:
+    """While at 1:1 a drag pans (the photo follows the cursor) and its
+    release is NOT a click — the zoom stays on; a fling past the edge clamps
+    (background never shows, and no dead travel is left to wind back
+    through); Ctrl+arrows pan a quarter-viewport without navigating."""
+    from PySide6.QtCore import QEvent, Qt
+    v, orig = _viewer_with_original(tmp_path)
+    monkeypatch.setattr(v, "devicePixelRatioF", lambda: 1.0)
+    v.toggle_zoom()                              # center: rect at (-640,-400)
+    assert v._shown_rect(1280, 800, orig).x() == -640
+    _mouse(v, QEvent.Type.MouseButtonPress, 600, 400)
+    _mouse(v, QEvent.Type.MouseMove, 500, 350)   # drag left/up 100/50
+    _mouse(v, QEvent.Type.MouseButtonRelease, 500, 350)
+    assert v.zoomed                              # a drag never toggles
+    z = v._shown_rect(1280, 800, orig)
+    assert (z.x(), z.y()) == (-740, -450)        # photo moved with the cursor
+    _mouse(v, QEvent.Type.MouseButtonPress, 600, 400)
+    _mouse(v, QEvent.Type.MouseMove, 9000, 400)  # fling far right
+    _mouse(v, QEvent.Type.MouseButtonRelease, 9000, 400)
+    assert v._shown_rect(1280, 800, orig).x() == 0   # clamped at the edge
+    before = v._shown_rect(1280, 800, orig).x()
+    pos_before = v.pos
+    _key(v, Qt.Key.Key_Right, Qt.KeyboardModifier.ControlModifier)
+    assert v.pos == pos_before                   # pan, not navigation
+    assert v._shown_rect(1280, 800, orig).x() == before - 1280 // 4
+
+
+def test_viewer_zoom_resets_on_photo_change_and_show(tmp_path: Path) -> None:
+    """Zoom state is per-photo-shown (Picasa behavior): _step and a fresh
+    show_photo both land at fit with a centered pan."""
+    v, _ = _viewer_with_original(tmp_path)
+    v.toggle_zoom()
+    v._pan_by(-300, -200)
+    assert v.zoomed and v._zoom_cx != 0.5
+    v.show_photo(v.display, 1)
+    assert not v.zoomed and v._zoom_cx == 0.5 and v._zoom_cy == 0.5
+
+
+def test_viewer_zoom_dpr_and_preview_standin(tmp_path: Path,
+                                             monkeypatch) -> None:
+    """The instance path is devicePixelRatio-correct (a forced dpr 2 halves
+    the logical 1:1 rect: native DEVICE pixels, not a 2x blowup), and before
+    the original lands the zoomed paint shows the cached preview at ITS own
+    pixels — "paint whatever is available" — centered when smaller than the
+    viewport, and still paints cleanly (grab)."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256])
+    v = ViewerPage(cat, cache)
+    v.resize(1280, 800)
+    monkeypatch.setattr(v, "devicePixelRatioF", lambda: 2.0)
+    v.show_photo(list(range(cache.count)), 0)
+    assert v.preview is not None and v.image is None   # original still async
+    v.toggle_zoom()
+    z = v._shown_rect(1280, 800, v.preview)
+    # preview at its own native device px: logical size = preview/2, centered
+    assert z.width() == max(1, round(v.preview.width() / 2.0))
+    assert z.x() == (1280 - z.width()) // 2
+    assert not v.grab().isNull()                       # zoomed paint is clean
+    from PySide6.QtGui import QImage
+    orig = QImage(2560, 1600, QImage.Format.Format_RGB32)
+    orig.fill(0x224466)
+    v._on_loaded(v._serial, orig)                      # the original lands...
+    assert v.zoomed                                    # ...zoom holds, and
+    z2 = v._shown_rect(1280, 800, orig)                # deepens to true 1:1
+    assert z2.width() == 1280                          # 2560 px at dpr 2
+    v.quiesce()                                        # reap the decode worker
+    assert v._decoder is None or not v._decoder.is_alive()
+
+
