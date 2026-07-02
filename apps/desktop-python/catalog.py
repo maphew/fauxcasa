@@ -22,6 +22,16 @@ an external thumbnail cache without running the indexer, so its catalog
 stays ini-only (the in-file read piggybacks on the index's file reads,
 which adopt mode skips by design — N4). See apps/desktop-python/README.md.
 
+Dates/GPS/Rating follow the same two-pass shape (fauxcasa-cam.9/.10/.11,
+via apps/desktop-python/metareader.py — the exiv2 seam): scan_library fills
+geotag from the ini ``geotag=lat,lon`` key and the 0-5 star count from
+``star=yes`` (legacy import = 1, §3 star authority); the indexer then
+overrides with in-file values when the file carries them — EXIF
+DateTimeOriginal/DateTime -> date_taken (the ini has no per-photo date
+key), EXIF GPS -> geotag, XMP Rating 1-5 -> star — because in-file
+metadata wins for tier-1 data per §4 (oracle hardening of that precedence
+is fauxcasa-ed5.9's). The adopt-mode ini-only caveat applies identically.
+
 Faces/people (§3 People first-class, read-only slice): scan_library parses
 per-photo ini `faces=` regions via picasa_db.parse_faces, harvests
 [Contacts2] id->name tables with the documented downward-inheritance rule
@@ -35,7 +45,7 @@ read-only slice carries.
 
 Remaining tracer-scope gaps (see apps/desktop-python/README.md): EXIF orientation is
 applied at decode (Qt/PIL auto-transform, composed with the rotate= user
-turns), but faces-in-XMP, geotags, and in-file dates are not ingested.
+turns), but faces-in-XMP is not ingested (fauxcasa-cam.5).
 The folder-level Hidden Folders category IS now honored: a folder whose
 own [Picasa] section carries `P2category=Hidden Folders` hides all of its
 photos, mirroring per-photo hidden=yes (oracle fixture 017) and the stash
@@ -94,13 +104,26 @@ class Photo:
     rel: str  # library-relative POSIX path
     folder: str  # library-relative POSIX folder path ("" = root)
     name: str
-    star: bool = False
+    # Star COUNT, 0-5 (§3 star authority; fauxcasa-cam.11): ini star=yes
+    # imports as 1, in-file XMP Rating 1-5 as that count, 0 = unstarred.
+    # Was a bool; every consumer that treated it as truthy (badge, Starred
+    # view, status ★) still works — count >= 1 is "starred".
+    star: int = 0
     caption: str | None = None
     keywords: tuple[str, ...] = ()
     rotate: int = 0  # quarter-turns clockwise, from rotate=rotate(N)
     hidden: bool = False
     albums: tuple[str, ...] = ()
     faces: tuple[FaceTag, ...] = ()
+    # Capture date, canonical "YYYY-MM-DDTHH:MM:SS" from in-file EXIF
+    # (metareader, fauxcasa-cam.9). Year is UNBOUNDED (§6 footgun 16:
+    # scanned photos predate 1903). None until indexed / when absent;
+    # consumers may fall back to mtime for grouping (q6l.11's call).
+    date_taken: str | None = None
+    # Signed decimal (lat, lon) — §3 geotag v1: read, preserve, display
+    # (fauxcasa-cam.10). ini geotag= at scan; in-file EXIF GPS overrides
+    # at index (§4 tier-1: in-file wins for standard metadata).
+    geotag: tuple[float, float] | None = None
     # Picasa stashes pre-edit originals in .picasaoriginals/; those files
     # are catalog entries (cache-order parity) but never shown in the grid.
     visible: bool = True
@@ -239,6 +262,36 @@ def _is_stashed(folder_rel: str) -> bool:
 
 def _flag(sec: picasa_db.IniSection, key: str) -> bool:
     return (sec.get(key) or "").strip().lower() == "yes"
+
+
+def _parse_ini_geotag(value: str) -> tuple[float, float] | None:
+    """One ini ``geotag=lat,lon`` value (decimal floats, per
+    picasa-ini-format.md) -> signed (lat, lon). Fail-soft per line
+    (§4 robustness rule): a malformed or out-of-range value is None,
+    never an exception."""
+    parts = value.split(",")
+    if len(parts) != 2:
+        return None
+    try:
+        lat, lon = float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+    if not (abs(lat) <= 90.0 and abs(lon) <= 180.0):
+        return None
+    return (lat, lon)
+
+
+def format_geotag(geotag: tuple[float, float]) -> str:
+    """The coordinates readout (§3 geotag v1: read, preserve, display),
+    shared by the status bar and the viewer info line so both surfaces
+    show identical text: signed decimal degrees, 5 places (~1 m)."""
+    return f"{geotag[0]:.5f}, {geotag[1]:.5f}"
+
+
+def format_date_taken(date_taken: str) -> str:
+    """Human form of the canonical capture date: the ISO 'T' becomes a
+    space; no other reinterpretation (footgun 16: never a year floor)."""
+    return date_taken.replace("T", " ")
 
 
 # Picasa hides a WHOLE folder by putting it in the built-in "Hidden Folders"
@@ -428,7 +481,9 @@ def scan_library(root: Path,
 
         sec = secmap.get(name.lower())
         if sec is not None:
-            photo.star = _flag(sec, "star")  # presence-only key
+            # star= is a presence-only key with no count: legacy star=yes
+            # imports as 1 star (§3). XMP Rating may raise it at index time.
+            photo.star = 1 if _flag(sec, "star") else 0
             photo.caption = sec.get("caption") or None  # "" -> None
             kw = sec.get("keywords")
             if kw:
@@ -442,6 +497,11 @@ def scan_library(root: Path,
                 except ValueError:
                     pass
             photo.hidden = _flag(sec, "hidden")
+            gt = sec.get("geotag")
+            if gt:
+                # The non-EXIF geotag source (fauxcasa-cam.10): in-file GPS,
+                # when present, overrides this at index time (§4 tier-1).
+                photo.geotag = _parse_ini_geotag(gt)
             al = sec.get("albums")
             if al:
                 photo.albums = tuple(
@@ -544,13 +604,18 @@ def scan_library(root: Path,
 # ingested and persisted (per-photo `f` rows + a `contacts` registry) — a
 # v3 catalog has neither, so a warm start would silently show an empty
 # People surface; reject it and cold-rebuild.
-CATALOG_VERSION = 4
+# v5: in-file capture date, GPS, and XMP Rating (fauxcasa-cam.9/.10/.11)
+# are ingested (ini geotag= at scan, metareader at index) and persisted
+# (per-photo `d`/`g` rows; `s` is now the 0-5 star COUNT, not a 0/1 flag) —
+# a v4 catalog has none of these, so a warm start would silently drop
+# dates/geotags and cap every star count at 1; reject and cold-rebuild.
+CATALOG_VERSION = 5
 
 
 def _photo_to_row(p: Photo) -> dict:
     row: dict = {"r": p.rel}
     if p.star:
-        row["s"] = 1
+        row["s"] = p.star  # 0-5 count since v5 (0 = key absent)
     if p.caption:
         row["c"] = p.caption
     if p.keywords:
@@ -565,6 +630,12 @@ def _photo_to_row(p: Photo) -> dict:
         # rect fractions are n/65536 — exact binary fractions, so they
         # round-trip through JSON floats byte-identically.
         row["f"] = [[list(rect), cid, name] for rect, cid, name in p.faces]
+    if p.date_taken:
+        row["d"] = p.date_taken
+    if p.geotag is not None:
+        # decimal degrees rounded to 6 places at parse time, so the JSON
+        # float round-trip is exact
+        row["g"] = list(p.geotag)
     if p.size >= 0:
         row["z"] = p.size
     if p.mtime >= 0:
@@ -637,13 +708,16 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
         for row in rows:
             rel = row["r"]
             folder, _, name = rel.rpartition("/")
+            g = row.get("g")
             p = Photo(
                 rel=rel, folder=folder, name=name,
-                star=bool(row.get("s")), caption=row.get("c"),
+                star=int(row.get("s") or 0), caption=row.get("c"),
                 keywords=tuple(row.get("k", ())), rotate=row.get("o", 0),
                 hidden=bool(row.get("h")), albums=tuple(row.get("a", ())),
                 faces=tuple((tuple(rect), cid, fname)
                             for rect, cid, fname in row.get("f", ())),
+                date_taken=row.get("d"),
+                geotag=(float(g[0]), float(g[1])) if g else None,
                 size=row.get("z", -1), mtime=row.get("m", -1),
                 sha256=row.get("x"),
             )
@@ -678,7 +752,7 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
         contacts = data.get("contacts", {})
         if not isinstance(contacts, dict):
             contacts = {}
-    except (KeyError, TypeError, AttributeError, ValueError):
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError):
         return None
 
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,

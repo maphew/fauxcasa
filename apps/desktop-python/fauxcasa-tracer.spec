@@ -47,8 +47,13 @@ _repo = os.path.dirname(os.path.dirname(_here))
 
 # apps/desktop-python/main.py imports its siblings (catalog/grid/thumbcache/viewer) as
 # top-level modules after sys.path.insert(parent) — they are NOT a package,
-# so PyInstaller's module graph needs them named explicitly.
-_hidden = ["catalog", "grid", "thumbcache", "viewer", "picasa_db", "applog"]
+# so PyInstaller's module graph needs them named explicitly. "exiv2" is the
+# python-exiv2 binding metareader imports lazily (inside a function, with a
+# fail-soft fallback that would otherwise let a missed collection ship a
+# build that silently reads no dates/GPS/Rating) — named here so the graph
+# can never drop it.
+_hidden = ["catalog", "grid", "thumbcache", "viewer", "picasa_db", "applog",
+           "metareader", "exiv2"]
 
 # Qt modules the tracer never touches (QtCore/QtGui/QtWidgets only). Mostly
 # no-ops under PySide6-Essentials, but they make the build self-documenting

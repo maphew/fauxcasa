@@ -28,6 +28,7 @@ from typing import Callable, Sequence
 
 from catalog import Catalog
 from inmeta import read_jpeg_metadata
+from metareader import read_file_meta
 
 MAGIC = b"FCTC"
 THUMB_EDGE = 256
@@ -250,8 +251,10 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     """One photo: read bytes, sha256 (N6 identity), SCALED-decode ONCE to the
     top (largest) level's box (libjpeg DCT decode — see INDEX_WORKERS), then
     downscale that decoded image to each lower level and JPEG-encode every
-    level. Also reads in-file caption/keywords (XMP/IPTC) from the bytes
-    already in hand. Returns the per-level (blob, w, h) records the fcache
+    level. Also reads in-file metadata from the bytes already in hand:
+    caption/keywords (inmeta, XMP/IPTC, JPEG only) plus capture date / GPS /
+    XMP Rating (metareader, the exiv2 seam, all carriers — fauxcasa-
+    cam.9/.10/.11). Returns the per-level (blob, w, h) records the fcache
     needs, the catalog signals, and the PRIMARY-level QImage for the live grid
     feed. A null/corrupt image yields a zero-length blob per level (error
     tile). With a single 256 level this is byte-identical to the legacy path.
@@ -276,6 +279,7 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
         data, size, mtime = b"", -1, -1
     sha = hashlib.sha256(data).hexdigest()
     meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG only)
+    fmeta = read_file_meta(data)     # in-file date/GPS/Rating (all carriers)
 
     # setData copies into the buffer's own QByteArray; passing a temporary
     # QByteArray to QBuffer(...) instead leaves a dangling pointer (PySide6
@@ -297,7 +301,8 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
                                    max(1, round(sz.height() * s))))
     img = reader.read()
     if img.isNull():
-        return idx, [(b"", 0, 0) for _ in levels], size, mtime, sha, meta, None
+        return (idx, [(b"", 0, 0) for _ in levels], size, mtime, sha,
+                meta, fmeta, None)
     # formats whose header size was unreadable skip the scaled decode above
     if img.width() > top or img.height() > top:
         img = img.scaled(
@@ -324,7 +329,7 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
         level_blobs.append((bytes(out.data()), lvl.width(), lvl.height()))
         if li == primary_li:
             primary_img = lvl
-    return idx, level_blobs, size, mtime, sha, meta, primary_img
+    return idx, level_blobs, size, mtime, sha, meta, fmeta, primary_img
 
 
 def _write_fcache(out: Path, levels: list[int],
@@ -398,7 +403,8 @@ def build_cache(
             if cancel is not None and cancel.is_set():
                 pool.shutdown(wait=False, cancel_futures=True)
                 return None
-            idx, level_blobs, size, mtime, sha, meta, img = fut.result()
+            idx, level_blobs, size, mtime, sha, meta, fmeta, img = \
+                fut.result()
             photo_levels[idx] = level_blobs
             photo = catalog.photos[idx]
             photo.size, photo.mtime, photo.sha256 = size, mtime, sha
@@ -411,6 +417,26 @@ def build_cache(
                 photo.caption = meta.caption
             if meta.keywords:
                 photo.keywords = meta.keywords
+            # Same §4 tier-1 rule for the metareader fields
+            # (fauxcasa-cam.9/.10/.11):
+            if fmeta.date_taken:
+                # the ini has no per-photo date key, so in-file is the only
+                # source; None leaves the field for a consumer-side mtime
+                # fallback (q6l.11 owns date grouping/sort)
+                photo.date_taken = fmeta.date_taken
+            if fmeta.gps is not None:
+                # in-file EXIF GPS wins over the ini geotag= value the scan
+                # set — §4 tier-1: in-file wins for standard metadata; the
+                # ini key remains the source for files with no GPS in them.
+                # The oracle check of this precedence is fauxcasa-ed5.9's.
+                photo.geotag = fmeta.gps
+            if fmeta.rating:
+                # §3 star authority: XMP Rating 1-5 maps losslessly to the
+                # star count and WINS over a bare ini star=yes (which
+                # carries no count and imported as 1 at scan). An explicit
+                # Rating 0 does NOT unstar an ini-starred photo: the ini
+                # star= line stays authoritative for zero-vs-nonzero (§3).
+                photo.star = fmeta.rating
             if progress:
                 progress(idx, total, img)
     elapsed = time.perf_counter() - t0
