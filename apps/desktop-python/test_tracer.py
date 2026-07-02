@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "PySide6", "pillow"]
+# dependencies = ["pytest", "PySide6", "pillow", "exiv2", "rawpy"]
 # ///
 """Tests for the tracer's non-GUI layers: catalog scan + metadata,
 thumbnail-cache build/load/bind, and walk-rule parity with
@@ -4231,5 +4231,663 @@ def test_peek_target_screen_falls_back_to_primary(monkeypatch) -> None:
 
     monkeypatch.setattr(peek, "QGuiApplication", _NoHit)
     assert peek.PeekPage._target_screen() is primary
+# In-file capture date / GPS / XMP Rating via metareader — the exiv2
+# bytes-mode seam (fauxcasa-cam.9/.10/.11). Fixtures are synthesized through
+# metareader's OWN test-support writer (embed_test_metadata) so every exiv2
+# call in the repo stays inside that one module (the library-swap seam);
+# pixels are flat synthetic fills, metadata invented — privacy-safe.
+# ---------------------------------------------------------------------------
+
+import metareader  # noqa: E402
+
+# Whitehorse YT — the western longitude exercises the hemisphere sign, and
+# both coordinates convert to EXIF d/m/s rationals exactly (spike truth).
+WHITEHORSE = (60.72125, -135.05685)
+SYDNEY = (-33.8568, 151.2153)  # southern lat: the other sign branch
+
+
+def _meta_jpeg(path: Path | None = None, **meta) -> bytes:
+    """JPEG bytes carrying exactly the given in-file metadata; also written
+    to `path` when given (embed_test_metadata raises on failure — a broken
+    fixture must fail loudly)."""
+    data = metareader.embed_test_metadata(_jpeg_bytes(), **meta)
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return data
+
+
+def test_metareader_reads_date_gps_rating() -> None:
+    """The three fields off one JPEG's bytes — and the date is pre-1903
+    (footgun 16: scanned photos predate Picasa's UI floor; no year floor
+    here, ever)."""
+    fm = metareader.read_file_meta(_meta_jpeg(
+        date_time_original="1899:03:02 14:00:00",
+        gps=WHITEHORSE, rating=3))
+    assert fm.date_taken == "1899-03-02T14:00:00"
+    assert fm.gps == pytest.approx(WHITEHORSE)
+    assert fm.rating == 3
+    # southern/eastern signs too
+    fm2 = metareader.read_file_meta(_meta_jpeg(gps=SYDNEY))
+    assert fm2.gps == pytest.approx(SYDNEY)
+
+
+def test_metareader_datetime_fallback_and_garbage() -> None:
+    """DateTimeOriginal wins; Exif.Image.DateTime is the fallback; the
+    all-zeros camera placeholder and free-text garbage read as None."""
+    both = _meta_jpeg(date_time_original="2009:07:04 13:00:00",
+                      date_time="2020:01:01 00:00:00")
+    assert metareader.read_file_meta(both).date_taken == "2009-07-04T13:00:00"
+    only_fallback = _meta_jpeg(date_time="2020:01:01 08:30:59")
+    assert metareader.read_file_meta(only_fallback).date_taken == \
+        "2020-01-01T08:30:59"
+    zeros = _meta_jpeg(date_time_original="0000:00:00 00:00:00")
+    assert metareader.read_file_meta(zeros).date_taken is None
+    junk = _meta_jpeg(date_time_original="not a date")
+    assert metareader.read_file_meta(junk).date_taken is None
+    absent = _meta_jpeg(rating=1)  # no date fields at all
+    assert metareader.read_file_meta(absent).date_taken is None
+
+
+def test_metareader_rating_clamps_to_0_5() -> None:
+    """xmp:Rating -> int clamped into the §3 star model: out-of-range
+    values clamp (7 -> 5; XMP's -1 'rejected' -> 0 until the M2
+    reverse-star work owns it); an explicit 0 is 0, not None; absent is
+    None (no Rating in the packet at all)."""
+    assert metareader.read_file_meta(_meta_jpeg(rating=7)).rating == 5
+    assert metareader.read_file_meta(_meta_jpeg(rating=-1)).rating == 0
+    assert metareader.read_file_meta(_meta_jpeg(rating=0)).rating == 0
+    assert metareader.read_file_meta(_meta_jpeg(rating="3.0")).rating == 3
+    assert metareader.read_file_meta(_jpeg_bytes()).rating is None
+
+
+def test_metareader_fail_soft_on_garbage_bytes() -> None:
+    """The fail-soft contract: hostile/degenerate bytes yield all-None,
+    never an exception (one corrupt photo must not abort an index)."""
+    empty = metareader.FileMeta()
+    assert metareader.read_file_meta(b"") == empty
+    assert metareader.read_file_meta(b"garbage" * 1000) == empty
+    good = _meta_jpeg(date_time_original="2009:07:04 13:00:00", rating=4)
+    assert metareader.read_file_meta(good[:40]) == empty  # truncated
+    assert metareader.read_file_meta(good) != empty  # sanity: intact reads
+
+
+def test_metareader_non_jpeg_carriers() -> None:
+    """metareader is bytes-in, container-sniffing: PNG and WebP carriers
+    (two of the §4 non-JPEG homes) read the same fields back."""
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QColor, QImage
+
+    img = QImage(40, 30, QImage.Format.Format_RGB32)
+    img.fill(QColor(50, 90, 130))
+    for fmt in ("PNG", "WEBP"):
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not img.save(buf, fmt):
+            continue  # a Qt build without this plugin: skip the carrier
+        data = metareader.embed_test_metadata(
+            bytes(buf.data()),
+            date_time_original="2015:03:15 09:30:00", rating=2)
+        fm = metareader.read_file_meta(data)
+        assert fm.date_taken == "2015-03-15T09:30:00", fmt
+        assert fm.rating == 2, fmt
+
+
+def test_scan_ini_geotag_and_star_count(tmp_path: Path) -> None:
+    """scan_library fills geotag from the ini geotag=lat,lon key (the
+    non-EXIF source) fail-soft per line, and star=yes imports as exactly
+    1 star (§3: legacy star=yes -> 1)."""
+    root = tmp_path / "lib"
+    for name in ("a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"):
+        make_jpeg(root / "f" / name)
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\ngeotag=-33.856800,151.215300\r\nstar=yes\r\n"
+        "[b.jpg]\r\ngeotag=not,numbers\r\n"      # garbage floats
+        "[c.jpg]\r\ngeotag=1,2,3\r\n"            # wrong arity
+        "[d.jpg]\r\ngeotag=95.0,10.0\r\n"        # out of range
+        "[e.jpg]\r\ngeotag=\r\n"                 # empty value
+    )
+    cat = scan_library(root)
+    by = {p.name: p for p in cat.photos}
+    assert by["a.jpg"].geotag == pytest.approx((-33.8568, 151.2153))
+    assert by["a.jpg"].star == 1
+    assert by["b.jpg"].geotag is None
+    assert by["c.jpg"].geotag is None
+    assert by["d.jpg"].geotag is None
+    assert by["e.jpg"].geotag is None
+    assert by["b.jpg"].star == 0
+
+
+@pytest.fixture()
+def metadata_library(tmp_path: Path) -> Path:
+    """One folder, four precedence cases (§4 tier-1 / §3 star authority):
+      a.jpg  in-file EXIF GPS + Rating 3 + date; ini geotag= + star=yes
+             -> in-file wins everything
+      b.jpg  no in-file metadata; ini geotag= + star=yes
+             -> ini fallback holds after indexing
+      c.jpg  in-file Rating 2 only; no ini
+             -> Rating alone sets the count
+      d.jpg  in-file Rating 0; ini star=yes
+             -> ini stays authoritative for zero-vs-nonzero (still 1)"""
+    root = tmp_path / "mlib"
+    _meta_jpeg(root / "f" / "a.jpg",
+               date_time_original="1899:03:02 14:00:00",
+               gps=WHITEHORSE, rating=3)
+    make_jpeg(root / "f" / "b.jpg")
+    _meta_jpeg(root / "f" / "c.jpg", rating=2)
+    _meta_jpeg(root / "f" / "d.jpg", rating=0)
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\nstar=yes\r\ngeotag=-33.856800,151.215300\r\n"
+        "[b.jpg]\r\nstar=yes\r\ngeotag=-33.856800,151.215300\r\n"
+        "[d.jpg]\r\nstar=yes\r\n"
+    )
+    return root
+
+
+def test_index_precedence_infile_beats_ini(
+        metadata_library: Path, tmp_path: Path) -> None:
+    cat = scan_library(metadata_library)
+    by = {p.name: p for p in cat.photos}
+    # scan-level state before the index: ini only, in-file not read yet
+    assert by["a.jpg"].geotag == pytest.approx(SYDNEY)
+    assert by["a.jpg"].star == 1 and by["a.jpg"].date_taken is None
+    assert by["c.jpg"].star == 0
+
+    assert thumbcache.build_cache(cat, tmp_path / "c") is not None
+    # a: in-file EXIF GPS beats ini geotag=; Rating 3 beats bare star=yes
+    assert by["a.jpg"].geotag == pytest.approx(WHITEHORSE)
+    assert by["a.jpg"].star == 3
+    assert by["a.jpg"].date_taken == "1899-03-02T14:00:00"  # footgun 16
+    # b: no in-file values -> the ini fallback survives the index pass
+    assert by["b.jpg"].geotag == pytest.approx(SYDNEY)
+    assert by["b.jpg"].star == 1 and by["b.jpg"].date_taken is None
+    # c: Rating alone sets the count
+    assert by["c.jpg"].star == 2
+    # d: an explicit Rating 0 does NOT unstar an ini-starred photo (§3:
+    # ini star= is authoritative for zero-vs-nonzero)
+    assert by["d.jpg"].star == 1
+
+
+def test_metadata_catalog_roundtrip_and_version_gate(
+        metadata_library: Path, tmp_path: Path) -> None:
+    """date_taken / geotag / star count survive save_catalog/load_catalog
+    (the warm-load path), and a pre-v5 catalog is rejected so a warm start
+    can never silently drop the new fields."""
+    import catalog as catmod
+
+    cat = scan_library(metadata_library)
+    assert thumbcache.build_cache(cat, tmp_path / "c") is not None
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, metadata_library)
+    assert loaded is not None
+    for orig, back in zip(cat.photos, loaded.photos):
+        assert back.star == orig.star and isinstance(back.star, int)
+        assert back.date_taken == orig.date_taken
+        assert back.geotag == orig.geotag  # exact: rounded before persist
+    a = next(p for p in loaded.photos if p.name == "a.jpg")
+    assert a.star == 3 and a.geotag == pytest.approx(WHITEHORSE)
+    assert a.date_taken == "1899-03-02T14:00:00"
+
+    # the version gate: a v4 (pre-metadata) catalog cold-rebuilds
+    assert catmod.CATALOG_VERSION == 5
+    data = json.loads(path.read_text())
+    data["version"] = 4
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, metadata_library) is None
+
+
+def test_grid_geotag_badge_paint_smoke(tmp_path: Path) -> None:
+    """The geotag corner badge paints without incident alongside the star
+    badge and selection chrome (offscreen render through paintEvent), in
+    a corner of its own (bottom-right vs the star's top-right)."""
+    from PySide6.QtGui import QImage
+
+    from grid import GEO_TEAL, STAR_GOLD, _pin_polygon
+
+    g = _selection_grid(tmp_path)
+    cat = g.catalog
+    d = g.display
+    cat.photos[d[0]].geotag = WHITEHORSE            # pin only
+    cat.photos[d[1]].geotag = SYDNEY                # pin + star together
+    cat.photos[d[1]].star = 4
+    _click(g, d[1])                                 # selection chrome on top
+    shot = g.grab().toImage().convertToFormat(QImage.Format.Format_RGB32)
+    assert not shot.isNull()
+
+    # both badges actually hit the viewport: their colors appear in the shot
+    found = {"geo": False, "star": False}
+    for y in range(0, shot.height(), 2):
+        for x in range(0, shot.width(), 2):
+            c = shot.pixelColor(x, y)
+            if (abs(c.red() - GEO_TEAL.red()) < 30
+                    and abs(c.green() - GEO_TEAL.green()) < 30
+                    and abs(c.blue() - GEO_TEAL.blue()) < 30):
+                found["geo"] = True
+            elif (abs(c.red() - STAR_GOLD.red()) < 30
+                    and abs(c.green() - STAR_GOLD.green()) < 30
+                    and abs(c.blue() - STAR_GOLD.blue()) < 30):
+                found["star"] = True
+        if all(found.values()):
+            break
+    assert found["geo"] and found["star"]
+
+    # shape sanity: a closed teardrop — the tip plus a 13-point head arc
+    poly = _pin_polygon(10.0, 10.0, 8.0)
+    assert poly.size() == 14
+    assert poly.at(0).y() > poly.at(7).y()  # tip below the head's top arc
+
+
+def test_status_readout_date_coords_and_star_count(library: Path) -> None:
+    """Single-photo status-bar mode (§5 dual mode) reads out capture date,
+    coordinates (§3 geotag v1 display), and the star COUNT (one ★ per
+    star); the Starred view still treats any count >= 1 as starred
+    (backward-compatible truthiness)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    cat = scan_library(library)
+    a = next(p for p in cat.photos if p.rel.endswith("Trip/a.jpg"))
+    a.star = 3
+    a.date_taken = "1899-03-02T14:00:00"
+    a.geotag = WHITEHORSE
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    idx = cat.photos.index(a)
+    win.grid._select(idx)
+    text = win.meta_label.text()
+    assert "★★★" in text and "★★★★" not in text   # exactly three
+    assert "1899-03-02 14:00:00" in text            # unbounded year, displayed
+    assert "60.72125, -135.05685" in text           # signed decimal readout
+    assert "the beach" in text                      # caption still present
+
+    # Starred view: count >= 1 keeps every existing truthy consumer working
+    win._apply_view("starred", "")
+    assert idx in win.grid.display
+    assert "Starred: 1 photos" in win.counts_label.text()
+
+
+def test_viewer_info_line_paints_metadata(library: Path) -> None:
+    """The viewer's info bar composes star count + date + coordinates
+    without incident (offscreen paint smoke; the text path is the shared
+    catalog.format_* formatting the status bar test asserts on)."""
+    _offscreen_app()
+    from viewer import ViewerPage
+
+    cat = scan_library(library)
+    a = next(p for p in cat.photos if p.rel.endswith("Trip/a.jpg"))
+    a.star = 5
+    a.date_taken = "2009-07-04T13:00:00"
+    a.geotag = SYDNEY
+    v = ViewerPage(cat, None)
+    v.resize(320, 240)
+    v.show()
+    v.show_photo([cat.photos.index(a)], 0)
+    assert not v.grab().isNull()   # paints the bar with all fields present
+    v.quiesce()
+
+
+# ---------------------------------------------------------------------------
+# RAW support (fauxcasa-v46.1): Picasa's documented 16-vendor extension list
+# in BOTH walkers (lockstep, or caches stop binding), rawpy decode routed by
+# extension ahead of any content sniff (TIFF-based RAW containers fool
+# QImageReader/PIL), embedded-JPEG-preview-first with demosaic fallback,
+# orientation applied exactly once per path, and corrupt-RAW fail-soft.
+#
+# Fixture provenance (privacy rule: NEVER real family data): _make_dng below
+# hand-rolls a minimal-but-valid little-endian DNG 1.4 from scratch — a TIFF
+# container holding a deterministic synthetic 16-bit RGGB CFA mosaic
+# (struct-packed gradient, no camera involved), optionally an embedded JPEG
+# preview built by the suite's own Qt encoder (_jpeg_bytes), plus the tags
+# LibRaw's identify() requires (DNGVersion, CFA geometry, ColorMatrix1,
+# UniqueCameraModel; note LibRaw rejects raws under 22 px per side). Verified
+# against rawpy/LibRaw: imread + postprocess succeed, extract_thumb returns
+# the preview when present and LibRawNoThumbnailError when absent.
+# ---------------------------------------------------------------------------
+
+
+def _dng_ifd(entries: list, ifd_off: int) -> bytes:
+    """Serialize one TIFF IFD at ifd_off: sorted 12-byte entries, values
+    <= 4 bytes inline, larger payloads appended after the table (word-
+    aligned). entries: (tag, type, count, payload_bytes)."""
+    entries = sorted(entries, key=lambda e: e[0])
+    data_off = ifd_off + 2 + 12 * len(entries) + 4
+    table = struct.pack("<H", len(entries))
+    data = b""
+    for tag, typ, count, payload in entries:
+        if len(payload) <= 4:
+            table += struct.pack("<HHI", tag, typ, count) \
+                + payload.ljust(4, b"\0")
+        else:
+            if (data_off + len(data)) % 2:
+                data += b"\0"
+            table += struct.pack("<HHII", tag, typ, count,
+                                 data_off + len(data))
+            data += payload
+    return table + struct.pack("<I", 0) + data
+
+
+def _dng_ifd_size(entries: list) -> int:
+    return 2 + 12 * len(entries) + 4 + sum(
+        len(p) + (len(p) % 2) for _t, _y, _c, p in entries if len(p) > 4)
+
+
+def _make_dng(path: Path, w: int = 32, h: int = 24, orientation: int = 1,
+              preview_jpeg: bytes | None = None,
+              preview_size: tuple[int, int] = (0, 0),
+              truncate: bool = False) -> Path:
+    """A tiny synthetic DNG (see the section comment for provenance). With
+    `preview_jpeg`, IFD0 is a JPEG-compressed preview (the layout real
+    cameras use) and the CFA raw lives in a SubIFD; without, the raw IS
+    IFD0 and the file carries no thumbnail at all (forces the demosaic
+    fallback). `orientation` writes TIFF tag 274 so LibRaw bakes the flip
+    during postprocess. `truncate` chops half the CFA strip off the end —
+    a structurally-valid header whose pixel read fails (fail-soft test)."""
+    _SHORT, _LONG, _BYTE, _ASCII, _SRAT = 3, 4, 1, 2, 10
+    strip = struct.pack(f"<{w * h}H", *(((x * 89 + y * 71) % 4096)
+                                        for y in range(h) for x in range(w)))
+    cam = b"Fauxcasa Synthetic\0"
+    cm = b"".join(struct.pack("<ii", v, 10000) for v in
+                  (10000, 0, 0, 0, 10000, 0, 0, 0, 10000))  # identity XYZ
+
+    def E(tag, typ, fmt, *vals):
+        return (tag, typ, len(vals) if len(vals) > 1 else 1,
+                struct.pack(fmt, *vals))
+
+    raw_entries = [
+        E(254, _LONG, "<I", 0),            # NewSubfileType: the raw image
+        E(256, _LONG, "<I", w), E(257, _LONG, "<I", h),
+        E(258, _SHORT, "<H", 16),          # 16-bit samples
+        E(259, _SHORT, "<H", 1),           # uncompressed
+        E(262, _SHORT, "<H", 32803),       # PhotometricInterpretation: CFA
+        E(277, _SHORT, "<H", 1),           # 1 sample/px
+        E(278, _LONG, "<I", h),            # RowsPerStrip
+        E(279, _LONG, "<I", len(strip)),   # StripByteCounts
+        E(284, _SHORT, "<H", 1),
+        E(33421, _SHORT, "<HH", 2, 2),     # CFARepeatPatternDim
+        (33422, _BYTE, 4, bytes([0, 1, 1, 2])),  # CFAPattern: RGGB
+        E(50714, _SHORT, "<H", 0),         # BlackLevel
+        E(50717, _LONG, "<I", 4095),       # WhiteLevel
+    ]
+    shared = [
+        (50706, _BYTE, 4, bytes([1, 4, 0, 0])),      # DNGVersion 1.4
+        (50708, _ASCII, len(cam), cam),              # UniqueCameraModel
+        (50721, _SRAT, 9, cm),                       # ColorMatrix1
+        E(50778, _SHORT, "<H", 21),                  # CalibrationIlluminant1
+        E(274, _SHORT, "<H", orientation),           # Orientation
+    ]
+
+    if preview_jpeg is None:
+        ifd0 = raw_entries + shared + [E(273, _LONG, "<I", 0)]
+        strip_off = 8 + _dng_ifd_size(ifd0)
+        ifd0[-1] = E(273, _LONG, "<I", strip_off)    # StripOffsets -> raw
+        out = struct.pack("<2sHI", b"II", 42, 8) + _dng_ifd(ifd0, 8)
+        assert len(out) == strip_off
+        out += strip
+    else:
+        pw, ph = preview_size
+        ifd0 = [
+            E(254, _LONG, "<I", 1),        # reduced-resolution preview
+            E(256, _LONG, "<I", pw), E(257, _LONG, "<I", ph),
+            (258, _SHORT, 3, struct.pack("<HHH", 8, 8, 8)),
+            E(259, _SHORT, "<H", 7),       # JPEG-compressed strip
+            E(262, _SHORT, "<H", 6),       # YCbCr
+            E(277, _SHORT, "<H", 3),
+            E(278, _LONG, "<I", ph),
+            E(279, _LONG, "<I", len(preview_jpeg)),
+            E(273, _LONG, "<I", 0),        # -> preview jpeg (patched below)
+            E(330, _LONG, "<I", 0),        # SubIFDs -> raw (patched below)
+        ] + shared
+        raw_ifd = raw_entries + [E(273, _LONG, "<I", 0)]
+        sub_off = 8 + _dng_ifd_size(ifd0)
+        jpeg_off = sub_off + _dng_ifd_size(raw_ifd)
+        strip_off = jpeg_off + len(preview_jpeg)
+        ifd0 = [E(273, _LONG, "<I", jpeg_off) if e[0] == 273
+                else E(330, _LONG, "<I", sub_off) if e[0] == 330
+                else e for e in ifd0]
+        raw_ifd[-1] = E(273, _LONG, "<I", strip_off)
+        out = struct.pack("<2sHI", b"II", 42, 8) + _dng_ifd(ifd0, 8)
+        assert len(out) == sub_off
+        out += _dng_ifd(raw_ifd, sub_off)
+        assert len(out) == jpeg_off
+        out += preview_jpeg + strip
+    if truncate:
+        out = out[:len(out) - len(strip) // 2]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(out)
+    return path
+
+
+def _thumb_qimage(cache, idx: int):
+    """Decode cache entry idx's primary-level blob, or None on error tile."""
+    from PySide6.QtGui import QImage
+
+    offset, length, _w, _h = cache.entries[idx]
+    if length <= 0:
+        return None
+    with open(cache.path, "rb") as f:
+        f.seek(offset)
+        img = QImage.fromData(f.read(length), "JPEG")
+    return None if img.isNull() else img
+
+
+def test_raw_extensions_in_both_walkers(tmp_path: Path) -> None:
+    """Picasa's documented RAW list (files-supported-by-picasa3.md: 18
+    extensions, 16 vendors) is in BOTH EXTS sets, in lockstep, and both
+    walks pick RAW files up case-insensitively — the walk-parity contract
+    that keeps caches binding."""
+    import importlib.util
+
+    import catalog
+    import rawload
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+
+    documented = {".dng", ".crw", ".cr2", ".raw", ".raf", ".3fr", ".dcr",
+                  ".kdc", ".mrw", ".nef", ".nrw", ".orf", ".rw2", ".pef",
+                  ".x3f", ".arw", ".srf", ".sr2"}
+    assert rawload.RAW_EXTS == documented
+    assert mtc.RAW_EXTS == rawload.RAW_EXTS   # the script's mirror
+    assert catalog.EXTS == mtc.EXTS           # the whole lockstep set
+    assert documented <= catalog.EXTS
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    for name in ("a.NEF", "b.dng", "c.Cr2", "d.ARW"):
+        (root / name).write_bytes(b"stub")    # walk checks suffix only
+    make_jpeg(root / "e.jpg")
+    walked = [p.name for p in walk_library(root)]
+    assert sorted(walked) == ["a.NEF", "b.dng", "c.Cr2", "d.ARW", "e.jpg"]
+    script_walk = sorted(p for p in root.rglob("*")
+                         if p.suffix.lower() in mtc.EXTS and p.is_file())
+    assert [p.name for p in script_walk] == walked
+
+
+def test_raw_thumb_via_embedded_preview(tmp_path: Path) -> None:
+    """A DNG with an embedded JPEG preview thumbs through extract_thumb, NOT
+    demosaic: the cached thumb has the preview's dimensions (64x48; the
+    half-size demosaic of the 32x24 raw would be 16x12) and the preview's
+    uniform color (the synthetic CFA gradient could never decode to it)."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    _make_dng(root / "p.dng", preview_jpeg=_jpeg_bytes(64, 48),
+              preview_size=(64, 48))
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    (_o, length, w, h), = cache.entries
+    assert length > 0 and (w, h) == (64, 48)
+    img = _thumb_qimage(cache, 0)
+    px = img.pixelColor(32, 24)
+    # _jpeg_bytes fills (120, 160, 200); allow JPEG q80 drift
+    assert abs(px.red() - 120) < 30 and abs(px.green() - 160) < 30 \
+        and abs(px.blue() - 200) < 30
+
+
+def test_raw_thumb_demosaic_fallback(tmp_path: Path) -> None:
+    """A DNG with NO embedded preview falls back to rawpy postprocess
+    (half_size=True): the 32x24 raw demosaics to a 16x12 thumb — a real
+    decode, not an error tile."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    _make_dng(root / "n.dng")                  # no preview IFD at all
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    (_o, length, w, h), = cache.entries
+    assert length > 0 and (w, h) == (16, 12)   # half of 32x24
+    assert _thumb_qimage(cache, 0) is not None
+
+
+def test_raw_orientation_applied_once_demosaic(tmp_path: Path) -> None:
+    """Orientation=6 on a landscape 32x24 raw with no preview: LibRaw bakes
+    the flip during postprocess, and the indexer must NOT transform again —
+    the thumb comes out portrait (12x16). A double application would be a
+    180-degree turn, landing back at landscape."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    _make_dng(root / "r.dng", orientation=6)
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    (_o, length, w, h), = cache.entries
+    assert length > 0 and w < h and (w, h) == (12, 16)
+
+
+def test_raw_orientation_applied_once_preview(tmp_path: Path) -> None:
+    """An embedded preview carrying its OWN EXIF Orientation=6 tag (LibRaw
+    passes EXIF'd previews through byte-preserving): the ordinary JPEG
+    auto-transform applies it exactly once, so the 64x48 landscape preview
+    thumbs portrait (48x64). Twice would be 180 degrees — landscape again."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    pj = _inject(_jpeg_bytes(64, 48), 0xE1, _exif_orientation_app1(6))
+    _make_dng(root / "pr.dng", preview_jpeg=pj, preview_size=(64, 48))
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    (_o, length, w, h), = cache.entries
+    assert length > 0 and (w, h) == (48, 64)   # portrait: applied once
+
+
+def test_raw_corrupt_fails_soft(tmp_path: Path) -> None:
+    """Corrupt RAWs — a truncated CFA strip and outright garbage bytes —
+    yield the existing zero-length error tile and never abort the build;
+    the good neighbors still index."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    _make_dng(root / "trunc.dng", truncate=True)
+    (root / "garbage.nef").write_bytes(b"\x00\x01 not a raw file" * 64)
+    make_jpeg(root / "ok.jpg")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    lengths = {rel: length for rel, (_o, length, _w, _h) in
+               zip(cache.files, cache.entries)}
+    assert lengths["trunc.dng"] == 0           # error tile
+    assert lengths["garbage.nef"] == 0         # error tile
+    assert lengths["ok.jpg"] > 0               # neighbors unharmed
+
+
+def test_viewer_load_original_raw(tmp_path: Path) -> None:
+    """viewer.load_original (the seam the slideshow prefetch shares): the
+    embedded preview decodes for responsiveness (proven by dimensions AND
+    the preview's color), a preview-less DNG demosaics at full size, the
+    Picasa rotate= turns compose on top exactly like any format, and a
+    corrupt RAW returns a null QImage (the viewer's fail-soft contract)."""
+    _offscreen_app()
+    from viewer import load_original
+
+    prev = _make_dng(tmp_path / "p.dng", preview_jpeg=_jpeg_bytes(64, 48),
+                     preview_size=(64, 48))
+    img = load_original(str(prev), 0)
+    assert (img.width(), img.height()) == (64, 48)
+    px = img.pixelColor(32, 24)
+    assert abs(px.red() - 120) < 30 and abs(px.blue() - 200) < 30
+
+    noprev = _make_dng(tmp_path / "n.dng")
+    img = load_original(str(noprev), 0)        # full demosaic: native 32x24
+    assert (img.width(), img.height()) == (32, 24)
+    img = load_original(str(noprev), 1)        # rotate= composes on top
+    assert (img.width(), img.height()) == (24, 32)
+
+    bad = tmp_path / "bad.dng"
+    bad.write_bytes(b"garbage" * 100)
+    assert load_original(str(bad), 0).isNull()
+
+
+def test_make_thumbcache_raw_paths(tmp_path: Path) -> None:
+    """The standalone PIL builder mirrors the same routing: preview-first
+    (its own EXIF applied once by exif_transpose), demosaic fallback (flip
+    baked by LibRaw, NOT transposed again), error tile on corrupt bytes."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+
+    prev = _make_dng(tmp_path / "p.dng", preview_jpeg=_jpeg_bytes(64, 48),
+                     preview_size=(64, 48))
+    (blob, w, h), = mtc._make_thumb(prev, [256])
+    assert blob and (w, h) == (64, 48)         # the preview, not 16x12
+
+    rot_prev = _make_dng(
+        tmp_path / "rp.dng",
+        preview_jpeg=_inject(_jpeg_bytes(64, 48),
+                             0xE1, _exif_orientation_app1(6)),
+        preview_size=(64, 48))
+    (blob, w, h), = mtc._make_thumb(rot_prev, [256])
+    assert blob and (w, h) == (48, 64)         # preview EXIF applied once
+
+    noprev = _make_dng(tmp_path / "n.dng", orientation=6)
+    (blob, w, h), = mtc._make_thumb(noprev, [256])
+    assert blob and (w, h) == (12, 16)         # LibRaw flip only, once
+
+    bad = tmp_path / "bad.arw"
+    bad.write_bytes(b"not a raw")
+    assert mtc._make_thumb(bad, [256]) == [(b"", 0, 0)]
+
+
+def test_pre_raw_cache_stops_binding_on_exts_change(tmp_path: Path) -> None:
+    """The upgrade path: a cache whose walk never saw RAW files (built by a
+    pre-v46 binary, or before the RAW arrived) must fail bind() the moment
+    the new walk includes them — the count mismatch that makes main() fall
+    back to a cold rescan + rebuild instead of showing misbound tiles."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    make_jpeg(root / "b.jpg")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    thumbcache.bind(cache, cat)                # sanity: binds pre-change
+
+    _make_dng(root / "new.dng")                # RAW joins the walk
+    fresh = scan_library(root)
+    with pytest.raises(thumbcache.CacheError,
+                       match="does not match the library walk"):
+        thumbcache.bind(cache, fresh)
+
+
+def test_scan_filter_never_drops_raw(tmp_path: Path) -> None:
+    """The size scan-filter judges RAW dimensions as unknowable (a
+    QImageReader sniff of the TIFF container would report the tiny embedded
+    preview's dims — a wrong answer) and therefore always KEEPS RAW files,
+    while still filtering ordinary images."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    make_jpeg(root / "small.jpg", 64, 48)
+    _make_dng(root / "m.dng")
+    files = [p.name for p in
+             walk_library(root, ScanFilter(min_width=1000))]
+    assert files == ["m.dng"]                  # jpeg filtered, RAW kept
 
 

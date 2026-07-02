@@ -40,12 +40,13 @@ from __future__ import annotations
 
 import queue
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QWidget
 
-from catalog import Catalog
+from catalog import Catalog, format_date_taken, format_geotag
 from thumbcache import THUMB_EDGE, ThumbCache
 
 BACKGROUND = QColor(12, 12, 12)
@@ -63,12 +64,27 @@ def load_original(path: str, rotate: int) -> QImage:
     viewer's async load and the slideshow's dwell prefetch (slideshow.py),
     so every consumer orients identically. Returns a null QImage on
     failure. Thread-safe: QImage (unlike QPixmap) may be built off the GUI
-    thread, and callers do call this from worker threads."""
+    thread, and callers do call this from worker threads.
+
+    RAW files route by extension to rawload BEFORE QImageReader can sniff
+    the TIFF-based container (rawload module doc): embedded JPEG preview
+    first — usually full-size, so the viewer stays responsive — else a
+    full demosaic; orientation lands exactly once on either path, and the
+    rotate= turns compose on top exactly as for any other format."""
     from PySide6.QtGui import QImageReader
 
-    reader = QImageReader(path)
-    reader.setAutoTransform(True)
-    img = reader.read()
+    from rawload import is_raw_suffix, load_raw_qimage
+
+    if is_raw_suffix(path):
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return QImage()
+        img = load_raw_qimage(data)
+    else:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        img = reader.read()
     if not img.isNull() and rotate:
         from PySide6.QtGui import QTransform
 
@@ -523,7 +539,11 @@ class ViewerPage(QWidget):
             # 1 / Ctrl+Alt+0 / click return to fit).
             parts.append("1:1 — drag to pan, click/1 to fit")
         if photo.star:
-            parts.append("★")
+            parts.append("★" * min(photo.star, 5))  # 0-5 count (cam.11)
+        if photo.date_taken:
+            parts.append(format_date_taken(photo.date_taken))
+        if photo.geotag is not None:
+            parts.append(format_geotag(photo.geotag))  # §3 geotag readout
         if photo.caption:
             parts.append(f"“{photo.caption}”")
         bar = "   ·   ".join(parts)
