@@ -71,13 +71,15 @@ sys.path.insert(0, str(_REPO / "scripts"))
 
 import picasa_db  # noqa: E402
 from rawload import RAW_EXTS, is_raw_suffix  # noqa: E402
+from videoload import VIDEO_EXTS, is_video_suffix  # noqa: E402
 
 # Must match scripts/make-thumbcache.py EXTS exactly (cache-order parity):
 # the stills set below PLUS Picasa's documented 16-vendor RAW extension
-# list (rawload.RAW_EXTS, fauxcasa-v46.1) — any change to either half
+# list (rawload.RAW_EXTS, fauxcasa-v46.1) PLUS Picasa's documented video
+# list (videoload.VIDEO_EXTS, fauxcasa-v46.2) — any change to any part
 # lands in BOTH files or caches stop binding.
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
-        ".webp"} | RAW_EXTS
+        ".webp"} | RAW_EXTS | VIDEO_EXTS
 
 INI_NAMES = (".picasa.ini", "Picasa.ini", "picasa.ini")
 
@@ -124,6 +126,12 @@ class Photo:
     rel: str  # library-relative POSIX path
     folder: str  # library-relative POSIX folder path ("" = root)
     name: str
+    # Media kind, 'image' | 'video' (fauxcasa-v46.2): pure extension
+    # routing (videoload.VIDEO_EXTS), so it is DERIVED — set at scan and
+    # re-derived from rel on catalog load, never persisted (it could only
+    # drift). Videos index as poster-frame thumbnails and show a play
+    # badge; playback is v46.3.
+    media: str = "image"
     # Star COUNT, 0-5 (§3 star authority; fauxcasa-cam.11): ini star=yes
     # imports as 1, in-file XMP Rating 1-5 as that count, 0 = unstarred.
     # Was a bool; every consumer that treated it as truthy (badge, Starred
@@ -144,6 +152,11 @@ class Photo:
     # (fauxcasa-cam.10). ini geotag= at scan; in-file EXIF GPS overrides
     # at index (§4 tier-1: in-file wins for standard metadata).
     geotag: tuple[float, float] | None = None
+    # Source pixel dimensions (w, h), seeded from the ini's width=/
+    # height= keys when both parse (fauxcasa-v46.2 — Picasa records them
+    # for video files, the tracer's only pre-decode dim source there;
+    # harmless extra signal on stills that carry them). None = unknown.
+    dims: tuple[int, int] | None = None
     # Picasa stashes pre-edit originals in .picasaoriginals/; those files
     # are catalog entries (cache-order parity) but never shown in the grid.
     visible: bool = True
@@ -255,8 +268,10 @@ def _image_size(path: Path) -> tuple[int, int] | None:
     RAW files report None BY DESIGN: their TIFF-based containers make
     QImageReader's sniff return the embedded preview's dimensions (a tiny
     wrong answer), so the size filter must never judge a RAW by it — the
-    file is kept and the rawpy path decodes it (rawload module doc)."""
-    if is_raw_suffix(path.name):
+    file is kept and the rawpy path decodes it (rawload module doc).
+    Video files likewise report None: QImageReader must never sniff video
+    bytes (videoload module doc), so the size filter always keeps them."""
+    if is_raw_suffix(path.name) or is_video_suffix(path.name):
         return None
     try:
         from PySide6.QtGui import QImageReader
@@ -720,7 +735,8 @@ def scan_library(root: Path,
 
     for p, rel in zip(files, rel_paths(root, files)):
         folder_rel, _, name = rel.rpartition("/")
-        photo = Photo(rel=rel, folder=folder_rel, name=name)
+        photo = Photo(rel=rel, folder=folder_rel, name=name,
+                      media="video" if is_video_suffix(name) else "image")
         if _is_stashed(folder_rel):
             photo.visible = False
 
@@ -764,6 +780,17 @@ def scan_library(root: Path,
                 # The non-EXIF geotag source (fauxcasa-cam.10): in-file GPS,
                 # when present, overrides this at index time (§4 tier-1).
                 photo.geotag = _parse_ini_geotag(gt)
+            wv, hv = sec.get("width"), sec.get("height")
+            if wv and hv:
+                # ini width=/height= seed the source dims — Picasa records
+                # them for videos (fauxcasa-v46.2). Fail-soft per line (§4
+                # robustness): a malformed value just leaves dims unknown.
+                try:
+                    dims = (int(wv), int(hv))
+                except ValueError:
+                    dims = None
+                if dims is not None and dims[0] > 0 and dims[1] > 0:
+                    photo.dims = dims
             al = sec.get("albums")
             if al:
                 photo.albums = tuple(
@@ -909,12 +936,18 @@ def scan_library(root: Path,
 # flags; the import report lands beside this file as import-report.json) —
 # a v5 catalog silently dropped both album classes, so a warm start would
 # hide them again; reject and cold-rebuild.
-# v7: adopt-mode backfill state (fauxcasa-cam.12) is persisted as a
+# v7: video files join the walk (videoload.VIDEO_EXTS in EXTS,
+# fauxcasa-v46.2) and ini width=/height= dims are ingested (per-photo
+# `wh` rows) — a v6 catalog was walked without videos, so a warm start
+# would silently hide every video in the library; reject and cold-
+# rebuild. (Photo.media is derived from the extension on load, like
+# folder/name/visible — never persisted.)
+# v8: adopt-mode backfill state (fauxcasa-cam.12) is persisted as a
 # top-level `backfill` object when a backfill is pending/underway (absent
-# = complete). A v6 adopt catalog carries neither the key nor any way to
+# = complete). A v7 adopt catalog carries neither the key nor any way to
 # tell "never backfilled" from "complete", so it is rejected and the cold
 # walk re-adopts with an explicit NOT_STARTED state — which then backfills.
-CATALOG_VERSION = 7
+CATALOG_VERSION = 8
 
 # The import report's file name, written beside catalog.json (same cache
 # dir) by save_report and re-attached on warm starts via load_report.
@@ -976,6 +1009,8 @@ def _photo_to_row(p: Photo) -> dict:
         # decimal degrees rounded to 6 places at parse time, so the JSON
         # float round-trip is exact
         row["g"] = list(p.geotag)
+    if p.dims is not None:
+        row["wh"] = list(p.dims)  # ini width=/height= seed (v46.2)
     if p.size >= 0:
         row["z"] = p.size
     if p.mtime >= 0:
@@ -1059,8 +1094,11 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
             rel = row["r"]
             folder, _, name = rel.rpartition("/")
             g = row.get("g")
+            wh = row.get("wh")
             p = Photo(
                 rel=rel, folder=folder, name=name,
+                # media is DERIVED from the extension, like folder/name
+                media="video" if is_video_suffix(name) else "image",
                 star=int(row.get("s") or 0), caption=row.get("c"),
                 keywords=tuple(row.get("k", ())), rotate=row.get("o", 0),
                 hidden=bool(row.get("h")), albums=tuple(row.get("a", ())),
@@ -1068,6 +1106,7 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
                             for rect, cid, fname in row.get("f", ())),
                 date_taken=row.get("d"),
                 geotag=(float(g[0]), float(g[1])) if g else None,
+                dims=(int(wh[0]), int(wh[1])) if wh else None,
                 size=row.get("z", -1), mtime=row.get("m", -1),
                 sha256=row.get("x"),
             )

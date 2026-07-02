@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
+import inmeta
+import metareader
 from catalog import (
     BACKFILL_COMPLETE,
     BACKFILL_IN_PROGRESS,
@@ -35,6 +37,7 @@ from catalog import (
 from inmeta import read_jpeg_metadata
 from metareader import read_file_meta
 from rawload import is_raw_suffix, raw_demosaic_qimage, raw_preview_jpeg
+from videoload import is_video_suffix, poster_qimage
 
 MAGIC = b"FCTC"
 THUMB_EDGE = 256
@@ -272,8 +275,14 @@ def read_photo_meta(root: Path, photo):
     except OSError:
         data, size, mtime = b"", -1, -1
     sha = hashlib.sha256(data).hexdigest()
-    meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG only)
-    fmeta = read_file_meta(data)     # in-file date/GPS/Rating (all carriers)
+    if is_video_suffix(photo.rel):
+        # No in-file piggyback for video (exiv2 video support is patchy —
+        # see the docstring); ini values already set at scan stay in force.
+        # Applies to indexer AND backfill identically (fauxcasa-v46.2).
+        meta, fmeta = inmeta.EMPTY, metareader.EMPTY
+    else:
+        meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG)
+        fmeta = read_file_meta(data)     # in-file date/GPS/Rating
     return data, size, mtime, sha, meta, fmeta
 
 
@@ -333,7 +342,17 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     the embedded JPEG preview, when present, simply becomes the bytes the
     scaled-JPEG path below decodes (its own EXIF tag auto-applied, once);
     otherwise a half-size demosaic yields the image directly, flip already
-    baked by LibRaw, so no second orientation pass ever runs."""
+    baked by LibRaw, so no second orientation pass ever runs.
+
+    Video files route BY EXTENSION too (fauxcasa-v46.2): the PyAV poster
+    frame (videoload module doc) becomes the image and rides the ordinary
+    downscale/encode path below; a clip PyAV cannot decode yields the
+    same error tile. The in-file metadata piggyback (inmeta + metareader)
+    is deliberately SKIPPED for video — exiv2's video support is patchy
+    (metadata-library-decision.md), so ini sidecar values stay the tier-1
+    source for video in M1. sha256/size/mtime identity is as usual: the
+    bytes are read whole for the N6 content hash and the same in-memory
+    bytes feed the poster decode (seekable, so moov-at-end MP4s work)."""
     from PySide6.QtCore import QBuffer, QIODevice, QSize, Qt
     from PySide6.QtGui import QImageReader
 
@@ -341,9 +360,14 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     primary_li = _primary_level(levels)
 
     data, size, mtime, sha, meta, fmeta = read_photo_meta(root, photo)
+    is_video = is_video_suffix(photo.rel)
 
     img = None
-    if data and is_raw_suffix(photo.rel):
+    if data and is_video:
+        # Poster frame via PyAV (videoload): a QImage that rides the
+        # ordinary downscale/encode below; null on failure -> error tile.
+        img = poster_qimage(data)
+    elif data and is_raw_suffix(photo.rel):
         jpeg = raw_preview_jpeg(data)
         if jpeg is not None:
             data = jpeg  # ride the ordinary scaled-JPEG decode below
