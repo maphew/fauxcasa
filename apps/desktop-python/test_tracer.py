@@ -5936,6 +5936,37 @@ def test_backfill_interrupt_resume_and_periodic_persist(
     assert again is not None and again.backfill_state == BACKFILL_COMPLETE
 
 
+def test_backfill_survives_transient_checkpoint_failure(
+        tmp_path: Path, monkeypatch) -> None:
+    """Windows regression (caught live at photo 96,500 of the 100k
+    benchmark run): os.replace onto a catalog.json some reader momentarily
+    holds open without FILE_SHARE_DELETE (antivirus, the search indexer,
+    any tool peeking at the file) raises a transient PermissionError. A
+    PERIODIC checkpoint failing must not abort the multi-minute pass — it
+    retries at the next photo — and the terminal save still lands."""
+    root = tmp_path / "lib"
+    for n in range(6):
+        make_jpeg(root / "f" / f"p{n}.jpg")
+    cat, cat_path = _adopted_catalog(root, tmp_path)
+
+    calls = [0]
+    real_save = thumbcache.save_catalog
+
+    def flaky_save(c, p):
+        calls[0] += 1
+        if calls[0] == 1:                        # first periodic checkpoint
+            raise PermissionError(5, "Access is denied")
+        real_save(c, p)
+
+    monkeypatch.setattr(thumbcache, "save_catalog", flaky_save)
+    result = thumbcache.backfill_catalog(cat, cat_path, persist_every=2)
+    assert result is not None and result.photos == 6   # pass not aborted
+    assert calls[0] >= 2                         # ...and saves resumed
+    disk = load_catalog(cat_path, root)
+    assert disk is not None and disk.backfill_state == BACKFILL_COMPLETE
+    assert all(p.sha256 for p in disk.photos)
+
+
 def test_backfill_worker_cap_two(tmp_path: Path, monkeypatch) -> None:
     """Rate limiting is structural: BACKFILL_WORKERS is 2 (deliberately far
     below INDEX_WORKERS) and the pass never has more than that many reads

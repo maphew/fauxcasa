@@ -556,13 +556,39 @@ def backfill_catalog(
     [0, cursor) are done-and-durable, photos [cursor:] untouched. Every
     applied photo yields the GIL (time.sleep(0)) so the two reader threads
     never starve the UI thread's grid scrolling; a set `pause` event parks
-    the pass (checked between photos) until cleared or cancelled."""
+    the pass (checked between photos) until cleared or cancelled. Periodic
+    checkpoints are fail-soft against transient Windows sharing violations
+    (see checkpoint below); only the terminal saves must land."""
     total = len(catalog.photos)
     start = 0
     if catalog.backfill_state == BACKFILL_IN_PROGRESS:
         start = min(max(0, catalog.backfill_cursor), total)
     catalog.backfill_state = BACKFILL_IN_PROGRESS
     catalog.backfill_cursor = start
+
+    def checkpoint(must: bool) -> bool:
+        """Persist the catalog. A PERIODIC checkpoint is fail-soft (one
+        attempt, False on failure): on Windows, os.replace onto a file some
+        reader momentarily holds open without FILE_SHARE_DELETE — an
+        antivirus scan, the search indexer, any tool peeking at
+        catalog.json — raises a transient PermissionError, and one missed
+        checkpoint only costs resume granularity, never the multi-minute
+        pass (observed live at photo 96,500 of the 100k benchmark run).
+        The TERMINAL saves (complete / cancel cursor) retry with backoff
+        and then raise: silently losing those would strand the on-disk
+        state at the last periodic cursor."""
+        err: OSError | None = None
+        for attempt in range(5 if must else 1):
+            try:
+                save_catalog(catalog, catalog_path)
+                return True
+            except OSError as e:
+                err = e
+                if must:
+                    time.sleep(0.1 * (attempt + 1))
+        if must:
+            raise err
+        return False
 
     def wait_while_paused() -> None:
         while pause is not None and pause.is_set():
@@ -606,13 +632,13 @@ def backfill_catalog(
             if progress:
                 progress(idx + 1, total)
             if since_save >= persist_every:
-                since_save = 0
-                save_catalog(catalog, catalog_path)
+                if checkpoint(must=False):
+                    since_save = 0  # a missed one retries next photo
             wait_while_paused()
             if cancelled():
                 pool.shutdown(wait=False, cancel_futures=True)
                 # persist the frontier so the next launch resumes here
-                save_catalog(catalog, catalog_path)
+                checkpoint(must=True)
                 return None
             top_up()
             time.sleep(0)  # yield the GIL to the UI thread (throttle)
@@ -620,11 +646,11 @@ def backfill_catalog(
     if catalog.backfill_cursor < total:
         # cancelled before the first read landed (the in-loop cancel path
         # returned above): keep IN_PROGRESS at the current frontier
-        save_catalog(catalog, catalog_path)
+        checkpoint(must=True)
         return None
     catalog.backfill_state = BACKFILL_COMPLETE
     catalog.backfill_cursor = total
-    save_catalog(catalog, catalog_path)
+    checkpoint(must=True)
     return BackfillResult(photos=done, total=total,
                           elapsed_s=time.perf_counter() - t0,
                           workers=workers)
