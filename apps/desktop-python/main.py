@@ -46,6 +46,7 @@ from pathlib import Path
 T0 = time.perf_counter()
 
 from PySide6.QtCore import QObject, QProcess, Qt, QTimer, Signal
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -67,16 +68,20 @@ from PySide6.QtWidgets import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from catalog import (  # noqa: E402
+    REPORT_NAME,
     Catalog,
     Photo,
     ScanFilter,
     default_contacts_xml,
+    default_pal_dir,
     format_date_taken,
     format_geotag,
     load_catalog,
     load_contacts_xml,
+    load_report,
     reconcile_walk,
     save_catalog,
+    save_report,
     scan_library,
 )
 from grid import GridView  # noqa: E402
@@ -491,7 +496,8 @@ class MainWindow(QMainWindow):
                  scan_filter: ScanFilter | None = None,
                  warm: bool = False, adopt: bool = False,
                  cache_root: Path | None = None,
-                 contacts: dict[str, str] | None = None):
+                 contacts: dict[str, str] | None = None,
+                 pal_dir: Path | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
@@ -499,6 +505,9 @@ class MainWindow(QMainWindow):
         # machine-local contacts.xml names, kept so a reconcile rebuild's
         # rescan resolves faces the same way the startup scan did
         self.contacts = contacts or {}
+        # Picasa2Albums .pal directory, kept for the same reason: a
+        # reconcile rescan must merge albums the way the startup scan did
+        self.pal_dir = pal_dir
         self.cache_root = cache_root or (
             cache_dir.parent if cache_dir is not None else _default_cache_root()
         )
@@ -506,6 +515,18 @@ class MainWindow(QMainWindow):
         self.ready_reported = False
         self.build_failed = False
         self.last_index_rate = 0.0
+        # §7 search-latency instrumentation (fauxcasa-ed5.4): _search_changed
+        # records its own end-to-end latency + hit count here; the
+        # --search-probe harness (run_search_probe) reads them per query.
+        self.last_search_ms = 0.0
+        self.last_search_hits = 0
+        # §7 search index (fauxcasa-ed5.4): (catalog index, lowercase
+        # haystack) pairs parallel to catalog.photos, owned by the WINDOW —
+        # deliberately not Photo fields — and rebuilt at every
+        # filter-relevant mutation point (see _rebuild_search_index).
+        self._search_pairs: list[tuple[int, str]] = []
+        self._search_pairs_vis: list[tuple[int, str]] = []
+        self._rebuild_search_index()
         self.setWindowTitle(f"{APP_NAME} tracer — {catalog.root.name}")
         self.resize(1280, 800)
 
@@ -602,10 +623,16 @@ class MainWindow(QMainWindow):
         self.counts_label = QLabel()
         self.progress_label = QLabel()
         self.meta_label = QLabel()
+        # Import-report count (fauxcasa-cam.13): "N import notes" with the
+        # first few entries in the tooltip — deliberately lean; the full
+        # inspector surface is N7/M2 work.
+        self.notes_label = QLabel()
         self.statusBar().addWidget(self.counts_label)
         self.statusBar().addWidget(self.progress_label)
+        self.statusBar().addPermanentWidget(self.notes_label)
         self.statusBar().addPermanentWidget(self.meta_label)
         self._show_counts("All photos", self._shown_count())
+        self._update_import_notes()
 
         # --- wiring ---
         # The grid's set-valued signal drives the status label (single
@@ -674,6 +701,7 @@ class MainWindow(QMainWindow):
                 if result is None:
                     return  # cancelled
                 save_catalog(catalog, build_dir / "catalog.json")
+                save_report(catalog.report, build_dir / REPORT_NAME)
                 _emit(bridge.finished, result, catalog, False)
             except Exception as e:  # report, never crash the UI
                 log.error("cache build failed: %s", e)
@@ -710,12 +738,13 @@ class MainWindow(QMainWindow):
             fresh = None
             try:
                 fresh = scan_library(old.root, self.scan_filter,
-                                     self.contacts)
+                                     self.contacts, self.pal_dir)
                 result = build_cache(fresh, cache_dir, None,
                                      cancel=self.build_cancel)
                 if result is None:
                     return
                 save_catalog(fresh, cache_dir / "catalog.json")
+                save_report(fresh.report, cache_dir / REPORT_NAME)
                 _emit(bridge.finished, result, fresh, True)
             except Exception as e:
                 log.error("reindex failed: %s", e)
@@ -758,6 +787,9 @@ class MainWindow(QMainWindow):
             self.viewer.set_thumbs(cache)      # ...so the viewer previews too
             self.tray.set_thumbs(cache)        # ...and held thumbs render
             self._refresh_recent_count()       # mtimes just landed (q6l.7)
+            # build_cache merged in-file captions/keywords into these SAME
+            # Photo objects in place — the prebuilt haystacks are stale.
+            self._rebuild_search_index()
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
         self.statusBar().showMessage(
@@ -768,6 +800,7 @@ class MainWindow(QMainWindow):
         re-point grid + viewer, rebuild the sidebar, return to the
         browser (a viewer index may no longer be valid)."""
         self.catalog = catalog
+        self._rebuild_search_index()           # new photos -> new haystacks
         self.viewer.catalog = catalog
         self.viewer.set_thumbs(thumbs)         # reconciled cache for previews
         if self._slideshow is not None and self._slideshow.isVisible():
@@ -789,6 +822,7 @@ class MainWindow(QMainWindow):
         # any that vanished for the readout's note (fauxcasa-q6l.2).
         self.tray.rebind(catalog, thumbs)
         self._show_counts("All photos", self._shown_count())
+        self._update_import_notes()   # the rescan collected a fresh report
         self.meta_label.setText("")
 
     def index_busy(self) -> bool:
@@ -967,10 +1001,29 @@ class MainWindow(QMainWindow):
             albums_root.setFlags(
                 albums_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             for uid, album in cat.albums.items():
+                # §3: a placeholder (albums= uid with no definition) is
+                # never dropped — shown dimmed/italic with a "?" suffix so
+                # the gap is visible, not silent (import report has the
+                # entry). A .pal-sourced album reads like a real one; its
+                # provenance lives in the tooltip.
+                suffix = " ?" if album.placeholder else ""
                 item = QTreeWidgetItem(
                     albums_root,
-                    [f"{album.name}  ({len(album.members)})"])
+                    [f"{album.name}{suffix}  ({len(album.members)})"])
                 item.setData(0, Qt.ItemDataRole.UserRole, ("album", uid))
+                if album.placeholder:
+                    f = item.font(0)
+                    f.setItalic(True)
+                    item.setFont(0, f)
+                    item.setForeground(0, t.palette().brush(
+                        QPalette.ColorGroup.Disabled,
+                        QPalette.ColorRole.Text))
+                    item.setToolTip(
+                        0, "Referenced by albums= lines but defined nowhere "
+                           "— placeholder (see import notes)")
+                elif album.pal_sourced:
+                    item.setToolTip(
+                        0, "Album definition from a Picasa2Albums .pal file")
             albums_root.setExpanded(True)
 
         # People (read-only v1 slice, fauxcasa-cam.3): named people with
@@ -1082,6 +1135,50 @@ class MainWindow(QMainWindow):
 
     # ---------- search ----------
 
+    def _rebuild_search_index(self) -> None:
+        """Precompute every photo's lowercase search haystack ONCE per
+        catalog load / filter-relevant mutation, instead of rebuilding the
+        strings per photo per keystroke — at 100k that string-building
+        dominated _search_changed at ~58-95 ms/keystroke, over the §7
+        50 ms budget; scanning these prebuilt pairs is single-digit ms
+        (fauxcasa-ed5.4, before/after numbers in the bead/PR).
+
+        Sync points (photos are otherwise immutable in this read-only app):
+        construction, reload_data (reconcile swapped in a new catalog), and
+        the cold-build finish (build_cache merges in-file captions/keywords
+        into the SAME Photo objects in place). _search_changed also rebuilds
+        as a backstop if the pair count no longer matches the catalog.
+
+        The haystack text is exactly what the per-keystroke scan built:
+        every searchable field newline-joined (terms are whitespace-free, so
+        no term can straddle two fields), folder title + rel path shared per
+        folder. The visible-only subset is precomputed too (same string
+        objects, so the memory cost is one extra list of references) because
+        off-reveal searches — the common case — then skip the per-photo
+        visibility test entirely."""
+        cat = self.catalog
+        t0 = time.perf_counter()
+        folder_hay = {rel: f"{f.title}\n{rel}".lower()
+                      for rel, f in cat.folders.items()}
+        pairs: list[tuple[int, str]] = []
+        append = pairs.append
+        for i, p in enumerate(cat.photos):
+            append((i, "\n".join((
+                p.name,
+                p.caption or "",
+                " ".join(p.keywords),
+                " ".join(n for _rect, _cid, n in p.faces if n),  # people (§5)
+                folder_hay[p.folder],
+            )).lower()))
+        self._search_pairs = pairs
+        if cat.visible_count == len(cat.photos):
+            self._search_pairs_vis = pairs  # nothing hidden: share the list
+        else:
+            self._search_pairs_vis = [
+                ih for ih, p in zip(pairs, cat.photos) if p.visible]
+        log.info("search index: %d haystacks in %.0f ms",
+                 len(pairs), (time.perf_counter() - t0) * 1000.0)
+
     @staticmethod
     def _parse_query(text: str) -> tuple[list[str], list[str]]:
         """Whitespace-tokenized query -> (positive, negative) lowercase
@@ -1101,43 +1198,38 @@ class MainWindow(QMainWindow):
         return pos, neg
 
     def _search_changed(self, text: str) -> None:
+        # Timed end to end — parse + filter scan + grid.set_filter + status
+        # label — because §7's budget is "search keystroke -> filtered grid
+        # < 50 ms". The repaint after set_filter is the grid's normal async
+        # frame and is not included (fauxcasa-ed5.4).
+        t0 = time.perf_counter()
         pos, neg = self._parse_query(text)
         if not pos and not neg:
             self.grid.set_filter(None, "")
             self._show_counts("All photos", self._shown_count())
+            self.last_search_hits = self._shown_count()
+            self.last_search_ms = (time.perf_counter() - t0) * 1000.0
             return
-        cat = self.catalog
-        # Folder text is shared by every photo in a folder: precompute ONE
-        # lowercase haystack per folder — display title + rel path, so a hit
-        # on any path segment (a parent folder's name included) pulls that
-        # folder's photos into the flat result set — instead of rebuilding
-        # it per photo per term.
-        folder_hay = {rel: f"{f.title}\n{rel}".lower()
-                      for rel, f in cat.folders.items()}
-
-        def haystack(p: Photo) -> str:
-            # Every searchable field of one photo, newline-joined: terms are
-            # whitespace-free (split() above), so no term can straddle two
-            # fields.
-            return "\n".join((
-                p.name,
-                p.caption or "",
-                " ".join(p.keywords),
-                " ".join(n for _rect, _cid, n in p.faces if n),  # people (§5)
-                folder_hay[p.folder],
-            )).lower()
-
-        reveal = self.grid.reveal
-        idxs = []
-        for i, p in enumerate(cat.photos):
-            if not (p.visible or reveal):
-                continue
-            hay = haystack(p)
-            if all(t in hay for t in pos) and not any(t in hay for t in neg):
-                idxs.append(i)
+        # Scan the PREBUILT haystack pairs (_rebuild_search_index) as a term
+        # cascade — each positive pass keeps its matches (AND: survivors
+        # matched every earlier term), each negative pass drops its matches
+        # — list comprehensions per term measure ~3-4x faster at 100k than
+        # one pass with all()/any() generator predicates per photo, and
+        # order (catalog order) is preserved throughout.
+        if len(self._search_pairs) != len(self.catalog.photos):
+            self._rebuild_search_index()  # backstop; the sync points above
+        cur = (self._search_pairs if self.grid.reveal
+               else self._search_pairs_vis)
+        for term in pos:
+            cur = [ih for ih in cur if term in ih[1]]
+        for term in neg:
+            cur = [ih for ih in cur if term not in ih[1]]
+        idxs = [ih[0] for ih in cur]
         q = text.strip().lower()
         self.grid.set_filter(idxs, f"search: {q}")
         self._show_counts(f"Search “{q}”", len(idxs))
+        self.last_search_hits = len(idxs)
+        self.last_search_ms = (time.perf_counter() - t0) * 1000.0
 
     # ---------- selection tray (fauxcasa-q6l.2) ----------
 
@@ -1249,6 +1341,26 @@ class MainWindow(QMainWindow):
             f"  {label}: {n} photos · {folders} folders"
             f" · {len(self.catalog.albums)} albums")
 
+    def _update_import_notes(self) -> None:
+        """The lean import-report surface (fauxcasa-cam.13): a permanent
+        status-bar count when the catalog's report has entries, with the
+        first few in the tooltip. Hidden entirely at zero — most libraries
+        have no notes and deserve no chrome. The full inspector is N7/M2."""
+        entries = self.catalog.report.entries
+        if not entries:
+            self.notes_label.setVisible(False)
+            self.notes_label.setText("")
+            self.notes_label.setToolTip("")
+            return
+        n = len(entries)
+        self.notes_label.setText(
+            f"{n} import note{'s' if n != 1 else ''}  ")
+        shown = [f"[{e.source}] {e.kind}: {e.detail}" for e in entries[:6]]
+        if n > len(shown):
+            shown.append(f"… and {n - len(shown)} more (see {REPORT_NAME})")
+        self.notes_label.setToolTip("\n".join(shown))
+        self.notes_label.setVisible(True)
+
     def _selection_changed(self, selection: set) -> None:
         """Grid multi-select -> status label (spec §5 dual mode): exactly
         one selected shows that photo's metadata; several show the
@@ -1356,6 +1468,31 @@ class MainWindow(QMainWindow):
             self._peek_page.dismiss()
 
 
+def run_search_probe(win: MainWindow, spec: str) -> list[dict]:
+    """§7 search-latency probe (fauxcasa-ed5.4): drive each comma-separated
+    query through the live search box exactly as its final keystroke would
+    (setText -> textChanged -> _search_changed, synchronously) and print one
+    machine-readable {"event": "search", "query", "ms", "hits"} line per
+    query for the CI/dev harness. `ms` is _search_changed end to end (see
+    its docstring comment for what that covers). The box is cleared between
+    queries — a repeated identical query would otherwise not re-fire
+    textChanged — and left empty afterwards. Blank segments are skipped, so
+    a trailing comma is harmless."""
+    events: list[dict] = []
+    for q in (t.strip() for t in spec.split(",")):
+        if not q:
+            continue
+        win.search.setText("")
+        win.search.setText(q)
+        ev = {"event": "search", "query": q,
+              "ms": round(win.last_search_ms, 3),
+              "hits": win.last_search_hits}
+        print(json.dumps(ev), flush=True)
+        events.append(ev)
+    win.search.setText("")
+    return events
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -1378,6 +1515,12 @@ def main() -> int:
                     help="Picasa contacts.xml for face names (read-only; "
                          "default: the machine-local copy under "
                          "%%LocalAppData%%\\Google\\Picasa2 when present)")
+    ap.add_argument("--pal-dir", type=Path, default=None,
+                    help="Picasa2Albums directory of .pal album files "
+                         "(read-only; merged per spec §4 — ini wins "
+                         "membership, .pal fills gaps; default: the "
+                         "machine-local Picasa2Albums under "
+                         "%%LocalAppData%%\\Google\\Picasa2 when present)")
     ap.add_argument("--min-image-size", type=_parse_image_size_arg,
                     metavar="WIDTHxHEIGHT",
                     help="ignore images smaller than WIDTHxHEIGHT during "
@@ -1397,6 +1540,12 @@ def main() -> int:
                          "of the current view (screenshot testing)")
     ap.add_argument("--quit-after-ready", action="store_true",
                     help="exit right after the READY line (perf probe)")
+    ap.add_argument("--search-probe", type=str, default=None, metavar="TERMS",
+                    help="after READY, run each comma-separated query "
+                         "through the search box, print a machine-readable "
+                         '{"event":"search",...} line per query, then quit '
+                         "(§7 latency probe; offscreen-safe; a query may "
+                         "contain spaces and -negations)")
     ap.add_argument("--finish-build", action="store_true",
                     help="scripted runs: wait for an in-flight cache "
                          "build before quitting (warm-run scripting)")
@@ -1436,6 +1585,18 @@ def main() -> int:
         elif args.contacts is not None:
             log.warning("no contacts loaded from %s", contacts_path)
 
+    # Picasa2Albums .pal files (fauxcasa-cam.8): an explicit --pal-dir wins,
+    # else the machine-local Picasa2Albums default when present. Same
+    # read-only-enrichment posture as contacts.xml — but an explicitly
+    # named directory that doesn't exist earns a warning, not silence.
+    pal_dir = args.pal_dir or default_pal_dir()
+    if pal_dir is not None and not pal_dir.is_dir():
+        if args.pal_dir is not None:
+            log.warning("--pal-dir %s is not a directory; ignored", pal_dir)
+        pal_dir = None
+    if pal_dir is not None:
+        log.info("albums: merging .pal files from %s", pal_dir)
+
     # Data prep. Try a WARM start first: load the persisted catalog (no
     # walk) and bind it to the thumbnail cache. Else fall back to a COLD
     # walk + build (or adopt an external --thumbs cache). The cache dir is
@@ -1459,11 +1620,14 @@ def main() -> int:
                 cached = load_cache(thumbs_path)
                 bind(cached, loaded)
                 catalog, thumbs, warm = loaded, cached, True
+                # the report was persisted beside the catalog at scan time;
+                # re-attach it so the status-bar count survives warm starts
+                catalog.report = load_report(cache_dir / REPORT_NAME)
             except (CacheError, OSError) as e:
                 log.warning("persisted cache unusable (%s); rescanning", e)
 
     if catalog is None:  # cold path
-        catalog = scan_library(root, scan_filter, contacts)
+        catalog = scan_library(root, scan_filter, contacts, pal_dir)
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
@@ -1472,6 +1636,7 @@ def main() -> int:
                 log.error("cannot adopt %s: %s", args.thumbs, e)
                 return 2
             save_catalog(catalog, cat_path)  # warm-start next time
+            save_report(catalog.report, cache_dir / REPORT_NAME)
         else:
             build_dir = cache_dir  # the build thread persists the catalog
 
@@ -1488,13 +1653,18 @@ def main() -> int:
     log.info("%s: %d photos, %d folders, %d albums in %.0f ms",
              mode, len(catalog.photos), len(catalog.folders),
              len(catalog.albums), prep_ms)
+    if catalog.report.entries:
+        # §4: conflicts are surfaced, never silent — the applog line plus
+        # the status-bar count are the minimal v1 surface (full inspector
+        # is N7/M2). Details live in the persisted import-report.json.
+        log.info("import report: %s", catalog.report.summary())
 
     # A frozen first-run picker may already have created the app.
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
-                     contacts=contacts)
+                     contacts=contacts, pal_dir=pal_dir)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
@@ -1502,7 +1672,8 @@ def main() -> int:
 
     # READY instrumentation (§7 cold start): poll until every visible
     # tile is decoded, then report cold start + RSS on stdout.
-    state = {"scrolled": False, "shot": False, "opened": False}
+    state = {"scrolled": False, "shot": False, "opened": False,
+             "probed": False}
 
     def may_quit() -> bool:
         if not args.finish_build:
@@ -1524,6 +1695,17 @@ def main() -> int:
             win.ready_reported = True
             cold_ms = (time.perf_counter() - T0) * 1000.0
             rss, hwm = read_rss_mb()
+            # §7 catalog-size row (fauxcasa-ed5.3): the persisted
+            # catalog.json's on-disk bytes, normalized per photo. 0 = not
+            # yet persisted (a cold build writes it when the index lands).
+            # KNOWN TENSION (fauxcasa-1jb): the ~50 B/photo budget is
+            # oracle-derived, and the tracer's JSON rows (rel + sha256
+            # alone are ~100 chars) do not meet it — this field MEASURES
+            # the row honestly; it does not claim the budget.
+            try:
+                cat_bytes = cat_path.stat().st_size
+            except OSError:
+                cat_bytes = 0
             print("READY", flush=True)
             print(json.dumps({
                 "event": "ready",
@@ -1534,14 +1716,23 @@ def main() -> int:
                 "visible_photos": catalog.visible_count,
                 "folders": len(catalog.folders),
                 "albums": len(catalog.albums),
+                "catalog_bytes": cat_bytes,
+                "catalog_bytes_per_photo": round(
+                    cat_bytes / max(1, len(catalog.photos)), 1),
                 "vm_rss_mb": round(rss, 1),
                 "vm_hwm_mb": round(hwm, 1),
             }), flush=True)
             if args.quit_after_ready and args.screenshot is None \
                     and args.scroll_to is None and args.open is None \
-                    and may_quit():
+                    and args.search_probe is None and may_quit():
                 app.quit()
                 return
+        if args.search_probe is not None and not state["probed"]:
+            # §7 search probe (fauxcasa-ed5.4): run once, right after READY,
+            # then fall through to the normal scripted-quit path below —
+            # --search-probe implies quit (see the bottom of check_ready).
+            state["probed"] = True
+            run_search_probe(win, args.search_probe)
         if args.scroll_to is not None and not state["scrolled"]:
             state["scrolled"] = True
             win.grid.scroll_to_fraction(args.scroll_to)
@@ -1566,23 +1757,25 @@ def main() -> int:
                 app.exit(1)
                 return
             app.quit()
-        elif args.quit_after_ready:
+        elif args.quit_after_ready or args.search_probe is not None:
             app.quit()
         else:
             poll.stop()  # interactive run: instrumentation is done
 
-    # Parented to the window it polls: check_ready dereferences win.grid,
-    # and the timeout connection forms a Python reference cycle (poll ->
-    # check_ready -> poll) that keeps the timer alive past main()'s return
-    # — an in-process caller (the test suite) that later deletes the window
-    # would otherwise get a stale fire into a deleted GridView.
+    # Parented to the window it polls (fauxcasa-q6l.15): check_ready
+    # dereferences win.grid, and the timeout connection forms a Python
+    # reference cycle (poll -> check_ready -> poll) that kept the orphan
+    # timer alive past main()'s return — an in-process caller (the test
+    # suite) that later deleted the window got a stale fire into a deleted
+    # GridView (rediscovered independently three times before the fix).
     poll = QTimer(win)
     poll.setInterval(50)
     poll.timeout.connect(check_ready)
     poll.start()
     # Hard stop for scripted runs: a stuck decode must fail loudly, not
     # hang CI or masquerade as success.
-    if args.screenshot is not None or args.quit_after_ready:
+    if args.screenshot is not None or args.quit_after_ready \
+            or args.search_probe is not None:
         def on_timeout() -> None:
             log.error("TIMEOUT after %ss — ready=%s state=%s",
                       args.timeout, win.ready_reported, state)
@@ -1591,6 +1784,7 @@ def main() -> int:
         QTimer.singleShot(int(args.timeout * 1000), on_timeout)
 
     code = app.exec()
+    poll.stop()  # belt to the parenting suspenders: never fire post-exec
     win.shutdown()  # reap any in-flight cache build cleanly
     rss, hwm = read_rss_mb()
     print(json.dumps({"event": "exit", "vm_rss_mb": round(rss, 1),
