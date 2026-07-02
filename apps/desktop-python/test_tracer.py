@@ -2449,5 +2449,139 @@ def test_main_run_logs_and_keeps_stdout_protocol(
     assert "READY" not in log_text and '"event": "ready"' not in log_text
 
 
+def test_grid_decodes_dpr_scaled_v2_level(tmp_path: Path) -> None:
+    """fauxcasa-q7m: the grid's decode worker reads the v2 level chosen by the
+    DPR-scaled native edge, then caps the tile to that edge. At native 256
+    (devicePixelRatio 1) it reads the 256 level — the legacy primary, a no-op;
+    at native 512 (a 2x display) it reads the 512 level so a hi-DPI tile is
+    sharp. The cap holds the tile at exactly the device footprint."""
+    import queue as _queue
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from grid import GridView
+
+    root = tmp_path / "lib"
+    _big_library(root)               # land.jpg 600x400 (idx 0), port.jpg (idx 1)
+    cat = scan_library(root)
+    v2 = thumbcache.load_cache(thumbcache.build_cache(
+        cat, tmp_path / "c", levels=[512, 256, 128]).path)
+    assert v2.levels == [512, 256, 128]
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    g = GridView()
+    g.set_data(cat, v2)
+
+    def decode(idx: int, native: int):
+        g._tile_native = native
+        g.generation += 1
+        g.wanted = frozenset({idx})
+        with g.pending_lock:
+            g.pending.discard(idx)
+        g.tiles.pop(idx, None)
+        g._request(idx)              # a daemon worker decodes onto g.done
+        for _ in range(200):         # bounded wait (~10s worst case)
+            try:
+                gen, di, img = g.done.get(timeout=0.05)
+            except _queue.Empty:
+                continue
+            if gen == g.generation and di == idx:
+                return img
+        raise AssertionError("decode did not complete")
+
+    # idx 0 == land.jpg 600x400: 512 level caps the long edge to 512x341, the
+    # 256 level to 256x171. The long edge equals the chosen level -> proves
+    # which level the worker read. rotate=0, so dims are not transposed.
+    big = decode(0, 512)
+    assert big is not None and max(big.width(), big.height()) == 512
+    small = decode(0, 256)
+    assert small is not None and max(small.width(), small.height()) == 256
+
+
+def test_grid_v1_cache_falls_back_to_only_level(tmp_path: Path) -> None:
+    """fauxcasa-q7m: a v1 cache has only the 256 level, so even a hi-DPI native
+    edge (512) reads it via best_level's largest-available fallback — the grid
+    never asks a v1 cache for a level it doesn't have, it just stays soft."""
+    import queue as _queue
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from grid import GridView
+
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat = scan_library(root)
+    v1 = thumbcache.load_cache(thumbcache.build_cache(cat, tmp_path / "c").path)
+    assert v1.levels == [256]
+
+    app = QApplication.instance() or QApplication([])
+    g = GridView()
+    g.set_data(cat, v1)
+    g._tile_native = 512             # pretend a 2x display
+    g.generation += 1
+    g.wanted = frozenset({0})
+    with g.pending_lock:
+        g.pending.discard(0)
+    g.tiles.pop(0, None)
+    g._request(0)
+    img = None
+    for _ in range(200):
+        try:
+            gen, di, im = g.done.get(timeout=0.05)
+        except _queue.Empty:
+            continue
+        if gen == g.generation and di == 0:
+            img = im
+            break
+    assert img is not None and max(img.width(), img.height()) == 256
+
+
+def test_refresh_tile_native_dpr_and_invalidation(monkeypatch) -> None:
+    """fauxcasa-q7m: _refresh_tile_native scales the native edge by
+    devicePixelRatio, floors at TILE_NATIVE, and invalidates (forcing a
+    re-decode at the new level) ONLY when the edge changes — a steady ratio
+    costs an int compare, moving to a 2x monitor drops stale 256 tiles."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import grid as gridmod
+    from grid import GridView
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    g = GridView()
+
+    monkeypatch.setattr(g, "devicePixelRatioF", lambda: 1.0)
+    g._tile_native = 0               # force the first refresh to set it
+    g._refresh_tile_native()
+    assert g._tile_native == gridmod.TILE_NATIVE          # 256, the v1/dpr1 base
+
+    # steady DPR -> no invalidation: a seeded tile and generation survive
+    g.tiles[7] = [None, 0, 0]
+    gen = g.generation
+    g._refresh_tile_native()
+    assert g._tile_native == gridmod.TILE_NATIVE
+    assert g.generation == gen and 7 in g.tiles
+
+    # move to a 2x display -> native 512, tiles invalidated for re-decode
+    monkeypatch.setattr(g, "devicePixelRatioF", lambda: 2.0)
+    g._refresh_tile_native()
+    assert g._tile_native == 2 * gridmod.TILE_NATIVE      # 512
+    assert g.generation == gen + 1 and 7 not in g.tiles
+
+    # fractional ratio rounds; sub-1 (rare) stays floored at TILE_NATIVE
+    monkeypatch.setattr(g, "devicePixelRatioF", lambda: 1.5)
+    g._refresh_tile_native()
+    assert g._tile_native == round(gridmod.TILE_NATIVE * 1.5)   # 384
+    monkeypatch.setattr(g, "devicePixelRatioF", lambda: 0.5)
+    g._refresh_tile_native()
+    assert g._tile_native == gridmod.TILE_NATIVE          # never below the base
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
