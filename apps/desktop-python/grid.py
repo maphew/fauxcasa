@@ -6,7 +6,7 @@ LRU of decoded tiles) with the benchmark hacks replaced by product
 behavior: event-driven repaints instead of a 240 Hz timer, a real
 scrollbar via QAbstractScrollArea, resize handling, group headers with
 a pinned current-folder header, multi-selection (set + current/anchor,
-Ctrl/Shift semantics) and activation, star badges, and
+Ctrl/Shift semantics) and activation, star + geotag corner badges, and
 error tiles for undecodable entries. Scrolling reads ONLY the cache
 pair, never originals (N4).
 """
@@ -120,6 +120,7 @@ HEADER_BG = QColor(34, 34, 34)
 HEADER_FG = QColor(200, 200, 200)
 SELECT = QColor(64, 140, 255)
 STAR_GOLD = QColor(255, 200, 40)
+GEO_TEAL = QColor(64, 205, 175)  # geotag badge (fauxcasa-cam.10)
 HIDDEN_VEIL = QColor(0, 0, 0, 110)  # reveal mode: dim hidden/stash tiles
 # Selection pens, hoisted out of the paint loop (fauxcasa-q6l.1): every
 # member of the selection set gets the thin rect; the CURRENT item gets the
@@ -136,6 +137,21 @@ def _star_polygon(cx: float, cy: float, r: float) -> QPolygonF:
         rad = r if i % 2 == 0 else r * 0.42
         ang = -math.pi / 2 + i * math.pi / 5
         poly.append(QPointF(cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+    return poly
+
+
+def _pin_polygon(cx: float, cy: float, r: float) -> QPolygonF:
+    """Map-pin teardrop for the geotag corner badge (fauxcasa-cam.10):
+    a round head swept as a 13-point arc, closed through a point at the
+    bottom. (cx, cy) is the shape center, r the half-height — the same
+    size convention as _star_polygon so the two badges read as a set."""
+    poly = QPolygonF()
+    poly.append(QPointF(cx, cy + r))  # the tip
+    head_r, head_cy = r * 0.68, cy - r * 0.28
+    for i in range(13):  # lower-right, over the top, to lower-left
+        ang = math.radians(40.0 - i * 22.0)
+        poly.append(QPointF(cx + head_r * math.cos(ang),
+                            head_cy + head_r * math.sin(ang)))
     return poly
 
 
@@ -755,11 +771,22 @@ class GridView(QAbstractScrollArea):
             if self.reveal and not photo.visible:
                 painter.fillRect(r, HIDDEN_VEIL)
             if photo.star:
+                # count >= 1 shows the badge (star is 0-5 now; the exact
+                # count reads out in the status bar / viewer info line)
                 s = max(7.0, self.tile / 14.0)
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(STAR_GOLD)
                 painter.drawPolygon(_star_polygon(
                     r.right() - s - 2, r.y() + s + 2, s))
+            if photo.geotag is not None:
+                # Geotag corner badge (§5 corner badges; fauxcasa-cam.10) —
+                # BOTTOM-right, its own corner: star owns top-right and the
+                # M2 reject badge will claim a third.
+                s = max(7.0, self.tile / 14.0)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(GEO_TEAL)
+                painter.drawPolygon(_pin_polygon(
+                    r.right() - s - 2, r.bottom() - s - 2, s))
             # Multi-select paint (fauxcasa-q6l.1): every selected tile
             # shows the selection rect; the current item is distinct via
             # the stronger border (dashed focus cue if Ctrl-toggled out of

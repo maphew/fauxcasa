@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["PySide6"]
+# dependencies = ["PySide6", "exiv2"]
 # ///
 """Tracer bullet app (fauxcasa-pzx): a thin but real end-to-end slice of
 the product on the proposed Python + Qt stack.
@@ -70,6 +70,8 @@ from catalog import (  # noqa: E402
     Photo,
     ScanFilter,
     default_contacts_xml,
+    format_date_taken,
+    format_geotag,
     load_catalog,
     load_contacts_xml,
     reconcile_walk,
@@ -1092,13 +1094,21 @@ class MainWindow(QMainWindow):
             self.meta_label.setText("")
 
     def _photo_selected(self, idx: int) -> None:
+        """Single-photo status readout (§5 dual mode): path, star count
+        (★ repeated — one glyph per star, so a count > 1 reads at a
+        glance), capture date, geotag coordinates (§3 geotag v1 display,
+        fauxcasa-cam.9/.10/.11), caption, keywords."""
         if idx < 0:
             self.meta_label.setText("")
             return
         p = self.catalog.photos[idx]
         parts = [p.rel]
         if p.star:
-            parts.append("★")
+            parts.append("★" * min(p.star, 5))
+        if p.date_taken:
+            parts.append(format_date_taken(p.date_taken))
+        if p.geotag is not None:
+            parts.append(format_geotag(p.geotag))
         if p.caption:
             parts.append(f"“{p.caption}”")
         if p.keywords:
