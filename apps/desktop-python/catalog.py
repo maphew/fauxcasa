@@ -174,6 +174,49 @@ class Album:
     date: str | None = None
     description: str | None = None
     members: list[int] = field(default_factory=list)  # catalog photo indices
+    # §3: an albums= token naming a uid with no [.album:] definition (and no
+    # .pal) materializes as a PLACEHOLDER album — "surfaced in the import
+    # diagnostics, never dropped". The sidebar marks these visually.
+    placeholder: bool = False
+    # §4: this album's definition came from a Picasa2Albums .pal file (a
+    # .pal-only album, or a placeholder whose definition a .pal filled).
+    pal_sourced: bool = False
+
+
+@dataclass
+class ReportEntry:
+    """One surfaced import decision: where it came from (source), what
+    class of decision it was (kind), the id/path it concerns (subject),
+    and the human sentence recording what was chosen and why (detail)."""
+    source: str   # "ini", "contacts", "pal", ...
+    kind: str     # "unknown_album", "contact_name_conflict", "pal_divergence"…
+    subject: str  # album uid, contact id, file name…
+    detail: str
+
+
+@dataclass
+class ImportReport:
+    """§4: "every conflict is surfaced in the import report, never silently
+    resolved." The collector is owned by Catalog and populated during scan
+    (fauxcasa-cam.13); it is persisted as JSON beside catalog.json
+    (save_report/load_report) and surfaced minimally — an applog summary
+    line plus a status-bar count. The full inspector surface is N7/M2."""
+    entries: list[ReportEntry] = field(default_factory=list)
+
+    def add(self, source: str, kind: str, subject: str, detail: str) -> None:
+        self.entries.append(ReportEntry(source, kind, subject, detail))
+
+    def summary(self) -> str:
+        """One applog-sized line: total + per-kind tallies."""
+        if not self.entries:
+            return "no import notes"
+        kinds: dict[str, int] = {}
+        for e in self.entries:
+            kinds[e.kind] = kinds.get(e.kind, 0) + 1
+        parts = ", ".join(f"{k} x{n}" if n > 1 else k
+                          for k, n in kinds.items())
+        n = len(self.entries)
+        return f"{n} import note{'s' if n != 1 else ''} ({parts})"
 
 
 @dataclass
@@ -189,6 +232,9 @@ class Catalog:
     # folder inheritance chain instead, so they stay right even where
     # folders disagree; this registry is the flat, persistable union.
     contacts: dict[str, str] = field(default_factory=dict)
+    # Import diagnostics collected while this catalog was built (§4; empty
+    # on a warm load until main() re-attaches the persisted report).
+    report: ImportReport = field(default_factory=ImportReport)
 
     @property
     def visible_count(self) -> int:
@@ -413,6 +459,184 @@ def _harvest_contacts2(secmap: dict, out: dict[str, str]) -> None:
             out[cid] = name
 
 
+# ---- .pal album files (Picasa2Albums directory, fauxcasa-cam.8) ----------
+#
+# Picasa 2-era per-album files, one `<32-hex uid>.pal` each, XML-ish
+# picasa2album docs per docs/research/sources/forensicir-2007-picasa-analysis.md
+# (~lines 234-267): dbid, albumid, property elements (uid string, category
+# num, date real64 = OLE automation days, token, name) with a <files> member
+# list of `[C]\path\to\file` volume-token paths nested in the name property.
+# §4 merge rank (assumed ini > .pal > db3 pending spec pin, fauxcasa-79b):
+# ini wins membership; .pal fills gaps ONLY — a .pal-only album materializes
+# like a real album flagged pal-sourced, and a divergent .pal's extra members
+# become import-report entries, never membership.
+
+_PAL_UID_RE = re.compile(r"[0-9a-f]{32}")
+# `[C]\...` / `[CF32-BA1D]\...` volume tokens: strip token + its separator.
+_PAL_VOLUME_RE = re.compile(r"^\[[^\]]*\][\\/]?")
+
+
+@dataclass
+class PalAlbum:
+    uid: str
+    name: str
+    date: str | None          # canonical ISO form of the real64 OLE date
+    members: list[str]        # volume-token-stripped POSIX paths
+
+
+def _ole_days_to_iso(value: str) -> str | None:
+    """A .pal `date` real64 — OLE automation days since 1899-12-30 — to the
+    catalog's canonical ISO string. Fail-soft: a non-numeric or wildly
+    out-of-range value is None, never an exception (negative OLE dates use
+    a different fraction rule and predate Picasa; not worth decoding)."""
+    try:
+        days = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= days < 200000.0):  # 1899-12-30 .. ~year 2447
+        return None
+    from datetime import datetime, timedelta
+    dt = datetime(1899, 12, 30) + timedelta(days=days)
+    return dt.replace(microsecond=0).isoformat()
+
+
+def read_pal(path: Path) -> PalAlbum | None:
+    """Parse one .pal file; None on any defect (fail-soft PER FILE — one
+    corrupt album file must never sink the rest of the directory). The uid
+    comes from the uid property, then <albumid>, then the file's own name
+    (Picasa names the file by its uid); no valid 32-hex uid anywhere means
+    the file is not a usable album."""
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    if root.tag != "picasa2album":
+        return None
+    props: dict[str, str] = {}
+    for el in root.iter("property"):
+        pname = (el.get("name") or "").strip().lower()
+        if pname and pname not in props:
+            props[pname] = el.get("value") or ""
+    uid = (props.get("uid") or root.findtext("albumid") or "").strip().lower()
+    if not _PAL_UID_RE.fullmatch(uid):
+        uid = path.stem.strip().lower()
+        if not _PAL_UID_RE.fullmatch(uid):
+            return None
+    name = (props.get("name") or "").strip() or uid[:8]
+    date = _ole_days_to_iso(props["date"]) if "date" in props else None
+    members: list[str] = []
+    for el in root.iter("filename"):
+        rel = _PAL_VOLUME_RE.sub("", (el.text or "").strip())
+        rel = rel.replace("\\", "/")
+        if rel:
+            members.append(rel)
+    return PalAlbum(uid=uid, name=name, date=date, members=members)
+
+
+def read_pal_dir(pal_dir: Path) -> tuple[list[PalAlbum], list[str]]:
+    """Every parseable *.pal under `pal_dir` (name-sorted for determinism)
+    plus the file names that failed to parse (import-report material)."""
+    pals: list[PalAlbum] = []
+    bad: list[str] = []
+    try:
+        files = sorted(pal_dir.glob("*.pal"))
+    except OSError:
+        return [], []
+    for f in files:
+        pal = read_pal(f)
+        if pal is None:
+            bad.append(f.name)
+        else:
+            pals.append(pal)
+    return pals, bad
+
+
+def default_pal_dir() -> Path | None:
+    """The machine-local Picasa2Albums directory, if this machine has one:
+    %LocalAppData%\\Google\\Picasa2\\Picasa2Albums (same discovery shape as
+    default_contacts_xml). None when the env var or directory is absent."""
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return None
+    p = Path(base) / "Google" / "Picasa2" / "Picasa2Albums"
+    return p if p.is_dir() else None
+
+
+def _merge_pal_albums(pal_dir: Path, photos: list[Photo],
+                      albums: dict[str, Album],
+                      report: ImportReport) -> None:
+    """§4 merge, rank assumed ini > .pal > db3 (spec pin: fauxcasa-79b):
+
+    - a uid the ini knows nothing of (no [.album:] definition, no albums=
+      token) materializes from its .pal like a real album, flagged
+      pal_sourced — membership from the .pal is the gap being filled;
+    - a PLACEHOLDER uid (albums= tokens, no definition) gets its missing
+      DEFINITION (name/date) from the .pal — membership stays the ini's;
+    - an ini-defined album keeps its ini membership verbatim: a divergent
+      .pal (extra or absent members) is an import-report entry recording
+      the choice, never a membership change; only a missing date is a gap
+      the .pal may fill;
+    - .pal members that resolve to no catalog photo are reported, and an
+      unparseable .pal file is reported and skipped (fail-soft per file)."""
+    pals, bad = read_pal_dir(pal_dir)
+    for fname in bad:
+        report.add("pal", "pal_unreadable", fname,
+                   "unparseable .pal file skipped (fail-soft per file)")
+    if not pals:
+        return
+    index_by_rel = {p.rel: i for i, p in enumerate(photos)}
+    for pal in pals:
+        resolved: list[int] = []
+        missing: list[str] = []
+        for rel in pal.members:
+            i = index_by_rel.get(rel)
+            if i is None:
+                missing.append(rel)
+            elif photos[i].visible:  # same rule as ini membership
+                resolved.append(i)
+        album = albums.get(pal.uid)
+        if album is None:
+            # .pal-only album: nothing to conflict with — the whole album
+            # is the gap, filled like a real album, flagged pal-sourced.
+            albums[pal.uid] = Album(uid=pal.uid, name=pal.name,
+                                    date=pal.date, members=resolved,
+                                    pal_sourced=True)
+            if missing:
+                report.add("pal", "pal_member_missing", pal.uid,
+                           f".pal album “{pal.name}” lists {len(missing)} "
+                           f"member(s) not in the library: "
+                           f"{', '.join(missing)}")
+            continue
+        if album.placeholder:
+            # The .pal IS the missing definition: fill the name/date gap;
+            # membership authority stays with the ini's albums= tokens.
+            album.name = pal.name
+            album.placeholder = False
+            album.pal_sourced = True
+        if album.date is None and pal.date is not None:
+            album.date = pal.date  # the ini definition carried no date
+        ini_set = set(album.members)
+        pal_set = set(resolved)
+        extra = pal_set - ini_set
+        absent = ini_set - pal_set
+        if extra or absent or missing:
+            bits = []
+            if extra:
+                bits.append(
+                    "extra members NOT added (ini wins membership): "
+                    + ", ".join(sorted(photos[i].rel for i in extra)))
+            if absent:
+                bits.append(
+                    "ini members the .pal lacks (kept): "
+                    + ", ".join(sorted(photos[i].rel for i in absent)))
+            if missing:
+                bits.append("members not in the library: "
+                            + ", ".join(missing))
+            report.add("pal", "pal_divergence", pal.uid,
+                       f".pal album “{pal.name}” diverges from the ini — "
+                       + "; ".join(bits))
+
+
 def rel_paths(root: Path, files: list[Path]) -> list[str]:
     """Library-relative POSIX paths — exactly relative_to().as_posix(),
     but via string-slicing the constant root prefix: two relative_to()
@@ -437,13 +661,19 @@ def rel_paths(root: Path, files: list[Path]) -> list[str]:
 
 def scan_library(root: Path,
                  scan_filter: ScanFilter | None = None,
-                 contacts: dict[str, str] | None = None) -> Catalog:
+                 contacts: dict[str, str] | None = None,
+                 pal_dir: Path | None = None) -> Catalog:
     """Walk `root` and build the catalog. `contacts` is the machine-local
     contacts.xml id->name map (load_contacts_xml); per §4 it wins over the
-    ini [Contacts2] tables when both name a contact."""
+    ini [Contacts2] tables when both name a contact. `pal_dir` is a
+    Picasa2Albums directory of .pal album files, merged per §4 (ini wins
+    membership; .pal fills gaps only — see _merge_pal_albums). Conflicts
+    and unknown-uid placeholders land on the catalog's ImportReport, never
+    resolved silently (fauxcasa-cam.13/.8)."""
     root = root.resolve()
     files = walk_library(root, scan_filter)
     contacts = contacts or {}
+    report = ImportReport()
 
     photos: list[Photo] = []
     folders: dict[str, Folder] = {}
@@ -570,8 +800,7 @@ def scan_library(root: Path,
         photos.append(photo)
 
     # Album definitions: [.album:<uid>] sections live in each member
-    # folder's ini; collect once per uid, then resolve membership tokens
-    # (orphaned tokens are documented ini/db drift — skip silently).
+    # folder's ini; collect once per uid, then resolve membership tokens.
     # When folders carry diverging duplicate definitions of one uid,
     # first-wins in walk order — a known-arbitrary choice; Picasa's own
     # resolution rule is unobserved (no oracle fixture yet).
@@ -589,26 +818,60 @@ def scan_library(root: Path,
                         description=sec.get("description"),
                     )
 
+    # Membership + §3 placeholder albums (fauxcasa-cam.13): an albums=
+    # token whose uid has no [.album:] definition anywhere used to be
+    # skipped silently; it now materializes as a placeholder album —
+    # "surfaced in the import diagnostics, never dropped".
+    placeholders: dict[str, Album] = {}
     for i, photo in enumerate(photos):
         folders[photo.folder].total_count += 1  # reveal-mode count
         if not photo.visible:
             continue
         folders[photo.folder].photo_count += 1
         for uid in photo.albums:
-            if uid in albums:
-                albums[uid].members.append(i)
+            album = albums.get(uid)
+            if album is None:
+                album = placeholders.get(uid)
+                if album is None:
+                    album = Album(uid=uid, name=f"Unknown album {uid[:8]}",
+                                  placeholder=True)
+                    placeholders[uid] = album
+                    albums[uid] = album  # after real albums: display order
+            album.members.append(i)
+
+    # .pal albums (fauxcasa-cam.8): merged AFTER ini resolution so the ini
+    # rank holds; may de-placeholder a uid whose definition lives in a .pal.
+    if pal_dir is not None:
+        _merge_pal_albums(pal_dir, photos, albums, report)
+
+    # Report the uids still unexplained after every source had its say.
+    for uid, album in placeholders.items():
+        if album.placeholder:
+            report.add("ini", "unknown_album", uid,
+                       f"albums= references uid {uid} but no [.album:{uid}] "
+                       f"definition (or .pal) exists — materialized as "
+                       f"placeholder “{album.name}” with "
+                       f"{len(album.members)} member(s)")
 
     # Flat contact registry: every walked folder's effective [Contacts2]
     # table (first-wins across folders, like duplicate album definitions),
-    # with contacts.xml names overriding on conflict (§4).
+    # with contacts.xml names overriding on conflict (§4) — each such
+    # conflict is an import-report entry, not a silent resolution.
     registry: dict[str, str] = {}
     for folder_rel in folders:
         for cid, cname in folder_contacts(folder_rel).items():
             registry.setdefault(cid, cname)
+    for cid, xml_name in contacts.items():
+        ini_name = registry.get(cid)
+        if ini_name is not None and ini_name != xml_name:
+            report.add("contacts", "contact_name_conflict", cid,
+                       f"[Contacts2] names contact {cid} “{ini_name}” but "
+                       f"contacts.xml says “{xml_name}” — contacts.xml "
+                       f"wins (§4)")
     registry.update(contacts)
 
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
-                   contacts=registry)
+                   contacts=registry, report=report)
 
 
 # ---- persistent catalog (load-without-walking, §7 cold start) ------------
@@ -647,13 +910,53 @@ def scan_library(root: Path,
 # (per-photo `d`/`g` rows; `s` is now the 0-5 star COUNT, not a 0/1 flag) —
 # a v4 catalog has none of these, so a warm start would silently drop
 # dates/geotags and cap every star count at 1; reject and cold-rebuild.
-# v6: video files join the walk (videoload.VIDEO_EXTS in EXTS,
+# v6: placeholder albums for unknown albums= uids and .pal-sourced albums
+# (fauxcasa-cam.13/.8) are ingested and persisted (album `placeholder`/`pal`
+# flags; the import report lands beside this file as import-report.json) —
+# a v5 catalog silently dropped both album classes, so a warm start would
+# hide them again; reject and cold-rebuild.
+# v7: video files join the walk (videoload.VIDEO_EXTS in EXTS,
 # fauxcasa-v46.2) and ini width=/height= dims are ingested (per-photo
-# `wh` rows) — a v5 catalog was walked without videos, so a warm start
+# `wh` rows) — a v6 catalog was walked without videos, so a warm start
 # would silently hide every video in the library; reject and cold-
 # rebuild. (Photo.media is derived from the extension on load, like
 # folder/name/visible — never persisted.)
-CATALOG_VERSION = 6
+CATALOG_VERSION = 7
+
+# The import report's file name, written beside catalog.json (same cache
+# dir) by save_report and re-attached on warm starts via load_report.
+REPORT_NAME = "import-report.json"
+
+
+def save_report(report: ImportReport, path: Path) -> None:
+    """Atomically persist the import report as human-readable JSON."""
+    data = {
+        "version": 1,
+        "entries": [
+            {"source": e.source, "kind": e.kind,
+             "subject": e.subject, "detail": e.detail}
+            for e in report.entries
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".report.tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_report(path: Path) -> ImportReport:
+    """The persisted import report, or an EMPTY one when absent, unreadable,
+    or malformed — the report is diagnostics, never a gate (fail-soft)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entries = [
+            ReportEntry(source=str(e["source"]), kind=str(e["kind"]),
+                        subject=str(e["subject"]), detail=str(e["detail"]))
+            for e in data["entries"]
+        ]
+    except (OSError, ValueError, KeyError, TypeError):
+        return ImportReport()
+    return ImportReport(entries=entries)
 
 
 def _photo_to_row(p: Photo) -> dict:
@@ -710,7 +1013,10 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
         "contacts": catalog.contacts,
         "albums": [
             {"uid": a.uid, "name": a.name, "date": a.date,
-             "description": a.description, "members": a.members}
+             "description": a.description, "members": a.members,
+             # v6 flags, key-absent when False (keeps the file small)
+             **({"placeholder": True} if a.placeholder else {}),
+             **({"pal": True} if a.pal_sourced else {})}
             for a in catalog.albums.values()
         ],
     }
@@ -797,6 +1103,8 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
                 uid=a["uid"], name=a["name"], date=a.get("date"),
                 description=a.get("description"),
                 members=list(a.get("members", [])),
+                placeholder=bool(a.get("placeholder")),
+                pal_sourced=bool(a.get("pal")),
             )
 
         contacts = data.get("contacts", {})

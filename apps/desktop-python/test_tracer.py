@@ -4430,10 +4430,8 @@ def test_metadata_catalog_roundtrip_and_version_gate(
     assert a.star == 3 and a.geotag == pytest.approx(WHITEHORSE)
     assert a.date_taken == "1899-03-02T14:00:00"
 
-    # the version gate: a v4 (pre-metadata) catalog cold-rebuilds. >= not
-    # ==: later features keep bumping the version (v6 = video walk,
-    # fauxcasa-v46.2) and this test only cares that pre-v5 is rejected.
-    assert catmod.CATALOG_VERSION >= 5
+    # the version gate: a v4 (pre-metadata) catalog cold-rebuilds
+    assert catmod.CATALOG_VERSION >= 5   # exact value pinned by the v6 test
     data = json.loads(path.read_text())
     data["version"] = 4
     path.write_text(json.dumps(data))
@@ -4891,6 +4889,896 @@ def test_scan_filter_never_drops_raw(tmp_path: Path) -> None:
     files = [p.name for p in
              walk_library(root, ScanFilter(min_width=1000))]
     assert files == ["m.dng"]                  # jpeg filtered, RAW kept
+
+
+# ---------------------------------------------------------------------------
+# §7 performance gates (fauxcasa-ed5.4/.3): the --search-probe latency
+# harness and the per-catalog search-haystack index behind it. The probe
+# emits one machine-readable {"event":"search","query","ms","hits"} line
+# per comma-separated query (scripts/perf-canary.py parses these in CI);
+# the haystack list is a MainWindow-owned parallel structure — NOT Photo
+# fields — rebuilt on reload_data and on cold-index finish, because
+# build_cache merges in-file captions/keywords into photos in place.
+# ---------------------------------------------------------------------------
+
+
+def test_search_probe_emits_wellformed_events(search_library: Path,
+                                              capsys) -> None:
+    """run_search_probe drives each query through the real search box (the
+    same setText -> _search_changed path a keystroke takes), prints one JSON
+    line per query with the documented keys, skips blank segments, and
+    leaves the box empty. Repeated identical queries re-fire (the probe
+    clears the box between queries)."""
+    from main import run_search_probe
+
+    win = _search_win(search_library)
+    events = run_search_probe(
+        win, "beach, beach -dunes ,nosuchterm,-city, ,beach")
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    assert [json.loads(ln) for ln in lines] == events
+
+    assert [e["query"] for e in events] == [
+        "beach", "beach -dunes", "nosuchterm", "-city", "beach"]
+    by_q = {e["query"]: e for e in events}
+    assert by_q["beach"]["hits"] == 2           # sunset.jpg + dunes.jpg
+    assert by_q["beach -dunes"]["hits"] == 1    # negation applies
+    assert by_q["nosuchterm"]["hits"] == 0
+    assert by_q["-city"]["hits"] == 2           # negation-only query
+    for e in events:
+        assert e["event"] == "search"
+        assert isinstance(e["ms"], float) and e["ms"] >= 0.0
+        assert isinstance(e["hits"], int)
+    assert win.search.text() == ""              # box left clean
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg", "market.jpg",
+                          "street.jpg"}         # ...and the filter reset
+
+
+def test_search_changed_records_latency_and_hits(search_library: Path
+                                                 ) -> None:
+    """Every _search_changed run — including the empty-query reset path —
+    records last_search_ms/last_search_hits for the probe to read."""
+    win = _search_win(search_library)
+
+    win.search.setText("beach")
+    assert win.last_search_hits == 2
+    assert win.last_search_ms >= 0.0
+    win.search.setText("")                      # reset path records too
+    assert win.last_search_hits == 4            # the unfiltered view
+    assert win.last_search_ms >= 0.0
+
+
+def test_search_haystack_rebuilt_on_reload_data(search_library: Path,
+                                                tmp_path: Path) -> None:
+    """reload_data (the reconcile swap) rebuilds the haystack index for the
+    NEW catalog: photos and metadata that only exist in the swapped-in
+    library are searchable, vanished ones are not."""
+    win = _search_win(search_library)
+    win.search.setText("sunset")
+    assert _hits(win) == {"sunset.jpg"}
+    n_pairs = len(win._search_pairs)
+    assert n_pairs == len(win.catalog.photos)
+
+    other = tmp_path / "other-lib"
+    make_jpeg(other / "2022 Aurora" / "borealis.jpg")
+    (other / "2022 Aurora" / ".picasa.ini").write_text(
+        "[borealis.jpg]\r\ncaption=green curtain\r\nkeywords=night\r\n")
+    win.reload_data(scan_library(other), None)
+
+    assert len(win._search_pairs) == 1          # parallel to the new catalog
+    win.search.setText("curtain")               # new caption is indexed
+    assert _hits(win) == {"borealis.jpg"}
+    win.search.setText("sunset")                # the old library is gone
+    assert _hits(win) == set()
+
+
+def test_search_haystack_rebuilt_on_cold_index_finish(
+        search_library: Path, tmp_path: Path, capsys) -> None:
+    """The cold-build finish path re-indexes: build_cache merges in-file
+    captions/keywords into the SAME Photo objects in place, so
+    _on_index_finished must rebuild the haystacks — an in-place caption
+    change is invisible to the stale index (that staleness is exactly why
+    the sync point exists) and searchable after."""
+    win = _search_win(search_library)
+    result = thumbcache.build_cache(win.catalog, tmp_path / "cache")
+    assert result is not None
+
+    # In-place mutation, as the indexer does. The prebuilt index is stale
+    # by design until a sync point runs:
+    dunes = next(p for p in win.catalog.photos if p.name == "dunes.jpg")
+    dunes.caption = "windswept ripples"
+    win.search.setText("windswept")
+    assert _hits(win) == set()                  # stale: not re-indexed yet
+
+    win._on_index_finished(result, win.catalog, False)  # cold-build finish
+    win.search.setText("")                      # identical text would not
+    win.search.setText("windswept")             # re-fire textChanged
+    assert _hits(win) == {"dunes.jpg"}          # fresh haystacks
+    capsys.readouterr()                         # swallow the indexed event
+
+
+def test_search_haystack_visible_subset_and_reveal(tmp_path: Path) -> None:
+    """The precomputed visible-only pair list serves off-reveal searches
+    (hidden photos excluded); reveal searches scan the full list. Semantics
+    identical to the per-keystroke scan it replaced."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "shown.jpg")
+    make_jpeg(root / "Trip" / "secret.jpg")
+    (root / "Trip" / ".picasa.ini").write_text(
+        "[secret.jpg]\r\nhidden=yes\r\n")
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+
+    assert len(win._search_pairs) == 2
+    assert len(win._search_pairs_vis) == 1      # the hidden photo is out
+
+    win.search.setText("trip")                  # folder term, off-reveal
+    assert _hits(win) == {"shown.jpg"}
+    win.reveal_box.setChecked(True)             # reveal re-runs the search
+    assert _hits(win) == {"shown.jpg", "secret.jpg"}
+    win.reveal_box.setChecked(False)
+    assert _hits(win) == {"shown.jpg"}
+
+
+
+
+# ---------------------------------------------------------------------------
+# READY-poll timer lifecycle (fauxcasa-q6l.15): an in-process main() run must
+# not leave its 50 ms check_ready poll alive — an orphan QTimer outlived
+# main() and fired into a deleted GridView during a LATER test's
+# processEvents (RuntimeError noise through the excepthook; independently
+# rediscovered by three implementation sessions before being fixed).
+# ---------------------------------------------------------------------------
+
+
+def test_ready_poll_timer_dies_with_the_run(
+        monkeypatch, library: Path, tmp_path: Path, caplog) -> None:
+    """After a self-quitting in-process main() run, spinning the (reused)
+    QApplication's event loop must fire no stale check_ready — no CRITICAL
+    'uncaught exception' may reach the log."""
+    import logging
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    cache_root = tmp_path / "cr"
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(library), "--cache-root", str(cache_root),
+        "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    assert main.main() == 0
+
+    # The window is gone; give any leaked 50 ms poll several chances to fire.
+    with caplog.at_level(logging.CRITICAL, logger="fauxcasa"):
+        for _ in range(6):
+            loop = QEventLoop()
+            QTimer.singleShot(60, loop.quit)
+            loop.exec()
+            QCoreApplication.processEvents()
+    stale = [r for r in caplog.records if "uncaught exception" in r.message]
+    assert stale == [], f"stale check_ready fired: {stale}"
+
+
+# ---------------------------------------------------------------------------
+# M1 ingest completion: import report + placeholder albums (fauxcasa-cam.13)
+# and the Picasa2Albums .pal reader + §4 gap-fill merge (fauxcasa-cam.8).
+# Synthetic fixtures only (privacy rule): hand-authored inis and .pal XML per
+# the forensicir 2007 writeup. Merge rank ASSUMED ini > .pal > db3 pending
+# the spec pin (fauxcasa-79b); every departure from a source is an
+# ImportReport entry, never a silent resolution (§4).
+# ---------------------------------------------------------------------------
+
+# 32-hex album uids: one ini-defined, one referenced-but-never-defined
+# (the placeholder case), one that exists only as a .pal file.
+UID_DEF = "1111222233334444555566667777888a"
+UID_GHOST = "2222333344445555666677778888999b"
+UID_PAL = "3333444455556666777788889999aaab"
+
+
+@pytest.fixture()
+def album_library(tmp_path: Path) -> Path:
+    """Three photos in one folder: an ini-defined album holding a+b, and a
+    GHOST uid referenced from b+c with no [.album:] definition anywhere."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "a.jpg")
+    make_jpeg(root / "Trip" / "b.jpg")
+    make_jpeg(root / "Trip" / "c.jpg")
+    (root / "Trip" / ".picasa.ini").write_text(
+        f"[.album:{UID_DEF}]\r\n"
+        "name=Defined\r\n"
+        f"token=]album:{UID_DEF}\r\n"
+        "[a.jpg]\r\n"
+        f"albums={UID_DEF}\r\n"
+        "[b.jpg]\r\n"
+        f"albums={UID_DEF},{UID_GHOST}\r\n"
+        "[c.jpg]\r\n"
+        f"albums={UID_GHOST}\r\n")
+    return root
+
+
+def _write_pal(pal_dir: Path, uid: str, name: str, members: list[str],
+               date: str | None = "39272.630035") -> Path:
+    """One .pal file in the forensicir-documented picasa2album shape (the
+    same XML the synthetic-corpus generator writes): property elements,
+    then the <files> volume-token member list nested in the name property."""
+    files = "\n".join(
+        f" <filename>[C]\\{m.replace('/', chr(92))}</filename>"
+        for m in members)
+    date_prop = (f'<property name="date" type="real64" value="{date}"/>\n'
+                 if date is not None else "")
+    pal_dir.mkdir(parents=True, exist_ok=True)
+    p = pal_dir / f"{uid}.pal"
+    p.write_text(
+        "<picasa2album>\n"
+        f"<dbid>0164eaeacdd4046f5c1e44522fe44527</dbid>\n"
+        f"<albumid>{uid}</albumid>\n"
+        f'<property name="uid" type="string" value="{uid}"/>\n'
+        f'<property name="category" type="num" value="0"/>\n'
+        f"{date_prop}"
+        f'<property name="token" type="string" value="]album:{uid}"/>\n'
+        f'<property name="name" type="string" value="{name}">\n'
+        "<files>\n"
+        f"{files}\n"
+        "</files>\n"
+        "</property>\n"
+        "</picasa2album>\n",
+        encoding="utf-8")
+    return p
+
+
+def test_read_pal_good_garbage_and_fallbacks(tmp_path: Path) -> None:
+    """read_pal parses the documented shape — 32-hex uid, name, the real64
+    OLE date converted to the catalog's canonical ISO string, members with
+    the [C]\\ volume token stripped to POSIX paths — falls back to the
+    file's own name for the uid (Picasa names .pal files by uid), and
+    fails soft PER FILE on garbage: bytes that aren't XML, XML that isn't
+    a picasa2album, and a file with no usable uid anywhere are each None."""
+    from catalog import read_pal, read_pal_dir
+
+    good = _write_pal(tmp_path / "albums", UID_PAL, "Sammy",
+                      ["Trip/a.jpg", "Deep/er/b.jpg"])
+    pal = read_pal(good)
+    assert pal is not None
+    assert pal.uid == UID_PAL
+    assert pal.name == "Sammy"
+    assert pal.date == "2007-07-09T15:07:15"   # OLE 39272.630035
+    assert pal.members == ["Trip/a.jpg", "Deep/er/b.jpg"]
+
+    # uid falls back to the file stem when the properties carry none
+    stemmed = tmp_path / "albums" / f"{UID_DEF}.pal"
+    stemmed.write_text("<picasa2album><files>\n"
+                       "<filename>[C]\\x.jpg</filename>\n"
+                       "</files></picasa2album>")
+    pal = read_pal(stemmed)
+    assert pal is not None and pal.uid == UID_DEF
+    assert pal.name == UID_DEF[:8] and pal.date is None
+    assert pal.members == ["x.jpg"]
+
+    garbage = tmp_path / "albums" / "nothex.pal"
+    garbage.write_bytes(b"\x00\x01 not xml at all")
+    assert read_pal(garbage) is None
+    not_album = tmp_path / "albums" / "other.pal"
+    not_album.write_text("<somethingelse><a/></somethingelse>")
+    assert read_pal(not_album) is None
+    no_uid = tmp_path / "albums" / "badname.pal"   # stem not 32-hex either
+    no_uid.write_text("<picasa2album><files/></picasa2album>")
+    assert read_pal(no_uid) is None
+
+    # the directory reader keeps the good ones and reports the bad by name
+    pals, bad = read_pal_dir(tmp_path / "albums")
+    assert {p.uid for p in pals} == {UID_PAL, UID_DEF}
+    assert sorted(bad) == ["badname.pal", "nothex.pal", "other.pal"]
+    assert read_pal_dir(tmp_path / "no-such-dir") == ([], [])
+
+
+def test_pal_gap_fill_only_merge(album_library: Path, tmp_path: Path) -> None:
+    """§4 merge (rank assumed ini > .pal > db3, fauxcasa-79b): an AGREEING
+    .pal changes nothing except filling the ini definition's missing date;
+    a .pal-ONLY album materializes like a real album flagged pal-sourced
+    (unresolvable members reported, resolvable ones kept); and a .pal that
+    IS a placeholder's missing definition fills the name/date gap while
+    membership authority stays with the ini's albums= tokens."""
+    pal_dir = tmp_path / "albums"
+    _write_pal(pal_dir, UID_DEF, "Defined", ["Trip/a.jpg", "Trip/b.jpg"])
+    _write_pal(pal_dir, UID_PAL, "Pal Only",
+               ["Trip/c.jpg", "Gone/missing.jpg"])
+    _write_pal(pal_dir, UID_GHOST, "Ghost Found",
+               ["Trip/b.jpg", "Trip/c.jpg"], date=None)
+
+    cat = scan_library(album_library, pal_dir=pal_dir)
+    assert list(cat.albums) == [UID_DEF, UID_GHOST, UID_PAL]
+
+    d = cat.albums[UID_DEF]
+    assert d.members == [0, 1] and not d.placeholder and not d.pal_sourced
+    assert d.name == "Defined"
+    assert d.date == "2007-07-09T15:07:15"     # gap-filled: ini had no date
+
+    p = cat.albums[UID_PAL]
+    assert p.pal_sourced and not p.placeholder
+    assert p.name == "Pal Only" and p.members == [2]
+
+    g = cat.albums[UID_GHOST]
+    assert g.pal_sourced and not g.placeholder  # the .pal WAS the definition
+    assert g.name == "Ghost Found"
+    assert g.members == [1, 2]                  # ini membership, untouched
+
+    kinds = [(e.kind, e.subject) for e in cat.report.entries]
+    assert ("pal_member_missing", UID_PAL) in kinds
+    assert not any(k == "pal_divergence" for k, _u in kinds)
+    assert not any(k == "unknown_album" for k, _u in kinds)  # de-placeholdered
+    missing = next(e for e in cat.report.entries
+                   if e.kind == "pal_member_missing")
+    assert "Gone/missing.jpg" in missing.detail and missing.source == "pal"
+
+
+def test_pal_divergence_reported_not_membership(
+        album_library: Path, tmp_path: Path) -> None:
+    """A DIVERGENT .pal for an ini-defined album: the extra member is an
+    import-report entry, NOT a membership change, and the ini member the
+    .pal lacks is kept (and recorded). An unreadable .pal file is reported
+    and skipped without sinking the scan (fail-soft per file)."""
+    pal_dir = tmp_path / "albums"
+    _write_pal(pal_dir, UID_DEF, "Defined", ["Trip/a.jpg", "Trip/c.jpg"])
+    (pal_dir / f"{UID_PAL}.pal").write_bytes(b"\xff\xfe utterly broken")
+
+    cat = scan_library(album_library, pal_dir=pal_dir)
+    d = cat.albums[UID_DEF]
+    assert d.members == [0, 1]                 # ini wins: c.jpg NOT added
+    assert UID_PAL not in cat.albums           # broken file never lands
+
+    div = [e for e in cat.report.entries if e.kind == "pal_divergence"]
+    assert len(div) == 1 and div[0].subject == UID_DEF
+    assert "Trip/c.jpg" in div[0].detail       # the extra, surfaced
+    assert "Trip/b.jpg" in div[0].detail       # the ini member the .pal lacks
+    assert "ini wins" in div[0].detail         # the recorded choice
+    bad = [e for e in cat.report.entries if e.kind == "pal_unreadable"]
+    assert len(bad) == 1 and bad[0].subject == f"{UID_PAL}.pal"
+
+
+def test_placeholder_album_materializes_and_reports(
+        album_library: Path) -> None:
+    """§3: an albums= uid with no definition anywhere materializes as a
+    placeholder Album — uid, 'Unknown album <uid8>' name, members
+    populated, placeholder flag — plus an unknown_album import-report
+    entry. Never dropped (the pre-cam.13 code silently skipped these)."""
+    cat = scan_library(album_library)
+    assert list(cat.albums) == [UID_DEF, UID_GHOST]
+    g = cat.albums[UID_GHOST]
+    assert g.placeholder and not g.pal_sourced
+    assert g.name == f"Unknown album {UID_GHOST[:8]}"
+    assert g.members == [1, 2]                 # b.jpg + c.jpg
+    assert not cat.albums[UID_DEF].placeholder
+
+    unknown = [e for e in cat.report.entries if e.kind == "unknown_album"]
+    assert len(unknown) == 1
+    assert unknown[0].subject == UID_GHOST and unknown[0].source == "ini"
+    assert "placeholder" in unknown[0].detail
+
+
+def test_contact_name_conflict_reported(
+        faces_library: Path, tmp_path: Path) -> None:
+    """The §4 conflict PR #37 resolved silently: contacts.xml renaming a
+    [Contacts2] contact is now an import-report entry recording both names
+    and the winner. Agreeing ids and xml-only ids produce no entry."""
+    from catalog import load_contacts_xml
+
+    contacts = load_contacts_xml(
+        _write_faces_contacts_xml(tmp_path / "contacts.xml"))
+    cat = scan_library(faces_library, None, contacts)
+
+    conflicts = [e for e in cat.report.entries
+                 if e.kind == "contact_name_conflict"]
+    assert len(conflicts) == 1                 # only Carol truly conflicts
+    e = conflicts[0]
+    assert e.subject == "cccccccccccccccc" and e.source == "contacts"
+    assert "Carol Ini" in e.detail and "Carol Xml" in e.detail
+    assert "contacts.xml wins" in e.detail
+    # ...and the resolution itself is unchanged (xml wins, §4)
+    assert cat.contacts["cccccccccccccccc"] == "Carol Xml"
+
+    assert not scan_library(faces_library).report.entries  # no xml, no notes
+
+
+def test_placeholder_sidebar_marking_and_notes_count(
+        album_library: Path) -> None:
+    """The sidebar shows a placeholder album visually marked — dimmed,
+    italic, '?' suffix — while a real album renders normally; the status
+    bar carries the 'N import notes' count with the first entries in the
+    tooltip; and clicking the placeholder filters the grid to its members
+    exactly like a real album (never dropped, §3)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    def item_for(win, kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    cat = scan_library(album_library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    ghost = item_for(win, "album", UID_GHOST)
+    assert ghost is not None
+    assert ghost.text(0) == f"Unknown album {UID_GHOST[:8]} ?  (2)"
+    assert ghost.font(0).italic()
+    assert "placeholder" in ghost.toolTip(0)
+    real = item_for(win, "album", UID_DEF)
+    assert real.text(0) == "Defined  (2)" and not real.font(0).italic()
+
+    assert win.notes_label.isVisibleTo(win)
+    assert win.notes_label.text().strip() == "1 import note"
+    assert "unknown_album" in win.notes_label.toolTip()
+
+    win._sidebar_clicked(ghost, 0)             # placeholders filter like albums
+    assert [cat.photos[i].rel for i in win.grid.display] == [
+        "Trip/b.jpg", "Trip/c.jpg"]
+
+    # a catalog with no notes shows no chrome at all
+    clean = scan_library(album_library)
+    clean.report.entries.clear()
+    win2 = MainWindow(clean, None, cache_dir=None, build_dir=None)
+    assert not win2.notes_label.isVisibleTo(win2)
+
+
+def test_import_report_persistence_and_warm_status(
+        album_library: Path, tmp_path: Path) -> None:
+    """save_report/load_report round-trip the entries beside catalog.json;
+    a missing or corrupt report file degrades to an EMPTY report (fail-soft
+    — diagnostics, never a gate); and a warm start that re-attaches the
+    persisted report drives the same status-bar count the scan did."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from catalog import REPORT_NAME, load_report, save_report
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    cat = scan_library(album_library)
+    assert len(cat.report.entries) == 1
+    save_report(cat.report, tmp_path / REPORT_NAME)
+    back = load_report(tmp_path / REPORT_NAME)
+    assert back.entries == cat.report.entries
+    assert back.summary() == "1 import note (unknown_album)"
+
+    assert load_report(tmp_path / "absent.json").entries == []
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{not json")
+    assert load_report(corrupt).entries == []
+
+    # the warm path: persisted catalog (report NOT inside it) + re-attach
+    save_catalog(cat, tmp_path / "catalog.json")
+    loaded = load_catalog(tmp_path / "catalog.json", album_library)
+    assert loaded is not None
+    assert loaded.report.entries == []         # empty until re-attached
+    loaded.report = load_report(tmp_path / REPORT_NAME)
+    win = MainWindow(loaded, None, cache_dir=None, build_dir=None)
+    assert win.notes_label.text().strip() == "1 import note"
+
+
+def test_catalog_v6_roundtrips_album_flags(
+        album_library: Path, tmp_path: Path) -> None:
+    """From CATALOG_VERSION 6 on: placeholder and pal-sourced albums survive
+    the persisted catalog — flags, names, members — and a v5 catalog (which
+    silently dropped both classes) is rejected so a warm start cold-rebuilds
+    instead of hiding them again. (>= 6: the exact current value is pinned
+    by the newest version-gate test.)"""
+    import catalog as catmod
+
+    assert catmod.CATALOG_VERSION >= 6
+    pal_dir = tmp_path / "albums"
+    _write_pal(pal_dir, UID_PAL, "Pal Only", ["Trip/c.jpg"])
+    cat = scan_library(album_library, pal_dir=pal_dir)
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, album_library)
+    assert loaded is not None
+    assert list(loaded.albums) == list(cat.albums)
+    for uid, orig in cat.albums.items():
+        back = loaded.albums[uid]
+        assert back.placeholder == orig.placeholder
+        assert back.pal_sourced == orig.pal_sourced
+        assert back.members == orig.members and back.name == orig.name
+    assert loaded.albums[UID_GHOST].placeholder
+    assert loaded.albums[UID_PAL].pal_sourced
+
+    data = json.loads(path.read_text())
+    data["version"] = 5
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, album_library) is None
+
+
+# ---------------------------------------------------------------------------
+# Selection tray (fauxcasa-q6l.2): persistent CROSS-FOLDER Hold/Clear +
+# typed readout (spec §5). Decisions under test (tray.py module doc):
+# identity by REL PATH (survives reconcile index remaps), HOLD ORDER
+# (insertion order — a tray is a deliberately assembled staging set),
+# and the never-silent vanish note (N7). MainWindow.selection_context()
+# is the M2 output-action attachment point.
+# ---------------------------------------------------------------------------
+
+
+def _tray_window(tmp_path: Path, with_cache: bool = False):
+    """A MainWindow over a synthetic two-folder library (2 + 2 photos,
+    one single-member album), optionally with a built+bound fcache so
+    tray thumbs have real pixels. Display order (sorted rels) is
+    f0/a.jpg, f0/b.jpg, f1/c.jpg, f1/d.jpg -> catalog indices 0..3."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f0" / "a.jpg")
+    make_jpeg(root / "f0" / "b.jpg")
+    make_jpeg(root / "f1" / "c.jpg")
+    make_jpeg(root / "f1" / "d.jpg")
+    (root / "f0" / ".picasa.ini").write_text(
+        "[a.jpg]\r\nalbums=cafecafecafecafecafecafecafecafe\r\n"
+        "[.album:cafecafecafecafecafecafecafecafe]\r\nname=Best\r\n"
+    )
+    cat = scan_library(root)
+    thumbs = None
+    if with_cache:
+        built = thumbcache.build_cache(cat, tmp_path / "c")
+        thumbs = thumbcache.load_cache(built.path)
+        thumbcache.bind(thumbs, cat)
+    win = MainWindow(cat, thumbs, cache_dir=None, build_dir=None)
+    assert [cat.photos[i].rel for i in win.grid.display] == [
+        "f0/a.jpg", "f0/b.jpg", "f1/c.jpg", "f1/d.jpg"]
+    return win
+
+
+def _sidebar_click(win, kind: str, key: str) -> None:
+    """Click the sidebar item carrying (kind, key) through the real
+    itemClicked signal, so both connected slots (_sidebar_clicked and
+    the tray-readout refresh) run in connection order."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+
+    it = QTreeWidgetItemIterator(win.tree)
+    while it.value():
+        if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+            win.tree.itemClicked.emit(it.value(), 0)
+            return
+        it += 1
+    raise AssertionError(f"sidebar item {(kind, key)} not found")
+
+
+def test_tray_hold_appends_in_display_order_no_duplicates(
+        tmp_path: Path) -> None:
+    """Ctrl+H holds the CURRENT multi-selection: one Hold appends its
+    members in display order; a later Hold appends only the new rels —
+    an already-held photo keeps its original slot (hold order, the
+    q6l.1 handoff's ordering decision); an empty selection is a no-op."""
+    from PySide6.QtCore import Qt
+
+    win = _tray_window(tmp_path)
+    g = win.grid
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    _key(g, Qt.Key.Key_H, CTRL)                  # nothing selected: no-op
+    assert win.tray.held == []
+    g._set_selection({d[2], d[0]}, d[2], d[0])   # unordered set, cross-folder
+    _key(g, Qt.Key.Key_H, CTRL)
+    assert win.tray.held == ["f0/a.jpg", "f1/c.jpg"]   # display order
+    g._set_selection({d[3], d[0]}, d[3], d[3])   # d0 already held
+    _key(g, Qt.Key.Key_H, CTRL)
+    assert win.tray.held == ["f0/a.jpg", "f1/c.jpg", "f1/d.jpg"]
+    assert win.tray.held_indices() == [d[0], d[2], d[3]]
+    assert win.tray.readout.text() == "3 photos held"
+    # The Hold BUTTON is the same path as the key
+    g._set_selection({d[1]}, d[1], d[1])
+    win.tray.hold_btn.click()
+    assert win.tray.held[-1] == "f0/b.jpg" and len(win.tray.held) == 4
+
+
+def test_tray_persists_across_views_and_search(tmp_path: Path) -> None:
+    """The held set is CROSS-FOLDER and survives every view change by
+    construction (rel identity, owned above the grid): search, album,
+    starred, folder navigation — the grid's per-view selection collapses
+    while the tray never moves."""
+    win = _tray_window(tmp_path)
+    g = win.grid
+    d = list(g.display)
+    g._set_selection({d[0], d[3]}, d[3], d[0])   # one from each folder
+    win._hold_selection()
+    held = list(win.tray.held)
+    assert held == ["f0/a.jpg", "f1/d.jpg"]
+
+    win.search.setText("c")                      # search view
+    assert g.selection == set() or g.selection == {g.current}
+    assert win.tray.held == held
+    _sidebar_click(win, "album", "cafecafecafecafecafecafecafecafe")
+    assert win.tray.held == held
+    _sidebar_click(win, "folder", "f1")
+    assert win.tray.held == held
+    _sidebar_click(win, "all", "")
+    assert win.tray.held == held
+    assert win.tray.held_indices() == [d[0], d[3]]
+    # ...and holding FROM a filtered view appends across the boundary
+    win.search.setText("b")
+    assert [win.catalog.photos[i].rel for i in g.display] == ["f0/b.jpg"]
+    g._set_selection(set(g.display), g.display[0], g.display[0])
+    win._hold_selection()
+    assert win.tray.held == held + ["f0/b.jpg"]
+
+
+def test_tray_reload_data_remaps_indices_by_rel(tmp_path: Path) -> None:
+    """The subtle part: a reconcile swap REMAPS catalog indices. Held
+    photos survive by identity — after a file is ADDED ahead of them in
+    walk order, the same rels resolve to shifted indices."""
+    win = _tray_window(tmp_path)
+    root = win.catalog.root
+    d = list(win.grid.display)
+    win.grid._set_selection({d[2], d[3]}, d[3], d[2])
+    win._hold_selection()
+    assert win.tray.held_indices() == [2, 3]
+
+    make_jpeg(root / "f0" / "0-new.jpg")         # sorts ahead of everything
+    fresh = scan_library(root)
+    built = thumbcache.build_cache(fresh, tmp_path / "c2")
+    cache = thumbcache.load_cache(built.path)
+    thumbcache.bind(cache, fresh)
+    win.reload_data(fresh, cache)
+
+    assert win.tray.held == ["f1/c.jpg", "f1/d.jpg"]   # identity intact
+    assert win.tray.held_indices() == [3, 4]           # indices remapped
+    assert win.tray.vanished == 0
+    assert win.tray.readout.text() == "2 photos held"
+
+
+def test_tray_vanished_note_is_never_silent(tmp_path: Path) -> None:
+    """Held photos missing from the swapped catalog are dropped from the
+    set but surfaced as a count note (N7) — also when the WHOLE held set
+    vanished — and the note clears on the next tray action."""
+    win = _tray_window(tmp_path)
+    root = win.catalog.root
+    d = list(win.grid.display)
+    win.grid._set_selection({d[0], d[2]}, d[2], d[0])
+    win._hold_selection()
+
+    (root / "f1" / "c.jpg").unlink()
+    fresh = scan_library(root)
+    built = thumbcache.build_cache(fresh, tmp_path / "c2")
+    cache = thumbcache.load_cache(built.path)
+    thumbcache.bind(cache, fresh)
+    win.reload_data(fresh, cache)
+
+    assert win.tray.held == ["f0/a.jpg"] and win.tray.vanished == 1
+    assert win.tray.readout.text() == \
+        "1 photo held — 1 held photo no longer in the library"
+    # the whole set vanishing must still leave the note
+    (root / "f0" / "a.jpg").unlink()
+    fresh2 = scan_library(root)
+    built2 = thumbcache.build_cache(fresh2, tmp_path / "c3")
+    cache2 = thumbcache.load_cache(built2.path)
+    thumbcache.bind(cache2, fresh2)
+    win.reload_data(fresh2, cache2)
+    assert win.tray.held == [] and win.tray.vanished == 2
+    assert win.tray.readout.text() == \
+        "2 held photos no longer in the library"
+    # the next tray action acknowledges the note
+    win.grid._select(win.grid.display[0])
+    win._hold_selection()
+    assert win.tray.vanished == 0
+    assert win.tray.readout.text() == "1 photo held"
+
+
+def test_tray_click_navigates_grid_with_view_fallback(
+        tmp_path: Path) -> None:
+    """Clicking a held thumb selects + scrolls the grid to that photo —
+    from the viewer page, and from a view whose filter hides it (falls
+    back to the All-photos view; a held photo is cross-folder by
+    design)."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtCore import QEvent
+
+    win = _tray_window(tmp_path)
+    g = win.grid
+    d = list(g.display)
+    g._set_selection({d[3]}, d[3], d[3])
+    win._hold_selection()
+
+    win.search.setText("a")                      # filters f1/d.jpg away
+    assert d[3] not in g.display_pos
+    win.pages.setCurrentWidget(win.viewer)       # navigate leaves the viewer
+    # left-click the first tray thumb through the real bar hit test
+    win.tray.bar.resize(300, 56)
+    pos = QPointF(float(6 + 22), 28.0)           # center of cell 0
+    ev = QMouseEvent(QEvent.Type.MouseButtonPress, pos, pos, pos,
+                     Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier)
+    win.tray.bar.mousePressEvent(ev)
+
+    assert win.pages.currentWidget() is win.pages.widget(0)
+    assert win.search.text() == ""               # fell back to All photos
+    assert g.current == d[3] and g.selection == {d[3]}
+    assert d[3] in g.display_pos
+    # in a view that already shows it, the view is kept as-is
+    win.search.setText("c")
+    win._tray_navigate("f1/d.jpg")               # not shown -> falls back
+    win.search.setText("d")
+    win._tray_navigate("f1/d.jpg")               # shown -> search survives
+    assert win.search.text() == "d" and g.current == d[3]
+
+
+def test_tray_clear_and_per_item_remove(tmp_path: Path) -> None:
+    """Clear empties the tray (button enablement follows); middle-click
+    on a thumb removes exactly that item, keeping the rest in order."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    win = _tray_window(tmp_path)
+    g = win.grid
+    d = list(g.display)
+    assert not win.tray.clear_btn.isEnabled()
+    g._set_selection({d[0], d[1], d[2]}, d[2], d[0])
+    win._hold_selection()
+    assert win.tray.clear_btn.isEnabled()
+
+    win.tray.bar.resize(300, 56)
+    cell = 44 + 6                                # tray.THUMB + tray.PAD
+    pos = QPointF(float(6 + cell + 22), 28.0)    # center of cell 1
+    ev = QMouseEvent(QEvent.Type.MouseButtonPress, pos, pos, pos,
+                     Qt.MouseButton.MiddleButton,
+                     Qt.MouseButton.MiddleButton,
+                     Qt.KeyboardModifier.NoModifier)
+    win.tray.bar.mousePressEvent(ev)
+    assert win.tray.held == ["f0/a.jpg", "f1/c.jpg"]
+    win.tray.remove("nope/never-held.jpg")       # unknown rel: no-op
+    assert win.tray.held == ["f0/a.jpg", "f1/c.jpg"]
+
+    g._select(-1)                                # so the view readout shows
+    win.tray.clear_btn.click()
+    assert win.tray.held == [] and not win.tray.clear_btn.isEnabled()
+    assert win.tray.readout.text() == "4 photos"  # back to the view readout
+
+
+def test_tray_typed_readout_strings(tmp_path: Path) -> None:
+    """The spec's type-aware phrasing, driven by sidebar type + grid
+    selection + tray state: folder/album views, N selected, N held —
+    singular forms included. Lives in the tray strip; the status-bar
+    dual mode is a separate surface (q6l.1) and stays as-is."""
+    win = _tray_window(tmp_path)
+    g = win.grid
+    d = list(g.display)
+    assert win.tray.readout.text() == "4 photos"          # All photos view
+    _sidebar_click(win, "folder", "f0")
+    assert win.tray.readout.text() == "Folder selected — 2 photos"
+    _sidebar_click(win, "album", "cafecafecafecafecafecafecafecafe")
+    assert win.tray.readout.text() == "Album selected — 1 photo"
+    _sidebar_click(win, "all", "")
+    win.search.setText("c")
+    assert win.tray.readout.text() == "Search — 1 photo"
+    win.search.setText("")
+    g._set_selection({d[0]}, d[0], d[0])
+    assert win.tray.readout.text() == "1 photo selected"
+    g._set_selection({d[0], d[1], d[3]}, d[3], d[0])
+    assert win.tray.readout.text() == "3 photos selected"
+    win._hold_selection()                       # held wins over selection
+    assert win.tray.readout.text() == "3 photos held"
+    # the status bar's dual mode is untouched by the tray readout
+    assert win.meta_label.text() == "3 photos selected  "
+
+
+def test_tray_ctrl_h_from_grid_and_viewer(tmp_path: Path) -> None:
+    """Ctrl+H (Picasa muscle memory) holds from BOTH surfaces: the grid
+    holds its selection set, the viewer holds the photo on screen."""
+    from PySide6.QtCore import Qt
+
+    win = _tray_window(tmp_path)
+    g = win.grid
+    d = list(g.display)
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    g._set_selection({d[1]}, d[1], d[1])
+    _key(g, Qt.Key.Key_H, CTRL)
+    assert win.tray.held == ["f0/b.jpg"]
+
+    win._open_viewer(d[2], list(d), 2)           # viewer on f1/c.jpg
+    _key(win.viewer, Qt.Key.Key_H, CTRL)
+    assert win.tray.held == ["f0/b.jpg", "f1/c.jpg"]
+    _key(win.viewer, Qt.Key.Key_Right)           # -> f1/d.jpg
+    _key(win.viewer, Qt.Key.Key_H, CTRL)
+    assert win.tray.held == ["f0/b.jpg", "f1/c.jpg", "f1/d.jpg"]
+
+
+def test_selection_context_is_the_m2_hook(tmp_path: Path) -> None:
+    """selection_context() — what a future output action reads: kind
+    follows the precedence (held > photos > view type), indices carry
+    the input's own order (HOLD order for held, display order for a
+    selection), and the held rels ride along regardless of kind."""
+    win = _tray_window(tmp_path)
+    g = win.grid
+    d = list(g.display)
+
+    ctx = win.selection_context()
+    assert ctx.kind == "all" and ctx.indices == tuple(d) and ctx.held == ()
+    _sidebar_click(win, "folder", "f1")
+    assert win.selection_context().kind == "folder"
+    win.search.setText("c")
+    assert win.selection_context().kind == "search"
+    win.search.setText("")
+
+    g._set_selection({d[2], d[0]}, d[2], d[0])
+    ctx = win.selection_context()
+    assert ctx.kind == "photos" and ctx.indices == (d[0], d[2])
+
+    win._hold_from_viewer(d[3])                  # hold order: d3 first
+    win._hold_from_viewer(d[0])
+    ctx = win.selection_context()
+    assert ctx.kind == "held"
+    assert ctx.indices == (d[3], d[0])           # HOLD order, not display
+    assert ctx.held == ("f1/d.jpg", "f0/a.jpg")
+
+
+def test_tray_thumbs_render_from_fcache(tmp_path: Path) -> None:
+    """Held thumbs decode synchronously from the cache pair (no new
+    decode threads — the memo dict fills on paint); with no cache yet
+    the paint is a placeholder and nothing is memoized, so pixels
+    upgrade in place when the cold build lands (set_thumbs)."""
+    win = _tray_window(tmp_path, with_cache=True)
+    g = win.grid
+    d = list(g.display)
+    g._set_selection({d[0], d[2]}, d[2], d[0])
+    win._hold_selection()
+    win.tray.bar.resize(300, 56)
+    assert not win.tray.bar.grab().isNull()      # paints through paintEvent
+    imgs = [win.tray.thumb_image(r) for r in win.tray.held]
+    assert all(i is not None and not i.isNull() for i in imgs)
+    assert all(i.width() <= 44 and i.height() <= 44 for i in imgs)
+
+    # no-cache window: placeholder paint, no memoization, then upgrade
+    win2 = _tray_window(tmp_path / "w2")
+    d2 = list(win2.grid.display)
+    win2.grid._set_selection({d2[0]}, d2[0], d2[0])
+    win2._hold_selection()
+    win2.tray.bar.resize(300, 56)
+    assert not win2.tray.bar.grab().isNull()
+    assert win2.tray.thumb_image("f0/a.jpg") is None
+    assert win2.tray._thumb_imgs == {}
+    built = thumbcache.build_cache(scan_library(win2.catalog.root),
+                                   tmp_path / "w2" / "c")
+    cache = thumbcache.load_cache(built.path)
+    thumbcache.bind(cache, win2.catalog)
+    win2.tray.set_thumbs(cache)
+    assert win2.tray.thumb_image("f0/a.jpg") is not None
+
+
+def test_tray_overflow_paints_plus_n_tail(tmp_path: Path) -> None:
+    """More held photos than the bar fits: the tail collapses to a '+N'
+    cell (the model, not the pixels, is what actions read); hit testing
+    maps only painted thumbs."""
+    win = _tray_window(tmp_path)
+    g = win.grid
+    d = list(g.display)
+    g._set_selection(set(d), d[0], d[0])
+    win._hold_selection()
+    bar = win.tray.bar
+    # Pin the size: grab()/render() activate the parent layout, which
+    # would otherwise re-widen the bar past the overflow under test.
+    bar.setFixedSize(3 * (44 + 6) + 6, 44 + 2 * 6)   # three whole cells
+    assert bar._slots() == 3
+    assert bar._shown() == (2, 2)                # 2 thumbs + '+2' tail
+    assert bar.item_at(6 + 22) == 0              # first painted thumb
+    assert bar.item_at(6 + 2 * (44 + 6) + 22) == -1   # the '+N' cell
+    assert bar.item_at(2) == -1                  # left gutter
+    assert not bar.grab().isNull()               # paints the '+N' branch
+    assert bar._shown() == (2, 2)                # geometry held through paint
 
 
 # ---------------------------------------------------------------------------

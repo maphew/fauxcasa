@@ -109,6 +109,10 @@ class _Loader(QObject):
 class ViewerPage(QWidget):
     closed = Signal(int)  # catalog index in view when closed
     photo_shown = Signal(int)
+    # Ctrl+H — Picasa's hold key (fauxcasa-q6l.2): hold the photo on
+    # screen in the selection tray, so triage can stage outputs without
+    # bouncing back to the grid. Payload: the catalog index shown.
+    hold_requested = Signal(int)
 
     def __init__(self, catalog: Catalog, thumbs: ThumbCache | None = None,
                  parent=None):
@@ -448,6 +452,11 @@ class ViewerPage(QWidget):
             # the conflict-free spelling that survives the M2 star-set keys
             # claiming bare digits (module docstring).
             self.toggle_zoom()
+        elif ctrl and key == Qt.Key.Key_H:
+            # Ctrl+H holds the shown photo in the tray (fauxcasa-q6l.2).
+            idx = self.current_index()
+            if idx >= 0:
+                self.hold_requested.emit(idx)
         elif self.zoomed and ctrl and key in arrows:
             # Ctrl+arrows pan a quarter-viewport at 1:1; PLAIN arrows keep
             # meaning next/prev below (the triage loop owns them).

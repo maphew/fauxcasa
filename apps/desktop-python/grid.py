@@ -208,6 +208,10 @@ class GridView(QAbstractScrollArea):
     # every subsequent mouse/key event landing HERE for dismissal.
     peek_requested = Signal(int)  # catalog idx to show (re-emits on retarget)
     peek_released = Signal()      # trigger ended: dismiss the peek
+    # Ctrl+H — Picasa's hold key (fauxcasa-q6l.2): ask the owner to add
+    # the CURRENT selection set to the selection tray. The grid only
+    # emits; the tray (rel-path identity, hold order) is MainWindow's.
+    hold_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -998,6 +1002,11 @@ class GridView(QAbstractScrollArea):
             # — Picasa's actual gesture. OR the pressed key's own bit in
             # (see keyReleaseEvent for why we normalize explicitly).
             self._peek_update(event.modifiers() | _MOD_OF[key])
+        if (key == Qt.Key.Key_H
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            # Ctrl+H: hold the current selection in the tray (q6l.2).
+            self.hold_requested.emit()
+            return
         if event.matches(QKeySequence.StandardKey.SelectAll):
             # Ctrl+A (Cmd+A on macOS via QKeySequence): the whole current
             # display set. Current/anchor keep their place if shown.
