@@ -5,7 +5,8 @@ virtualized grid, threaded JPEG decode from the packed fcache, bounded
 LRU of decoded tiles) with the benchmark hacks replaced by product
 behavior: event-driven repaints instead of a 240 Hz timer, a real
 scrollbar via QAbstractScrollArea, resize handling, group headers with
-a pinned current-folder header, selection/activation, star badges, and
+a pinned current-folder header, multi-selection (set + current/anchor,
+Ctrl/Shift semantics) and activation, star badges, and
 error tiles for undecodable entries. Scrolling reads ONLY the cache
 pair, never originals (N4).
 """
@@ -21,7 +22,15 @@ from dataclasses import dataclass, field
 from time import perf_counter
 
 from PySide6.QtCore import QObject, QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPolygonF, QTransform
+from PySide6.QtGui import (
+    QColor,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPolygonF,
+    QTransform,
+)
 from PySide6.QtWidgets import QAbstractScrollArea
 
 from catalog import Catalog
@@ -106,6 +115,13 @@ HEADER_FG = QColor(200, 200, 200)
 SELECT = QColor(64, 140, 255)
 STAR_GOLD = QColor(255, 200, 40)
 HIDDEN_VEIL = QColor(0, 0, 0, 110)  # reveal mode: dim hidden/stash tiles
+# Selection pens, hoisted out of the paint loop (fauxcasa-q6l.1): every
+# member of the selection set gets the thin rect; the CURRENT item gets the
+# stronger border; a current item the user Ctrl-toggled OUT of the set keeps
+# a dashed focus cue so keyboard navigation never goes invisible.
+PEN_SELECTED = QPen(SELECT, 1)
+PEN_CURRENT = QPen(SELECT, 3)
+PEN_FOCUS = QPen(SELECT, 1, Qt.PenStyle.DashLine)
 
 
 def _star_polygon(cx: float, cy: float, r: float) -> QPolygonF:
@@ -134,8 +150,13 @@ class _Notifier(QObject):
 class GridView(QAbstractScrollArea):
     """set_data() once, then set_filter()/set_zoom() as the user drives."""
 
-    photo_selected = Signal(int)  # catalog index, -1 = none
+    photo_selected = Signal(int)  # CURRENT item (catalog index), -1 = none
     photo_activated = Signal(int, list, int)  # catalog idx, display list, pos
+    # The multi-select payload (fauxcasa-q6l.1): a set[int] of selected
+    # catalog indices (a defensive copy — receivers may keep or mutate it).
+    # Emitted whenever the SET changes; photo_selected still tracks the
+    # current item for single-photo consumers (viewer open/close).
+    selection_changed = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -149,7 +170,15 @@ class GridView(QAbstractScrollArea):
         self.filter_label = ""
         self.content_h = 0
         self.cols = 1
-        self.selected = -1  # catalog index
+        # Selection model (fauxcasa-q6l.1): a SET of selected catalog
+        # indices plus a current item (keyboard focus, what Enter opens,
+        # what the stronger border marks) and an anchor (where Shift
+        # ranges grow from). Plain click collapses the set to one; Ctrl
+        # toggles membership; Shift selects the anchor..hit range in
+        # display order.
+        self.selection: set[int] = set()
+        self.current = -1  # catalog index, -1 = none
+        self.anchor = -1   # catalog index Shift-ranges grow from
         # Reveal toggle: when True the default ("All photos"/folder) view
         # also shows hidden=yes photos and stash-folder files, veiled so
         # they read as not-normally-shown. Owned/driven by MainWindow.
@@ -270,8 +299,13 @@ class GridView(QAbstractScrollArea):
                 self.loc[idx] = (gi, n)
                 self.display.append(idx)
         self.display_pos = {idx: n for n, idx in enumerate(self.display)}
-        if self.selected not in self.display_pos:
-            self._select(-1)
+        # Selection policy on a view change (fauxcasa-q6l.1): the set
+        # COLLAPSES to the current item if the new view still shows it,
+        # else clears entirely. Simple, and it preserves the old
+        # single-select behavior (a selected photo survives a filter
+        # change it still matches); cross-view persistence is the
+        # selection tray's job (fauxcasa-q6l.2), not the grid's.
+        self._select(self.current if self.current in self.display_pos else -1)
         self._relayout()
         self.verticalScrollBar().setValue(0)
 
@@ -646,8 +680,17 @@ class GridView(QAbstractScrollArea):
                 painter.setBrush(STAR_GOLD)
                 painter.drawPolygon(_star_polygon(
                     r.right() - s - 2, r.y() + s + 2, s))
-            if idx == self.selected:
-                painter.setPen(SELECT)
+            # Multi-select paint (fauxcasa-q6l.1): every selected tile
+            # shows the selection rect; the current item is distinct via
+            # the stronger border (dashed focus cue if Ctrl-toggled out of
+            # the set). Pens are module constants — no per-tile allocation.
+            if idx == self.current:
+                painter.setPen(PEN_CURRENT if idx in self.selection
+                               else PEN_FOCUS)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(r.adjusted(-2, -2, 1, 1))
+            elif idx in self.selection:
+                painter.setPen(PEN_SELECTED)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(r.adjusted(-2, -2, 1, 1))
 
@@ -679,11 +722,40 @@ class GridView(QAbstractScrollArea):
     # ---------- input ----------
 
     def mousePressEvent(self, event) -> None:
+        """Modifier-aware selection (fauxcasa-q6l.1). Qt's standard
+        modifiers are platform-correct: on macOS, Cmd reports as
+        ControlModifier — no raw key handling here."""
         idx = self.photo_at(int(event.position().x()),
                             int(event.position().y()))
-        self._select(idx)
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        if idx < 0:
+            # Background/header click clears (as before) — but not with a
+            # modifier held, so a near-miss during Ctrl/Shift assembly
+            # can't nuke a painstaking selection.
+            if not (ctrl or shift):
+                self._select(-1)
+            return
+        if shift and self.anchor in self.display_pos:
+            rng = self._range(self.anchor, idx)
+            # Shift+click: anchor..hit range replaces the selection;
+            # Ctrl+Shift+click adds the range instead (both standard).
+            sel = (self.selection | rng) if ctrl else rng
+            self._set_selection(sel, idx, self.anchor)
+        elif ctrl:
+            sel = set(self.selection)
+            sel.symmetric_difference_update({idx})  # toggle membership
+            self._set_selection(sel, idx, idx)
+        else:
+            self._select(idx)
 
     def mouseDoubleClickEvent(self, event) -> None:
+        # A modified double-click is selection assembly (the press half
+        # already toggled/ranged) — never an accidental viewer open.
+        if event.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                | Qt.KeyboardModifier.ShiftModifier):
+            return
         idx = self.photo_at(int(event.position().x()),
                             int(event.position().y()))
         if idx >= 0:
@@ -692,15 +764,30 @@ class GridView(QAbstractScrollArea):
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
-        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.selected >= 0:
-            self._activate(self.selected)
+        if event.matches(QKeySequence.StandardKey.SelectAll):
+            # Ctrl+A (Cmd+A on macOS via QKeySequence): the whole current
+            # display set. Current/anchor keep their place if shown.
+            if self.display:
+                cur = (self.current if self.current in self.display_pos
+                       else self.display[0])
+                anc = (self.anchor if self.anchor in self.display_pos
+                       else cur)
+                self._set_selection(set(self.display), cur, anc)
+            return
+        if key == Qt.Key.Key_Escape:
+            # Esc: collapse the set to the current item only (clears all
+            # when there is no current item).
+            self._select(self.current)
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.current >= 0:
+            self._activate(self.current)
             return
         if not self.display:
             super().keyPressEvent(event)
             return
         if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
             step = -1 if key == Qt.Key.Key_Left else 1
-            pos = self.display_pos.get(self.selected, -1)
+            pos = self.display_pos.get(self.current, -1)
             pos = max(0, min(len(self.display) - 1,
                              pos + step if pos >= 0 else 0))
             target = self.display[pos]
@@ -711,15 +798,23 @@ class GridView(QAbstractScrollArea):
         else:
             super().keyPressEvent(event)
             return
-        self._select(target)
+        if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                and self.anchor in self.display_pos):
+            # Shift+arrows: the selection becomes the anchor..target range
+            # — the anchor stays put while the current end walks, so
+            # extending then shrinking behaves like every native list.
+            self._set_selection(self._range(self.anchor, target),
+                                target, self.anchor)
+        else:
+            self._select(target)
         self._ensure_visible(target)
 
     def _row_step(self, down: bool) -> int:
         """Move one visual row, preserving the column — group-aware
         (stepping by cols in the flat list misaligns at group seams)."""
-        if self.selected not in self.loc:
+        if self.current not in self.loc:
             return self.display[0]
-        gi, n = self.loc[self.selected]
+        gi, n = self.loc[self.current]
         g = self.groups[gi]
         row, col = divmod(n, self.cols)
         last_row = (len(g.items) - 1) // self.cols
@@ -737,13 +832,36 @@ class GridView(QAbstractScrollArea):
                 prow = (len(prev.items) - 1) // self.cols
                 return prev.items[min(prow * self.cols + col,
                                       len(prev.items) - 1)]
-        return self.selected
+        return self.current
+
+    def _range(self, a: int, b: int) -> set[int]:
+        """Catalog indices between two displayed items, inclusive, in
+        display order (spans group seams — display is the flat list)."""
+        pa, pb = self.display_pos[a], self.display_pos[b]
+        lo, hi = (pa, pb) if pa <= pb else (pb, pa)
+        return set(self.display[lo:hi + 1])
 
     def _select(self, idx: int) -> None:
-        if idx == self.selected:
+        """Plain single-select: the set collapses to {idx} (empty for -1)
+        and idx becomes both current and anchor."""
+        self._set_selection({idx} if idx >= 0 else set(), idx, idx)
+
+    def _set_selection(self, selection: set[int], current: int,
+                       anchor: int) -> None:
+        """The one mutation point for the selection model. Emits
+        photo_selected when the CURRENT item changes and selection_changed
+        (a set copy) when the SET changes; no-op mutations emit nothing."""
+        self.anchor = anchor
+        sel_changed = selection != self.selection
+        cur_changed = current != self.current
+        if not (sel_changed or cur_changed):
             return
-        self.selected = idx
-        self.photo_selected.emit(idx)
+        self.selection = selection
+        self.current = current
+        if cur_changed:
+            self.photo_selected.emit(current)
+        if sel_changed:
+            self.selection_changed.emit(set(selection))
         self.viewport().update()
 
     def _activate(self, idx: int) -> None:

@@ -514,7 +514,10 @@ class MainWindow(QMainWindow):
         self._show_counts("All photos", self._shown_count())
 
         # --- wiring ---
-        self.grid.photo_selected.connect(self._photo_selected)
+        # The grid's set-valued signal drives the status label (single
+        # metadata vs "N photos selected"); the viewer stays single-photo
+        # and keeps feeding _photo_selected directly (fauxcasa-q6l.1).
+        self.grid.selection_changed.connect(self._selection_changed)
         self.grid.photo_activated.connect(self._open_viewer)
         self.viewer.closed.connect(self._close_viewer)
         self.viewer.photo_shown.connect(self._photo_selected)
@@ -937,6 +940,17 @@ class MainWindow(QMainWindow):
         self.counts_label.setText(
             f"  {label}: {n} photos · {folders} folders"
             f" · {len(self.catalog.albums)} albums")
+
+    def _selection_changed(self, selection: set) -> None:
+        """Grid multi-select -> status label (spec §5 dual mode): exactly
+        one selected shows that photo's metadata; several show the
+        aggregate count; none clears (fauxcasa-q6l.1)."""
+        if len(selection) == 1:
+            self._photo_selected(next(iter(selection)))
+        elif selection:
+            self.meta_label.setText(f"{len(selection)} photos selected  ")
+        else:
+            self.meta_label.setText("")
 
     def _photo_selected(self, idx: int) -> None:
         if idx < 0:
