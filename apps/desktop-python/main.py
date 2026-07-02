@@ -40,6 +40,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 T0 = time.perf_counter()
@@ -89,6 +90,7 @@ from thumbcache import (  # noqa: E402
 )
 from peek import PeekPage  # noqa: E402
 from slideshow import SlideshowPage  # noqa: E402
+from tray import SelectionTray  # noqa: E402
 from viewer import ViewerPage  # noqa: E402
 
 import applog  # noqa: E402
@@ -453,6 +455,30 @@ def _emit(signal, *args) -> None:
         pass
 
 
+@dataclass(frozen=True)
+class SelectionContext:
+    """What an output action would act on RIGHT NOW — the M2 attachment
+    point. Spec §5 makes the tray/selection the universal input to every
+    output action, with enablement keyed to selection type: future
+    output actions (export, movie, print, email…) call
+    MainWindow.selection_context() and key their enablement off `kind`
+    instead of re-deriving UI state from widgets.
+
+    kind:    "held" when the tray holds photos (the tray wins — Picasa's
+             contract), else "photos" for a grid multi-selection, else
+             the active view's own type ("folder", "album", "starred",
+             "recent", "person", "unnamed", "search", "all").
+    indices: catalog indices the action acts on, in the input's own
+             order — HOLD order for "held" (tray.py's ordering
+             decision), display order otherwise.
+    held:    the held rel paths (hold order) regardless of kind, so an
+             action can still offer a use-tray/use-view choice later.
+    """
+    kind: str
+    indices: tuple[int, ...]
+    held: tuple[str, ...]
+
+
 class _BuildBridge(QObject):
     progress = Signal(int, int)            # done, total (cold build live feed)
     status = Signal(str)                   # inline status text (reconcile)
@@ -559,6 +585,13 @@ class MainWindow(QMainWindow):
         split.setSizes([240, 1040])
         split.setCollapsible(1, False)
         lay.addWidget(split)
+        # Selection tray (fauxcasa-q6l.2): docked at the bottom of the
+        # browser page, Picasa's location. Held identity/order decisions
+        # live in tray.py; the typed readout text is computed here
+        # (_tray_readout_text) because only MainWindow knows the sidebar
+        # view type the spec's phrasing keys on.
+        self.tray = SelectionTray(catalog, thumbs)
+        lay.addWidget(self.tray)
         self.pages = QStackedWidget()
         self.pages.addWidget(browser)
         self.pages.addWidget(self.viewer)
@@ -584,8 +617,22 @@ class MainWindow(QMainWindow):
         self.grid.peek_released.connect(self._hide_peek)
         self.viewer.closed.connect(self._close_viewer)
         self.viewer.photo_shown.connect(self._photo_selected)
+        # Selection-tray wiring (fauxcasa-q6l.2). The readout also listens
+        # to selection_changed and the search box directly — SEPARATE
+        # connections, so the status-bar dual mode (_selection_changed)
+        # and _search_changed stay untouched.
+        self.grid.hold_requested.connect(self._hold_selection)
+        self.viewer.hold_requested.connect(self._hold_from_viewer)
+        self.tray.hold_clicked.connect(self._hold_selection)
+        self.tray.navigate.connect(self._tray_navigate)
+        self.tray.changed.connect(self._refresh_tray_readout)
+        self.grid.selection_changed.connect(
+            lambda _sel: self._refresh_tray_readout())
+        self.search.textChanged.connect(
+            lambda _t: self._refresh_tray_readout())
 
         self.grid.set_data(catalog, thumbs)
+        self._refresh_tray_readout()
 
         # --- background index plumbing (modes, not modals) ---
         # Either a COLD build (no cache yet — feeds tiles live so the
@@ -709,6 +756,7 @@ class MainWindow(QMainWindow):
         if catalog is self.catalog:
             self.grid.set_thumbs(cache)        # cold build: same catalog
             self.viewer.set_thumbs(cache)      # ...so the viewer previews too
+            self.tray.set_thumbs(cache)        # ...and held thumbs render
             self._refresh_recent_count()       # mtimes just landed (q6l.7)
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
@@ -736,6 +784,10 @@ class MainWindow(QMainWindow):
         self.search.blockSignals(False)
         self.grid.set_data(catalog, thumbs)
         self._rebuild_sidebar()
+        # Held photos survive the swap BY IDENTITY (rel path): rebind
+        # re-resolves them against the new catalog's indices and counts
+        # any that vanished for the readout's note (fauxcasa-q6l.2).
+        self.tray.rebind(catalog, thumbs)
         self._show_counts("All photos", self._shown_count())
         self.meta_label.setText("")
 
@@ -808,6 +860,7 @@ class MainWindow(QMainWindow):
             self._apply_view(kind, key)
             self.grid.scroll_to_fraction(frac)   # best-effort scroll restore
         self.grid.setFocus()
+        self._refresh_tray_readout()             # view counts changed (q6l.2)
 
     def _selected_view(self) -> tuple[str, str]:
         """The (kind, key) of the active sidebar selection, defaulting to the
@@ -838,6 +891,10 @@ class MainWindow(QMainWindow):
         tree = QTreeWidget()
         tree.setHeaderHidden(True)
         tree.itemClicked.connect(self._sidebar_clicked)
+        # After the view applies: the tray readout's type/count follow the
+        # sidebar selection (q6l.2). Connection order makes this run second.
+        tree.itemClicked.connect(
+            lambda *_a: self._refresh_tray_readout())
         return tree
 
     def _rebuild_sidebar(self) -> None:
@@ -1081,6 +1138,106 @@ class MainWindow(QMainWindow):
         q = text.strip().lower()
         self.grid.set_filter(idxs, f"search: {q}")
         self._show_counts(f"Search “{q}”", len(idxs))
+
+    # ---------- selection tray (fauxcasa-q6l.2) ----------
+
+    def selection_context(self) -> SelectionContext:
+        """The universal-input snapshot output actions read — see
+        SelectionContext (the M2 attachment point). Precedence mirrors
+        Picasa: held photos win, then the grid selection, then the whole
+        active view."""
+        held = tuple(self.tray.held)
+        if held:
+            return SelectionContext(
+                "held", tuple(self.tray.held_indices()), held)
+        if self.grid.selection:
+            pos = self.grid.display_pos
+            idxs = sorted(self.grid.selection,
+                          key=lambda i: pos.get(i, len(pos)))
+            return SelectionContext("photos", tuple(idxs), held)
+        kind, _key = self._selected_view()
+        if self.search.text().strip():
+            kind = "search"
+        return SelectionContext(kind, tuple(self.grid.display), held)
+
+    def _hold_selection(self) -> None:
+        """Hold button / Ctrl+H in the grid: append the current grid
+        selection to the tray. Within this ONE action members go in
+        display order (deterministic); across actions the tray keeps
+        hold order (tray.py's ordering decision). Empty selection is a
+        no-op — Hold never guesses."""
+        sel = self.grid.selection
+        if not sel:
+            return
+        pos = self.grid.display_pos
+        order = sorted(sel, key=lambda i: pos.get(i, len(pos)))
+        self.tray.hold(self.catalog.photos[i].rel for i in order)
+
+    def _hold_from_viewer(self, idx: int) -> None:
+        """Ctrl+H in the viewer: hold the photo on screen."""
+        if 0 <= idx < len(self.catalog.photos):
+            self.tray.hold([self.catalog.photos[idx].rel])
+
+    def _tray_navigate(self, rel: str) -> None:
+        """A held thumb was clicked: show that photo in the grid — back
+        on the browser page, falling back to the All-photos view when
+        the active filter doesn't show it (a held photo is cross-folder
+        by design, so a search/album/starred view may not contain it)."""
+        idx = self.tray.index_of(rel)
+        if idx is None:
+            return
+        self.pages.setCurrentWidget(self.pages.widget(0))
+        if idx not in self.grid.display_pos:
+            self.search.blockSignals(True)
+            self.search.clear()
+            self.search.blockSignals(False)
+            self.grid.set_filter(None, "")
+            self._reselect_view("all", "")
+            self._show_counts("All photos", self._shown_count())
+        if idx in self.grid.display_pos:
+            self.grid._select(idx)
+            self.grid._ensure_visible(idx)
+        self.grid.setFocus()
+        self._refresh_tray_readout()
+
+    def _refresh_tray_readout(self) -> None:
+        tray = getattr(self, "tray", None)  # sidebar exists before tray
+        if tray is not None:
+            tray.readout.setText(self._tray_readout_text())
+
+    def _tray_readout_text(self) -> str:
+        """The tray's live type-aware readout (spec §5: "Folder Selected
+        — 14 photos"). Precedence: held set -> grid selection -> the
+        active view's type. The vanish note (held photos a reconcile
+        dropped) rides along until the next tray action acknowledges it
+        — including when the ENTIRE held set vanished; dropping them
+        silently is exactly what N7 forbids. Lives in the tray strip;
+        the status bar keeps its own dual mode untouched (q6l.1)."""
+        def photos(n: int) -> str:
+            return f"{n} photo" + ("" if n == 1 else "s")
+
+        parts = []
+        if self.tray.held:
+            parts.append(f"{photos(len(self.tray.held))} held")
+        if self.tray.vanished:
+            v = self.tray.vanished
+            parts.append(f"{v} held photo{'' if v == 1 else 's'} "
+                         "no longer in the library")
+        if parts:
+            return " — ".join(parts)
+        if self.grid.selection:
+            return f"{photos(len(self.grid.selection))} selected"
+        kind, key = self._selected_view()
+        if self.search.text().strip():
+            return f"Search — {photos(len(self.grid.display))}"
+        if kind == "folder" and key in self.catalog.folders:
+            f = self.catalog.folders[key]
+            n = f.total_count if self.grid.reveal else f.photo_count
+            return f"Folder selected — {photos(n)}"
+        if kind == "album" and key in self.catalog.albums:
+            n = len(self.catalog.albums[key].members)
+            return f"Album selected — {photos(n)}"
+        return photos(len(self.grid.display))
 
     # ---------- status ----------
 
