@@ -177,14 +177,17 @@ policy and stays valid.
   membership stays visible-only, and the folder-level "Hidden Folders"
   category is still ignored — it needs an oracle fixture for its
   `category=` value. No faces, no edits, no writes.
-- In-file metadata is read for JPEG captions/keywords only (XMP
-  `dc:description`/`dc:subject`, IPTC 2:120/2:25 — `inmeta.py`), the
-  tier-1 fields the grid/search/viewer surface; faces-in-XMP, geotags,
-  and in-file dates are out of tracer scope (the product wraps a mature
-  metadata library, spec §5 P1). The read piggybacks on the index (the
+- In-file metadata: JPEG captions/keywords via the hand-rolled
+  `inmeta.py` (XMP `dc:description`/`dc:subject`, IPTC 2:120/2:25), plus
+  capture date / GPS / XMP Rating via `metareader.py` — the python-exiv2
+  bytes-mode seam ruled by the metadata-library decision
+  (docs/research/metadata-library-decision.md); faces-in-XMP is the
+  remaining gap (fauxcasa-cam.5). Both reads piggyback on the index (the
   bytes are already in hand for hashing), so a cold walk shows ini-only
-  captions until the index fills the in-file ones; warm starts load the
-  merged result from the persisted catalog. **Adopt mode (`--thumbs`)
+  values until the index fills the in-file ones; warm starts load the
+  merged result from the persisted catalog. In-file wins over the ini per
+  §4 tier-1 (EXIF GPS over `geotag=`; XMP Rating 1–5 over bare
+  `star=yes` — stars are a 0–5 count now, `star=yes` imports as 1). **Adopt mode (`--thumbs`)
   binds an external cache without indexing, so its catalog stays ini-only
   (no in-file ingest)** — the benchmark library it targets carries none
   anyway; a real library wanting in-file captions runs a normal build.

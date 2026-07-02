@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["PySide6", "rawpy"]
+# dependencies = ["PySide6", "rawpy", "exiv2"]
 # ///
 """Tracer bullet app (fauxcasa-pzx): a thin but real end-to-end slice of
 the product on the proposed Python + Qt stack.
@@ -70,6 +70,8 @@ from catalog import (  # noqa: E402
     Photo,
     ScanFilter,
     default_contacts_xml,
+    format_date_taken,
+    format_geotag,
     load_catalog,
     load_contacts_xml,
     reconcile_walk,
@@ -99,6 +101,38 @@ log = applog.log
 # Single source of truth for the (provisional) product name — nothing
 # else may hard-code it.
 APP_NAME = "Fauxcasa"
+
+# "Recently Updated" auto-collection (fauxcasa-q6l.7). DECISION (2026-07-02):
+# in a read-only app "updated" means FILE MTIME — the honest proxy until the
+# app itself writes anything (Picasa's collection tracked its own recent
+# edits; we have none yet). Window: mtime within the last RECENT_DAYS days
+# (Picasa kept the collection to recent edits; 30 days is the pick). If the
+# window is empty — a library untouched for months — fall back to the
+# RECENT_FALLBACK_K most recently modified photos so the collection is never
+# uselessly empty. Photo.mtime is filled by the indexer and persisted;
+# unindexed photos (mtime < 0, e.g. an adopt-mode --thumbs catalog) never
+# qualify, so those runs honestly show a count of 0.
+RECENT_DAYS = 30
+RECENT_FALLBACK_K = 100
+
+
+def recent_indices(catalog: Catalog, reveal: bool,
+                   now: float | None = None) -> list[int]:
+    """Catalog indices of the Recently Updated auto-collection: photos
+    (visible, or all under reveal) whose file mtime falls within the last
+    RECENT_DAYS days — else the RECENT_FALLBACK_K most recently modified
+    ones. Returned in catalog order (the grid regroups by folder anyway);
+    `now` is injectable for tests."""
+    if now is None:
+        now = time.time()
+    cutoff = now - RECENT_DAYS * 86400
+    known = [(i, p.mtime) for i, p in enumerate(catalog.photos)
+             if (p.visible or reveal) and p.mtime >= 0]
+    idxs = [i for i, m in known if m >= cutoff]
+    if idxs:
+        return idxs
+    known.sort(key=lambda im: im[1], reverse=True)
+    return sorted(i for i, _m in known[:RECENT_FALLBACK_K])
 
 APP_DIR = Path(__file__).resolve().parent
 REPO = APP_DIR.parents[1]
@@ -668,6 +702,7 @@ class MainWindow(QMainWindow):
         if catalog is self.catalog:
             self.grid.set_thumbs(cache)        # cold build: same catalog
             self.viewer.set_thumbs(cache)      # ...so the viewer previews too
+            self._refresh_recent_count()       # mtimes just landed (q6l.7)
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
         self.statusBar().showMessage(
@@ -831,6 +866,12 @@ class MainWindow(QMainWindow):
             1 for p in cat.photos if (p.visible or reveal) and p.star)
         star_item = QTreeWidgetItem(t, [f"★ Starred  ({starred})"])
         star_item.setData(0, Qt.ItemDataRole.UserRole, ("starred", ""))
+        # Recently Updated auto-collection (fauxcasa-q6l.7): mtime recency,
+        # semantics in recent_indices(). Live count like Starred — rebuilt
+        # with the sidebar, plus a cold-build refresh once mtimes exist.
+        recent_item = QTreeWidgetItem(
+            t, [f"↻ Recently Updated  ({len(self._recent_indices())})"])
+        recent_item.setData(0, Qt.ItemDataRole.UserRole, ("recent", ""))
 
         folders_root = QTreeWidgetItem(t, ["Folders"])
         folders_root.setFlags(
@@ -885,6 +926,24 @@ class MainWindow(QMainWindow):
                 item.setData(0, Qt.ItemDataRole.UserRole, ("unnamed", ""))
             people_root.setExpanded(True)
 
+    def _recent_indices(self) -> list[int]:
+        """The Recently Updated set for the current reveal state (semantics
+        + one-line mtime decision live on recent_indices above)."""
+        return recent_indices(self.catalog, self.grid.reveal)
+
+    def _refresh_recent_count(self) -> None:
+        """A COLD build fills Photo.mtime in-place only after the sidebar was
+        first built (its count then read 0) — update just that item's label.
+        setText on a live item is safe; only clear()+repopulate of a tree
+        with a current item is the fauxcasa-gfz crash path."""
+        n = len(self._recent_indices())
+        it = QTreeWidgetItemIterator(self.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == ("recent", ""):
+                it.value().setText(0, f"↻ Recently Updated  ({n})")
+                return
+            it += 1
+
     def _people_counts(self) -> tuple[dict[str, int], int]:
         """Per-person photo tallies for the current reveal state: {name:
         photo count} over named faces, plus how many photos carry at least
@@ -928,6 +987,10 @@ class MainWindow(QMainWindow):
                     if (p.visible or self.grid.reveal) and p.star]
             self.grid.set_filter(idxs, "Starred")
             self._show_counts("Starred", len(idxs))
+        elif kind == "recent":
+            idxs = self._recent_indices()
+            self.grid.set_filter(idxs, "Recently Updated")
+            self._show_counts("Recently Updated", len(idxs))
         elif kind == "album" and key in cat.albums:
             album = cat.albums[key]
             self.grid.set_filter(list(album.members), album.name)
@@ -1031,13 +1094,21 @@ class MainWindow(QMainWindow):
             self.meta_label.setText("")
 
     def _photo_selected(self, idx: int) -> None:
+        """Single-photo status readout (§5 dual mode): path, star count
+        (★ repeated — one glyph per star, so a count > 1 reads at a
+        glance), capture date, geotag coordinates (§3 geotag v1 display,
+        fauxcasa-cam.9/.10/.11), caption, keywords."""
         if idx < 0:
             self.meta_label.setText("")
             return
         p = self.catalog.photos[idx]
         parts = [p.rel]
         if p.star:
-            parts.append("★")
+            parts.append("★" * min(p.star, 5))
+        if p.date_taken:
+            parts.append(format_date_taken(p.date_taken))
+        if p.geotag is not None:
+            parts.append(format_geotag(p.geotag))
         if p.caption:
             parts.append(f"“{p.caption}”")
         if p.keywords:

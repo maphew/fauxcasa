@@ -29,7 +29,7 @@ from PySide6.QtCore import QObject, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QWidget
 
-from catalog import Catalog
+from catalog import Catalog, format_date_taken, format_geotag
 from thumbcache import THUMB_EDGE, ThumbCache
 
 BACKGROUND = QColor(12, 12, 12)
@@ -335,7 +335,11 @@ class ViewerPage(QWidget):
         photo = self.catalog.photos[idx]
         parts = [f"{self.pos + 1}/{len(self.display)}", photo.rel]
         if photo.star:
-            parts.append("★")
+            parts.append("★" * min(photo.star, 5))  # 0-5 count (cam.11)
+        if photo.date_taken:
+            parts.append(format_date_taken(photo.date_taken))
+        if photo.geotag is not None:
+            parts.append(format_geotag(photo.geotag))  # §3 geotag readout
         if photo.caption:
             parts.append(f"“{photo.caption}”")
         bar = "   ·   ".join(parts)
