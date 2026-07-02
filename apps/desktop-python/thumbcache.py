@@ -29,6 +29,7 @@ from typing import Callable, Sequence
 from catalog import Catalog
 from inmeta import read_jpeg_metadata
 from metareader import read_file_meta
+from rawload import is_raw_suffix, raw_demosaic_qimage, raw_preview_jpeg
 
 MAGIC = b"FCTC"
 THUMB_EDGE = 256
@@ -263,7 +264,14 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     baked display-upright, so the grid, the viewer (which auto-transforms the
     original), and both cache builders agree. The Picasa rotate= user
     quarter-turns are a separate, live display transform composed on top (see
-    grid/viewer); a rotate change never invalidates the cache."""
+    grid/viewer); a rotate change never invalidates the cache.
+
+    RAW files are routed BY EXTENSION before QImageReader ever sniffs the
+    bytes (TIFF-based RAW containers would fool it — rawload module doc):
+    the embedded JPEG preview, when present, simply becomes the bytes the
+    scaled-JPEG path below decodes (its own EXIF tag auto-applied, once);
+    otherwise a half-size demosaic yields the image directly, flip already
+    baked by LibRaw, so no second orientation pass ever runs."""
     from PySide6.QtCore import QBuffer, QIODevice, QSize, Qt
     from PySide6.QtGui import QImageReader
 
@@ -281,25 +289,36 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG only)
     fmeta = read_file_meta(data)     # in-file date/GPS/Rating (all carriers)
 
-    # setData copies into the buffer's own QByteArray; passing a temporary
-    # QByteArray to QBuffer(...) instead leaves a dangling pointer (PySide6
-    # frees the temporary) and every read silently fails.
-    buf = QBuffer()
-    buf.setData(data)
-    buf.open(QIODevice.OpenModeFlag.ReadOnly)
-    reader = QImageReader(buf)
-    # Apply EXIF orientation at decode (handles all 8 cases, mirrors too);
-    # the thumbnail is stored display-upright. setScaledSize is in pre-
-    # transform pixels — for a 90/270 image the box edges swap but both stay
-    # <= top, and the post-read clamp below covers any header that couldn't
-    # be pre-sized.
-    reader.setAutoTransform(True)
-    sz = reader.size()  # header-only; full pixels not decoded yet
-    if sz.isValid() and (sz.width() > top or sz.height() > top):
-        s = min(top / sz.width(), top / sz.height())
-        reader.setScaledSize(QSize(max(1, round(sz.width() * s)),
-                                   max(1, round(sz.height() * s))))
-    img = reader.read()
+    img = None
+    if data and is_raw_suffix(photo.rel):
+        jpeg = raw_preview_jpeg(data)
+        if jpeg is not None:
+            data = jpeg  # ride the ordinary scaled-JPEG decode below
+        else:
+            # No embedded preview: real demosaic at half size (plenty for
+            # a <= 512 px thumb). Null on failure -> the error tile below.
+            img = raw_demosaic_qimage(data, half_size=True)
+    if img is None:
+        # setData copies into the buffer's own QByteArray; passing a
+        # temporary QByteArray to QBuffer(...) instead leaves a dangling
+        # pointer (PySide6 frees the temporary) and every read silently
+        # fails.
+        buf = QBuffer()
+        buf.setData(data)
+        buf.open(QIODevice.OpenModeFlag.ReadOnly)
+        reader = QImageReader(buf)
+        # Apply EXIF orientation at decode (handles all 8 cases, mirrors
+        # too); the thumbnail is stored display-upright. setScaledSize is in
+        # pre-transform pixels — for a 90/270 image the box edges swap but
+        # both stay <= top, and the post-read clamp below covers any header
+        # that couldn't be pre-sized.
+        reader.setAutoTransform(True)
+        sz = reader.size()  # header-only; full pixels not decoded yet
+        if sz.isValid() and (sz.width() > top or sz.height() > top):
+            s = min(top / sz.width(), top / sz.height())
+            reader.setScaledSize(QSize(max(1, round(sz.width() * s)),
+                                       max(1, round(sz.height() * s))))
+        img = reader.read()
     if img.isNull():
         return (idx, [(b"", 0, 0) for _ in levels], size, mtime, sha,
                 meta, fmeta, None)

@@ -66,9 +66,14 @@ _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "scripts"))
 
 import picasa_db  # noqa: E402
+from rawload import RAW_EXTS, is_raw_suffix  # noqa: E402
 
-# Must match scripts/make-thumbcache.py EXTS exactly (cache-order parity).
-EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
+# Must match scripts/make-thumbcache.py EXTS exactly (cache-order parity):
+# the stills set below PLUS Picasa's documented 16-vendor RAW extension
+# list (rawload.RAW_EXTS, fauxcasa-v46.1) — any change to either half
+# lands in BOTH files or caches stop binding.
+EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
+        ".webp"} | RAW_EXTS
 
 INI_NAMES = (".picasa.ini", "Picasa.ini", "picasa.ini")
 
@@ -179,7 +184,13 @@ class Catalog:
 
 def _image_size(path: Path) -> tuple[int, int] | None:
     """Read dimensions without decoding pixels. None means unreadable/unknown,
-    and callers should keep the file so the indexer can surface its error."""
+    and callers should keep the file so the indexer can surface its error.
+    RAW files report None BY DESIGN: their TIFF-based containers make
+    QImageReader's sniff return the embedded preview's dimensions (a tiny
+    wrong answer), so the size filter must never judge a RAW by it — the
+    file is kept and the rawpy path decodes it (rawload module doc)."""
+    if is_raw_suffix(path.name):
+        return None
     try:
         from PySide6.QtGui import QImageReader
     except ImportError:

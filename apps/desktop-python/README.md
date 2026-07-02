@@ -26,6 +26,26 @@ source of truth.
 | Viewer | `viewer.py` | double-click / Enter; **instant cached preview** (the fcache v2 hi-DPI / loupe consumer — the nearest cached level ≥ the viewport's device pixels via `ThumbCache.best_level()`: 512 on a hi-DPI/large window, 256 from a v1 cache) painted while the async original loads (the explicit N4 exception); ←/→ or J/K; Esc back |
 | Instrumentation | `main.py` | `READY` line + JSON: cold-start ms, prep ms, `warm`, RSS, and an `indexed` event with photos/s — the §7 numbers |
 
+## Formats
+
+Stills: JPEG, PNG, GIF, BMP, TIFF, WebP (Qt image plugins). **RAW**
+(fauxcasa-v46.1): Picasa's documented 16-vendor extension list — DNG,
+CRW/CR2, RAW, RAF, 3FR, DCR/KDC, MRW, NEF/NRW, ORF, RW2, PEF, X3F,
+ARW/SRF/SR2 — decoded via `rawpy` (an *updatable* LibRaw wheel, never a
+frozen table — §6 footgun 14) behind the `rawload.py` seam (the future
+decode-sandbox boundary, `docs/decode-threat-model.md`). RAW files route
+**by extension before any content sniff** (the TIFF-based containers fool
+QImageReader/PIL into decoding the tiny embedded preview IFD); thumbs and
+viewer prefer the embedded JPEG preview (`extract_thumb`, cheap and
+usually full-size) and fall back to a real demosaic (`postprocess`;
+half-size for thumbs). Orientation lands exactly once per path: the
+preview's own EXIF tag via the normal JPEG auto-transform, or LibRaw's
+flip baked during demosaic. Corrupt RAW → the standard error tile. RAW
+originals are never written (§5). Both walkers' `EXTS` sets carry the
+RAW list in lockstep (`catalog.py` / `scripts/make-thumbcache.py`) so
+caches keep binding; a pre-RAW cache fails `bind()` on the count
+mismatch and rebuilds via the existing path.
+
 ## The §7 numbers (Linux dev machine, offscreen; overshoots reference HW)
 
 - **Cold start, already-indexed (warm load, no walk):** 100k photos in

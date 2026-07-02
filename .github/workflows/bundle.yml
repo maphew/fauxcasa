@@ -34,6 +34,12 @@ jobs:
       # the gated artifact under us (graduate to a lockfile for a release gate)
       PYSIDE6: "PySide6-Essentials==6.11.1"
       PYINSTALLER: "pyinstaller==6.20.0"
+      # LibRaw as a wheel (fauxcasa-v46.1): the artifact must bundle RAW
+      # decode — rawpy is imported lazily (rawload.py), so a build without
+      # it "succeeds" and ships error tiles for every RAW. Pinned like the
+      # others; bump deliberately (it vendors libraw — §6 footgun 14 says
+      # UPDATE it, on purpose, not by accident).
+      RAWPY: "rawpy==0.27.0"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -49,6 +55,7 @@ jobs:
         # dist/fauxcasa-tracer-gui (console=False, shipping). See fauxcasa-pqw.
         run: >
           uv run --with "${{ env.PYSIDE6 }}" --with "${{ env.PYINSTALLER }}"
+          --with "${{ env.RAWPY }}"
           pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 
       - name: Generate a smoke library (JPEG fixtures)

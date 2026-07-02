@@ -5,8 +5,11 @@
 # PyInstaller-class, ~100-150 MB is expected and acceptable — §7 anchors
 # austerity on resident memory + cold start, not installer megabytes.
 #
-# Build from the repo root (ONE invocation produces BOTH variants below):
+# Build from the repo root (ONE invocation produces BOTH variants below;
+# rawpy MUST be in the build env or the artifact silently ships without
+# RAW decode — rawload.py imports it lazily, so nothing fails at build):
 #   uv run --with "PySide6-Essentials==6.11.1" --with "pyinstaller==6.20.0" \
+#       --with "rawpy==0.27.0" \
 #       pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 #
 # Decisions (see the synthesis in the §7-validation report):
@@ -47,13 +50,15 @@ _repo = os.path.dirname(os.path.dirname(_here))
 
 # apps/desktop-python/main.py imports its siblings (catalog/grid/thumbcache/viewer) as
 # top-level modules after sys.path.insert(parent) — they are NOT a package,
-# so PyInstaller's module graph needs them named explicitly. "exiv2" is the
-# python-exiv2 binding metareader imports lazily (inside a function, with a
-# fail-soft fallback that would otherwise let a missed collection ship a
-# build that silently reads no dates/GPS/Rating) — named here so the graph
-# can never drop it.
+# so PyInstaller's module graph needs them named explicitly. "exiv2" (the
+# python-exiv2 binding behind metareader) and "rawpy" (the LibRaw wheel
+# behind the rawload seam, fauxcasa-v46.1) are imported lazily inside
+# functions with fail-soft fallbacks that would otherwise let a missed
+# collection ship a build that silently reads no dates/GPS/Rating or
+# error-tiles every RAW — named here so the graph can never drop them.
+# Wheels only, no system libs.
 _hidden = ["catalog", "grid", "thumbcache", "viewer", "picasa_db", "applog",
-           "metareader", "exiv2"]
+           "metareader", "exiv2", "rawload", "rawpy"]
 
 # Qt modules the tracer never touches (QtCore/QtGui/QtWidgets only). Mostly
 # no-ops under PySide6-Essentials, but they make the build self-documenting
