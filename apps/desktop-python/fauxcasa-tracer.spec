@@ -57,8 +57,8 @@ _repo = os.path.dirname(os.path.dirname(_here))
 # collection ship a build that silently reads no dates/GPS/Rating or
 # error-tiles every RAW — named here so the graph can never drop them.
 # Wheels only, no system libs.
-_hidden = ["catalog", "grid", "thumbcache", "viewer", "picasa_db", "applog",
-           "metareader", "exiv2", "rawload", "rawpy"]
+_hidden = ["catalog", "grid", "thumbcache", "viewer", "slideshow", "peek",
+           "picasa_db", "applog", "metareader", "exiv2", "rawload", "rawpy"]
 
 # Qt modules the tracer never touches (QtCore/QtGui/QtWidgets only). Mostly
 # no-ops under PySide6-Essentials, but they make the build self-documenting

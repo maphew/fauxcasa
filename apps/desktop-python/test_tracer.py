@@ -3856,6 +3856,381 @@ def test_grid_jump_top_end_and_buttons(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The two N4 exceptions (fauxcasa-q6l.4/.5): the viewer's explicit fit <-> 1:1
+# zoom toggle + pan, and the grid's Ctrl+Alt hover full-screen peek. Bindings
+# follow the Picasa shortcut corpus (docs/research/sources/picasaresources/
+# keyboard-shortcuts.md): `1` toggles 100% zoom (plus conflict-free
+# Ctrl+Alt+0, plus click anchored at the click point); "Hover over a photo
+# and use Ctrl-Alt" shows the full-screen preview. All offscreen-safe: mouse
+# and key events are constructed and delivered to the widget handlers
+# directly; DPR paths force the ratio via monkeypatch.
+# ---------------------------------------------------------------------------
+
+
+def _viewer_with_original(tmp_path: Path, w: int = 2560, h: int = 1600):
+    """A 1280x800 ViewerPage showing photo 0 with a decoded `w`x`h` original
+    already landed (via _on_loaded, no thread) — the common zoom case."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    cat = scan_library(root)
+    v = ViewerPage(cat, None)
+    v.resize(1280, 800)
+    v.show_photo(list(range(len(cat.photos))), 0)
+    orig = QImage(w, h, QImage.Format.Format_RGB32)
+    orig.fill(0x336699)
+    v._on_loaded(v._serial, orig)
+    assert v.image is orig and not v.zoomed
+    return v, orig
+
+
+def _mouse(widget, kind, x: float, y: float,
+           button=None, modifiers=None) -> None:
+    """Deliver a synthetic left-button mouse event to the widget handlers
+    (press/move/release), offscreen-safe."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    pos = QPointF(x, y)
+    btn = button if button is not None else Qt.MouseButton.LeftButton
+    mods = (modifiers if modifiers is not None
+            else Qt.KeyboardModifier.NoModifier)
+    ev = QMouseEvent(kind, pos, pos, pos, btn, btn, mods)
+    if kind == QEvent.Type.MouseButtonPress:
+        widget.mousePressEvent(ev)
+    elif kind == QEvent.Type.MouseMove:
+        widget.mouseMoveEvent(ev)
+    else:
+        widget.mouseReleaseEvent(ev)
+
+
+def test_viewer_zoom_rect_dpr_and_pan_clamping() -> None:
+    """The pure 1:1 geometry: one image pixel per DEVICE pixel (logical size
+    = src/dpr, so dpr 2 halves the logical rect), pan clamped so background
+    never shows past an edge, and an image smaller than the box centers
+    regardless of the pan state."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    zr = ViewerPage._zoom_rect
+    from PySide6.QtCore import QRect
+    # dpr 1, centered: 2560x1600 in 1280x800 hangs half out on every side
+    assert zr(1280, 800, 2560, 1600, 1.0, 0.5, 0.5) == \
+        QRect(-640, -400, 2560, 1600)
+    # pan clamps: fractional centers past the ends pin the matching edge
+    assert zr(1280, 800, 2560, 1600, 1.0, 0.0, 0.0) == \
+        QRect(0, 0, 2560, 1600)               # top-left pinned
+    assert zr(1280, 800, 2560, 1600, 1.0, 1.0, 1.0) == \
+        QRect(-1280, -800, 2560, 1600)        # bottom-right pinned
+    assert zr(1280, 800, 2560, 1600, 1.0, -9.0, 99.0) == \
+        QRect(0, -800, 2560, 1600)            # wild pans still clamp
+    # dpr 2: the SAME source covers half the logical px (native device px)
+    assert zr(1280, 800, 2560, 1600, 2.0, 0.5, 0.5) == \
+        QRect(0, 0, 1280, 800)
+    # smaller than the box: centered, pan has no freedom
+    assert zr(1280, 800, 600, 400, 1.0, 0.9, 0.1) == QRect(340, 200, 600, 400)
+    # degenerate 1x1 never yields a zero-size rect
+    assert zr(1280, 800, 1, 1, 3.0, 0.5, 0.5).width() == 1
+
+
+def test_viewer_zoom_key_toggles_and_arrows_still_navigate(
+        tmp_path: Path) -> None:
+    """`1` (Picasa Photo Viewer's 100% toggle) and Ctrl+Alt+0 both toggle
+    fit <-> 1:1; PLAIN arrows keep meaning next/prev even while zoomed (the
+    triage loop owns them), and the photo change resets the zoom to fit."""
+    from PySide6.QtCore import Qt
+    v, _ = _viewer_with_original(tmp_path)
+    _press(v, Qt.Key.Key_1)
+    assert v.zoomed
+    _press(v, Qt.Key.Key_1)
+    assert not v.zoomed
+    _key(v, Qt.Key.Key_0, Qt.KeyboardModifier.ControlModifier
+         | Qt.KeyboardModifier.AltModifier)
+    assert v.zoomed
+    _press(v, Qt.Key.Key_Right)               # plain arrow: NAVIGATES
+    assert v.pos == 1
+    assert not v.zoomed                        # ...and the zoom reset to fit
+    # a modified 1 (future star-set chords etc.) does NOT toggle
+    _key(v, Qt.Key.Key_1, Qt.KeyboardModifier.ControlModifier)
+    assert not v.zoomed
+
+
+def test_viewer_zoom_click_anchor_stays_put(tmp_path: Path,
+                                            monkeypatch) -> None:
+    """Click-to-zoom keeps the clicked image point PUT under the cursor: the
+    image pixel under (ax, ay) at fit paints at (ax, ay) at 1:1. A second
+    click returns to fit."""
+    from PySide6.QtCore import QEvent
+    v, orig = _viewer_with_original(tmp_path)
+    monkeypatch.setattr(v, "devicePixelRatioF", lambda: 1.0)
+    ax, ay = 900.0, 300.0
+    _mouse(v, QEvent.Type.MouseButtonPress, ax, ay)
+    _mouse(v, QEvent.Type.MouseButtonRelease, ax, ay)
+    assert v.zoomed
+    fit = v._display_rect(1280, 800, orig.width(), orig.height(), cap=True)
+    u_img = (ax - fit.x()) / fit.width() * orig.width()
+    v_img = (ay - fit.y()) / fit.height() * orig.height()
+    z = v._shown_rect(1280, 800, orig)
+    assert z.size().width() == orig.width()      # 1:1 at dpr 1
+    assert abs(z.x() + u_img * z.width() / orig.width() - ax) <= 1.0
+    assert abs(z.y() + v_img * z.height() / orig.height() - ay) <= 1.0
+    _mouse(v, QEvent.Type.MouseButtonPress, ax, ay)
+    _mouse(v, QEvent.Type.MouseButtonRelease, ax, ay)
+    assert not v.zoomed                          # click toggles back to fit
+
+
+def test_viewer_zoom_drag_pans_and_release_does_not_toggle(
+        tmp_path: Path, monkeypatch) -> None:
+    """While at 1:1 a drag pans (the photo follows the cursor) and its
+    release is NOT a click — the zoom stays on; a fling past the edge clamps
+    (background never shows, and no dead travel is left to wind back
+    through); Ctrl+arrows pan a quarter-viewport without navigating."""
+    from PySide6.QtCore import QEvent, Qt
+    v, orig = _viewer_with_original(tmp_path)
+    monkeypatch.setattr(v, "devicePixelRatioF", lambda: 1.0)
+    v.toggle_zoom()                              # center: rect at (-640,-400)
+    assert v._shown_rect(1280, 800, orig).x() == -640
+    _mouse(v, QEvent.Type.MouseButtonPress, 600, 400)
+    _mouse(v, QEvent.Type.MouseMove, 500, 350)   # drag left/up 100/50
+    _mouse(v, QEvent.Type.MouseButtonRelease, 500, 350)
+    assert v.zoomed                              # a drag never toggles
+    z = v._shown_rect(1280, 800, orig)
+    assert (z.x(), z.y()) == (-740, -450)        # photo moved with the cursor
+    _mouse(v, QEvent.Type.MouseButtonPress, 600, 400)
+    _mouse(v, QEvent.Type.MouseMove, 9000, 400)  # fling far right
+    _mouse(v, QEvent.Type.MouseButtonRelease, 9000, 400)
+    assert v._shown_rect(1280, 800, orig).x() == 0   # clamped at the edge
+    before = v._shown_rect(1280, 800, orig).x()
+    pos_before = v.pos
+    _key(v, Qt.Key.Key_Right, Qt.KeyboardModifier.ControlModifier)
+    assert v.pos == pos_before                   # pan, not navigation
+    assert v._shown_rect(1280, 800, orig).x() == before - 1280 // 4
+
+
+def test_viewer_zoom_resets_on_photo_change_and_show(tmp_path: Path) -> None:
+    """Zoom state is per-photo-shown (Picasa behavior): _step and a fresh
+    show_photo both land at fit with a centered pan."""
+    v, _ = _viewer_with_original(tmp_path)
+    v.toggle_zoom()
+    v._pan_by(-300, -200)
+    assert v.zoomed and v._zoom_cx != 0.5
+    v.show_photo(v.display, 1)
+    assert not v.zoomed and v._zoom_cx == 0.5 and v._zoom_cy == 0.5
+
+
+def test_viewer_zoom_dpr_and_preview_standin(tmp_path: Path,
+                                             monkeypatch) -> None:
+    """The instance path is devicePixelRatio-correct (a forced dpr 2 halves
+    the logical 1:1 rect: native DEVICE pixels, not a 2x blowup), and before
+    the original lands the zoomed paint shows the cached preview at ITS own
+    pixels — "paint whatever is available" — centered when smaller than the
+    viewport, and still paints cleanly (grab)."""
+    _offscreen_app()
+    from viewer import ViewerPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256])
+    v = ViewerPage(cat, cache)
+    v.resize(1280, 800)
+    monkeypatch.setattr(v, "devicePixelRatioF", lambda: 2.0)
+    v.show_photo(list(range(cache.count)), 0)
+    assert v.preview is not None and v.image is None   # original still async
+    v.toggle_zoom()
+    z = v._shown_rect(1280, 800, v.preview)
+    # preview at its own native device px: logical size = preview/2, centered
+    assert z.width() == max(1, round(v.preview.width() / 2.0))
+    assert z.x() == (1280 - z.width()) // 2
+    assert not v.grab().isNull()                       # zoomed paint is clean
+    from PySide6.QtGui import QImage
+    orig = QImage(2560, 1600, QImage.Format.Format_RGB32)
+    orig.fill(0x224466)
+    v._on_loaded(v._serial, orig)                      # the original lands...
+    assert v.zoomed                                    # ...zoom holds, and
+    z2 = v._shown_rect(1280, 800, orig)                # deepens to true 1:1
+    assert z2.width() == 1280                          # 2560 px at dpr 2
+    v.quiesce()                                        # reap the decode worker
+    assert v._decoder is None or not v._decoder.is_alive()
+
+
+# -- the hover peek trigger state machine in the grid (fauxcasa-q6l.5) and
+# the frameless full-screen surface MainWindow drives from it (peek.py) --
+
+
+def _peek_move(g, idx: int | None, mods) -> None:
+    """Deliver a button-free mouse move at the center of `idx`'s tile
+    (or the top-left header/padding band for idx=None: no photo there)."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    if idx is None:
+        pos = QPointF(2.0, 2.0)
+    else:
+        gi, n = g.loc[idx]
+        r = g._item_rect(g.groups[gi], n)
+        pos = QPointF(r.center().x(),
+                      r.center().y() - g.verticalScrollBar().value())
+    ev = QMouseEvent(QEvent.Type.MouseMove, pos, pos, pos,
+                     Qt.MouseButton.NoButton, Qt.MouseButton.NoButton, mods)
+    g.mouseMoveEvent(ev)
+
+
+def _key_up(g, key, modifiers=None) -> None:
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    mods = (modifiers if modifiers is not None
+            else Qt.KeyboardModifier.NoModifier)
+    g.keyReleaseEvent(QKeyEvent(QEvent.Type.KeyRelease, key, mods))
+
+
+def _peek_probes(g):
+    """(requested, released) recorders wired to the grid's peek signals."""
+    req: list[int] = []
+    rel: list[bool] = []
+    g.peek_requested.connect(req.append)
+    g.peek_released.connect(lambda: rel.append(True))
+    return req, rel
+
+
+def test_grid_peek_hover_trigger_retarget_and_mouse_out(
+        tmp_path: Path) -> None:
+    """The Ctrl+Alt hover trigger: a bare hover (or half the chord) never
+    fires; the full chord over a photo requests the peek; hovering to a NEW
+    photo re-points it (a fresh request, no release between); hovering off
+    any photo — or leaving the grid — releases."""
+    from PySide6.QtCore import QEvent, Qt
+    from grid import PEEK_MODS
+    g = _selection_grid(tmp_path)
+    req, rel = _peek_probes(g)
+    first, second = g.display[0], g.display[1]
+    _peek_move(g, first, Qt.KeyboardModifier.NoModifier)   # bare hover
+    _peek_move(g, first, Qt.KeyboardModifier.ControlModifier)  # half a chord
+    assert req == [] and g._peek_idx == -1
+    _peek_move(g, first, PEEK_MODS)
+    assert req == [first] and g._peek_idx == first
+    _peek_move(g, first, PEEK_MODS)                        # same tile: no spam
+    assert req == [first]
+    _peek_move(g, second, PEEK_MODS)                       # retarget re-emits
+    assert req == [first, second] and rel == []
+    _peek_move(g, None, PEEK_MODS)                         # off any photo
+    assert rel == [True] and g._peek_idx == -1
+    _peek_move(g, second, PEEK_MODS)                       # back on: re-fires
+    assert req[-1] == second
+    g.leaveEvent(QEvent(QEvent.Type.Leave))                # left the grid
+    assert rel == [True, True] and g._hover is None
+
+
+def test_grid_peek_key_chord_triggers_without_a_move(tmp_path: Path) -> None:
+    """Picasa's actual gesture: park the cursor on a photo, THEN press
+    Ctrl+Alt — the completed chord triggers from the remembered hover
+    position with no mouse move; either modifier's release dismisses."""
+    from PySide6.QtCore import Qt
+    g = _selection_grid(tmp_path)
+    req, rel = _peek_probes(g)
+    first = g.display[0]
+    _peek_move(g, first, Qt.KeyboardModifier.NoModifier)   # park the cursor
+    _key(g, Qt.Key.Key_Control, Qt.KeyboardModifier.ControlModifier)
+    assert req == []                                       # half the chord
+    _key(g, Qt.Key.Key_Alt, Qt.KeyboardModifier.ControlModifier
+         | Qt.KeyboardModifier.AltModifier)
+    assert req == [first] and g._peek_idx == first         # chord completed
+    _key_up(g, Qt.Key.Key_Control, Qt.KeyboardModifier.AltModifier)
+    assert rel == [True] and g._peek_idx == -1             # chord broken
+
+
+def test_grid_peek_esc_and_click_dismiss_and_rearm(tmp_path: Path) -> None:
+    """Esc dismisses the peek WITHOUT touching the selection (the normal
+    selection-collapse Esc is only consumed by an active peek), a click
+    dismisses it while still doing its selection work, and both hold the
+    peek dismissed until the chord drops and re-triggers."""
+    from PySide6.QtCore import Qt
+    from grid import PEEK_MODS
+    g = _selection_grid(tmp_path)
+    req, rel = _peek_probes(g)
+    first, second = g.display[0], g.display[1]
+    g._select(first)
+    _peek_move(g, second, PEEK_MODS)
+    assert g._peek_idx == second
+    _key(g, Qt.Key.Key_Escape, PEEK_MODS)                  # Esc: peek only
+    assert rel == [True] and g._peek_idx == -1
+    assert g.selection == {first} and g.current == first   # selection intact
+    _peek_move(g, second, PEEK_MODS)                       # chord still held:
+    assert g._peek_idx == -1 and len(req) == 1             # suppressed
+    _peek_move(g, second, Qt.KeyboardModifier.NoModifier)  # chord drops...
+    _peek_move(g, second, PEEK_MODS)                       # ...re-arms
+    assert req == [second, second] and g._peek_idx == second
+    # a click dismisses AND still does its (Ctrl-toggle) selection work
+    _click(g, second, modifiers=PEEK_MODS)
+    assert g._peek_idx == -1 and rel == [True, True]
+    assert g.selection == {first, second}                  # Ctrl+click added
+    _peek_move(g, first, PEEK_MODS)                        # still suppressed
+    assert g._peek_idx == -1
+
+
+def test_mainwindow_peek_lifecycle_reuses_surface_and_cache(
+        tmp_path: Path) -> None:
+    """MainWindow's peek surface: lazily created on the first request, then
+    REUSED (one instance, one persistent decode worker — the slideshow
+    lifecycle discipline); it shares the grid's cache pair so the cached
+    preview paints instantly; it shows at fit; and it is frameless,
+    full-screen on the target screen, input-transparent, and can never take
+    focus from the grid (flags + WA_ShowWithoutActivating + NoFocus)."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    import main
+    from peek import PeekPage
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root, levels=[512, 256])
+    win = main.MainWindow(cat, cache, cache_dir=None, build_dir=None)
+    assert win._peek_page is None                          # lazy until used
+    win.grid.peek_requested.emit(0)
+    page = win._peek_page
+    assert isinstance(page, PeekPage) and page.isVisible()
+    assert page.current_index() == 0 and not page.zoomed   # shown at fit
+    assert page.thumbs is win.grid.thumbs                  # shared cache pair
+    assert page.preview is not None                        # instant preview
+    flags = page.windowFlags()
+    for f in (Qt.WindowType.FramelessWindowHint,
+              Qt.WindowType.WindowStaysOnTopHint,
+              Qt.WindowType.WindowTransparentForInput,
+              Qt.WindowType.WindowDoesNotAcceptFocus):
+        assert flags & f, f
+    assert page.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+    assert page.focusPolicy() == Qt.FocusPolicy.NoFocus
+    assert page.geometry() == PeekPage._target_screen().geometry()
+    win.grid.peek_released.emit()
+    assert page.isHidden()
+    win.grid.peek_requested.emit(1)                        # reuse, re-pointed
+    assert win._peek_page is page and page.isVisible()
+    assert page.current_index() == 1
+    worker = page._decoder                                 # ONE worker...
+    win.grid.peek_released.emit()
+    win.grid.peek_requested.emit(0)
+    assert page._decoder is worker                         # ...every peek
+    page.quiesce()                                         # no thread leak
+    assert worker is None or not worker.is_alive()
+
+
+def test_peek_target_screen_falls_back_to_primary(monkeypatch) -> None:
+    """Multi-monitor placement: the peek goes to the screen containing the
+    cursor; when screenAt can't resolve one (headless, or a cursor parked
+    between screens) it falls back to the primary rather than nowhere."""
+    _offscreen_app()
+    import peek
+    from PySide6.QtGui import QGuiApplication
+    primary = QGuiApplication.primaryScreen()
+
+    class _NoHit:  # QGuiApplication stand-in: cursor over no known screen
+        @staticmethod
+        def screenAt(_pos):
+            return None
+
+        @staticmethod
+        def primaryScreen():
+            return primary
+
+    monkeypatch.setattr(peek, "QGuiApplication", _NoHit)
+    assert peek.PeekPage._target_screen() is primary
 # In-file capture date / GPS / XMP Rating via metareader — the exiv2
 # bytes-mode seam (fauxcasa-cam.9/.10/.11). Fixtures are synthesized through
 # metareader's OWN test-support writer (embed_test_metadata) so every exiv2
