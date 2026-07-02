@@ -1414,7 +1414,12 @@ def main() -> int:
         else:
             poll.stop()  # interactive run: instrumentation is done
 
-    poll = QTimer()
+    # Parented to the window it polls: check_ready dereferences win.grid,
+    # and the timeout connection forms a Python reference cycle (poll ->
+    # check_ready -> poll) that keeps the timer alive past main()'s return
+    # — an in-process caller (the test suite) that later deletes the window
+    # would otherwise get a stale fire into a deleted GridView.
+    poll = QTimer(win)
     poll.setInterval(50)
     poll.timeout.connect(check_ready)
     poll.start()
