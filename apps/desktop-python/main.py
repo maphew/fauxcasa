@@ -82,6 +82,7 @@ from thumbcache import (  # noqa: E402
     cache_dir_for,
     load_cache,
 )
+from slideshow import SlideshowPage  # noqa: E402
 from viewer import ViewerPage  # noqa: E402
 
 import applog  # noqa: E402
@@ -445,6 +446,9 @@ class MainWindow(QMainWindow):
         # preview (the nearest v2 level) while the full original loads
         # (fauxcasa-9pp). thumbs is None on a cold start until the build lands.
         self.viewer = ViewerPage(catalog, thumbs)
+        # Full-screen slideshow surface (fauxcasa-q6l.3): created per show
+        # in _start_slideshow so it can never hold a stale catalog/cache.
+        self._slideshow: SlideshowPage | None = None
 
         # --- sidebar: All / Starred / Folders / Albums ---
         self.tree = self._new_sidebar_tree()
@@ -457,6 +461,15 @@ class MainWindow(QMainWindow):
         self.open_action = bar.addAction("Open...")
         self.open_action.setToolTip("Choose a different photo library folder")
         self.open_action.triggered.connect(self._change_library)
+        bar.addSeparator()
+        # Picasa's green Play (folder/album headers + toolbar) distilled to
+        # one toolbar affordance acting on the CURRENT view; F11 is the
+        # Picasa-heritage shortcut (fauxcasa-q6l.3).
+        self.play_action = bar.addAction("▶ Play")
+        self.play_action.setToolTip(
+            "Slideshow of the current view (F11) — Space pauses, Esc exits")
+        self.play_action.setShortcut("F11")
+        self.play_action.triggered.connect(self._start_slideshow)
         bar.addSeparator()
         self.search = QLineEdit()
         self.search.setPlaceholderText(
@@ -928,6 +941,40 @@ class MainWindow(QMainWindow):
             self.grid._select(idx)
             self.grid._ensure_visible(idx)
         self.grid.setFocus()
+
+    # ---------- slideshow (fauxcasa-q6l.3) ----------
+
+    def _start_slideshow(self) -> None:
+        """Play the CURRENT display set — whatever the grid is showing
+        (folder view, album, All, Starred, search results) — full-screen,
+        from the current photo (or the first when none is selected).
+        Read-only playback; the overlay star/reject controls are M2. The
+        show is a separate top-level surface, so the grid/viewer beneath
+        keeps its exact state for the Esc return trip."""
+        display = list(self.grid.display)
+        if not display:
+            return
+        if self.pages.currentWidget() is self.viewer:
+            current = self.viewer.current_index()
+        else:
+            current = self.grid.selected
+        pos = self.grid.display_pos.get(current, 0)
+        show = SlideshowPage(self.catalog, self.grid.thumbs)
+        show.closed.connect(self._slideshow_closed)
+        self._slideshow = show
+        show.start(display, pos)
+
+    def _slideshow_closed(self, _idx: int) -> None:
+        show, self._slideshow = self._slideshow, None
+        if show is None:
+            return  # already torn down (Esc exit + a window close both fired)
+        show.hide()
+        show.deleteLater()
+        # The pages beneath were never touched — "back to exactly the prior
+        # state" is just re-taking focus on whichever page is current.
+        self.activateWindow()
+        current = self.pages.currentWidget()
+        (self.viewer if current is self.viewer else self.grid).setFocus()
 
 
 def main() -> int:

@@ -34,6 +34,27 @@ BACKGROUND = QColor(12, 12, 12)
 CAPTION_BG = QColor(0, 0, 0, 170)
 
 
+def load_original(path: str, rotate: int) -> QImage:
+    """Decode a full original: EXIF auto-orientation on read (so it matches
+    the EXIF-baked grid thumbnails), then the Picasa rotate= user
+    quarter-turns composed on top — see apps/desktop-python/README.md
+    "EXIF orientation". The ONE full-image decode path, shared by the
+    viewer's async load and the slideshow's dwell prefetch (slideshow.py),
+    so every consumer orients identically. Returns a null QImage on
+    failure. Thread-safe: QImage (unlike QPixmap) may be built off the GUI
+    thread, and callers do call this from worker threads."""
+    from PySide6.QtGui import QImageReader
+
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    img = reader.read()
+    if not img.isNull() and rotate:
+        from PySide6.QtGui import QTransform
+
+        img = img.transformed(QTransform().rotate(90 * rotate))
+    return img
+
+
 class _Loader(QObject):
     loaded = Signal(int, QImage)  # serial, image (null = failed)
 
@@ -76,14 +97,33 @@ class ViewerPage(QWidget):
             return -1
         return self.display[self.pos]
 
+    def _take_prefetched(self, idx: int) -> QImage | None:
+        """Subclass hook: hand back an already-decoded original for `idx`,
+        or None. The base viewer never prefetches; the slideshow decodes the
+        NEXT photo's original during the current dwell and surrenders it
+        here, making a timed advance a pure swap (slideshow.py)."""
+        return None
+
     def _load_current(self) -> None:
         idx = self.current_index()
         if idx < 0:
             return
-        self.image = None
-        self.loading = True
         self._serial += 1
         serial = self._serial
+        ready = self._take_prefetched(idx)
+        if ready is not None:
+            # A prefetcher already decoded this original during the previous
+            # dwell: show it NOW — no preview flash, no redundant decode. The
+            # serial bump above stales any in-flight load (_on_loaded guard),
+            # exactly as a normal navigation would.
+            self.loading = False
+            self.image = ready
+            self.preview = None
+            self.photo_shown.emit(idx)
+            self.update()
+            return
+        self.image = None
+        self.loading = True
         path = str(self.catalog.root / self.catalog.photos[idx].rel)
         rotate = self.catalog.photos[idx].rotate
         # Show a cached stand-in NOW — synchronous, but cheap (a <= 512 px
@@ -102,21 +142,9 @@ class ViewerPage(QWidget):
             # decode, and the emit is guarded against Qt teardown.
             if serial != self._serial:
                 return
-            # Apply EXIF orientation on read (setAutoTransform), so the
-            # viewer matches the EXIF-baked grid thumbnails; the Picasa
-            # rotate= user quarter-turns compose on top. See
-            # apps/desktop-python/README.md "EXIF orientation".
-            from PySide6.QtGui import QImageReader
-
-            reader = QImageReader(path)
-            reader.setAutoTransform(True)
-            img = reader.read()
+            img = load_original(path, rotate)
             if serial != self._serial:
                 return
-            if not img.isNull() and rotate:
-                from PySide6.QtGui import QTransform
-
-                img = img.transformed(QTransform().rotate(90 * rotate))
             try:
                 self._loader.loaded.emit(serial, img)
             except RuntimeError:
