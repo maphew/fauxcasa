@@ -23,7 +23,7 @@ source of truth.
 | Virtualized grid | `grid.py` | balloon lineage: threaded fcache decode, bounded LRU — plus event-driven repaint, real scrollbar, group headers w/ pinned current folder, selection, star badges, error tiles. Never reads originals (N4) |
 | Sidebar | `main.py` | All / Starred / folder tree (filesystem truth) / albums (pure references resolved from `albums=` tokens) |
 | Search | `main.py` | substring over filename + caption + keywords, live filter |
-| Viewer | `viewer.py` | double-click / Enter; **instant cached preview** (the fcache v2 hi-DPI / loupe consumer — the nearest cached level ≥ the viewport's device pixels via `ThumbCache.best_level()`: 512 on a hi-DPI/large window, 256 from a v1 cache) painted while the async original loads (the explicit N4 exception); ←/→ or J/K; Esc back. **Explicit 1:1 zoom** (the other N4 exception, fauxcasa-q6l.4): `1` (Picasa Photo Viewer's toggle) / `Ctrl+Alt+0` / click (anchored at the click point), one image pixel per **device** pixel; drag or Ctrl+arrows pan, plain arrows stay next/prev; resets to fit on photo change |
+| Viewer | `viewer.py` | double-click / Enter; **instant cached preview** (the fcache v2 hi-DPI / loupe consumer — the nearest cached level ≥ the viewport's device pixels via `ThumbCache.best_level()`: 512 on a hi-DPI/large window, 256 from a v1 cache) painted while the async original loads (the explicit N4 exception); ←/→ or J/K; Esc back. **Explicit 1:1 zoom** (the other N4 exception, fauxcasa-q6l.4): `1` (Picasa Photo Viewer's toggle) / `Ctrl+Alt+0` / click (anchored at the click point), one image pixel per **device** pixel; drag or Ctrl+arrows pan, plain arrows stay next/prev; resets to fit on photo change. **Face overlay** (fauxcasa-cam.4): `F` toggles rounded boxes + names over the photo's ini `faces=` regions (dashed + "Unnamed" for unconfirmed/unnamed); stored-pixel rect64 fractions mapped through the composed EXIF-orientation × `rotate=` transform and the live fit/1:1 rect, so boxes track pan and zoom; viewer-only (peek/slideshow are glance surfaces). Picasa documents no view-mode key for face boxes — `F` is this app's own pick |
 | Hover peek | `peek.py` + grid trigger | Picasa's **Ctrl+Alt while hovering** a grid photo (the shortcut corpus, verbatim): frameless full-screen preview on the cursor's screen, riding the viewer's preview + async-original machinery; input-transparent and non-activating so the grid keeps focus and the event stream; dismisses on hover-out, modifier release, click, or Esc (fauxcasa-q6l.5) |
 | Instrumentation | `main.py` | `READY` line + JSON: cold-start ms, prep ms, `warm`, RSS, and an `indexed` event with photos/s — the §7 numbers |
 
@@ -145,6 +145,16 @@ the cheap `rotate=` turns stay a live display transform, so a rotate never
 invalidates the cache. Synthetic/benchmark photos carry no Orientation
 tag, so the shipped benchmark `.fcache` is pixel-identical under this
 policy and stays valid.
+
+The one consumer that needs the **raw stored value** back is the viewer's
+face overlay (fauxcasa-cam.4): `faces=` rect64 fractions are relative to
+the *stored* pixels, so the overlay un-maps them through the same
+composed transform the pixels get (`viewer.map_face_fraction`, all 8
+orientations × 4 `rotate=` turns, unit-tested against Qt's own pixel
+transforms). The value is read at **view time** from the original's bytes
+(`metareader.read_orientation`, the exiv2 seam, fail-soft 1) on the
+decode worker — deliberately *not* persisted in the catalog, so no
+catalog version bump.
 
 ## Deliberate tracer shortcuts (not product decisions)
 

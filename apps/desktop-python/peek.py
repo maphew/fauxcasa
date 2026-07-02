@@ -56,6 +56,10 @@ class PeekPage(ViewerPage):
         # The base viewer takes StrongFocus for its triage keys; a peek is
         # pure output and must never pull focus off the grid.
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # No face overlay on a glance surface (fauxcasa-cam.4): a peek is
+        # a sub-second full-screen flash — boxes and labels there are
+        # noise, and the surface takes no keys to toggle them anyway.
+        self.face_overlay_allowed = False
 
     @staticmethod
     def _target_screen():

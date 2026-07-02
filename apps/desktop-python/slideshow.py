@@ -55,6 +55,11 @@ class SlideshowPage(ViewerPage):
                  parent=None):
         super().__init__(catalog, thumbs, parent)
         self.setWindowTitle("Slideshow")
+        # No face overlay on a glance surface (fauxcasa-cam.4): a timed
+        # show is for watching, not inspecting — boxes would be noise.
+        # (This surface's keyPressEvent doesn't route F anyway; the flag
+        # makes the policy explicit and testable.)
+        self.face_overlay_allowed = False
         self.paused = False
         self._timer = QTimer(self)
         self._timer.setInterval(delay_ms)
