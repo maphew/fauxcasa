@@ -150,24 +150,6 @@ def _count_photo_values(cat: Catalog, field: str) -> int:
     return n
 
 
-def probe_pal(cat: Catalog, ref: Reference) -> int | None:
-    """Behavioral: the corpus ships one album that exists ONLY as a .pal
-    file; if its uid shows up in catalog.albums, .pal ingest has landed."""
-    pal_only = ref.manifest["uids"]["pal_only"]
-    if pal_only in cat.albums:
-        return sum(1 for u in ref.manifest["uids"]["pal_files"]
-                   if u in cat.albums)
-    return None
-
-
-def probe_placeholder_albums(cat: Catalog, ref: Reference) -> int | None:
-    """Behavioral: albums= tokens naming a uid with no definition anywhere
-    (the placeholder-album case, fauxcasa-cam.13). Ingested when the
-    unknown uid materializes as a catalog album."""
-    unknown = ref.manifest["uids"]["unknown"]
-    return 1 if unknown in cat.albums else None
-
-
 def probe_edit_keys(cat: Catalog, ref: Reference) -> int | None:
     f = _photo_field(("filters", "edits", "edit_stack", "crop"))
     return _count_photo_values(cat, f) if f else None
@@ -294,15 +276,24 @@ CLASSES: list[ParityClass] = [
         "geotagged", _feat("geotagged"),
         lambda c, r: sum(1 for p in c.photos if p.geotag is not None),
         manifest_key="geotagged"),
-    # ---- expected-missing: owned, probed, ratchets forward -----------------
+    # ---- .pal + placeholder albums: ingested by fauxcasa-cam.8/.13 PR ------
     ParityClass(
-        "pal_albums", lambda r: r.pal_files, probe_pal,
-        owner="fauxcasa-cam.8", manifest_key="pal_albums"),
+        # every albums/*.pal file lands in the catalog: ini-defined uids as
+        # the merge's membership authority, the .pal-only uid materialized
+        # pal-sourced (§4: ini wins membership, .pal fills gaps only)
+        "pal_albums", lambda r: r.pal_files,
+        lambda c, r: sum(1 for u in r.manifest["uids"]["pal_files"]
+                         if u in c.albums),
+        manifest_key="pal_albums"),
     ParityClass(
+        # albums= tokens naming a uid with no definition anywhere: each
+        # distinct uid materializes as a placeholder-flagged album,
+        # surfaced in the import report, never dropped
         "placeholder_albums",
         lambda r: r.manifest["expected"]["placeholder_album_uids"],
-        probe_placeholder_albums,
-        owner="fauxcasa-cam.13", manifest_key="placeholder_album_uids"),
+        lambda c, r: sum(1 for a in c.albums.values() if a.placeholder),
+        manifest_key="placeholder_album_uids"),
+    # ---- expected-missing: owned, probed, ratchets forward -----------------
     ParityClass(
         "edit_keys_other",
         # survey's edit_keys folds in rotate=, which IS ingested; subtract it
@@ -321,10 +312,13 @@ CLASSES: list[ParityClass] = [
 def run_gate(corpus: Path) -> int:
     ref = build_reference(corpus)
     # The gate scans the way the app does: contacts.xml threaded in when the
-    # corpus ships one (fauxcasa-cam.2's --contacts discovery, made explicit).
+    # corpus ships one (fauxcasa-cam.2's --contacts discovery, made explicit),
+    # and the Picasa2Albums .pal dir likewise (fauxcasa-cam.8's --pal-dir).
     cx = corpus / "contacts" / "contacts.xml"
     contacts = load_contacts_xml(cx) if cx.is_file() else {}
-    cat = scan_library(corpus / "library", contacts=contacts)
+    pal_dir = corpus / "albums"
+    cat = scan_library(corpus / "library", contacts=contacts,
+                       pal_dir=pal_dir if pal_dir.is_dir() else None)
     expected = ref.manifest.get("expected", {})
 
     failures: list[str] = []
