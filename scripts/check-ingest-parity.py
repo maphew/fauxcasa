@@ -150,11 +150,6 @@ def _count_photo_values(cat: Catalog, field: str) -> int:
     return n
 
 
-def probe_geotag(cat: Catalog, ref: Reference) -> int | None:
-    f = _photo_field(("geotag", "geo", "latlon", "gps"))
-    return _count_photo_values(cat, f) if f else None
-
-
 def probe_pal(cat: Catalog, ref: Reference) -> int | None:
     """Behavioral: the corpus ships one album that exists ONLY as a .pal
     file; if its uid shows up in catalog.albums, .pal ingest has landed."""
@@ -290,10 +285,16 @@ CLASSES: list[ParityClass] = [
         lambda r: r.manifest["expected"]["contacts_registry"],
         lambda c, r: len(c.contacts),
         manifest_key="contacts_registry"),
-    # ---- expected-missing: owned, probed, ratchets forward -----------------
+    # ---- geotags: ingested by fauxcasa-cam.9/.10/.11 PR --------------------
     ParityClass(
-        "geotagged", _feat("geotagged"), probe_geotag,
-        owner="fauxcasa-cam.10", manifest_key="geotagged"),
+        # ini geotag= keys at scan; in-file EXIF GPS overrides at index.
+        # This gate runs scan_library only (no indexer) and the extras
+        # corpus's geotags are ini-only (no EXIF GPS), so the scan-level
+        # count matches the survey's geotag= key count exactly.
+        "geotagged", _feat("geotagged"),
+        lambda c, r: sum(1 for p in c.photos if p.geotag is not None),
+        manifest_key="geotagged"),
+    # ---- expected-missing: owned, probed, ratchets forward -----------------
     ParityClass(
         "pal_albums", lambda r: r.pal_files, probe_pal,
         owner="fauxcasa-cam.8", manifest_key="pal_albums"),

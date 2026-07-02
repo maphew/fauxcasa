@@ -291,7 +291,7 @@ def decorate(catalog: Catalog) -> dict:
     stars = rotated = 0
     for i, p in enumerate(catalog.photos):
         if i % 12 == 0:                 # ~8.3 % starred
-            p.star = True
+            p.star = 1                  # star is a 0-5 count (cam.11)
             stars += 1
         r = (1 if i % 9 == 4 else 2 if i % 23 == 7 else 3 if i % 31 == 11
              else 0)                    # ~11 % + ~4 % + ~3 % ≈ 18 % rotated

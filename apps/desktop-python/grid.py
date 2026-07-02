@@ -6,7 +6,7 @@ LRU of decoded tiles) with the benchmark hacks replaced by product
 behavior: event-driven repaints instead of a 240 Hz timer, a real
 scrollbar via QAbstractScrollArea, resize handling, group headers with
 a pinned current-folder header, multi-selection (set + current/anchor,
-Ctrl/Shift semantics) and activation, star badges, and
+Ctrl/Shift semantics) and activation, star + geotag corner badges, and
 error tiles for undecodable entries. Scrolling reads ONLY the cache
 pair, never originals (N4).
 """
@@ -24,6 +24,7 @@ from time import perf_counter
 from PySide6.QtCore import QObject, QPointF, QRect, Qt, Signal
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QImage,
     QKeySequence,
     QPainter,
@@ -120,6 +121,7 @@ HEADER_BG = QColor(34, 34, 34)
 HEADER_FG = QColor(200, 200, 200)
 SELECT = QColor(64, 140, 255)
 STAR_GOLD = QColor(255, 200, 40)
+GEO_TEAL = QColor(64, 205, 175)  # geotag badge (fauxcasa-cam.10)
 HIDDEN_VEIL = QColor(0, 0, 0, 110)  # reveal mode: dim hidden/stash tiles
 # Selection pens, hoisted out of the paint loop (fauxcasa-q6l.1): every
 # member of the selection set gets the thin rect; the CURRENT item gets the
@@ -128,6 +130,13 @@ HIDDEN_VEIL = QColor(0, 0, 0, 110)  # reveal mode: dim hidden/stash tiles
 PEN_SELECTED = QPen(SELECT, 1)
 PEN_CURRENT = QPen(SELECT, 3)
 PEN_FOCUS = QPen(SELECT, 1, Qt.PenStyle.DashLine)
+# The hover-peek trigger chord (fauxcasa-q6l.5): Picasa's "Hover over a
+# photo and use Ctrl-Alt" (the shortcut corpus). Qt's standard modifiers
+# keep it platform-correct (Cmd reports as ControlModifier on macOS).
+PEEK_MODS = (Qt.KeyboardModifier.ControlModifier
+             | Qt.KeyboardModifier.AltModifier)
+_MOD_OF = {Qt.Key.Key_Control: Qt.KeyboardModifier.ControlModifier,
+           Qt.Key.Key_Alt: Qt.KeyboardModifier.AltModifier}
 
 
 def _star_polygon(cx: float, cy: float, r: float) -> QPolygonF:
@@ -136,6 +145,21 @@ def _star_polygon(cx: float, cy: float, r: float) -> QPolygonF:
         rad = r if i % 2 == 0 else r * 0.42
         ang = -math.pi / 2 + i * math.pi / 5
         poly.append(QPointF(cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+    return poly
+
+
+def _pin_polygon(cx: float, cy: float, r: float) -> QPolygonF:
+    """Map-pin teardrop for the geotag corner badge (fauxcasa-cam.10):
+    a round head swept as a 13-point arc, closed through a point at the
+    bottom. (cx, cy) is the shape center, r the half-height — the same
+    size convention as _star_polygon so the two badges read as a set."""
+    poly = QPolygonF()
+    poly.append(QPointF(cx, cy + r))  # the tip
+    head_r, head_cy = r * 0.68, cy - r * 0.28
+    for i in range(13):  # lower-right, over the top, to lower-left
+        ang = math.radians(40.0 - i * 22.0)
+        poly.append(QPointF(cx + head_r * math.cos(ang),
+                            head_cy + head_r * math.sin(ang)))
     return poly
 
 
@@ -163,6 +187,13 @@ class GridView(QAbstractScrollArea):
     # Emitted whenever the SET changes; photo_selected still tracks the
     # current item for single-photo consumers (viewer open/close).
     selection_changed = Signal(object)
+    # Hover full-screen peek trigger (fauxcasa-q6l.5): Picasa's own gesture,
+    # Ctrl+Alt while hovering a photo (a bare hover never fires). The grid
+    # owns only this trigger state machine; the owner shows/hides the
+    # input-transparent full-screen surface (peek.py), which is what keeps
+    # every subsequent mouse/key event landing HERE for dismissal.
+    peek_requested = Signal(int)  # catalog idx to show (re-emits on retarget)
+    peek_released = Signal()      # trigger ended: dismiss the peek
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -189,6 +220,14 @@ class GridView(QAbstractScrollArea):
         # also shows hidden=yes photos and stash-folder files, veiled so
         # they read as not-normally-shown. Owned/driven by MainWindow.
         self.reveal = False
+        # Hover-peek state (fauxcasa-q6l.5): the last known viewport hover
+        # position (mouse tracking below feeds it button-free, so a later
+        # Ctrl+Alt press can trigger without a move — Picasa's actual
+        # gesture), the idx currently peeked (-1 = none), and the Esc/click
+        # suppression that holds re-trigger until Ctrl+Alt drop.
+        self._hover: QPointF | None = None
+        self._peek_idx = -1
+        self._peek_suppressed = False
 
         # decode machinery (balloon lineage)
         self.generation = 0  # bumped on zoom/cache change; stale results drop
@@ -230,6 +269,10 @@ class GridView(QAbstractScrollArea):
             lambda _v: self.viewport().update()
         )
         self.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        # Button-free hover for the peek trigger; the tooltip is the
+        # discoverability hint for the modifier chord (it has no other UI).
+        self.viewport().setMouseTracking(True)
+        self.setToolTip("Ctrl+Alt while hovering a photo: full-screen peek")
         self._make_jump_cluster()
 
     def _make_jump_cluster(self) -> None:
@@ -755,11 +798,22 @@ class GridView(QAbstractScrollArea):
             if self.reveal and not photo.visible:
                 painter.fillRect(r, HIDDEN_VEIL)
             if photo.star:
+                # count >= 1 shows the badge (star is 0-5 now; the exact
+                # count reads out in the status bar / viewer info line)
                 s = max(7.0, self.tile / 14.0)
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(STAR_GOLD)
                 painter.drawPolygon(_star_polygon(
                     r.right() - s - 2, r.y() + s + 2, s))
+            if photo.geotag is not None:
+                # Geotag corner badge (§5 corner badges; fauxcasa-cam.10) —
+                # BOTTOM-right, its own corner: star owns top-right and the
+                # M2 reject badge will claim a third.
+                s = max(7.0, self.tile / 14.0)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(GEO_TEAL)
+                painter.drawPolygon(_pin_polygon(
+                    r.right() - s - 2, r.bottom() - s - 2, s))
             # Multi-select paint (fauxcasa-q6l.1): every selected tile
             # shows the selection rect; the current item is distinct via
             # the stronger border (dashed focus cue if Ctrl-toggled out of
@@ -799,12 +853,76 @@ class GridView(QAbstractScrollArea):
         painter.drawText(QRect(PAD, y, width - 2 * PAD, HEADER_H),
                          Qt.AlignmentFlag.AlignVCenter, label)
 
+    # ---------- hover peek trigger (fauxcasa-q6l.5) ----------
+
+    def _peek_update(self, mods) -> None:
+        """Drive the peek trigger state machine from the CURRENT modifier
+        state and last known hover position — mouse moves, Ctrl/Alt presses
+        and releases all funnel here. While the chord is held, hovering a
+        new photo re-points the peek (peek_requested re-emits) and hovering
+        off any photo — or the peek being suppressed by Esc/click — ends
+        it; the chord dropping always ends it and re-arms suppression."""
+        if (mods & PEEK_MODS) != PEEK_MODS:
+            self._peek_suppressed = False   # trigger dropped: re-arm
+            self._end_peek()
+            return
+        if self._peek_suppressed:
+            return
+        pos = self._hover
+        if pos is None:
+            # Chord pressed before any tracked move (e.g. focus arrived by
+            # keyboard): fall back to the live cursor position.
+            pos = QPointF(self.viewport().mapFromGlobal(QCursor.pos()))
+        idx = self.photo_at(int(pos.x()), int(pos.y()))
+        if idx == self._peek_idx:
+            return
+        if idx >= 0:
+            self._peek_idx = idx
+            self.peek_requested.emit(idx)
+        else:
+            self._end_peek()
+
+    def _end_peek(self) -> None:
+        """Dismiss an active peek (no-op otherwise). Also the owner's hook
+        for forced dismissal (e.g. a reconcile swap invalidates the peeked
+        index — main.reload_data)."""
+        if self._peek_idx >= 0:
+            self._peek_idx = -1
+            self.peek_released.emit()
+
+    def mouseMoveEvent(self, event) -> None:
+        # Mouse tracking is on: every move updates the hover position (so a
+        # later Ctrl+Alt press can trigger in place) and feeds the trigger
+        # state machine — the peek surface is input-transparent, so these
+        # moves keep arriving while it covers the cursor.
+        self._hover = event.position()
+        self._peek_update(event.modifiers())
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = None
+        self._end_peek()
+        super().leaveEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:
+        if event.key() in _MOD_OF:
+            # Either modifier up ends the chord. Mask the released key's
+            # own bit out — modifiers() timing around the modifier keys
+            # themselves is platform-wobbly, so normalize explicitly.
+            self._peek_update(event.modifiers() & ~_MOD_OF[event.key()])
+        super().keyReleaseEvent(event)
+
     # ---------- input ----------
 
     def mousePressEvent(self, event) -> None:
         """Modifier-aware selection (fauxcasa-q6l.1). Qt's standard
         modifiers are platform-correct: on macOS, Cmd reports as
         ControlModifier — no raw key handling here."""
+        if self._peek_idx >= 0:
+            # Any click dismisses the peek and holds it dismissed until the
+            # chord drops; the click then does its normal selection work.
+            self._peek_suppressed = True
+            self._end_peek()
         idx = self.photo_at(int(event.position().x()),
                             int(event.position().y()))
         mods = event.modifiers()
@@ -844,6 +962,18 @@ class GridView(QAbstractScrollArea):
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
+        if key == Qt.Key.Key_Escape and self._peek_idx >= 0:
+            # Esc dismisses the peek — and ONLY the peek this press (the
+            # selection-collapse Esc below is untouched for the next one) —
+            # suppressed until the chord drops, so a twitch can't re-fire.
+            self._peek_suppressed = True
+            self._end_peek()
+            return
+        if key in _MOD_OF:
+            # Ctrl+Alt completed over a photo triggers WITHOUT a mouse move
+            # — Picasa's actual gesture. OR the pressed key's own bit in
+            # (see keyReleaseEvent for why we normalize explicitly).
+            self._peek_update(event.modifiers() | _MOD_OF[key])
         if event.matches(QKeySequence.StandardKey.SelectAll):
             # Ctrl+A (Cmd+A on macOS via QKeySequence): the whole current
             # display set. Current/anchor keep their place if shown.
