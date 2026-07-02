@@ -1605,7 +1605,12 @@ def main() -> int:
         else:
             poll.stop()  # interactive run: instrumentation is done
 
-    poll = QTimer()
+    # Parented to the window: when tests drive main() in-process the timer
+    # must die with the widgets it polls — an orphan QTimer here outlived
+    # main() and fired check_ready into a deleted GridView during a LATER
+    # test's processEvents (rediscovered independently three times,
+    # fauxcasa-q6l.15).
+    poll = QTimer(win)
     poll.setInterval(50)
     poll.timeout.connect(check_ready)
     poll.start()
@@ -1621,6 +1626,7 @@ def main() -> int:
         QTimer.singleShot(int(args.timeout * 1000), on_timeout)
 
     code = app.exec()
+    poll.stop()  # belt to the parenting suspenders: never fire post-exec
     win.shutdown()  # reap any in-flight cache build cleanly
     rss, hwm = read_rss_mb()
     print(json.dumps({"event": "exit", "vm_rss_mb": round(rss, 1),

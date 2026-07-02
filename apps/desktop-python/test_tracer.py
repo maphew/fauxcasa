@@ -5024,6 +5024,47 @@ def test_search_haystack_visible_subset_and_reveal(tmp_path: Path) -> None:
     assert _hits(win) == {"shown.jpg"}
 
 
+
+
+# ---------------------------------------------------------------------------
+# READY-poll timer lifecycle (fauxcasa-q6l.15): an in-process main() run must
+# not leave its 50 ms check_ready poll alive — an orphan QTimer outlived
+# main() and fired into a deleted GridView during a LATER test's
+# processEvents (RuntimeError noise through the excepthook; independently
+# rediscovered by three implementation sessions before being fixed).
+# ---------------------------------------------------------------------------
+
+
+def test_ready_poll_timer_dies_with_the_run(
+        monkeypatch, library: Path, tmp_path: Path, caplog) -> None:
+    """After a self-quitting in-process main() run, spinning the (reused)
+    QApplication's event loop must fire no stale check_ready — no CRITICAL
+    'uncaught exception' may reach the log."""
+    import logging
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    cache_root = tmp_path / "cr"
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(library), "--cache-root", str(cache_root),
+        "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    assert main.main() == 0
+
+    # The window is gone; give any leaked 50 ms poll several chances to fire.
+    with caplog.at_level(logging.CRITICAL, logger="fauxcasa"):
+        for _ in range(6):
+            loop = QEventLoop()
+            QTimer.singleShot(60, loop.quit)
+            loop.exec()
+            QCoreApplication.processEvents()
+    stale = [r for r in caplog.records if "uncaught exception" in r.message]
+    assert stale == [], f"stale check_ready fired: {stale}"
+
+
 # ---------------------------------------------------------------------------
 # M1 ingest completion: import report + placeholder albums (fauxcasa-cam.13)
 # and the Picasa2Albums .pal reader + §4 gap-fill merge (fauxcasa-cam.8).
