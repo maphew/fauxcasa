@@ -562,9 +562,13 @@ _EXTRAS_EXPECTED = {
     "album_memberships": 7,  # albums= tokens incl. the unknown-uid refs
     "folder_descriptions": 2,
     "face_tags": 7,
-    "face_tags_named": 6,    # one ffffffffffffffff suggestion
+    # named after the §4 merge ([Contacts2] ∪ contacts.xml): unnamed are the
+    # ffffffffffffffff suggestion AND the CONTACT_ORPHAN (dddd…) whose id is
+    # defined nowhere — the original value 6 miscounted its own orphan case
+    "face_tags_named": 5,
     "contacts_ini": 4,       # [Contacts2] entries
     "contacts_xml": 3,
+    "contacts_registry": 5,  # merged registry: 4 ini ∪ {CONTACT_EVE}
     "geotagged": 3,
     "pal_albums": 3,
     "placeholder_album_uids": 1,   # distinct unknown-UID albums (ALBUM_UNKNOWN)
@@ -618,6 +622,8 @@ def make_extras_library(root: Path | None = None) -> Path:
             "pal_files": sorted(_EXTRAS_PALS),
         },
         "contacts_xml_ids": [CONTACT_ALICE, CONTACT_BOB, CONTACT_EVE],
+        "contacts_ini_ids": [CONTACT_ALICE, CONTACT_BOB, CONTACT_CAROL,
+                             CONTACT_PAD],
     }
     (root / "manifest.json").write_text(
         json.dumps(manifest, indent=1), encoding="utf-8"

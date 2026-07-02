@@ -60,7 +60,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 sys.path.insert(0, str(REPO / "apps" / "desktop-python"))
 
 import picasa_db  # noqa: E402
-from catalog import Catalog, Photo, scan_library  # noqa: E402
+from catalog import Catalog, Photo, load_contacts_xml, scan_library  # noqa: E402
 
 # Image extensions the tracer walks (catalog.EXTS is the tracer's rule;
 # imported, not copied, so the photo count follows the tracer's walk).
@@ -148,19 +148,6 @@ def _count_photo_values(cat: Catalog, field: str) -> int:
             continue
         n += len(v) if isinstance(v, (tuple, list)) else 1
     return n
-
-
-def probe_faces(cat: Catalog, ref: Reference) -> int | None:
-    f = _photo_field(("faces", "face_tags", "face_regions"))
-    return _count_photo_values(cat, f) if f else None
-
-
-def probe_contacts(cat: Catalog, ref: Reference) -> int | None:
-    f = _catalog_field(("contacts", "contacts2", "people"))
-    if f is None:
-        return None
-    v = getattr(cat, f, None)
-    return len(v) if v is not None else 0
 
 
 def probe_geotag(cat: Catalog, ref: Reference) -> int | None:
@@ -269,19 +256,41 @@ CLASSES: list[ParityClass] = [
         "folder_descriptions", _key("description"),
         lambda c, r: sum(1 for f in c.folders.values() if f.description),
         manifest_key="folder_descriptions"),
+    # ---- faces/contacts: ingested by PR #37 (fauxcasa-cam.1/.2) ------------
+    ParityClass(
+        "face_tags", _feat("face_tags"),
+        lambda c, r: sum(len(p.faces) for p in c.photos),
+        manifest_key="face_tags"),
+    ParityClass(
+        # "named" means named AFTER the §4 merge (contacts.xml ∪ [Contacts2]),
+        # which the ini-only survey cannot express (its face_tags_named counts
+        # non-sentinel ids, i.e. nameable — a different notion). The manifest
+        # ground truth is the reference; the two unnamed faces are the
+        # ffffffffffffffff suggestion and the orphaned id.
+        "face_tags_named",
+        lambda r: r.manifest["expected"]["face_tags_named"],
+        lambda c, r: sum(1 for p in c.photos
+                         for _rect, _cid, name in p.faces if name),
+        manifest_key="face_tags_named"),
+    ParityClass(
+        # every [Contacts2] id survives into the merged registry
+        "contacts_ini", _feat("contacts"),
+        lambda c, r: sum(1 for i in r.manifest["contacts_ini_ids"]
+                         if i in c.contacts),
+        manifest_key="contacts_ini"),
+    ParityClass(
+        # every contacts.xml id survives into the merged registry
+        "contacts_xml", lambda r: r.contacts_xml,
+        lambda c, r: sum(1 for i in r.manifest["contacts_xml_ids"]
+                         if i in c.contacts),
+        manifest_key="contacts_xml"),
+    ParityClass(
+        # the merged registry as a whole: ini ∪ xml, no dupes, no strays
+        "contacts_registry",
+        lambda r: r.manifest["expected"]["contacts_registry"],
+        lambda c, r: len(c.contacts),
+        manifest_key="contacts_registry"),
     # ---- expected-missing: owned, probed, ratchets forward -----------------
-    ParityClass(
-        "face_tags", _feat("face_tags"), probe_faces,
-        owner="fauxcasa-cam.1", manifest_key="face_tags"),
-    ParityClass(
-        "face_tags_named", _feat("face_tags_named"), probe_faces,
-        owner="fauxcasa-cam.1", manifest_key="face_tags_named"),
-    ParityClass(
-        "contacts_ini", _feat("contacts"), probe_contacts,
-        owner="fauxcasa-cam.1", manifest_key="contacts_ini"),
-    ParityClass(
-        "contacts_xml", lambda r: r.contacts_xml, probe_contacts,
-        owner="fauxcasa-cam.2", manifest_key="contacts_xml"),
     ParityClass(
         "geotagged", _feat("geotagged"), probe_geotag,
         owner="fauxcasa-cam.10", manifest_key="geotagged"),
@@ -310,7 +319,11 @@ CLASSES: list[ParityClass] = [
 
 def run_gate(corpus: Path) -> int:
     ref = build_reference(corpus)
-    cat = scan_library(corpus / "library")
+    # The gate scans the way the app does: contacts.xml threaded in when the
+    # corpus ships one (fauxcasa-cam.2's --contacts discovery, made explicit).
+    cx = corpus / "contacts" / "contacts.xml"
+    contacts = load_contacts_xml(cx) if cx.is_file() else {}
+    cat = scan_library(corpus / "library", contacts=contacts)
     expected = ref.manifest.get("expected", {})
 
     failures: list[str] = []
