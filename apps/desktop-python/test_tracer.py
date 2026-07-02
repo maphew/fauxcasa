@@ -3761,3 +3761,97 @@ def test_recent_sidebar_item_click_filters_and_counts(tmp_path: Path) -> None:
     by_rel["Trip/stale.jpg"].mtime = int(_days_ago(0.5))
     win._refresh_recent_count()
     assert item_for(win, "recent", "").text(0).endswith("(2)")
+
+
+def _jump_grid(tmp_path: Path):
+    """A shown offscreen GridView over a 3-folder library (8 photos each),
+    2 columns, viewport far shorter than the content so every jump has
+    room to move. Returns the grid; group tops are read from g.groups."""
+    _offscreen_app()
+    from grid import GridView
+
+    root = tmp_path / "lib"
+    k = 0
+    for fi in range(3):
+        for _ in range(8):
+            make_jpeg(root / f"f{fi}" / f"p{k:02d}.jpg")
+            k += 1
+    cat = scan_library(root)
+    g = GridView()
+    g.resize(400, 300)
+    g.show()
+    g.set_data(cat, None)
+    assert len(g.groups) == 3 and g.content_h > g.viewport().height()
+    assert g.verticalScrollBar().maximum() > g.groups[2].y
+    return g
+
+
+def test_grid_current_group_index_bisect(tmp_path: Path) -> None:
+    g = _jump_grid(tmp_path)
+    sb = g.verticalScrollBar()
+    tops = [grp.y for grp in g.groups]
+    assert tops[0] == 0 and tops[0] < tops[1] < tops[2]
+    for gi, top in enumerate(tops):
+        sb.setValue(top)                      # exactly at a header
+        assert g.current_group_index() == gi
+        sb.setValue(top + 5)                  # a bit into the group
+        assert g.current_group_index() == gi
+    sb.setValue(tops[1] - 1)                  # last row of the group before
+    assert g.current_group_index() == 0
+
+
+def test_grid_jump_folder_stepping_across_boundaries(tmp_path: Path) -> None:
+    """next walks group top -> group top; prev from MID-group first snaps
+    to the current group's own top (Picasa behavior), THEN to the prior
+    group; both are no-ops at their respective ends."""
+    g = _jump_grid(tmp_path)
+    sb = g.verticalScrollBar()
+    tops = [grp.y for grp in g.groups]
+
+    sb.setValue(0)
+    g.jump_next_folder()
+    assert sb.value() == tops[1]
+    g.jump_next_folder()
+    assert sb.value() == tops[2]
+    g.jump_next_folder()                      # inside the last group: no-op
+    assert sb.value() == tops[2]
+
+    sb.setValue(tops[2] + 40)                 # mid-group...
+    g.jump_prev_folder()
+    assert sb.value() == tops[2]              # ...its own top first
+    g.jump_prev_folder()
+    assert sb.value() == tops[1]              # then the prior group
+    g.jump_prev_folder()
+    assert sb.value() == tops[0] == 0
+    g.jump_prev_folder()                      # top of the first group: no-op
+    assert sb.value() == 0
+
+
+def test_grid_jump_top_end_and_buttons(tmp_path: Path) -> None:
+    """jump_to_end/top hit the scrollbar's extremes, and the scrollbar-side
+    button cluster drives the same primitives (clicked wiring)."""
+    g = _jump_grid(tmp_path)
+    sb = g.verticalScrollBar()
+    tops = [grp.y for grp in g.groups]
+
+    g.jump_to_end()
+    assert sb.value() == sb.maximum() > 0
+    g.jump_to_top()
+    assert sb.value() == 0
+
+    g.btn_end.click()
+    assert sb.value() == sb.maximum()
+    g.btn_prev_folder.click()                 # end is mid-last-group here
+    assert sb.value() == tops[2]
+    g.btn_next_folder.click()                 # no next group: no-op
+    assert sb.value() == tops[2]
+    g.btn_top.click()
+    assert sb.value() == 0
+    g.btn_next_folder.click()
+    assert sb.value() == tops[1]
+    # The cluster must never steal the grid's keyboard focus (triage keys).
+    from PySide6.QtCore import Qt as _Qt
+    for b in (g.btn_top, g.btn_prev_folder, g.btn_next_folder, g.btn_end):
+        assert b.focusPolicy() == _Qt.FocusPolicy.NoFocus
+
+
