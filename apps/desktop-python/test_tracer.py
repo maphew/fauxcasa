@@ -2449,6 +2449,138 @@ def test_main_run_logs_and_keeps_stdout_protocol(
     assert "READY" not in log_text and '"event": "ready"' not in log_text
 
 
+# ---- search upgrades: multi-word AND, -term negation, folder names --------
+# (fauxcasa-q6l.6) §5: instant search over filenames, captions, keywords and
+# folder names, with '-term' negation. Positive terms AND together (each may
+# match a different field of the same photo); any '-term' hit excludes the
+# photo; a lone '-' (a negation still being typed) is ignored. People-name
+# search joins the same haystack once faces land (see the haystack() parts
+# list in main.MainWindow._search_changed).
+
+@pytest.fixture()
+def search_library(tmp_path: Path) -> Path:
+    """Distinct vocabulary per field so each test proves WHICH field matched:
+    'beach'/'city'/'osaka' appear only in folder names, 'ocean'/'sand'/'neon'
+    only in keywords, 'golden'/'stalls' only in captions, and
+    'sunset'/'dunes'/'market'/'street' only in filenames. Osaka is nested
+    under 2021 City to exercise rel-path-segment matching."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "2020 Beach Trip" / "sunset.jpg")
+    make_jpeg(root / "2020 Beach Trip" / "dunes.jpg")
+    make_jpeg(root / "2021 City" / "market.jpg")
+    make_jpeg(root / "2021 City" / "Osaka" / "street.jpg")
+    (root / "2020 Beach Trip" / ".picasa.ini").write_text(
+        "[sunset.jpg]\r\ncaption=Golden hour\r\nkeywords=sun, ocean\r\n"
+        "[dunes.jpg]\r\nkeywords=sand\r\n")
+    (root / "2021 City" / ".picasa.ini").write_text(
+        "[market.jpg]\r\ncaption=night stalls\r\nkeywords=food, neon\r\n")
+    return root
+
+
+def _search_win(library_root: Path):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    return MainWindow(scan_library(library_root), None,
+                      cache_dir=None, build_dir=None)
+
+
+def _hits(win) -> set:
+    return {win.catalog.photos[i].name for i in win.grid.display}
+
+
+def test_search_multi_word_and(search_library: Path) -> None:
+    """Multiple terms AND together — each must match somewhere on the same
+    photo, fields may differ per term — instead of the old single-substring
+    reading where 'sunset ocean' had to appear verbatim, space included."""
+    win = _search_win(search_library)
+
+    win.search.setText("sunset ocean")         # filename AND keyword
+    assert _hits(win) == {"sunset.jpg"}
+    win.search.setText("beach golden")         # folder AND caption
+    assert _hits(win) == {"sunset.jpg"}
+    assert "Search" in win.counts_label.text()
+    win.search.setText("sunset neon")          # terms hit different photos
+    assert _hits(win) == set()
+
+
+def test_search_negation(search_library: Path) -> None:
+    """'-term' excludes any photo it matches, whatever the field; a
+    negation-only query stands alone (Picasa's all-photos hack was exactly
+    a match-nothing negation search)."""
+    win = _search_win(search_library)
+
+    win.search.setText("beach -dunes")         # folder hits minus a filename
+    assert _hits(win) == {"sunset.jpg"}
+    win.search.setText("beach -ocean")         # ...minus a keyword hit
+    assert _hits(win) == {"dunes.jpg"}
+    win.search.setText("-city")                # negation-only: the rest
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg"}
+    win.search.setText("-nosuchterm")          # excludes nothing -> all
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg", "market.jpg",
+                          "street.jpg"}
+
+
+def test_search_folder_name(search_library: Path) -> None:
+    """A term matching a folder's display title or any rel-path segment
+    pulls that folder's photos into the flat result set — a nested folder's
+    photos are also reached through their parent's segment."""
+    win = _search_win(search_library)
+
+    win.search.setText("beach")
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg"}
+    win.search.setText("osaka")                # the nested folder's own name
+    assert _hits(win) == {"street.jpg"}
+    win.search.setText("city")                 # parent segment: nested too
+    assert _hits(win) == {"market.jpg", "street.jpg"}
+
+
+def test_search_negated_folder(search_library: Path) -> None:
+    win = _search_win(search_library)
+
+    win.search.setText("-beach")
+    assert _hits(win) == {"market.jpg", "street.jpg"}
+    win.search.setText(".jpg -city")           # everything minus a subtree
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg"}
+    win.search.setText("sun -beach")           # positive vetoed by folder
+    assert _hits(win) == set()
+
+
+def test_search_case_insensitive(search_library: Path) -> None:
+    """Both positive and negative terms match case-insensitively against
+    every field (filename, caption, keyword, folder)."""
+    win = _search_win(search_library)
+
+    win.search.setText("BEACH Golden")
+    assert _hits(win) == {"sunset.jpg"}
+    win.search.setText("OcEaN")
+    assert _hits(win) == {"sunset.jpg"}
+    win.search.setText("beach -DUNES")
+    assert _hits(win) == {"sunset.jpg"}
+    win.search.setText("OSAKA")
+    assert _hits(win) == {"street.jpg"}
+
+
+def test_search_degenerate_queries(search_library: Path) -> None:
+    """Empty/whitespace queries and a lone '-' (a negation still being
+    typed) fall back to the unfiltered All-photos view instead of blanking
+    the grid; a trailing lone '-' inside a real query is simply ignored."""
+    win = _search_win(search_library)
+    all_names = {"sunset.jpg", "dunes.jpg", "market.jpg", "street.jpg"}
+
+    for q in ("", "   ", "-", " - ", "- -"):
+        win.search.setText("beach")            # a real filter first...
+        win.search.setText(q)                  # ...then the degenerate query
+        assert _hits(win) == all_names, repr(q)
+        assert "All photos" in win.counts_label.text(), repr(q)
+
+    win.search.setText("beach -")              # half-typed negation: ignored
+    assert _hits(win) == {"sunset.jpg", "dunes.jpg"}
+    assert "Search" in win.counts_label.text()
 def test_grid_decodes_dpr_scaled_v2_level(tmp_path: Path) -> None:
     """fauxcasa-q7m: the grid's decode worker reads the v2 level chosen by the
     DPR-scaled native edge, then caps the tile to that edge. At native 256
