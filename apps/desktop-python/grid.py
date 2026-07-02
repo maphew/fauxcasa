@@ -31,7 +31,13 @@ from PySide6.QtGui import (
     QPolygonF,
     QTransform,
 )
-from PySide6.QtWidgets import QAbstractScrollArea
+from PySide6.QtWidgets import (
+    QAbstractScrollArea,
+    QStyle,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from catalog import Catalog
 from thumbcache import THUMB_EDGE, ThumbCache
@@ -240,6 +246,43 @@ class GridView(QAbstractScrollArea):
             lambda _v: self.viewport().update()
         )
         self.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self._make_jump_cluster()
+
+    def _make_jump_cluster(self) -> None:
+        """Jump-to-folder/end buttons beside the scrollbar (fauxcasa-q6l.9).
+        Spec §5 keeps a conventional scrollbar PLUS Picasa's jump buttons
+        (the recentering thumb was deliberately dropped). addScrollBarWidget
+        puts the cluster in the vertical scrollbar's own column, below the
+        bar, sized to the bar's width — it appears and hides with the bar,
+        so it never exists when everything already fits. No key bindings
+        here: the research corpus documents no Picasa keys for these
+        buttons, and the keymap layer is fauxcasa-q6l.8."""
+        ext = self.style().pixelMetric(
+            QStyle.PixelMetric.PM_ScrollBarExtent, None, self)
+        cluster = QWidget(self)
+        lay = QVBoxLayout(cluster)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        def btn(glyph: str, tip: str, slot) -> QToolButton:
+            b = QToolButton(cluster)
+            b.setText(glyph)
+            b.setToolTip(tip)
+            b.setAutoRaise(True)
+            b.setFixedSize(ext, ext)
+            # Never steal keyboard focus from the grid (triage keys live
+            # there); these are mouse affordances only.
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(slot)
+            lay.addWidget(b)
+            return b
+
+        self.btn_top = btn("⤒", "Jump to top", self.jump_to_top)
+        self.btn_prev_folder = btn("↑", "Previous folder (from mid-folder: "
+                                   "top of this folder)", self.jump_prev_folder)
+        self.btn_next_folder = btn("↓", "Next folder", self.jump_next_folder)
+        self.btn_end = btn("⤓", "Jump to end", self.jump_to_end)
+        self.addScrollBarWidget(cluster, Qt.AlignmentFlag.AlignBottom)
 
     # ---------- data & layout ----------
 
@@ -393,6 +436,43 @@ class GridView(QAbstractScrollArea):
     def scroll_to_fraction(self, frac: float) -> None:
         sb = self.verticalScrollBar()
         sb.setValue(int(sb.maximum() * max(0.0, min(1.0, frac))))
+
+    def current_group_index(self) -> int:
+        """Index into self.groups of the group under the viewport top: the
+        last group whose header y is <= the scroll position (same bisect
+        the pinned-header logic uses). -1 when there are no groups."""
+        if not self.groups:
+            return -1
+        ys = [g.y for g in self.groups]
+        return max(0, bisect_right(ys, self.verticalScrollBar().value()) - 1)
+
+    def jump_prev_folder(self) -> None:
+        """Step the viewport up one folder boundary, Picasa-style: from
+        MID-group first snap to the current group's own top; from a group
+        top go to the previous group's top; no-op at the top of the first
+        group."""
+        gi = self.current_group_index()
+        if gi < 0:
+            return
+        sb = self.verticalScrollBar()
+        if sb.value() > self.groups[gi].y:
+            sb.setValue(self.groups[gi].y)
+        elif gi > 0:
+            sb.setValue(self.groups[gi - 1].y)
+
+    def jump_next_folder(self) -> None:
+        """Step the viewport down to the next folder's header (setValue
+        clamps near the end); no-op inside the last group."""
+        gi = self.current_group_index()
+        if 0 <= gi and gi + 1 < len(self.groups):
+            self.verticalScrollBar().setValue(self.groups[gi + 1].y)
+
+    def jump_to_top(self) -> None:
+        self.verticalScrollBar().setValue(0)
+
+    def jump_to_end(self) -> None:
+        sb = self.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     # ---------- decode pool ----------
 
