@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "PySide6", "pillow"]
+# dependencies = ["pytest", "PySide6", "pillow", "exiv2"]
 # ///
 """Tests for the tracer's non-GUI layers: catalog scan + metadata,
 thumbnail-cache build/load/bind, and walk-rule parity with
@@ -3627,5 +3627,307 @@ def test_search_matches_person_names(faces_library: Path) -> None:
     win.reveal_box.setChecked(False)
     win.search.setText("nobody-here")
     assert win.grid.display == []
+
+
+# ---------------------------------------------------------------------------
+# In-file capture date / GPS / XMP Rating via metareader — the exiv2
+# bytes-mode seam (fauxcasa-cam.9/.10/.11). Fixtures are synthesized through
+# metareader's OWN test-support writer (embed_test_metadata) so every exiv2
+# call in the repo stays inside that one module (the library-swap seam);
+# pixels are flat synthetic fills, metadata invented — privacy-safe.
+# ---------------------------------------------------------------------------
+
+import metareader  # noqa: E402
+
+# Whitehorse YT — the western longitude exercises the hemisphere sign, and
+# both coordinates convert to EXIF d/m/s rationals exactly (spike truth).
+WHITEHORSE = (60.72125, -135.05685)
+SYDNEY = (-33.8568, 151.2153)  # southern lat: the other sign branch
+
+
+def _meta_jpeg(path: Path | None = None, **meta) -> bytes:
+    """JPEG bytes carrying exactly the given in-file metadata; also written
+    to `path` when given (embed_test_metadata raises on failure — a broken
+    fixture must fail loudly)."""
+    data = metareader.embed_test_metadata(_jpeg_bytes(), **meta)
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return data
+
+
+def test_metareader_reads_date_gps_rating() -> None:
+    """The three fields off one JPEG's bytes — and the date is pre-1903
+    (footgun 16: scanned photos predate Picasa's UI floor; no year floor
+    here, ever)."""
+    fm = metareader.read_file_meta(_meta_jpeg(
+        date_time_original="1899:03:02 14:00:00",
+        gps=WHITEHORSE, rating=3))
+    assert fm.date_taken == "1899-03-02T14:00:00"
+    assert fm.gps == pytest.approx(WHITEHORSE)
+    assert fm.rating == 3
+    # southern/eastern signs too
+    fm2 = metareader.read_file_meta(_meta_jpeg(gps=SYDNEY))
+    assert fm2.gps == pytest.approx(SYDNEY)
+
+
+def test_metareader_datetime_fallback_and_garbage() -> None:
+    """DateTimeOriginal wins; Exif.Image.DateTime is the fallback; the
+    all-zeros camera placeholder and free-text garbage read as None."""
+    both = _meta_jpeg(date_time_original="2009:07:04 13:00:00",
+                      date_time="2020:01:01 00:00:00")
+    assert metareader.read_file_meta(both).date_taken == "2009-07-04T13:00:00"
+    only_fallback = _meta_jpeg(date_time="2020:01:01 08:30:59")
+    assert metareader.read_file_meta(only_fallback).date_taken == \
+        "2020-01-01T08:30:59"
+    zeros = _meta_jpeg(date_time_original="0000:00:00 00:00:00")
+    assert metareader.read_file_meta(zeros).date_taken is None
+    junk = _meta_jpeg(date_time_original="not a date")
+    assert metareader.read_file_meta(junk).date_taken is None
+    absent = _meta_jpeg(rating=1)  # no date fields at all
+    assert metareader.read_file_meta(absent).date_taken is None
+
+
+def test_metareader_rating_clamps_to_0_5() -> None:
+    """xmp:Rating -> int clamped into the §3 star model: out-of-range
+    values clamp (7 -> 5; XMP's -1 'rejected' -> 0 until the M2
+    reverse-star work owns it); an explicit 0 is 0, not None; absent is
+    None (no Rating in the packet at all)."""
+    assert metareader.read_file_meta(_meta_jpeg(rating=7)).rating == 5
+    assert metareader.read_file_meta(_meta_jpeg(rating=-1)).rating == 0
+    assert metareader.read_file_meta(_meta_jpeg(rating=0)).rating == 0
+    assert metareader.read_file_meta(_meta_jpeg(rating="3.0")).rating == 3
+    assert metareader.read_file_meta(_jpeg_bytes()).rating is None
+
+
+def test_metareader_fail_soft_on_garbage_bytes() -> None:
+    """The fail-soft contract: hostile/degenerate bytes yield all-None,
+    never an exception (one corrupt photo must not abort an index)."""
+    empty = metareader.FileMeta()
+    assert metareader.read_file_meta(b"") == empty
+    assert metareader.read_file_meta(b"garbage" * 1000) == empty
+    good = _meta_jpeg(date_time_original="2009:07:04 13:00:00", rating=4)
+    assert metareader.read_file_meta(good[:40]) == empty  # truncated
+    assert metareader.read_file_meta(good) != empty  # sanity: intact reads
+
+
+def test_metareader_non_jpeg_carriers() -> None:
+    """metareader is bytes-in, container-sniffing: PNG and WebP carriers
+    (two of the §4 non-JPEG homes) read the same fields back."""
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QColor, QImage
+
+    img = QImage(40, 30, QImage.Format.Format_RGB32)
+    img.fill(QColor(50, 90, 130))
+    for fmt in ("PNG", "WEBP"):
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not img.save(buf, fmt):
+            continue  # a Qt build without this plugin: skip the carrier
+        data = metareader.embed_test_metadata(
+            bytes(buf.data()),
+            date_time_original="2015:03:15 09:30:00", rating=2)
+        fm = metareader.read_file_meta(data)
+        assert fm.date_taken == "2015-03-15T09:30:00", fmt
+        assert fm.rating == 2, fmt
+
+
+def test_scan_ini_geotag_and_star_count(tmp_path: Path) -> None:
+    """scan_library fills geotag from the ini geotag=lat,lon key (the
+    non-EXIF source) fail-soft per line, and star=yes imports as exactly
+    1 star (§3: legacy star=yes -> 1)."""
+    root = tmp_path / "lib"
+    for name in ("a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"):
+        make_jpeg(root / "f" / name)
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\ngeotag=-33.856800,151.215300\r\nstar=yes\r\n"
+        "[b.jpg]\r\ngeotag=not,numbers\r\n"      # garbage floats
+        "[c.jpg]\r\ngeotag=1,2,3\r\n"            # wrong arity
+        "[d.jpg]\r\ngeotag=95.0,10.0\r\n"        # out of range
+        "[e.jpg]\r\ngeotag=\r\n"                 # empty value
+    )
+    cat = scan_library(root)
+    by = {p.name: p for p in cat.photos}
+    assert by["a.jpg"].geotag == pytest.approx((-33.8568, 151.2153))
+    assert by["a.jpg"].star == 1
+    assert by["b.jpg"].geotag is None
+    assert by["c.jpg"].geotag is None
+    assert by["d.jpg"].geotag is None
+    assert by["e.jpg"].geotag is None
+    assert by["b.jpg"].star == 0
+
+
+@pytest.fixture()
+def metadata_library(tmp_path: Path) -> Path:
+    """One folder, four precedence cases (§4 tier-1 / §3 star authority):
+      a.jpg  in-file EXIF GPS + Rating 3 + date; ini geotag= + star=yes
+             -> in-file wins everything
+      b.jpg  no in-file metadata; ini geotag= + star=yes
+             -> ini fallback holds after indexing
+      c.jpg  in-file Rating 2 only; no ini
+             -> Rating alone sets the count
+      d.jpg  in-file Rating 0; ini star=yes
+             -> ini stays authoritative for zero-vs-nonzero (still 1)"""
+    root = tmp_path / "mlib"
+    _meta_jpeg(root / "f" / "a.jpg",
+               date_time_original="1899:03:02 14:00:00",
+               gps=WHITEHORSE, rating=3)
+    make_jpeg(root / "f" / "b.jpg")
+    _meta_jpeg(root / "f" / "c.jpg", rating=2)
+    _meta_jpeg(root / "f" / "d.jpg", rating=0)
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\nstar=yes\r\ngeotag=-33.856800,151.215300\r\n"
+        "[b.jpg]\r\nstar=yes\r\ngeotag=-33.856800,151.215300\r\n"
+        "[d.jpg]\r\nstar=yes\r\n"
+    )
+    return root
+
+
+def test_index_precedence_infile_beats_ini(
+        metadata_library: Path, tmp_path: Path) -> None:
+    cat = scan_library(metadata_library)
+    by = {p.name: p for p in cat.photos}
+    # scan-level state before the index: ini only, in-file not read yet
+    assert by["a.jpg"].geotag == pytest.approx(SYDNEY)
+    assert by["a.jpg"].star == 1 and by["a.jpg"].date_taken is None
+    assert by["c.jpg"].star == 0
+
+    assert thumbcache.build_cache(cat, tmp_path / "c") is not None
+    # a: in-file EXIF GPS beats ini geotag=; Rating 3 beats bare star=yes
+    assert by["a.jpg"].geotag == pytest.approx(WHITEHORSE)
+    assert by["a.jpg"].star == 3
+    assert by["a.jpg"].date_taken == "1899-03-02T14:00:00"  # footgun 16
+    # b: no in-file values -> the ini fallback survives the index pass
+    assert by["b.jpg"].geotag == pytest.approx(SYDNEY)
+    assert by["b.jpg"].star == 1 and by["b.jpg"].date_taken is None
+    # c: Rating alone sets the count
+    assert by["c.jpg"].star == 2
+    # d: an explicit Rating 0 does NOT unstar an ini-starred photo (§3:
+    # ini star= is authoritative for zero-vs-nonzero)
+    assert by["d.jpg"].star == 1
+
+
+def test_metadata_catalog_roundtrip_and_version_gate(
+        metadata_library: Path, tmp_path: Path) -> None:
+    """date_taken / geotag / star count survive save_catalog/load_catalog
+    (the warm-load path), and a pre-v5 catalog is rejected so a warm start
+    can never silently drop the new fields."""
+    import catalog as catmod
+
+    cat = scan_library(metadata_library)
+    assert thumbcache.build_cache(cat, tmp_path / "c") is not None
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, metadata_library)
+    assert loaded is not None
+    for orig, back in zip(cat.photos, loaded.photos):
+        assert back.star == orig.star and isinstance(back.star, int)
+        assert back.date_taken == orig.date_taken
+        assert back.geotag == orig.geotag  # exact: rounded before persist
+    a = next(p for p in loaded.photos if p.name == "a.jpg")
+    assert a.star == 3 and a.geotag == pytest.approx(WHITEHORSE)
+    assert a.date_taken == "1899-03-02T14:00:00"
+
+    # the version gate: a v4 (pre-metadata) catalog cold-rebuilds
+    assert catmod.CATALOG_VERSION == 5
+    data = json.loads(path.read_text())
+    data["version"] = 4
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, metadata_library) is None
+
+
+def test_grid_geotag_badge_paint_smoke(tmp_path: Path) -> None:
+    """The geotag corner badge paints without incident alongside the star
+    badge and selection chrome (offscreen render through paintEvent), in
+    a corner of its own (bottom-right vs the star's top-right)."""
+    from PySide6.QtGui import QImage
+
+    from grid import GEO_TEAL, STAR_GOLD, _pin_polygon
+
+    g = _selection_grid(tmp_path)
+    cat = g.catalog
+    d = g.display
+    cat.photos[d[0]].geotag = WHITEHORSE            # pin only
+    cat.photos[d[1]].geotag = SYDNEY                # pin + star together
+    cat.photos[d[1]].star = 4
+    _click(g, d[1])                                 # selection chrome on top
+    shot = g.grab().toImage().convertToFormat(QImage.Format.Format_RGB32)
+    assert not shot.isNull()
+
+    # both badges actually hit the viewport: their colors appear in the shot
+    found = {"geo": False, "star": False}
+    for y in range(0, shot.height(), 2):
+        for x in range(0, shot.width(), 2):
+            c = shot.pixelColor(x, y)
+            if (abs(c.red() - GEO_TEAL.red()) < 30
+                    and abs(c.green() - GEO_TEAL.green()) < 30
+                    and abs(c.blue() - GEO_TEAL.blue()) < 30):
+                found["geo"] = True
+            elif (abs(c.red() - STAR_GOLD.red()) < 30
+                    and abs(c.green() - STAR_GOLD.green()) < 30
+                    and abs(c.blue() - STAR_GOLD.blue()) < 30):
+                found["star"] = True
+        if all(found.values()):
+            break
+    assert found["geo"] and found["star"]
+
+    # shape sanity: a closed teardrop — the tip plus a 13-point head arc
+    poly = _pin_polygon(10.0, 10.0, 8.0)
+    assert poly.size() == 14
+    assert poly.at(0).y() > poly.at(7).y()  # tip below the head's top arc
+
+
+def test_status_readout_date_coords_and_star_count(library: Path) -> None:
+    """Single-photo status-bar mode (§5 dual mode) reads out capture date,
+    coordinates (§3 geotag v1 display), and the star COUNT (one ★ per
+    star); the Starred view still treats any count >= 1 as starred
+    (backward-compatible truthiness)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    cat = scan_library(library)
+    a = next(p for p in cat.photos if p.rel.endswith("Trip/a.jpg"))
+    a.star = 3
+    a.date_taken = "1899-03-02T14:00:00"
+    a.geotag = WHITEHORSE
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    idx = cat.photos.index(a)
+    win.grid._select(idx)
+    text = win.meta_label.text()
+    assert "★★★" in text and "★★★★" not in text   # exactly three
+    assert "1899-03-02 14:00:00" in text            # unbounded year, displayed
+    assert "60.72125, -135.05685" in text           # signed decimal readout
+    assert "the beach" in text                      # caption still present
+
+    # Starred view: count >= 1 keeps every existing truthy consumer working
+    win._apply_view("starred", "")
+    assert idx in win.grid.display
+    assert "Starred: 1 photos" in win.counts_label.text()
+
+
+def test_viewer_info_line_paints_metadata(library: Path) -> None:
+    """The viewer's info bar composes star count + date + coordinates
+    without incident (offscreen paint smoke; the text path is the shared
+    catalog.format_* formatting the status bar test asserts on)."""
+    _offscreen_app()
+    from viewer import ViewerPage
+
+    cat = scan_library(library)
+    a = next(p for p in cat.photos if p.rel.endswith("Trip/a.jpg"))
+    a.star = 5
+    a.date_taken = "2009-07-04T13:00:00"
+    a.geotag = SYDNEY
+    v = ViewerPage(cat, None)
+    v.resize(320, 240)
+    v.show()
+    v.show_photo([cat.photos.index(a)], 0)
+    assert not v.grab().isNull()   # paints the bar with all fields present
+    v.quiesce()
 
 
