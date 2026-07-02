@@ -5024,3 +5024,340 @@ def test_search_haystack_visible_subset_and_reveal(tmp_path: Path) -> None:
     assert _hits(win) == {"shown.jpg"}
 
 
+# ---------------------------------------------------------------------------
+# M1 ingest completion: import report + placeholder albums (fauxcasa-cam.13)
+# and the Picasa2Albums .pal reader + §4 gap-fill merge (fauxcasa-cam.8).
+# Synthetic fixtures only (privacy rule): hand-authored inis and .pal XML per
+# the forensicir 2007 writeup. Merge rank ASSUMED ini > .pal > db3 pending
+# the spec pin (fauxcasa-79b); every departure from a source is an
+# ImportReport entry, never a silent resolution (§4).
+# ---------------------------------------------------------------------------
+
+# 32-hex album uids: one ini-defined, one referenced-but-never-defined
+# (the placeholder case), one that exists only as a .pal file.
+UID_DEF = "1111222233334444555566667777888a"
+UID_GHOST = "2222333344445555666677778888999b"
+UID_PAL = "3333444455556666777788889999aaab"
+
+
+@pytest.fixture()
+def album_library(tmp_path: Path) -> Path:
+    """Three photos in one folder: an ini-defined album holding a+b, and a
+    GHOST uid referenced from b+c with no [.album:] definition anywhere."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "a.jpg")
+    make_jpeg(root / "Trip" / "b.jpg")
+    make_jpeg(root / "Trip" / "c.jpg")
+    (root / "Trip" / ".picasa.ini").write_text(
+        f"[.album:{UID_DEF}]\r\n"
+        "name=Defined\r\n"
+        f"token=]album:{UID_DEF}\r\n"
+        "[a.jpg]\r\n"
+        f"albums={UID_DEF}\r\n"
+        "[b.jpg]\r\n"
+        f"albums={UID_DEF},{UID_GHOST}\r\n"
+        "[c.jpg]\r\n"
+        f"albums={UID_GHOST}\r\n")
+    return root
+
+
+def _write_pal(pal_dir: Path, uid: str, name: str, members: list[str],
+               date: str | None = "39272.630035") -> Path:
+    """One .pal file in the forensicir-documented picasa2album shape (the
+    same XML the synthetic-corpus generator writes): property elements,
+    then the <files> volume-token member list nested in the name property."""
+    files = "\n".join(
+        f" <filename>[C]\\{m.replace('/', chr(92))}</filename>"
+        for m in members)
+    date_prop = (f'<property name="date" type="real64" value="{date}"/>\n'
+                 if date is not None else "")
+    pal_dir.mkdir(parents=True, exist_ok=True)
+    p = pal_dir / f"{uid}.pal"
+    p.write_text(
+        "<picasa2album>\n"
+        f"<dbid>0164eaeacdd4046f5c1e44522fe44527</dbid>\n"
+        f"<albumid>{uid}</albumid>\n"
+        f'<property name="uid" type="string" value="{uid}"/>\n'
+        f'<property name="category" type="num" value="0"/>\n'
+        f"{date_prop}"
+        f'<property name="token" type="string" value="]album:{uid}"/>\n'
+        f'<property name="name" type="string" value="{name}">\n'
+        "<files>\n"
+        f"{files}\n"
+        "</files>\n"
+        "</property>\n"
+        "</picasa2album>\n",
+        encoding="utf-8")
+    return p
+
+
+def test_read_pal_good_garbage_and_fallbacks(tmp_path: Path) -> None:
+    """read_pal parses the documented shape — 32-hex uid, name, the real64
+    OLE date converted to the catalog's canonical ISO string, members with
+    the [C]\\ volume token stripped to POSIX paths — falls back to the
+    file's own name for the uid (Picasa names .pal files by uid), and
+    fails soft PER FILE on garbage: bytes that aren't XML, XML that isn't
+    a picasa2album, and a file with no usable uid anywhere are each None."""
+    from catalog import read_pal, read_pal_dir
+
+    good = _write_pal(tmp_path / "albums", UID_PAL, "Sammy",
+                      ["Trip/a.jpg", "Deep/er/b.jpg"])
+    pal = read_pal(good)
+    assert pal is not None
+    assert pal.uid == UID_PAL
+    assert pal.name == "Sammy"
+    assert pal.date == "2007-07-09T15:07:15"   # OLE 39272.630035
+    assert pal.members == ["Trip/a.jpg", "Deep/er/b.jpg"]
+
+    # uid falls back to the file stem when the properties carry none
+    stemmed = tmp_path / "albums" / f"{UID_DEF}.pal"
+    stemmed.write_text("<picasa2album><files>\n"
+                       "<filename>[C]\\x.jpg</filename>\n"
+                       "</files></picasa2album>")
+    pal = read_pal(stemmed)
+    assert pal is not None and pal.uid == UID_DEF
+    assert pal.name == UID_DEF[:8] and pal.date is None
+    assert pal.members == ["x.jpg"]
+
+    garbage = tmp_path / "albums" / "nothex.pal"
+    garbage.write_bytes(b"\x00\x01 not xml at all")
+    assert read_pal(garbage) is None
+    not_album = tmp_path / "albums" / "other.pal"
+    not_album.write_text("<somethingelse><a/></somethingelse>")
+    assert read_pal(not_album) is None
+    no_uid = tmp_path / "albums" / "badname.pal"   # stem not 32-hex either
+    no_uid.write_text("<picasa2album><files/></picasa2album>")
+    assert read_pal(no_uid) is None
+
+    # the directory reader keeps the good ones and reports the bad by name
+    pals, bad = read_pal_dir(tmp_path / "albums")
+    assert {p.uid for p in pals} == {UID_PAL, UID_DEF}
+    assert sorted(bad) == ["badname.pal", "nothex.pal", "other.pal"]
+    assert read_pal_dir(tmp_path / "no-such-dir") == ([], [])
+
+
+def test_pal_gap_fill_only_merge(album_library: Path, tmp_path: Path) -> None:
+    """§4 merge (rank assumed ini > .pal > db3, fauxcasa-79b): an AGREEING
+    .pal changes nothing except filling the ini definition's missing date;
+    a .pal-ONLY album materializes like a real album flagged pal-sourced
+    (unresolvable members reported, resolvable ones kept); and a .pal that
+    IS a placeholder's missing definition fills the name/date gap while
+    membership authority stays with the ini's albums= tokens."""
+    pal_dir = tmp_path / "albums"
+    _write_pal(pal_dir, UID_DEF, "Defined", ["Trip/a.jpg", "Trip/b.jpg"])
+    _write_pal(pal_dir, UID_PAL, "Pal Only",
+               ["Trip/c.jpg", "Gone/missing.jpg"])
+    _write_pal(pal_dir, UID_GHOST, "Ghost Found",
+               ["Trip/b.jpg", "Trip/c.jpg"], date=None)
+
+    cat = scan_library(album_library, pal_dir=pal_dir)
+    assert list(cat.albums) == [UID_DEF, UID_GHOST, UID_PAL]
+
+    d = cat.albums[UID_DEF]
+    assert d.members == [0, 1] and not d.placeholder and not d.pal_sourced
+    assert d.name == "Defined"
+    assert d.date == "2007-07-09T15:07:15"     # gap-filled: ini had no date
+
+    p = cat.albums[UID_PAL]
+    assert p.pal_sourced and not p.placeholder
+    assert p.name == "Pal Only" and p.members == [2]
+
+    g = cat.albums[UID_GHOST]
+    assert g.pal_sourced and not g.placeholder  # the .pal WAS the definition
+    assert g.name == "Ghost Found"
+    assert g.members == [1, 2]                  # ini membership, untouched
+
+    kinds = [(e.kind, e.subject) for e in cat.report.entries]
+    assert ("pal_member_missing", UID_PAL) in kinds
+    assert not any(k == "pal_divergence" for k, _u in kinds)
+    assert not any(k == "unknown_album" for k, _u in kinds)  # de-placeholdered
+    missing = next(e for e in cat.report.entries
+                   if e.kind == "pal_member_missing")
+    assert "Gone/missing.jpg" in missing.detail and missing.source == "pal"
+
+
+def test_pal_divergence_reported_not_membership(
+        album_library: Path, tmp_path: Path) -> None:
+    """A DIVERGENT .pal for an ini-defined album: the extra member is an
+    import-report entry, NOT a membership change, and the ini member the
+    .pal lacks is kept (and recorded). An unreadable .pal file is reported
+    and skipped without sinking the scan (fail-soft per file)."""
+    pal_dir = tmp_path / "albums"
+    _write_pal(pal_dir, UID_DEF, "Defined", ["Trip/a.jpg", "Trip/c.jpg"])
+    (pal_dir / f"{UID_PAL}.pal").write_bytes(b"\xff\xfe utterly broken")
+
+    cat = scan_library(album_library, pal_dir=pal_dir)
+    d = cat.albums[UID_DEF]
+    assert d.members == [0, 1]                 # ini wins: c.jpg NOT added
+    assert UID_PAL not in cat.albums           # broken file never lands
+
+    div = [e for e in cat.report.entries if e.kind == "pal_divergence"]
+    assert len(div) == 1 and div[0].subject == UID_DEF
+    assert "Trip/c.jpg" in div[0].detail       # the extra, surfaced
+    assert "Trip/b.jpg" in div[0].detail       # the ini member the .pal lacks
+    assert "ini wins" in div[0].detail         # the recorded choice
+    bad = [e for e in cat.report.entries if e.kind == "pal_unreadable"]
+    assert len(bad) == 1 and bad[0].subject == f"{UID_PAL}.pal"
+
+
+def test_placeholder_album_materializes_and_reports(
+        album_library: Path) -> None:
+    """§3: an albums= uid with no definition anywhere materializes as a
+    placeholder Album — uid, 'Unknown album <uid8>' name, members
+    populated, placeholder flag — plus an unknown_album import-report
+    entry. Never dropped (the pre-cam.13 code silently skipped these)."""
+    cat = scan_library(album_library)
+    assert list(cat.albums) == [UID_DEF, UID_GHOST]
+    g = cat.albums[UID_GHOST]
+    assert g.placeholder and not g.pal_sourced
+    assert g.name == f"Unknown album {UID_GHOST[:8]}"
+    assert g.members == [1, 2]                 # b.jpg + c.jpg
+    assert not cat.albums[UID_DEF].placeholder
+
+    unknown = [e for e in cat.report.entries if e.kind == "unknown_album"]
+    assert len(unknown) == 1
+    assert unknown[0].subject == UID_GHOST and unknown[0].source == "ini"
+    assert "placeholder" in unknown[0].detail
+
+
+def test_contact_name_conflict_reported(
+        faces_library: Path, tmp_path: Path) -> None:
+    """The §4 conflict PR #37 resolved silently: contacts.xml renaming a
+    [Contacts2] contact is now an import-report entry recording both names
+    and the winner. Agreeing ids and xml-only ids produce no entry."""
+    from catalog import load_contacts_xml
+
+    contacts = load_contacts_xml(
+        _write_faces_contacts_xml(tmp_path / "contacts.xml"))
+    cat = scan_library(faces_library, None, contacts)
+
+    conflicts = [e for e in cat.report.entries
+                 if e.kind == "contact_name_conflict"]
+    assert len(conflicts) == 1                 # only Carol truly conflicts
+    e = conflicts[0]
+    assert e.subject == "cccccccccccccccc" and e.source == "contacts"
+    assert "Carol Ini" in e.detail and "Carol Xml" in e.detail
+    assert "contacts.xml wins" in e.detail
+    # ...and the resolution itself is unchanged (xml wins, §4)
+    assert cat.contacts["cccccccccccccccc"] == "Carol Xml"
+
+    assert not scan_library(faces_library).report.entries  # no xml, no notes
+
+
+def test_placeholder_sidebar_marking_and_notes_count(
+        album_library: Path) -> None:
+    """The sidebar shows a placeholder album visually marked — dimmed,
+    italic, '?' suffix — while a real album renders normally; the status
+    bar carries the 'N import notes' count with the first entries in the
+    tooltip; and clicking the placeholder filters the grid to its members
+    exactly like a real album (never dropped, §3)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    def item_for(win, kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    cat = scan_library(album_library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    ghost = item_for(win, "album", UID_GHOST)
+    assert ghost is not None
+    assert ghost.text(0) == f"Unknown album {UID_GHOST[:8]} ?  (2)"
+    assert ghost.font(0).italic()
+    assert "placeholder" in ghost.toolTip(0)
+    real = item_for(win, "album", UID_DEF)
+    assert real.text(0) == "Defined  (2)" and not real.font(0).italic()
+
+    assert win.notes_label.isVisibleTo(win)
+    assert win.notes_label.text().strip() == "1 import note"
+    assert "unknown_album" in win.notes_label.toolTip()
+
+    win._sidebar_clicked(ghost, 0)             # placeholders filter like albums
+    assert [cat.photos[i].rel for i in win.grid.display] == [
+        "Trip/b.jpg", "Trip/c.jpg"]
+
+    # a catalog with no notes shows no chrome at all
+    clean = scan_library(album_library)
+    clean.report.entries.clear()
+    win2 = MainWindow(clean, None, cache_dir=None, build_dir=None)
+    assert not win2.notes_label.isVisibleTo(win2)
+
+
+def test_import_report_persistence_and_warm_status(
+        album_library: Path, tmp_path: Path) -> None:
+    """save_report/load_report round-trip the entries beside catalog.json;
+    a missing or corrupt report file degrades to an EMPTY report (fail-soft
+    — diagnostics, never a gate); and a warm start that re-attaches the
+    persisted report drives the same status-bar count the scan did."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from catalog import REPORT_NAME, load_report, save_report
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    cat = scan_library(album_library)
+    assert len(cat.report.entries) == 1
+    save_report(cat.report, tmp_path / REPORT_NAME)
+    back = load_report(tmp_path / REPORT_NAME)
+    assert back.entries == cat.report.entries
+    assert back.summary() == "1 import note (unknown_album)"
+
+    assert load_report(tmp_path / "absent.json").entries == []
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{not json")
+    assert load_report(corrupt).entries == []
+
+    # the warm path: persisted catalog (report NOT inside it) + re-attach
+    save_catalog(cat, tmp_path / "catalog.json")
+    loaded = load_catalog(tmp_path / "catalog.json", album_library)
+    assert loaded is not None
+    assert loaded.report.entries == []         # empty until re-attached
+    loaded.report = load_report(tmp_path / REPORT_NAME)
+    win = MainWindow(loaded, None, cache_dir=None, build_dir=None)
+    assert win.notes_label.text().strip() == "1 import note"
+
+
+def test_catalog_v6_roundtrips_album_flags(
+        album_library: Path, tmp_path: Path) -> None:
+    """CATALOG_VERSION is 6: placeholder and pal-sourced albums survive the
+    persisted catalog — flags, names, members — and a v5 catalog (which
+    silently dropped both classes) is rejected so a warm start cold-rebuilds
+    instead of hiding them again."""
+    import catalog as catmod
+
+    assert catmod.CATALOG_VERSION == 6
+    pal_dir = tmp_path / "albums"
+    _write_pal(pal_dir, UID_PAL, "Pal Only", ["Trip/c.jpg"])
+    cat = scan_library(album_library, pal_dir=pal_dir)
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, album_library)
+    assert loaded is not None
+    assert list(loaded.albums) == list(cat.albums)
+    for uid, orig in cat.albums.items():
+        back = loaded.albums[uid]
+        assert back.placeholder == orig.placeholder
+        assert back.pal_sourced == orig.pal_sourced
+        assert back.members == orig.members and back.name == orig.name
+    assert loaded.albums[UID_GHOST].placeholder
+    assert loaded.albums[UID_PAL].pal_sourced
+
+    data = json.loads(path.read_text())
+    data["version"] = 5
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, album_library) is None
+
+
