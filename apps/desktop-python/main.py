@@ -68,6 +68,8 @@ from PySide6.QtWidgets import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from catalog import (  # noqa: E402
+    BACKFILL_COMPLETE,
+    BACKFILL_NOT_STARTED,
     REPORT_NAME,
     Catalog,
     Photo,
@@ -88,6 +90,7 @@ from grid import GridView  # noqa: E402
 from thumbcache import (  # noqa: E402
     CacheError,
     ThumbCache,
+    backfill_catalog,
     bind,
     build_cache,
     cache_dir_for,
@@ -118,8 +121,10 @@ APP_NAME = "Fauxcasa"
 # window is empty — a library untouched for months — fall back to the
 # RECENT_FALLBACK_K most recently modified photos so the collection is never
 # uselessly empty. Photo.mtime is filled by the indexer and persisted;
-# unindexed photos (mtime < 0, e.g. an adopt-mode --thumbs catalog) never
-# qualify, so those runs honestly show a count of 0.
+# unindexed photos (mtime < 0) never qualify, so those runs honestly show a
+# count of 0 — for an adopt-mode (--thumbs) catalog only until the
+# background backfill (fauxcasa-cam.12) fills real mtimes in, at which
+# point the collection populates and the count refreshes.
 RECENT_DAYS = 30
 RECENT_FALLBACK_K = 100
 
@@ -488,6 +493,7 @@ class _BuildBridge(QObject):
     progress = Signal(int, int)            # done, total (cold build live feed)
     status = Signal(str)                   # inline status text (reconcile)
     finished = Signal(object, object, bool)  # (IndexResult|None, Catalog, is_reconcile)
+    backfill_done = Signal(bool)           # adopt-mode backfill: completed?
 
 
 class MainWindow(QMainWindow):
@@ -669,13 +675,31 @@ class MainWindow(QMainWindow):
         self.build_cancel = threading.Event()
         self._build_thread: threading.Thread | None = None
         self._reconcile_thread: threading.Thread | None = None
+        self._backfill_thread: threading.Thread | None = None
+        # Parks the backfill's readers between photos while set — the
+        # low-priority hook (a future consumer can pause on heavy scroll);
+        # tests drive it directly.
+        self.backfill_pause = threading.Event()
+        self._reconcile_after_backfill = False
         self._bridge = _BuildBridge()
         self._bridge.progress.connect(self._build_progress)
         self._bridge.status.connect(self._on_status)
         self._bridge.finished.connect(self._on_index_finished)
+        self._bridge.backfill_done.connect(self._on_backfill_done)
 
         if build_dir is not None:
             self._start_cold_build(build_dir)
+        elif cache_dir is not None \
+                and catalog.backfill_state != BACKFILL_COMPLETE:
+            # Adopt-mode backfill (fauxcasa-cam.12): the catalog was bound
+            # to a prebuilt cache without the indexer ever reading a file,
+            # so fill signals + in-file metadata in the background —
+            # resuming from the persisted cursor on a relaunch. A warm
+            # start's reconcile is DEFERRED until the backfill lands: both
+            # walk the same files, and reconcile diffing signals the
+            # backfill is mid-writing would report phantom drift.
+            self._reconcile_after_backfill = warm
+            self._start_backfill()
         elif warm and cache_dir is not None:
             self._start_reconcile()
 
@@ -752,6 +776,62 @@ class MainWindow(QMainWindow):
 
         self._reconcile_thread = threading.Thread(target=work, daemon=True)
         self._reconcile_thread.start()
+
+    def _start_backfill(self) -> None:
+        """Adopt-mode metadata + identity-signal backfill (fauxcasa-cam.12):
+        run the read side of the indexer (thumbcache.backfill_catalog — no
+        thumbnail work) over the already-bound catalog, in place. Progress
+        rides the same inline status text as reconcile (modes, not modals);
+        the pass persists the catalog every BACKFILL_PERSIST_EVERY photos
+        and on cancel, so a quit mid-pass resumes on the next launch.
+        In-file captions/keywords/dates/GPS/ratings supersede the ini-tier
+        values photo by photo as the pass reaches them (§4 tier-1)."""
+        bridge, catalog = self._bridge, self.catalog
+        cat_path = self.cache_dir / "catalog.json"
+
+        def cb(done: int, total: int) -> None:
+            if done % 100 == 0 or done == total:
+                _emit(bridge.status,
+                      f"backfilling metadata {done:,}/{total:,}")
+
+        def work() -> None:
+            try:
+                result = backfill_catalog(catalog, cat_path, progress=cb,
+                                          cancel=self.build_cancel,
+                                          pause=self.backfill_pause)
+            except Exception as e:  # report, never crash the UI
+                log.error("metadata backfill failed: %s", e)
+                _emit(bridge.backfill_done, False)
+                return
+            if result is not None:
+                log.info("backfill: %d photos in %.1f s (%d workers)",
+                         result.photos, result.elapsed_s, result.workers)
+            _emit(bridge.backfill_done, result is not None)
+
+        self._backfill_thread = threading.Thread(target=work, daemon=True)
+        self._backfill_thread.start()
+
+    def _on_backfill_done(self, ok: bool) -> None:
+        """Backfill finished (ok) or was cancelled/failed (not ok — a
+        cancel resumes next launch, a failure is logged). On success the
+        catalog was mutated in place, so refresh what reads it: the sidebar
+        counts (Starred may grow from XMP ratings, Recently Updated
+        populates now that mtimes are real — the PR #41 rider), the grid's
+        painted star badges, and — if the user is looking at the Recently
+        Updated view outside a search — the view itself."""
+        self.progress_label.setText("")
+        if not ok:
+            return
+        kind, key = self._selected_view()
+        self._rebuild_sidebar()
+        self._reselect_view(kind, key)
+        if kind == "recent" and not self.search.text().strip():
+            self._apply_view(kind, key)   # the collection just populated
+        self.grid.viewport().update()     # star badges may have changed
+        self.statusBar().showMessage("metadata backfill complete", 8000)
+        if self._reconcile_after_backfill:
+            self._reconcile_after_backfill = False
+            self._start_reconcile()
 
     def _on_status(self, text: str) -> None:
         self.progress_label.setText(("   " + text) if text else "")
@@ -830,10 +910,15 @@ class MainWindow(QMainWindow):
                    for t in (self._build_thread, self._reconcile_thread))
 
     def shutdown(self) -> None:
-        """Stop and reap the index threads so neither is mid-write (or
-        inside a Qt codec) while the interpreter tears down."""
+        """Stop and reap the index threads so none is mid-write (or
+        inside a Qt codec) while the interpreter tears down. The backfill
+        persists its cursor on cancel, so a quit mid-backfill simply
+        resumes on the next launch (its final save is why it gets the
+        same join, not a bare daemon abandon)."""
         self.build_cancel.set()
-        for t in (self._build_thread, self._reconcile_thread):
+        self.backfill_pause.clear()  # a paused backfill must see the cancel
+        for t in (self._build_thread, self._reconcile_thread,
+                  self._backfill_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=5.0)
 
@@ -970,8 +1055,7 @@ class MainWindow(QMainWindow):
         # Recently Updated auto-collection (fauxcasa-q6l.7): mtime recency,
         # semantics in recent_indices(). Live count like Starred — rebuilt
         # with the sidebar, plus a cold-build refresh once mtimes exist.
-        recent_item = QTreeWidgetItem(
-            t, [f"↻ Recently Updated  ({len(self._recent_indices())})"])
+        recent_item = QTreeWidgetItem(t, [self._recent_label()])
         recent_item.setData(0, Qt.ItemDataRole.UserRole, ("recent", ""))
 
         folders_root = QTreeWidgetItem(t, ["Folders"])
@@ -1051,16 +1135,26 @@ class MainWindow(QMainWindow):
         + one-line mtime decision live on recent_indices above)."""
         return recent_indices(self.catalog, self.grid.reveal)
 
+    def _recent_label(self) -> str:
+        """The sidebar text for Recently Updated. Honesty hint (the PR #41
+        rider, fauxcasa-cam.12): while an adopt-mode backfill has not yet
+        filled real mtimes, an empty collection says WHY it is empty
+        instead of a bare 0 — the count appears once the backfill lands
+        (or immediately, if some already-backfilled photos qualify)."""
+        n = len(self._recent_indices())
+        if n == 0 and self.catalog.backfill_state != BACKFILL_COMPLETE:
+            return "↻ Recently Updated  (indexing metadata…)"
+        return f"↻ Recently Updated  ({n})"
+
     def _refresh_recent_count(self) -> None:
         """A COLD build fills Photo.mtime in-place only after the sidebar was
         first built (its count then read 0) — update just that item's label.
         setText on a live item is safe; only clear()+repopulate of a tree
         with a current item is the fauxcasa-gfz crash path."""
-        n = len(self._recent_indices())
         it = QTreeWidgetItemIterator(self.tree)
         while it.value():
             if it.value().data(0, Qt.ItemDataRole.UserRole) == ("recent", ""):
-                it.value().setText(0, f"↻ Recently Updated  ({n})")
+                it.value().setText(0, self._recent_label())
                 return
             it += 1
 
@@ -1111,6 +1205,12 @@ class MainWindow(QMainWindow):
             idxs = self._recent_indices()
             self.grid.set_filter(idxs, "Recently Updated")
             self._show_counts("Recently Updated", len(idxs))
+            if not idxs and self.catalog.backfill_state != BACKFILL_COMPLETE:
+                # empty-state honesty (cam.12): mtimes are still being
+                # backfilled, so an empty view is pending, not final
+                self.statusBar().showMessage(
+                    "Recently Updated fills in as the metadata backfill "
+                    "indexes file dates…", 8000)
         elif kind == "album" and key in cat.albums:
             album = cat.albums[key]
             self.grid.set_filter(list(album.members), album.name)
@@ -1635,6 +1735,10 @@ def main() -> int:
             except (CacheError, OSError) as e:
                 log.error("cannot adopt %s: %s", args.thumbs, e)
                 return 2
+            # The indexer never ran, so signals + in-file metadata are
+            # pending: record that, and MainWindow starts the background
+            # backfill pass (fauxcasa-cam.12) which persists as it goes.
+            catalog.backfill_state = BACKFILL_NOT_STARTED
             save_catalog(catalog, cat_path)  # warm-start next time
             save_report(catalog.report, cache_dir / REPORT_NAME)
         else:

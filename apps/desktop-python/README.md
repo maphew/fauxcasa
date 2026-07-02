@@ -183,8 +183,12 @@ catalog version bump.
   spec's compact ~50 B/photo binary catalog. Reconcile rebuilds the
   whole cache on drift rather than patching incrementally, and does not
   yet do N6 move-detection (the 2×2 hash-path matrix). Adopt-mode
-  catalogs carry no per-file signals (so reconcile sees only adds/removes
-  there).
+  catalogs *start* with no per-file signals; a background **backfill
+  pass** (`thumbcache.backfill_catalog`, fauxcasa-cam.12) then fills
+  size/mtime/sha256 + in-file metadata — the read side of the indexer,
+  throttled to 2 readers, persisting every 500 photos so a killed run
+  resumes from its cursor — after which reconcile sees in-place edits
+  there too.
 - Search is a linear scan (fast enough ≤100k), not the per-photo word
   index the spec names.
 - `hidden=yes` photos and stash folders (`.picasaoriginals/`, legacy
@@ -203,10 +207,13 @@ catalog version bump.
   values until the index fills the in-file ones; warm starts load the
   merged result from the persisted catalog. In-file wins over the ini per
   §4 tier-1 (EXIF GPS over `geotag=`; XMP Rating 1–5 over bare
-  `star=yes` — stars are a 0–5 count now, `star=yes` imports as 1). **Adopt mode (`--thumbs`)
-  binds an external cache without indexing, so its catalog stays ini-only
-  (no in-file ingest)** — the benchmark library it targets carries none
-  anyway; a real library wanting in-file captions runs a normal build.
+  `star=yes` — stars are a 0–5 count now, `star=yes` imports as 1). Adopt
+  mode (`--thumbs`) binds an external cache without indexing, so its
+  catalog *starts* ini-only — the background backfill pass (above) then
+  applies the same in-file reads and §4 precedence photo by photo, with
+  inline progress (`backfilling metadata N/M`) and an "indexing
+  metadata…" hint on the Recently Updated collection until real mtimes
+  land.
 - Scripted quits (`--screenshot`/`--quit-after-ready`) abandon an
   in-flight cache build cleanly; it completes on a later run. Pass
   `--finish-build` to hold the quit until the cache lands (raise

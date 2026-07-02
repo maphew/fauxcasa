@@ -97,27 +97,40 @@ def load_original_oriented(path: str, rotate: int) -> tuple[QImage, int]:
     rotate= turns compose on top exactly as for any other format. The
     reported orientation for a RAW is the container tag exiv2 reads —
     Picasa's faces=-on-RAW frame is unobserved (no oracle fixture), so
-    this is the documented best guess, fail-soft by construction."""
+    this is the documented best guess, fail-soft by construction.
+
+    Video files route by extension to the videoload poster seam
+    (fauxcasa-v46.2): the poster frame IS the M1 "original" for a video —
+    an honest still, painted with the "playback pending (v46.3)" note in
+    the info bar; no playback is attempted (v46.3 is gated on the
+    decode-service §3c sandbox-valve ruling). PyAV opens the path
+    seekably, so a multi-GB video is never read whole here; a decoded
+    poster carries no EXIF orientation, so it reports 1."""
     from PySide6.QtCore import QBuffer, QIODevice
     from PySide6.QtGui import QImageReader
 
     from metareader import read_orientation
     from rawload import is_raw_suffix, load_raw_qimage
+    from videoload import is_video_suffix, poster_qimage
 
-    try:
-        data = Path(path).read_bytes()
-    except OSError:
-        return QImage(), 1
-    orientation = read_orientation(data)
-    if is_raw_suffix(path):
-        img = load_raw_qimage(data)
+    if is_video_suffix(path):
+        img = poster_qimage(path)  # null on any failure (error text)
+        orientation = 1
     else:
-        buf = QBuffer()
-        buf.setData(data)  # setData copies; see thumbcache._index_one
-        buf.open(QIODevice.OpenModeFlag.ReadOnly)
-        reader = QImageReader(buf)
-        reader.setAutoTransform(True)
-        img = reader.read()
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return QImage(), 1
+        orientation = read_orientation(data)
+        if is_raw_suffix(path):
+            img = load_raw_qimage(data)
+        else:
+            buf = QBuffer()
+            buf.setData(data)  # setData copies; see thumbcache._index_one
+            buf.open(QIODevice.OpenModeFlag.ReadOnly)
+            reader = QImageReader(buf)
+            reader.setAutoTransform(True)
+            img = reader.read()
     if not img.isNull() and rotate:
         from PySide6.QtGui import QTransform
 
@@ -707,6 +720,35 @@ class ViewerPage(QWidget):
         # and zoom state resets with the next photo shown anyway.
         self.closed.emit(self.current_index())
 
+    def _info_text(self, photo) -> str:
+        """The info-bar line for `photo` under the current position/zoom
+        state (extracted from paintEvent so tests can assert the text)."""
+        parts = [f"{self.pos + 1}/{len(self.display)}", photo.rel]
+        if photo.media == "video":
+            # M1 honest placeholder (fauxcasa-v46.2): what the viewer
+            # paints is the POSTER frame; playback is v46.3 (gated on the
+            # decode-service §3c sandbox-valve ruling), so say so rather
+            # than pretending the still is the video.
+            parts.append("video — playback pending (v46.3)")
+        if self.zoomed:
+            # The mode chip doubles as the binding hint (drag pans;
+            # 1 / Ctrl+Alt+0 / click return to fit).
+            parts.append("1:1 — drag to pan, click/1 to fit")
+        if photo.faces and self.face_overlay_allowed:
+            # The face count doubles as the F-binding hint (like the 1:1
+            # chip above): subtle discoverability, no extra chrome.
+            n = len(photo.faces)
+            parts.append(f"{n} face{'s' if n != 1 else ''} (F)")
+        if photo.star:
+            parts.append("★" * min(photo.star, 5))  # 0-5 count (cam.11)
+        if photo.date_taken:
+            parts.append(format_date_taken(photo.date_taken))
+        if photo.geotag is not None:
+            parts.append(format_geotag(photo.geotag))  # §3 geotag readout
+        if photo.caption:
+            parts.append(f"“{photo.caption}”")
+        return "   ·   ".join(parts)
+
     @staticmethod
     def _display_rect(box_w: int, box_h: int, src_w: int, src_h: int,
                       cap: bool) -> QRect:
@@ -746,26 +788,7 @@ class ViewerPage(QWidget):
             msg = "loading…" if self.loading else "could not decode this file"
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, msg)
 
-        photo = self.catalog.photos[idx]
-        parts = [f"{self.pos + 1}/{len(self.display)}", photo.rel]
-        if self.zoomed:
-            # The mode chip doubles as the binding hint (drag pans;
-            # 1 / Ctrl+Alt+0 / click return to fit).
-            parts.append("1:1 — drag to pan, click/1 to fit")
-        if photo.faces and self.face_overlay_allowed:
-            # The face count doubles as the F-binding hint (like the 1:1
-            # chip above): subtle discoverability, no extra chrome.
-            n = len(photo.faces)
-            parts.append(f"{n} face{'s' if n != 1 else ''} (F)")
-        if photo.star:
-            parts.append("★" * min(photo.star, 5))  # 0-5 count (cam.11)
-        if photo.date_taken:
-            parts.append(format_date_taken(photo.date_taken))
-        if photo.geotag is not None:
-            parts.append(format_geotag(photo.geotag))  # §3 geotag readout
-        if photo.caption:
-            parts.append(f"“{photo.caption}”")
-        bar = "   ·   ".join(parts)
+        bar = self._info_text(self.catalog.photos[idx])
         painter.fillRect(0, h - 30, w, 30, CAPTION_BG)
         painter.setPen(QColor(220, 220, 220))
         painter.drawText(10, h - 30, w - 20, 30,
