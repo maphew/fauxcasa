@@ -45,6 +45,7 @@ from pathlib import Path
 T0 = time.perf_counter()
 
 from PySide6.QtCore import QObject, QProcess, Qt, QTimer, Signal
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -66,16 +67,20 @@ from PySide6.QtWidgets import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from catalog import (  # noqa: E402
+    REPORT_NAME,
     Catalog,
     Photo,
     ScanFilter,
     default_contacts_xml,
+    default_pal_dir,
     format_date_taken,
     format_geotag,
     load_catalog,
     load_contacts_xml,
+    load_report,
     reconcile_walk,
     save_catalog,
+    save_report,
     scan_library,
 )
 from grid import GridView  # noqa: E402
@@ -465,7 +470,8 @@ class MainWindow(QMainWindow):
                  scan_filter: ScanFilter | None = None,
                  warm: bool = False, adopt: bool = False,
                  cache_root: Path | None = None,
-                 contacts: dict[str, str] | None = None):
+                 contacts: dict[str, str] | None = None,
+                 pal_dir: Path | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
@@ -473,6 +479,9 @@ class MainWindow(QMainWindow):
         # machine-local contacts.xml names, kept so a reconcile rebuild's
         # rescan resolves faces the same way the startup scan did
         self.contacts = contacts or {}
+        # Picasa2Albums .pal directory, kept for the same reason: a
+        # reconcile rescan must merge albums the way the startup scan did
+        self.pal_dir = pal_dir
         self.cache_root = cache_root or (
             cache_dir.parent if cache_dir is not None else _default_cache_root()
         )
@@ -581,10 +590,16 @@ class MainWindow(QMainWindow):
         self.counts_label = QLabel()
         self.progress_label = QLabel()
         self.meta_label = QLabel()
+        # Import-report count (fauxcasa-cam.13): "N import notes" with the
+        # first few entries in the tooltip — deliberately lean; the full
+        # inspector surface is N7/M2 work.
+        self.notes_label = QLabel()
         self.statusBar().addWidget(self.counts_label)
         self.statusBar().addWidget(self.progress_label)
+        self.statusBar().addPermanentWidget(self.notes_label)
         self.statusBar().addPermanentWidget(self.meta_label)
         self._show_counts("All photos", self._shown_count())
+        self._update_import_notes()
 
         # --- wiring ---
         # The grid's set-valued signal drives the status label (single
@@ -639,6 +654,7 @@ class MainWindow(QMainWindow):
                 if result is None:
                     return  # cancelled
                 save_catalog(catalog, build_dir / "catalog.json")
+                save_report(catalog.report, build_dir / REPORT_NAME)
                 _emit(bridge.finished, result, catalog, False)
             except Exception as e:  # report, never crash the UI
                 log.error("cache build failed: %s", e)
@@ -675,12 +691,13 @@ class MainWindow(QMainWindow):
             fresh = None
             try:
                 fresh = scan_library(old.root, self.scan_filter,
-                                     self.contacts)
+                                     self.contacts, self.pal_dir)
                 result = build_cache(fresh, cache_dir, None,
                                      cancel=self.build_cancel)
                 if result is None:
                     return
                 save_catalog(fresh, cache_dir / "catalog.json")
+                save_report(fresh.report, cache_dir / REPORT_NAME)
                 _emit(bridge.finished, result, fresh, True)
             except Exception as e:
                 log.error("reindex failed: %s", e)
@@ -753,6 +770,7 @@ class MainWindow(QMainWindow):
         self.grid.set_data(catalog, thumbs)
         self._rebuild_sidebar()
         self._show_counts("All photos", self._shown_count())
+        self._update_import_notes()   # the rescan collected a fresh report
         self.meta_label.setText("")
 
     def index_busy(self) -> bool:
@@ -926,10 +944,29 @@ class MainWindow(QMainWindow):
             albums_root.setFlags(
                 albums_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             for uid, album in cat.albums.items():
+                # §3: a placeholder (albums= uid with no definition) is
+                # never dropped — shown dimmed/italic with a "?" suffix so
+                # the gap is visible, not silent (import report has the
+                # entry). A .pal-sourced album reads like a real one; its
+                # provenance lives in the tooltip.
+                suffix = " ?" if album.placeholder else ""
                 item = QTreeWidgetItem(
                     albums_root,
-                    [f"{album.name}  ({len(album.members)})"])
+                    [f"{album.name}{suffix}  ({len(album.members)})"])
                 item.setData(0, Qt.ItemDataRole.UserRole, ("album", uid))
+                if album.placeholder:
+                    f = item.font(0)
+                    f.setItalic(True)
+                    item.setFont(0, f)
+                    item.setForeground(0, t.palette().brush(
+                        QPalette.ColorGroup.Disabled,
+                        QPalette.ColorRole.Text))
+                    item.setToolTip(
+                        0, "Referenced by albums= lines but defined nowhere "
+                           "— placeholder (see import notes)")
+                elif album.pal_sourced:
+                    item.setToolTip(
+                        0, "Album definition from a Picasa2Albums .pal file")
             albums_root.setExpanded(True)
 
         # People (read-only v1 slice, fauxcasa-cam.3): named people with
@@ -1147,6 +1184,26 @@ class MainWindow(QMainWindow):
             f"  {label}: {n} photos · {folders} folders"
             f" · {len(self.catalog.albums)} albums")
 
+    def _update_import_notes(self) -> None:
+        """The lean import-report surface (fauxcasa-cam.13): a permanent
+        status-bar count when the catalog's report has entries, with the
+        first few in the tooltip. Hidden entirely at zero — most libraries
+        have no notes and deserve no chrome. The full inspector is N7/M2."""
+        entries = self.catalog.report.entries
+        if not entries:
+            self.notes_label.setVisible(False)
+            self.notes_label.setText("")
+            self.notes_label.setToolTip("")
+            return
+        n = len(entries)
+        self.notes_label.setText(
+            f"{n} import note{'s' if n != 1 else ''}  ")
+        shown = [f"[{e.source}] {e.kind}: {e.detail}" for e in entries[:6]]
+        if n > len(shown):
+            shown.append(f"… and {n - len(shown)} more (see {REPORT_NAME})")
+        self.notes_label.setToolTip("\n".join(shown))
+        self.notes_label.setVisible(True)
+
     def _selection_changed(self, selection: set) -> None:
         """Grid multi-select -> status label (spec §5 dual mode): exactly
         one selected shows that photo's metadata; several show the
@@ -1301,6 +1358,12 @@ def main() -> int:
                     help="Picasa contacts.xml for face names (read-only; "
                          "default: the machine-local copy under "
                          "%%LocalAppData%%\\Google\\Picasa2 when present)")
+    ap.add_argument("--pal-dir", type=Path, default=None,
+                    help="Picasa2Albums directory of .pal album files "
+                         "(read-only; merged per spec §4 — ini wins "
+                         "membership, .pal fills gaps; default: the "
+                         "machine-local Picasa2Albums under "
+                         "%%LocalAppData%%\\Google\\Picasa2 when present)")
     ap.add_argument("--min-image-size", type=_parse_image_size_arg,
                     metavar="WIDTHxHEIGHT",
                     help="ignore images smaller than WIDTHxHEIGHT during "
@@ -1365,6 +1428,18 @@ def main() -> int:
         elif args.contacts is not None:
             log.warning("no contacts loaded from %s", contacts_path)
 
+    # Picasa2Albums .pal files (fauxcasa-cam.8): an explicit --pal-dir wins,
+    # else the machine-local Picasa2Albums default when present. Same
+    # read-only-enrichment posture as contacts.xml — but an explicitly
+    # named directory that doesn't exist earns a warning, not silence.
+    pal_dir = args.pal_dir or default_pal_dir()
+    if pal_dir is not None and not pal_dir.is_dir():
+        if args.pal_dir is not None:
+            log.warning("--pal-dir %s is not a directory; ignored", pal_dir)
+        pal_dir = None
+    if pal_dir is not None:
+        log.info("albums: merging .pal files from %s", pal_dir)
+
     # Data prep. Try a WARM start first: load the persisted catalog (no
     # walk) and bind it to the thumbnail cache. Else fall back to a COLD
     # walk + build (or adopt an external --thumbs cache). The cache dir is
@@ -1388,11 +1463,14 @@ def main() -> int:
                 cached = load_cache(thumbs_path)
                 bind(cached, loaded)
                 catalog, thumbs, warm = loaded, cached, True
+                # the report was persisted beside the catalog at scan time;
+                # re-attach it so the status-bar count survives warm starts
+                catalog.report = load_report(cache_dir / REPORT_NAME)
             except (CacheError, OSError) as e:
                 log.warning("persisted cache unusable (%s); rescanning", e)
 
     if catalog is None:  # cold path
-        catalog = scan_library(root, scan_filter, contacts)
+        catalog = scan_library(root, scan_filter, contacts, pal_dir)
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
@@ -1401,6 +1479,7 @@ def main() -> int:
                 log.error("cannot adopt %s: %s", args.thumbs, e)
                 return 2
             save_catalog(catalog, cat_path)  # warm-start next time
+            save_report(catalog.report, cache_dir / REPORT_NAME)
         else:
             build_dir = cache_dir  # the build thread persists the catalog
 
@@ -1417,13 +1496,18 @@ def main() -> int:
     log.info("%s: %d photos, %d folders, %d albums in %.0f ms",
              mode, len(catalog.photos), len(catalog.folders),
              len(catalog.albums), prep_ms)
+    if catalog.report.entries:
+        # §4: conflicts are surfaced, never silent — the applog line plus
+        # the status-bar count are the minimal v1 surface (full inspector
+        # is N7/M2). Details live in the persisted import-report.json.
+        log.info("import report: %s", catalog.report.summary())
 
     # A frozen first-run picker may already have created the app.
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
-                     contacts=contacts)
+                     contacts=contacts, pal_dir=pal_dir)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
