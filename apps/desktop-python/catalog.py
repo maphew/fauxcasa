@@ -17,10 +17,13 @@ XMP/IPTC values when present — real Picasa stores JPEG captions/keywords
 in-file and uses ini caption=/keywords= only for formats with no
 XMP/IPTC home. So a freshly walked but not-yet-indexed catalog shows
 ini-only captions; once indexed, the persisted catalog and warm starts
-carry the merged result. Adopt mode (--thumbs) is the exception: it binds
-an external thumbnail cache without running the indexer, so its catalog
-stays ini-only (the in-file read piggybacks on the index's file reads,
-which adopt mode skips by design — N4). See apps/desktop-python/README.md.
+carry the merged result. Adopt mode (--thumbs) binds an external
+thumbnail cache without running the indexer, so its catalog STARTS
+ini-only — a background backfill pass (thumbcache.backfill_catalog,
+fauxcasa-cam.12) then runs the read side of the indexer (no thumbnail
+work) to fill the identity signals and in-file metadata, resumable via
+the backfill_state/backfill_cursor fields below. See
+apps/desktop-python/README.md.
 
 Dates/GPS/Rating follow the same two-pass shape (fauxcasa-cam.9/.10/.11,
 via apps/desktop-python/metareader.py — the exiv2 seam): scan_library fills
@@ -30,7 +33,8 @@ overrides with in-file values when the file carries them — EXIF
 DateTimeOriginal/DateTime -> date_taken (the ini has no per-photo date
 key), EXIF GPS -> geotag, XMP Rating 1-5 -> star — because in-file
 metadata wins for tier-1 data per §4 (oracle hardening of that precedence
-is fauxcasa-ed5.9's). The adopt-mode ini-only caveat applies identically.
+is fauxcasa-ed5.9's). Adopt-mode catalogs get the same values from the
+backfill pass instead of the indexer.
 
 Faces/people (§3 People first-class, read-only slice): scan_library parses
 per-photo ini `faces=` regions via picasa_db.parse_faces, harvests
@@ -76,6 +80,17 @@ EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
         ".webp"} | RAW_EXTS
 
 INI_NAMES = (".picasa.ini", "Picasa.ini", "picasa.ini")
+
+# Adopt-mode backfill states (fauxcasa-cam.12). A catalog built by the
+# indexer (build_cache read every file) is COMPLETE by construction — the
+# default below — so only adopt-mode (--thumbs) catalogs, whose indexer
+# never ran, carry NOT_STARTED / IN_PROGRESS. IN_PROGRESS means photos
+# [0, backfill_cursor) already have their identity signals + in-file
+# metadata applied AND persisted; a relaunch resumes at the cursor
+# (thumbcache.backfill_catalog owns the pass).
+BACKFILL_NOT_STARTED = "not_started"
+BACKFILL_IN_PROGRESS = "in_progress"
+BACKFILL_COMPLETE = "complete"
 
 # One ini face tag: (rect, contact id, display name or None). rect =
 # (left, top, right, bottom) fractions of the STORED pixels — rotate= does
@@ -222,6 +237,12 @@ class Catalog:
     # Import diagnostics collected while this catalog was built (§4; empty
     # on a warm load until main() re-attaches the persisted report).
     report: ImportReport = field(default_factory=ImportReport)
+    # Adopt-mode backfill progress (fauxcasa-cam.12; constants above).
+    # COMPLETE by default: the state tracks the BACKFILL job, so a catalog
+    # the indexer fills (or will fill — the cold-build path) has nothing
+    # pending; main()'s adopt path flips a fresh catalog to NOT_STARTED.
+    backfill_state: str = BACKFILL_COMPLETE
+    backfill_cursor: int = 0  # photos [0, cursor) done (IN_PROGRESS only)
 
     @property
     def visible_count(self) -> int:
@@ -888,7 +909,12 @@ def scan_library(root: Path,
 # flags; the import report lands beside this file as import-report.json) —
 # a v5 catalog silently dropped both album classes, so a warm start would
 # hide them again; reject and cold-rebuild.
-CATALOG_VERSION = 6
+# v7: adopt-mode backfill state (fauxcasa-cam.12) is persisted as a
+# top-level `backfill` object when a backfill is pending/underway (absent
+# = complete). A v6 adopt catalog carries neither the key nor any way to
+# tell "never backfilled" from "complete", so it is rejected and the cold
+# walk re-adopts with an explicit NOT_STARTED state — which then backfills.
+CATALOG_VERSION = 7
 
 # The import report's file name, written beside catalog.json (same cache
 # dir) by save_report and re-attached on warm starts via load_report.
@@ -985,6 +1011,13 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
             for a in catalog.albums.values()
         ],
     }
+    # Backfill progress (cam.12): persisted only while pending/underway,
+    # so an indexer-built catalog's file shape is unchanged. The periodic
+    # mid-backfill saves ride the same atomic write-temp-rename, so a
+    # killed app always finds either the previous cursor or the new one.
+    if catalog.backfill_state != BACKFILL_COMPLETE:
+        data["backfill"] = {"state": catalog.backfill_state,
+                            "cursor": catalog.backfill_cursor}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".catalog.tmp")
     tmp.write_text(json.dumps(data))
@@ -1071,11 +1104,32 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
         contacts = data.get("contacts", {})
         if not isinstance(contacts, dict):
             contacts = {}
+
+        # Backfill progress (cam.12): an absent key means complete (the
+        # indexer-built shape — save_catalog omits it then). A non-dict
+        # value raises here (AttributeError -> the defensive net); an
+        # unknown state string in a version-current file is the same
+        # corrupt case, so it degrades to a cold walk too. The cursor is
+        # clamped to the photo count so a hand-edited value can never make
+        # the resume index past the list.
+        backfill_state, backfill_cursor = BACKFILL_COMPLETE, 0
+        bf = data.get("backfill")
+        if bf is not None:
+            state = bf.get("state")
+            if state == BACKFILL_IN_PROGRESS:
+                backfill_state = state
+                backfill_cursor = min(max(0, int(bf.get("cursor", 0))),
+                                      len(photos))
+            elif state == BACKFILL_NOT_STARTED:
+                backfill_state = state
+            elif state != BACKFILL_COMPLETE:
+                return None
     except (KeyError, IndexError, TypeError, AttributeError, ValueError):
         return None
 
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
-                   contacts=contacts)
+                   contacts=contacts, backfill_state=backfill_state,
+                   backfill_cursor=backfill_cursor)
 
 
 @dataclass

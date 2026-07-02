@@ -4431,7 +4431,7 @@ def test_metadata_catalog_roundtrip_and_version_gate(
     assert a.date_taken == "1899-03-02T14:00:00"
 
     # the version gate: a v4 (pre-metadata) catalog cold-rebuilds
-    assert catmod.CATALOG_VERSION >= 5   # exact value pinned by the v6 test
+    assert catmod.CATALOG_VERSION >= 5   # exact value pinned by the v7 test
     data = json.loads(path.read_text())
     data["version"] = 4
     path.write_text(json.dumps(data))
@@ -5372,13 +5372,14 @@ def test_import_report_persistence_and_warm_status(
 
 def test_catalog_v6_roundtrips_album_flags(
         album_library: Path, tmp_path: Path) -> None:
-    """CATALOG_VERSION is 6: placeholder and pal-sourced albums survive the
-    persisted catalog — flags, names, members — and a v5 catalog (which
-    silently dropped both classes) is rejected so a warm start cold-rebuilds
-    instead of hiding them again."""
+    """CATALOG_VERSION grew past 6 (v6: placeholder and pal-sourced albums;
+    v7 then added backfill state — see the backfill tests): the album
+    flags survive the persisted catalog — flags, names, members — and a v5
+    catalog (which silently dropped both classes) is rejected so a warm
+    start cold-rebuilds instead of hiding them again."""
     import catalog as catmod
 
-    assert catmod.CATALOG_VERSION == 6
+    assert catmod.CATALOG_VERSION >= 6  # exact value pinned by the v7 test
     pal_dir = tmp_path / "albums"
     _write_pal(pal_dir, UID_PAL, "Pal Only", ["Trip/c.jpg"])
     cat = scan_library(album_library, pal_dir=pal_dir)
@@ -5778,5 +5779,415 @@ def test_tray_overflow_paints_plus_n_tail(tmp_path: Path) -> None:
     assert bar.item_at(2) == -1                  # left gutter
     assert not bar.grab().isNull()               # paints the '+N' branch
     assert bar._shown() == (2, 2)                # geometry held through paint
+
+
+# ---------------------------------------------------------------------------
+# Adopt-mode backfill (fauxcasa-cam.12): --thumbs binds a prebuilt fcache
+# without running the indexer, so the catalog starts with no identity
+# signals (N6 — reconcile blind to in-place edits), ini-only metadata (§4
+# tier-1 never applied), and no mtimes (Recently Updated honestly 0).
+# thumbcache.backfill_catalog is the read side of the indexer without the
+# thumbnail work — read_photo_meta + apply_photo_meta, the SAME factored
+# functions build_cache runs — applied in catalog order behind a bounded
+# two-reader window so the persisted cursor is a contiguous frontier and a
+# killed pass resumes exactly where it left off.
+# ---------------------------------------------------------------------------
+
+from catalog import (  # noqa: E402
+    BACKFILL_COMPLETE,
+    BACKFILL_IN_PROGRESS,
+    BACKFILL_NOT_STARTED,
+)
+
+
+def _adopted_catalog(root: Path, tmp_path: Path):
+    """main()'s --thumbs flow in miniature: build a prebuilt fcache from
+    one walk, bind a FRESH scan (ini-only, signal-less) to it, mark the
+    catalog NOT_STARTED and persist it — returns (catalog, catalog_path)
+    ready for backfill_catalog."""
+    built = thumbcache.build_cache(scan_library(root), tmp_path / "prebuilt")
+    assert built is not None
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(built.path)
+    thumbcache.bind(cache, cat)
+    cat.backfill_state = BACKFILL_NOT_STARTED
+    cat_path = tmp_path / "catalog.json"
+    save_catalog(cat, cat_path)
+    return cat, cat_path
+
+
+def test_backfill_matches_indexer_read_side(tmp_path: Path) -> None:
+    """The core parity claim: a backfilled adopt-mode catalog is
+    indistinguishable from an indexed one across every read-side field —
+    identity signals AND the §4 tier-1 precedence merge (in-file caption/
+    keywords beat ini, ini survives where the file carries none, EXIF GPS
+    beats geotag=, XMP Rating beats bare star=yes) — and the merged result
+    persists for the next warm start."""
+    root = tmp_path / "lib"
+    # a: ini caption/keywords + in-file XMP -> in-file wins
+    write_jpeg_meta(root / "f" / "a.jpg",
+                    xmp=_xmp_app1("in-file cap", ("ifkw",)))
+    # b: ini caption only -> survives the pass untouched
+    make_jpeg(root / "f" / "b.jpg")
+    # c: in-file EXIF date + GPS + XMP Rating over ini star=yes/geotag=
+    _meta_jpeg(root / "f" / "c.jpg",
+               date_time_original="1899:03:02 14:00:00",
+               gps=WHITEHORSE, rating=3)
+    # d: nothing anywhere (signals only)
+    make_jpeg(root / "f" / "d.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\ncaption=ini cap a\r\nkeywords=inikw\r\n"
+        "[b.jpg]\r\ncaption=ini cap b\r\n"
+        "[c.jpg]\r\nstar=yes\r\ngeotag=-33.856800,151.215300\r\n")
+
+    ref = scan_library(root)                     # reference: the indexer
+    assert thumbcache.build_cache(ref, tmp_path / "ref") is not None
+
+    cat, cat_path = _adopted_catalog(root, tmp_path)
+    a = next(p for p in cat.photos if p.name == "a.jpg")
+    assert a.caption == "ini cap a"              # the gap: ini tier showing
+    assert a.sha256 is None and a.mtime < 0 and a.size < 0
+
+    result = thumbcache.backfill_catalog(cat, cat_path)
+    assert result is not None
+    assert result.photos == len(cat.photos) and result.workers == 2
+    assert cat.backfill_state == BACKFILL_COMPLETE
+
+    for got, want in zip(cat.photos, ref.photos):
+        assert got.rel == want.rel
+        assert (got.size, got.mtime, got.sha256) == \
+            (want.size, want.mtime, want.sha256)
+        assert got.caption == want.caption
+        assert got.keywords == want.keywords
+        assert got.date_taken == want.date_taken
+        assert got.geotag == want.geotag
+        assert got.star == want.star
+    by = {p.name: p for p in cat.photos}
+    assert by["a.jpg"].caption == "in-file cap"          # tier-1 applied
+    assert by["a.jpg"].keywords == ("ifkw",)
+    assert by["b.jpg"].caption == "ini cap b"            # ini fallback kept
+    assert by["c.jpg"].star == 3                          # Rating over star=yes
+    assert by["c.jpg"].geotag == pytest.approx(WHITEHORSE)  # GPS over geotag=
+    assert by["c.jpg"].date_taken == "1899-03-02T14:00:00"  # no year floor
+    assert len(by["d.jpg"].sha256) == 64 and by["d.jpg"].mtime >= 0
+
+    # the merged result is durable: the next launch warm-loads it complete
+    loaded = load_catalog(cat_path, root)
+    assert loaded is not None
+    assert loaded.backfill_state == BACKFILL_COMPLETE
+    assert next(p for p in loaded.photos
+                if p.name == "a.jpg").caption == "in-file cap"
+    # ...and a complete catalog's file shape carries no backfill key
+    assert "backfill" not in json.loads(cat_path.read_text())
+
+
+def test_backfill_interrupt_resume_and_periodic_persist(
+        tmp_path: Path, monkeypatch) -> None:
+    """Kill-safety: the pass persists every persist_every photos AND on
+    cancel, recording IN_PROGRESS + a contiguous cursor; a relaunch loads
+    that catalog and resumes from the cursor, never re-reading the photos
+    already applied."""
+    import threading
+
+    root = tmp_path / "lib"
+    for n in range(6):
+        make_jpeg(root / "f" / f"p{n}.jpg")
+    cat, cat_path = _adopted_catalog(root, tmp_path)
+
+    saves: list[int] = []
+    real_save = thumbcache.save_catalog
+
+    def counting_save(c, p):
+        saves.append(c.backfill_cursor)
+        real_save(c, p)
+
+    monkeypatch.setattr(thumbcache, "save_catalog", counting_save)
+
+    stop = threading.Event()
+    assert thumbcache.backfill_catalog(
+        cat, cat_path, cancel=stop, persist_every=2,
+        progress=lambda done, total: stop.set() if done >= 3 else None,
+    ) is None                                    # cancelled mid-pass
+    # results apply IN ORDER, so the checkpoints are deterministic: the
+    # periodic save at 2, then the cancel checkpoint at 3
+    assert saves == [2, 3]
+
+    disk = load_catalog(cat_path, root)          # what a relaunch loads
+    assert disk is not None
+    assert disk.backfill_state == BACKFILL_IN_PROGRESS
+    assert disk.backfill_cursor == 3
+    assert all(p.sha256 and p.mtime >= 0 for p in disk.photos[:3])
+    assert all(p.sha256 is None and p.mtime < 0 for p in disk.photos[3:])
+
+    read: list[str] = []
+    real_read = thumbcache.read_photo_meta
+
+    def recording_read(r, photo):
+        read.append(photo.rel)
+        return real_read(r, photo)
+
+    monkeypatch.setattr(thumbcache, "read_photo_meta", recording_read)
+    result = thumbcache.backfill_catalog(disk, cat_path)
+    assert result is not None and result.photos == 3   # the tail only
+    assert sorted(read) == ["f/p3.jpg", "f/p4.jpg", "f/p5.jpg"]
+    assert disk.backfill_state == BACKFILL_COMPLETE
+    assert all(p.sha256 for p in disk.photos)
+    again = load_catalog(cat_path, root)
+    assert again is not None and again.backfill_state == BACKFILL_COMPLETE
+
+
+def test_backfill_worker_cap_two(tmp_path: Path, monkeypatch) -> None:
+    """Rate limiting is structural: BACKFILL_WORKERS is 2 (deliberately far
+    below INDEX_WORKERS) and the pass never has more than that many reads
+    in flight — a bounded submission window, not the indexer's
+    fire-everything pool."""
+    import threading
+    import time as _time
+
+    assert thumbcache.BACKFILL_WORKERS == 2
+    root = tmp_path / "lib"
+    for n in range(10):
+        make_jpeg(root / "f" / f"p{n}.jpg")
+    cat, cat_path = _adopted_catalog(root, tmp_path)
+
+    lock = threading.Lock()
+    active, peak = [0], [0]
+    real_read = thumbcache.read_photo_meta
+
+    def tracking_read(r, photo):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            _time.sleep(0.01)                    # widen the overlap window
+            return real_read(r, photo)
+        finally:
+            with lock:
+                active[0] -= 1
+
+    monkeypatch.setattr(thumbcache, "read_photo_meta", tracking_read)
+    assert thumbcache.backfill_catalog(cat, cat_path) is not None
+    assert 1 <= peak[0] <= thumbcache.BACKFILL_WORKERS
+
+
+def test_backfill_pause_parks_readers(tmp_path: Path, monkeypatch) -> None:
+    """The low-priority hook: a set pause event parks the pass before any
+    read is submitted (and between photos); clearing it lets the pass run
+    to completion."""
+    import threading
+    import time as _time
+
+    root = tmp_path / "lib"
+    for n in range(4):
+        make_jpeg(root / "f" / f"p{n}.jpg")
+    cat, cat_path = _adopted_catalog(root, tmp_path)
+
+    reads: list[str] = []
+    real_read = thumbcache.read_photo_meta
+
+    def recording_read(r, photo):
+        reads.append(photo.rel)
+        return real_read(r, photo)
+
+    monkeypatch.setattr(thumbcache, "read_photo_meta", recording_read)
+    pause = threading.Event()
+    pause.set()                                  # paused before the start
+    out: list = []
+    t = threading.Thread(
+        target=lambda: out.append(
+            thumbcache.backfill_catalog(cat, cat_path, pause=pause)),
+        daemon=True)
+    t.start()
+    _time.sleep(0.3)
+    assert reads == [] and t.is_alive()          # parked: nothing read yet
+    pause.clear()
+    t.join(timeout=15)
+    assert not t.is_alive()
+    assert out and out[0] is not None and out[0].photos == 4
+    assert len(reads) == 4
+    assert cat.backfill_state == BACKFILL_COMPLETE
+
+
+def test_backfill_flips_recently_updated_from_zero(tmp_path: Path) -> None:
+    """The PR #41 rider: adopt-mode mtimes are -1 so Recently Updated is
+    honestly empty; the backfill fills REAL file mtimes and the collection
+    populates through the exact same recent_indices seam."""
+    from main import recent_indices
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "T" / "fresh.jpg")
+    make_jpeg(root / "T" / "stale.jpg")
+    os.utime(root / "T" / "fresh.jpg", (_days_ago(1),) * 2)
+    os.utime(root / "T" / "stale.jpg", (_days_ago(90),) * 2)
+    cat, cat_path = _adopted_catalog(root, tmp_path)
+
+    assert recent_indices(cat, reveal=False) == []     # honest pre-backfill 0
+    assert thumbcache.backfill_catalog(cat, cat_path) is not None
+    got = [cat.photos[i].rel for i in recent_indices(cat, reveal=False)]
+    assert got == ["T/fresh.jpg"]                      # window, not fallback
+
+
+def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
+    """backfill_state/cursor persistence: NOT_STARTED and IN_PROGRESS(cursor)
+    round-trip (cursor clamped against hand-edits), COMPLETE writes no key at
+    all (an indexer-built catalog's file shape is unchanged), garbage in the
+    key degrades to a cold walk, and the v7 version gate rejects a v6 catalog
+    (which cannot say whether an adopt catalog was ever backfilled)."""
+    import catalog as catmod
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    cat = scan_library(root)
+    path = tmp_path / "catalog.json"
+
+    cat.backfill_state = BACKFILL_NOT_STARTED
+    save_catalog(cat, path)
+    loaded = load_catalog(path, root)
+    assert loaded is not None
+    assert loaded.backfill_state == BACKFILL_NOT_STARTED
+    assert loaded.backfill_cursor == 0
+
+    cat.backfill_state = BACKFILL_IN_PROGRESS
+    cat.backfill_cursor = 1
+    save_catalog(cat, path)
+    loaded = load_catalog(path, root)
+    assert loaded is not None
+    assert loaded.backfill_state == BACKFILL_IN_PROGRESS
+    assert loaded.backfill_cursor == 1
+    data = json.loads(path.read_text())
+    data["backfill"]["cursor"] = 99              # hand-edited overshoot
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, root).backfill_cursor == 2   # clamped to count
+
+    cat.backfill_state = BACKFILL_COMPLETE
+    save_catalog(cat, path)
+    assert "backfill" not in json.loads(path.read_text())
+    loaded = load_catalog(path, root)
+    assert loaded is not None
+    assert loaded.backfill_state == BACKFILL_COMPLETE
+
+    data = json.loads(path.read_text())
+    data["backfill"] = {"state": "banana"}       # unknown state string
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, root) is None
+    data["backfill"] = "not-an-object"
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, root) is None
+
+    assert catmod.CATALOG_VERSION == 7
+    cat.backfill_state = BACKFILL_COMPLETE
+    save_catalog(cat, path)
+    data = json.loads(path.read_text())
+    data["version"] = 6                          # pre-backfill-state format
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, root) is None
+
+
+def test_recent_empty_state_hint_while_backfill_pending(
+        tmp_path: Path) -> None:
+    """§1 modes-not-modals honesty (the PR #41 rider): while an adopt-mode
+    catalog's backfill has not yet filled mtimes, the sidebar's Recently
+    Updated says WHY it is empty ('indexing metadata…', not a bare 0) and
+    clicking it explains the empty view in the status bar; a COMPLETE
+    catalog's empty collection is a bare, final 0 again. cache_dir=None
+    keeps the pass itself from starting, so the label logic is tested
+    deterministically."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    def item_for(win, kind, key):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "T" / "a.jpg")
+    cat = scan_library(root)
+    cat.backfill_state = BACKFILL_NOT_STARTED
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None, adopt=True)
+    assert win._backfill_thread is None          # nowhere to persist into
+
+    item = item_for(win, "recent", "")
+    assert "indexing metadata" in item.text(0)   # the hint, not (0)
+    win._sidebar_clicked(item, 0)
+    assert "backfill" in win.statusBar().currentMessage()
+
+    cat.backfill_state = BACKFILL_COMPLETE
+    win.statusBar().clearMessage()
+    win._refresh_recent_count()
+    assert item_for(win, "recent", "").text(0).endswith("(0)")
+    win._apply_view("recent", "")
+    assert win.statusBar().currentMessage() == ""
+
+
+def test_mainwindow_adopt_backfill_end_to_end(tmp_path: Path) -> None:
+    """The wiring: an adopt-mode MainWindow starts the backfill thread
+    (NOT reconcile — a warm start's reconcile is deferred behind it), the
+    pass runs against cache_dir/catalog.json, and on completion the sidebar
+    refreshes (Recently Updated flips from the indexing hint to a real
+    count), the catalog persists COMPLETE with full signals, and the
+    deferred reconcile then starts."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import time as _time
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    def item_for(win, kind, key):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "T" / "fresh.jpg")
+    make_jpeg(root / "T" / "old.jpg")
+    os.utime(root / "T" / "fresh.jpg", (_days_ago(1),) * 2)
+    os.utime(root / "T" / "old.jpg", (_days_ago(90),) * 2)
+
+    built = thumbcache.build_cache(scan_library(root), tmp_path / "prebuilt")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(built.path)
+    thumbcache.bind(cache, cat)
+    cat.backfill_state = BACKFILL_NOT_STARTED
+    cache_dir = tmp_path / "cachedir"
+    save_catalog(cat, cache_dir / "catalog.json")  # what main()'s adopt saves
+
+    win = MainWindow(cat, cache, cache_dir=cache_dir, build_dir=None,
+                     warm=True, adopt=True)
+    assert win._backfill_thread is not None      # backfill, not reconcile
+    assert win._reconcile_thread is None
+    assert win._reconcile_after_backfill
+    assert "indexing metadata" in item_for(win, "recent", "").text(0)
+
+    deadline = _time.time() + 20
+    while win._backfill_thread.is_alive() and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    assert not win._backfill_thread.is_alive()
+    app.processEvents()                          # deliver backfill_done
+
+    assert cat.backfill_state == BACKFILL_COMPLETE
+    assert item_for(win, "recent", "").text(0).endswith("(1)")
+    disk = load_catalog(cache_dir / "catalog.json", root)
+    assert disk is not None
+    assert disk.backfill_state == BACKFILL_COMPLETE
+    assert all(p.sha256 and p.mtime >= 0 for p in disk.photos)
+    assert win._reconcile_thread is not None     # the deferred reconcile ran
+    win.shutdown()
 
 

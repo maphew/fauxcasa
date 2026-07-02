@@ -26,7 +26,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
-from catalog import Catalog
+from catalog import (
+    BACKFILL_COMPLETE,
+    BACKFILL_IN_PROGRESS,
+    Catalog,
+    save_catalog,
+)
 from inmeta import read_jpeg_metadata
 from metareader import read_file_meta
 from rawload import is_raw_suffix, raw_demosaic_qimage, raw_preview_jpeg
@@ -248,17 +253,74 @@ class IndexResult:
         return self.photos / self.elapsed_s if self.elapsed_s > 0 else 0.0
 
 
-def _index_one(root: Path, photo, idx: int, levels: list[int]):
-    """One photo: read bytes, sha256 (N6 identity), SCALED-decode ONCE to the
-    top (largest) level's box (libjpeg DCT decode — see INDEX_WORKERS), then
-    downscale that decoded image to each lower level and JPEG-encode every
-    level. Also reads in-file metadata from the bytes already in hand:
+def read_photo_meta(root: Path, photo):
+    """The READ side of indexing one photo — bytes, identity signals, and
+    in-file metadata — shared by the indexer (_index_one continues into the
+    thumbnail decode) and the adopt-mode backfill (backfill_catalog, which
+    needs exactly this and no thumbnail work — fauxcasa-cam.12). Returns
+    (data, size, mtime, sha256, inmeta.InMeta, metareader.FileMeta): the
+    sha256 is the N6 identity, size/mtime the cheap staleness signals, and
+    the two metadata reads come from the bytes already in hand —
     caption/keywords (inmeta, XMP/IPTC, JPEG only) plus capture date / GPS /
-    XMP Rating (metareader, the exiv2 seam, all carriers — fauxcasa-
-    cam.9/.10/.11). Returns the per-level (blob, w, h) records the fcache
-    needs, the catalog signals, and the PRIMARY-level QImage for the live grid
-    feed. A null/corrupt image yields a zero-length blob per level (error
-    tile). With a single 256 level this is byte-identical to the legacy path.
+    XMP Rating (metareader, the exiv2 seam, all carriers). An unreadable
+    file fails soft: empty bytes, -1 signals, empty metadata."""
+    src = root / photo.rel
+    try:
+        data = src.read_bytes()
+        st = src.stat()
+        size, mtime = st.st_size, int(st.st_mtime)
+    except OSError:
+        data, size, mtime = b"", -1, -1
+    sha = hashlib.sha256(data).hexdigest()
+    meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG only)
+    fmeta = read_file_meta(data)     # in-file date/GPS/Rating (all carriers)
+    return data, size, mtime, sha, meta, fmeta
+
+
+def apply_photo_meta(photo, size: int, mtime: int, sha: str,
+                     meta, fmeta) -> None:
+    """Apply one read_photo_meta result to the catalog photo IN PLACE —
+    identity/staleness signals plus the §4 tier-1 precedence merge. Shared
+    by build_cache's completion loop and backfill_catalog so the adopt-mode
+    backfill applies EXACTLY the precedence the indexer applies.
+
+    §4 precedence: in-file metadata wins over the ini for tier-1 data
+    (captions, keywords) on JPEGs. scan_library already set any ini value;
+    override only when the file actually carries one (truthy), so
+    non-JPEGs, untagged JPEGs, and a JPEG with an empty in-file caption all
+    keep their ini caption/keywords. Same rule for the metareader fields
+    (fauxcasa-cam.9/.10/.11): the ini has no per-photo date key, so
+    in-file date_taken is the only source (None leaves the field for a
+    consumer-side mtime fallback — q6l.11 owns date grouping/sort); in-file
+    EXIF GPS wins over the ini geotag= value the scan set (the ini key
+    remains the source for files with no GPS in them; the oracle check of
+    this precedence is fauxcasa-ed5.9's); XMP Rating 1-5 maps losslessly
+    to the star count and WINS over a bare ini star=yes (§3 star
+    authority — which carries no count and imported as 1 at scan), but an
+    explicit Rating 0 does NOT unstar an ini-starred photo: the ini star=
+    line stays authoritative for zero-vs-nonzero (§3)."""
+    photo.size, photo.mtime, photo.sha256 = size, mtime, sha
+    if meta.caption:
+        photo.caption = meta.caption
+    if meta.keywords:
+        photo.keywords = meta.keywords
+    if fmeta.date_taken:
+        photo.date_taken = fmeta.date_taken
+    if fmeta.gps is not None:
+        photo.geotag = fmeta.gps
+    if fmeta.rating:
+        photo.star = fmeta.rating
+
+
+def _index_one(root: Path, photo, idx: int, levels: list[int]):
+    """One photo: read bytes + signals + in-file metadata (read_photo_meta),
+    then SCALED-decode ONCE to the top (largest) level's box (libjpeg DCT
+    decode — see INDEX_WORKERS), downscale that decoded image to each lower
+    level and JPEG-encode every level. Returns the per-level (blob, w, h)
+    records the fcache needs, the catalog signals, and the PRIMARY-level
+    QImage for the live grid feed. A null/corrupt image yields a zero-length
+    blob per level (error tile). With a single 256 level this is
+    byte-identical to the legacy path.
 
     EXIF orientation IS applied here (setAutoTransform): the thumbnail is
     baked display-upright, so the grid, the viewer (which auto-transforms the
@@ -278,16 +340,7 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     top = levels[0]  # largest edge (levels are descending)
     primary_li = _primary_level(levels)
 
-    src = root / photo.rel
-    try:
-        data = src.read_bytes()
-        st = src.stat()
-        size, mtime = st.st_size, int(st.st_mtime)
-    except OSError:
-        data, size, mtime = b"", -1, -1
-    sha = hashlib.sha256(data).hexdigest()
-    meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG only)
-    fmeta = read_file_meta(data)     # in-file date/GPS/Rating (all carriers)
+    data, size, mtime, sha, meta, fmeta = read_photo_meta(root, photo)
 
     img = None
     if data and is_raw_suffix(photo.rel):
@@ -425,37 +478,10 @@ def build_cache(
             idx, level_blobs, size, mtime, sha, meta, fmeta, img = \
                 fut.result()
             photo_levels[idx] = level_blobs
-            photo = catalog.photos[idx]
-            photo.size, photo.mtime, photo.sha256 = size, mtime, sha
-            # §4 precedence: in-file metadata wins over the ini for tier-1
-            # data (captions, keywords) on JPEGs. scan_library already set
-            # any ini value; override only when the file actually carries
-            # one (truthy), so non-JPEGs, untagged JPEGs, and a JPEG with an
-            # empty in-file caption all keep their ini caption/keywords.
-            if meta.caption:
-                photo.caption = meta.caption
-            if meta.keywords:
-                photo.keywords = meta.keywords
-            # Same §4 tier-1 rule for the metareader fields
-            # (fauxcasa-cam.9/.10/.11):
-            if fmeta.date_taken:
-                # the ini has no per-photo date key, so in-file is the only
-                # source; None leaves the field for a consumer-side mtime
-                # fallback (q6l.11 owns date grouping/sort)
-                photo.date_taken = fmeta.date_taken
-            if fmeta.gps is not None:
-                # in-file EXIF GPS wins over the ini geotag= value the scan
-                # set — §4 tier-1: in-file wins for standard metadata; the
-                # ini key remains the source for files with no GPS in them.
-                # The oracle check of this precedence is fauxcasa-ed5.9's.
-                photo.geotag = fmeta.gps
-            if fmeta.rating:
-                # §3 star authority: XMP Rating 1-5 maps losslessly to the
-                # star count and WINS over a bare ini star=yes (which
-                # carries no count and imported as 1 at scan). An explicit
-                # Rating 0 does NOT unstar an ini-starred photo: the ini
-                # star= line stays authoritative for zero-vs-nonzero (§3).
-                photo.star = fmeta.rating
+            # identity signals + §4 tier-1 precedence merge, shared with
+            # the adopt-mode backfill (see apply_photo_meta)
+            apply_photo_meta(catalog.photos[idx], size, mtime, sha,
+                             meta, fmeta)
             if progress:
                 progress(idx, total, img)
     elapsed = time.perf_counter() - t0
@@ -475,3 +501,130 @@ def build_cache(
     out.with_suffix(".fcache.json").write_text(json.dumps(sidecar, indent=1))
     return IndexResult(path=out, photos=total, elapsed_s=elapsed,
                        workers=INDEX_WORKERS)
+
+
+# ---- adopt-mode backfill (fauxcasa-cam.12) --------------------------------
+#
+# Adopt mode (--thumbs) binds a prebuilt fcache without running the indexer,
+# so its catalog permanently lacked (a) size/mtime/sha256 — the N6 identity
+# substrate, leaving reconcile blind to in-place edits; (b) ALL in-file
+# metadata (captions/keywords, dates/GPS/Rating), so §4 tier-1 precedence
+# was never applied and real libraries showed the wrong (ini) caption tier;
+# (c) mtime for the Recently Updated collection (honest 0, no explanation).
+# backfill_catalog is "the read side of the indexer without the thumbnail
+# work": it walks the already-known photo list, runs read_photo_meta on
+# each, and applies apply_photo_meta — the very functions build_cache uses —
+# so the merged result is indistinguishable from an indexed catalog.
+
+# Deliberately far below INDEX_WORKERS: the backfill reads EVERY original
+# (a whole-library I/O pass on exactly the 100k-scale libraries adopt mode
+# exists for) while the user is browsing, so it is throttled to two readers
+# plus a GIL yield per photo — background nicety, never a foreground race.
+BACKFILL_WORKERS = 2
+
+# Persist the catalog every N applied photos so a killed/quit app resumes
+# from the persisted cursor instead of restarting a multi-minute pass.
+BACKFILL_PERSIST_EVERY = 500
+
+
+@dataclass
+class BackfillResult:
+    photos: int      # photos processed THIS run (a resume counts the rest)
+    total: int       # catalog size
+    elapsed_s: float
+    workers: int
+
+
+def backfill_catalog(
+    catalog: Catalog,
+    catalog_path: Path,
+    progress: Callable[[int, int], None] | None = None,
+    cancel: threading.Event | None = None,
+    pause: threading.Event | None = None,
+    workers: int = BACKFILL_WORKERS,
+    persist_every: int = BACKFILL_PERSIST_EVERY,
+) -> BackfillResult | None:
+    """Fill an adopt-mode catalog's identity signals + in-file metadata in
+    place, resumably, persisting to `catalog_path` as it goes. Returns a
+    BackfillResult, or None if `cancel` stopped it mid-pass — in which case
+    the catalog on disk records IN_PROGRESS plus the resume cursor, and the
+    next call picks up exactly there.
+
+    Results are applied IN CATALOG ORDER (a bounded submission window of
+    `workers` reads is kept in flight, and the oldest is applied first), so
+    the persisted cursor is always a contiguous frontier: photos
+    [0, cursor) are done-and-durable, photos [cursor:] untouched. Every
+    applied photo yields the GIL (time.sleep(0)) so the two reader threads
+    never starve the UI thread's grid scrolling; a set `pause` event parks
+    the pass (checked between photos) until cleared or cancelled."""
+    total = len(catalog.photos)
+    start = 0
+    if catalog.backfill_state == BACKFILL_IN_PROGRESS:
+        start = min(max(0, catalog.backfill_cursor), total)
+    catalog.backfill_state = BACKFILL_IN_PROGRESS
+    catalog.backfill_cursor = start
+
+    def wait_while_paused() -> None:
+        while pause is not None and pause.is_set():
+            if cancel is not None and cancel.is_set():
+                return
+            time.sleep(0.05)
+
+    def cancelled() -> bool:
+        return cancel is not None and cancel.is_set()
+
+    t0 = time.perf_counter()
+    done = 0
+    since_save = 0
+    workers = max(1, workers)
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        window: deque = deque()  # (idx, future) in submission order
+        nxt = start
+
+        def top_up() -> None:
+            nonlocal nxt
+            while nxt < total and len(window) < workers:
+                window.append(
+                    (nxt, pool.submit(read_photo_meta, catalog.root,
+                                      catalog.photos[nxt])))
+                nxt += 1
+
+        wait_while_paused()
+        if not cancelled():
+            top_up()
+        while window:
+            idx, fut = window.popleft()
+            _data, size, mtime, sha, meta, fmeta = fut.result()
+            apply_photo_meta(catalog.photos[idx], size, mtime, sha,
+                             meta, fmeta)
+            catalog.backfill_cursor = idx + 1
+            done += 1
+            since_save += 1
+            if progress:
+                progress(idx + 1, total)
+            if since_save >= persist_every:
+                since_save = 0
+                save_catalog(catalog, catalog_path)
+            wait_while_paused()
+            if cancelled():
+                pool.shutdown(wait=False, cancel_futures=True)
+                # persist the frontier so the next launch resumes here
+                save_catalog(catalog, catalog_path)
+                return None
+            top_up()
+            time.sleep(0)  # yield the GIL to the UI thread (throttle)
+
+    if catalog.backfill_cursor < total:
+        # cancelled before the first read landed (the in-loop cancel path
+        # returned above): keep IN_PROGRESS at the current frontier
+        save_catalog(catalog, catalog_path)
+        return None
+    catalog.backfill_state = BACKFILL_COMPLETE
+    catalog.backfill_cursor = total
+    save_catalog(catalog, catalog_path)
+    return BackfillResult(photos=done, total=total,
+                          elapsed_s=time.perf_counter() - t0,
+                          workers=workers)
