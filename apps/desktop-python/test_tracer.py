@@ -6998,3 +6998,170 @@ def test_viewer_load_original_psd(tmp_path: Path) -> None:
 
     broken = _make_psd(tmp_path / "b.psd", truncate=True)
     assert load_original(str(broken), 0).isNull()
+
+
+def test_file_types_cache_key_and_walk_seam(tmp_path: Path) -> None:
+    """The File Types choice folds into cache identity exactly like
+    ScanFilter.cache_key: the default choice keys "" (existing cache dirs
+    keep binding), an exclusion keys a deterministic string, and toggling
+    an extension off and back on derives the SAME cache dir. The walk
+    seam honors the effective set; unknown names subtract nothing."""
+    from filetypes import effective_exts, exts_cache_key
+
+    assert exts_cache_key(set()) == ""
+    assert exts_cache_key({".xyz"}) == ""        # unknown: not a real choice
+    key = exts_cache_key({".tga", ".psd"})
+    assert key == "exts:no=.psd,.tga"            # deterministic, sorted
+    assert exts_cache_key({".psd", ".tga"}) == key
+    import catalog as catmod
+    assert effective_exts({".xyz"}) == frozenset(catmod.EXTS)
+    assert ".tga" not in effective_exts({".tga"})
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    sf = ScanFilter()
+    croot = tmp_path / "cr"
+    base = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key(set()))
+    off = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key({".tga"}))
+    back = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key(set()))
+    assert off != base                           # a changed set: its own dir
+    assert back == base                          # off-and-on: the SAME dir
+
+    make_jpeg(lib / "a.jpg")
+    _make_tga(lib / "b.tga")
+    assert [p.name for p in walk_library(lib)] == ["a.jpg", "b.tga"]
+    assert [p.name for p in
+            walk_library(lib, exts=effective_exts({".tga"}))] == ["a.jpg"]
+
+
+def test_file_types_toggle_returns_to_same_warm_cache(tmp_path: Path) -> None:
+    """End-to-end warm coherence (the CRITICAL property): build the
+    DEFAULT cache once; excluding an extension derives a different (cold)
+    cache dir whose walk the default cache must NOT bind (cache-order
+    parity would silently misalign tiles); re-enabling derives the
+    ORIGINAL dir again, where the persisted catalog still loads and the
+    original cache still binds — the user gets their warm start back."""
+    from filetypes import effective_exts, exts_cache_key
+
+    lib = tmp_path / "lib"
+    make_jpeg(lib / "a.jpg")
+    _make_tga(lib / "b.tga")
+    croot = tmp_path / "cr"
+    sf = ScanFilter()
+    base_dir = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key(set()))
+    cat = scan_library(lib)
+    thumbcache.build_cache(cat, base_dir)
+    save_catalog(cat, base_dir / "catalog.json")
+
+    excluded = {".tga"}
+    off_dir = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key(excluded))
+    assert off_dir != base_dir
+    assert not (off_dir / "thumbs.fcache").exists()   # cold, its own dir
+    cat_off = scan_library(lib, exts=effective_exts(excluded))
+    assert [p.rel for p in cat_off.photos] == ["a.jpg"]
+    with pytest.raises(thumbcache.CacheError):
+        thumbcache.bind(
+            thumbcache.load_cache(base_dir / "thumbs.fcache"), cat_off)
+
+    on_dir = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key(set()))
+    assert on_dir == base_dir                    # back to the SAME dir...
+    loaded = load_catalog(on_dir / "catalog.json", lib)
+    assert loaded is not None                    # ...whose catalog loads...
+    cache = thumbcache.load_cache(on_dir / "thumbs.fcache")
+    thumbcache.bind(cache, loaded)               # ...and whose cache binds
+
+
+def test_file_types_config_roundtrip(tmp_path: Path) -> None:
+    """Per-library persistence in config.json: save/load round-trips,
+    other libraries' entries and the remembered-library key are
+    preserved, clearing an exclusion removes the entry (default = no
+    entry at all), and a garbage file, unknown names, or undotted case
+    variants all fail soft / normalize."""
+    from filetypes import load_excluded_exts, save_excluded_exts
+
+    croot = tmp_path / "cr"
+    croot.mkdir()
+    lib_a = tmp_path / "A"
+    lib_a.mkdir()
+    lib_b = tmp_path / "B"
+    lib_b.mkdir()
+    cfg = croot / "config.json"
+    cfg.write_text(json.dumps({"library": "keepme"}))
+
+    assert load_excluded_exts(croot, lib_a) == set()
+    assert save_excluded_exts(croot, lib_a, {".psd", ".tga"})
+    assert save_excluded_exts(croot, lib_b, {".gif"})
+    assert load_excluded_exts(croot, lib_a) == {".psd", ".tga"}
+    assert load_excluded_exts(croot, lib_b) == {".gif"}
+    data = json.loads(cfg.read_text())
+    assert data["library"] == "keepme"           # other keys preserved
+
+    assert save_excluded_exts(croot, lib_a, set())   # back to default
+    data = json.loads(cfg.read_text())
+    assert str(lib_a.resolve()) not in data.get("exclude_exts", {})
+    assert load_excluded_exts(croot, lib_b) == {".gif"}  # B untouched
+
+    cfg.write_text("not json at all")
+    assert load_excluded_exts(croot, lib_b) == set()     # fail-soft
+    assert save_excluded_exts(croot, lib_b, {".bmp"})    # rebuilds the file
+    assert load_excluded_exts(croot, lib_b) == {".bmp"}
+
+    cfg.write_text(json.dumps(
+        {"exclude_exts": {str(lib_b.resolve()): [".nope", "TGA", 7]}}))
+    assert load_excluded_exts(croot, lib_b) == {".tga"}  # normalized+filtered
+
+
+def test_file_types_dialog_checkboxes() -> None:
+    """The panel lists every supported extension exactly once (grouped
+    Stills / RAW / Video in EXTS lockstep by construction), reflects the
+    persisted exclusions, and edits round-trip through excluded() — the
+    set the accept handler persists and folds into the cache key."""
+    _offscreen_app()
+    import catalog as catmod
+    from filetypes import STILL_EXTS, FileTypesDialog
+    from rawload import RAW_EXTS
+    from videoload import VIDEO_EXTS
+
+    assert STILL_EXTS | RAW_EXTS | VIDEO_EXTS == frozenset(catmod.EXTS)
+    dlg = FileTypesDialog({".psd"})
+    assert set(dlg.boxes) == set(catmod.EXTS)    # one box per extension
+    assert not dlg.boxes[".psd"].isChecked()     # persisted exclusion shown
+    assert dlg.boxes[".jpg"].isChecked()
+    dlg.boxes[".tga"].setChecked(False)
+    dlg.boxes[".psd"].setChecked(True)
+    assert dlg.excluded() == {".tga"}
+
+
+def test_make_thumbcache_exclude_exts(tmp_path: Path) -> None:
+    """--exclude-exts mirrors the panel for adopt-mode parity, driven
+    through the pool-free --sidecar-only path: the excluded walk matches
+    a cache built over the same effective set (count + files agree), the
+    same invocation WITHOUT the flag sees the extra file and refuses, and
+    an unsupported name is a hard usage error (exit 2), never a silent
+    no-op."""
+    from filetypes import effective_exts
+
+    mtc = _load_mtc()
+    lib = tmp_path / "lib"
+    make_jpeg(lib / "a.jpg")
+    _make_tga(lib / "b.tga")
+    cat = scan_library(lib, exts=effective_exts({".tga"}))
+    out = thumbcache.build_cache(cat, tmp_path / "c").path
+
+    assert mtc.main(["--library", str(lib), "--out", str(out),
+                     "--sidecar-only", "--exclude-exts", ".tga"]) == 0
+    meta = json.loads(out.with_suffix(".fcache.json").read_text())
+    assert meta["files"] == ["a.jpg"]            # the excluded walk
+    thumbcache.bind(thumbcache.load_cache(out), cat)  # adopt-mode parity
+
+    # without the flag the fresh walk sees b.tga too: count mismatch
+    assert mtc.main(["--library", str(lib), "--out", str(out),
+                     "--sidecar-only"]) == 2
+    assert mtc.main(["--library", str(lib), "--out", str(out),
+                     "--exclude-exts", ".bogus"]) == 2
