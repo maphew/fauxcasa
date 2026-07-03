@@ -95,6 +95,7 @@ from filetypes import (  # noqa: E402
     save_excluded_exts,
 )
 from grid import DEFAULT_SORT_MODE, SORT_MODES, GridView  # noqa: E402
+import keymap  # noqa: E402
 from thumbcache import (  # noqa: E402
     CacheError,
     ThumbCache,
@@ -666,7 +667,8 @@ class MainWindow(QMainWindow):
         self.play_action = bar.addAction("▶ Play")
         self.play_action.setToolTip(
             "Slideshow of the current view (F11) — Space pauses, Esc exits")
-        self.play_action.setShortcut("F11")
+        # The binding comes from the keymap default scheme (q6l.8).
+        self.play_action.setShortcuts(keymap.shortcuts("app.play"))
         self.play_action.triggered.connect(self._start_slideshow)
         bar.addSeparator()
         self.search = QLineEdit()

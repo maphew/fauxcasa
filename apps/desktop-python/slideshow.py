@@ -30,6 +30,7 @@ import threading
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter
 
+import keymap
 from viewer import CAPTION_BG, ViewerPage, load_original
 
 # Dwell per slide. 4 s follows the one delay default the Picasa corpus
@@ -143,14 +144,14 @@ class SlideshowPage(ViewerPage):
         self.update()
 
     def keyPressEvent(self, event) -> None:
-        key = event.key()
-        if key == Qt.Key.Key_Space:
+        # Bindings via the keymap default scheme (fauxcasa-q6l.8).
+        if keymap.matches(event, "slideshow.pause"):
             self.toggle_pause()
-        elif key in (Qt.Key.Key_Left, Qt.Key.Key_K):
+        elif keymap.matches(event, "slideshow.prev"):
             self._manual(-1)
-        elif key in (Qt.Key.Key_Right, Qt.Key.Key_J):
+        elif keymap.matches(event, "slideshow.next"):
             self._manual(1)
-        elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace):
+        elif keymap.matches(event, "slideshow.exit"):
             self._exit()
         else:
             event.ignore()
