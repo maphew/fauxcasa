@@ -29,7 +29,17 @@ source of truth.
 
 ## Formats
 
-Stills: JPEG, PNG, GIF, BMP, TIFF, WebP (Qt image plugins). **RAW**
+Stills: JPEG, PNG, GIF, BMP, TIFF, WebP, TGA (Qt image plugins) and PSD
+(fauxcasa-v46.4): Qt ships no PSD plugin, so when `QImageReader` yields
+null for a still, `pillowload.py` makes one Pillow attempt on the same
+bytes — for PSD that reads the **flattened composite** only "maximize
+compatibility" saves carry; a PSD without one honestly error-tiles.
+**File Types panel** (Tools > File Types…, §5): per-extension
+include/exclude persisted per library in `config.json`; the choice folds
+into the cache identity like the scan filter (`filetypes.exts_cache_key`)
+so each extension set owns its cache dir and re-enabling a type returns
+to the same warm cache; `make-thumbcache.py --exclude-exts` mirrors it
+for adopt mode. **RAW**
 (fauxcasa-v46.1): Picasa's documented 16-vendor extension list — DNG,
 CRW/CR2, RAW, RAF, 3FR, DCR/KDC, MRW, NEF/NRW, ORF, RW2, PEF, X3F,
 ARW/SRF/SR2 — decoded via `rawpy` (an *updatable* LibRaw wheel, never a

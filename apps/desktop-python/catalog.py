@@ -74,12 +74,14 @@ from rawload import RAW_EXTS, is_raw_suffix  # noqa: E402
 from videoload import VIDEO_EXTS, is_video_suffix  # noqa: E402
 
 # Must match scripts/make-thumbcache.py EXTS exactly (cache-order parity):
-# the stills set below PLUS Picasa's documented 16-vendor RAW extension
+# the stills set below — the full §5 stills matrix incl. TGA (Qt's qtga
+# plugin decodes it) and PSD (Pillow flattened-composite fallback,
+# fauxcasa-v46.4) — PLUS Picasa's documented 16-vendor RAW extension
 # list (rawload.RAW_EXTS, fauxcasa-v46.1) PLUS Picasa's documented video
 # list (videoload.VIDEO_EXTS, fauxcasa-v46.2) — any change to any part
 # lands in BOTH files or caches stop binding.
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
-        ".webp"} | RAW_EXTS | VIDEO_EXTS
+        ".webp", ".tga", ".psd"} | RAW_EXTS | VIDEO_EXTS
 
 INI_NAMES = (".picasa.ini", "Picasa.ini", "picasa.ini")
 
@@ -305,12 +307,21 @@ def _passes_scan_filter(path: Path, scan_filter: ScanFilter | None) -> bool:
 
 
 def walk_library(root: Path,
-                 scan_filter: ScanFilter | None = None) -> list[Path]:
+                 scan_filter: ScanFilter | None = None,
+                 exts: frozenset[str] | set[str] | None = None) -> list[Path]:
     """The shared walk rule: sorted(Path) = path-component order. Any
     change here must also land in scripts/make-thumbcache.py or caches
-    stop binding (the shipped benchmark cache uses this order)."""
+    stop binding (the shipped benchmark cache uses this order).
+
+    `exts` is the EFFECTIVE extension set (None = the full EXTS): the
+    File Types panel's per-library include/exclude (fauxcasa-v46.4,
+    filetypes.py). Because the walk rule is load-bearing for cache-order
+    parity, any non-default set MUST be folded into the cache identity
+    by the caller (filetypes.exts_cache_key, the ScanFilter.cache_key
+    shape) so each set gets its own cache dir and warm starts cohere."""
+    pool = EXTS if exts is None else exts
     files = sorted(
-        p for p in root.rglob("*") if p.suffix.lower() in EXTS and p.is_file()
+        p for p in root.rglob("*") if p.suffix.lower() in pool and p.is_file()
     )
     if scan_filter is None or not scan_filter.active:
         return files
@@ -683,16 +694,18 @@ def rel_paths(root: Path, files: list[Path]) -> list[str]:
 def scan_library(root: Path,
                  scan_filter: ScanFilter | None = None,
                  contacts: dict[str, str] | None = None,
-                 pal_dir: Path | None = None) -> Catalog:
+                 pal_dir: Path | None = None,
+                 exts: frozenset[str] | set[str] | None = None) -> Catalog:
     """Walk `root` and build the catalog. `contacts` is the machine-local
     contacts.xml id->name map (load_contacts_xml); per §4 it wins over the
     ini [Contacts2] tables when both name a contact. `pal_dir` is a
     Picasa2Albums directory of .pal album files, merged per §4 (ini wins
     membership; .pal fills gaps only — see _merge_pal_albums). Conflicts
     and unknown-uid placeholders land on the catalog's ImportReport, never
-    resolved silently (fauxcasa-cam.13/.8)."""
+    resolved silently (fauxcasa-cam.13/.8). `exts` is the effective
+    extension set from the File Types panel (walk_library docstring)."""
     root = root.resolve()
-    files = walk_library(root, scan_filter)
+    files = walk_library(root, scan_filter, exts)
     contacts = contacts or {}
     report = ImportReport()
 
@@ -947,7 +960,11 @@ def scan_library(root: Path,
 # = complete). A v7 adopt catalog carries neither the key nor any way to
 # tell "never backfilled" from "complete", so it is rejected and the cold
 # walk re-adopts with an explicit NOT_STARTED state — which then backfills.
-CATALOG_VERSION = 8
+# v9: TGA and PSD stills join the walk (§5 stills matrix, fauxcasa-v46.4)
+# — a v8 catalog was walked without them, so a warm start would silently
+# hide every TGA/PSD in the library until some unrelated drift; reject
+# and cold-rebuild (the same shape as the v7 video bump).
+CATALOG_VERSION = 9
 
 # The import report's file name, written beside catalog.json (same cache
 # dir) by save_report and re-attached on warm starts via load_report.
@@ -1190,15 +1207,19 @@ class Drift:
 
 def reconcile_walk(catalog: Catalog, root: Path,
                    scan_filter: ScanFilter | None = None,
-                   cancel=None) -> Drift | None:
+                   cancel=None,
+                   exts: frozenset[str] | set[str] | None = None
+                   ) -> Drift | None:
     """Fresh walk + stat, compared to the catalog's stored signals.
     Photos whose stored signal is absent (-1) can't be compared and are
     never counted as modified (only a genuine size/mtime change is).
     Returns None if the cancel event is set mid-walk, so shutdown can
     reap the background thread promptly instead of waiting out a 100k
-    stat-walk on the join timeout."""
+    stat-walk on the join timeout. `exts` must be the SAME effective
+    extension set the catalog was walked with (walk_library docstring),
+    or every excluded file would read as phantom drift."""
     root = root.resolve()
-    files = walk_library(root, scan_filter)
+    files = walk_library(root, scan_filter, exts)
     fresh: dict[str, tuple[int, int]] = {}
     for i, (p, rel) in enumerate(zip(files, rel_paths(root, files))):
         if cancel is not None and i % 512 == 0 and cancel.is_set():

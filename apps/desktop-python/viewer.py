@@ -148,6 +148,14 @@ def load_original_oriented(path: str, rotate: int) -> tuple[QImage, int]:
             reader = QImageReader(buf)
             reader.setAutoTransform(True)
             img = reader.read()
+            if img.isNull():
+                # Qt has no decoder for this still (PSD — Pillow reads
+                # the flattened composite, fauxcasa-v46.4): same bytes,
+                # one Pillow attempt, orientation applied exactly once
+                # by exif_transpose there (pillowload module doc).
+                from pillowload import pillow_qimage
+
+                img = pillow_qimage(data)
     if not img.isNull() and rotate:
         from PySide6.QtGui import QTransform
 

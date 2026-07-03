@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["PySide6", "rawpy", "exiv2"]
+# dependencies = ["PySide6", "rawpy", "exiv2", "pillow", "av"]
 # ///
 """Tracer bullet app (fauxcasa-pzx): a thin but real end-to-end slice of
 the product on the proposed Python + Qt stack.
@@ -86,6 +86,13 @@ from catalog import (  # noqa: E402
     save_catalog,
     save_report,
     scan_library,
+)
+from filetypes import (  # noqa: E402
+    FileTypesDialog,
+    effective_exts,
+    exts_cache_key,
+    load_excluded_exts,
+    save_excluded_exts,
 )
 from grid import DEFAULT_SORT_MODE, SORT_MODES, GridView  # noqa: E402
 import keymap  # noqa: E402
@@ -571,11 +578,18 @@ class MainWindow(QMainWindow):
                  warm: bool = False, adopt: bool = False,
                  cache_root: Path | None = None,
                  contacts: dict[str, str] | None = None,
-                 pal_dir: Path | None = None):
+                 pal_dir: Path | None = None,
+                 excluded_exts: set[str] | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
         self.scan_filter = scan_filter
+        # File Types panel choice (fauxcasa-v46.4): the persisted excluded
+        # set and the effective walk set derived from it, kept so every
+        # background rescan/reconcile walks exactly what startup walked —
+        # an excluded extension must never read as phantom drift.
+        self.excluded_exts = set(excluded_exts or ())
+        self.exts = effective_exts(self.excluded_exts)
         # machine-local contacts.xml names, kept so a reconcile rebuild's
         # rescan resolves faces the same way the startup scan did
         self.contacts = contacts or {}
@@ -627,6 +641,17 @@ class MainWindow(QMainWindow):
         # --- sidebar: All / Starred / Folders / Albums ---
         self.tree = self._new_sidebar_tree()
         self._build_sidebar()
+
+        # --- menu bar: Tools (fauxcasa-v46.4) ---
+        # The File Types panel is the first menu item the tracer grows; a
+        # menu bar (not another toolbar button) because configuration
+        # belongs off the browsing surface — Picasa's own Tools > Options
+        # > File Types location, minus the Options tabs we don't have.
+        tools_menu = self.menuBar().addMenu("&Tools")
+        self.file_types_action = tools_menu.addAction("File &Types…")
+        self.file_types_action.setStatusTip(
+            "Choose which file types are scanned into this library")
+        self.file_types_action.triggered.connect(self._show_file_types)
 
         # --- toolbar: search + zoom ---
         bar = QToolBar()
@@ -818,7 +843,8 @@ class MainWindow(QMainWindow):
         def work() -> None:
             try:
                 drift = reconcile_walk(old, old.root, self.scan_filter,
-                                       cancel=self.build_cancel)
+                                       cancel=self.build_cancel,
+                                       exts=self.exts)
             except Exception as e:
                 log.error("reconcile walk failed: %s", e)
                 return
@@ -836,7 +862,8 @@ class MainWindow(QMainWindow):
             fresh = None
             try:
                 fresh = scan_library(old.root, self.scan_filter,
-                                     self.contacts, self.pal_dir)
+                                     self.contacts, self.pal_dir,
+                                     exts=self.exts)
                 result = build_cache(fresh, cache_dir, None,
                                      cancel=self.build_cancel)
                 if result is None:
@@ -1010,6 +1037,39 @@ class MainWindow(QMainWindow):
                 self, APP_NAME, f"Could not open the selected folder:\n{root}")
             return
         _remember_library(self.cache_root, root)
+        self.shutdown()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _show_file_types(self) -> None:
+        """Tools > File Types… (§5: per-extension include/exclude panel —
+        Picasa's Tools > Options > File Types). A plain modal dialog by
+        judgment (filetypes module doc): one-shot configuration with a
+        cache-identity consequence, not a browsing workflow. An accepted
+        change persists per-library into config.json and relaunches
+        through the same single-sourced startup as Open... — the walk AND
+        the cache dir both change with the extension set, and toggling a
+        type back returns to the previous warm cache (exts_cache_key)."""
+        dlg = FileTypesDialog(self.excluded_exts, self)
+        if not dlg.exec_():
+            return
+        excluded = dlg.excluded()
+        if excluded == self.excluded_exts:
+            return
+        if not save_excluded_exts(self.cache_root, self.catalog.root,
+                                  excluded):
+            self.statusBar().showMessage(
+                "could not save the file-type choice — see the log", 8000)
+            return
+        program, args = _restart_command(self.catalog.root, self.cache_root)
+        started = QProcess.startDetached(program, args)
+        ok = started[0] if isinstance(started, tuple) else started
+        if not ok:
+            # The choice IS saved; it just needs a launch to apply.
+            self.statusBar().showMessage(
+                "file-type choice saved — restart to apply", 8000)
+            return
         self.shutdown()
         app = QApplication.instance()
         if app is not None:
@@ -1804,6 +1864,18 @@ def main() -> int:
     scan_filter = ScanFilter(min_width=min_w, min_height=min_h,
                              max_width=max_w, max_height=max_h)
 
+    # Per-library File Types choice (fauxcasa-v46.4): the persisted
+    # excluded set drives the effective walk set for every scan below AND
+    # folds into the cache identity exactly like the scan filter — a
+    # changed extension set is its own cache dir; the default ("" key)
+    # keeps existing caches binding, and re-enabling a type returns to
+    # the earlier warm cache.
+    excluded_exts = load_excluded_exts(args.cache_root, root)
+    exts = effective_exts(excluded_exts)
+    if excluded_exts:
+        log.info("file types: excluding %s (Tools > File Types)",
+                 ", ".join(sorted(excluded_exts)))
+
     # Face names from the machine-local contacts.xml (fauxcasa-cam.2):
     # an explicit --contacts wins, else the Picasa AppData default when
     # present. Read-only enrichment — absence or garbage is never fatal,
@@ -1836,7 +1908,9 @@ def main() -> int:
     # always derived from the library root, so even an adopted-cache run
     # persists its catalog and warm-starts next time.
     adopt = args.thumbs is not None
-    cache_dir = cache_dir_for(root, args.cache_root, scan_filter.cache_key())
+    cache_dir = cache_dir_for(root, args.cache_root,
+                              scan_filter.cache_key()
+                              + exts_cache_key(excluded_exts))
     cat_path = cache_dir / "catalog.json"
     thumbs_path = args.thumbs if adopt else cache_dir / "thumbs.fcache"
 
@@ -1860,7 +1934,8 @@ def main() -> int:
                 log.warning("persisted cache unusable (%s); rescanning", e)
 
     if catalog is None:  # cold path
-        catalog = scan_library(root, scan_filter, contacts, pal_dir)
+        catalog = scan_library(root, scan_filter, contacts, pal_dir,
+                               exts=exts)
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
@@ -1901,7 +1976,8 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
-                     contacts=contacts, pal_dir=pal_dir)
+                     contacts=contacts, pal_dir=pal_dir,
+                     excluded_exts=excluded_exts)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)

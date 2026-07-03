@@ -36,6 +36,7 @@ from catalog import (
 )
 from inmeta import read_jpeg_metadata
 from metareader import read_file_meta
+from pillowload import pillow_qimage
 from rawload import is_raw_suffix, raw_demosaic_qimage, raw_preview_jpeg
 from videoload import is_video_suffix, poster_qimage
 
@@ -396,6 +397,13 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
             reader.setScaledSize(QSize(max(1, round(sz.width() * s)),
                                        max(1, round(sz.height() * s))))
         img = reader.read()
+        if img.isNull() and data:
+            # Qt yielded null for a still (no PSD plugin ships with Qt;
+            # exotic TIFF/JPEG variants): one Pillow attempt on the same
+            # bytes before the error tile (fauxcasa-v46.4). Extension-
+            # routed RAW/video never reach this branch — their decode
+            # above hands back a QImage, null or not (pillowload doc).
+            img = pillow_qimage(data, top)
     if img.isNull():
         return (idx, [(b"", 0, 0) for _ in levels], size, mtime, sha,
                 meta, fmeta, None)
