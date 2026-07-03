@@ -94,8 +94,10 @@ VIDEO_EXTS = frozenset({
 # Poster grab point, seconds — mirror of videoload.POSTER_SEEK_S.
 POSTER_SEEK_S = 1.0
 # Must match apps/desktop-python/catalog.py EXTS exactly (cache-order parity).
+# TGA/PSD joined the stills set with fauxcasa-v46.4; PIL reads both natively
+# (PSD = the flattened composite, matching the app's Pillow fallback).
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
-        ".webp"} | RAW_EXTS | VIDEO_EXTS
+        ".webp", ".tga", ".psd"} | RAW_EXTS | VIDEO_EXTS
 # Mirror of apps/desktop-python/thumbcache.py.RECOMMENDED_LEVELS — 512 is the
 # hi-DPI/loupe payload, 256 is the grid's primary, 128 a cheap low-DPI level.
 RECOMMENDED_LEVELS = (512, THUMB_EDGE, 128)
@@ -252,6 +254,16 @@ def main(argv: list[str] | None = None) -> int:
         "level set should include 256 so the tracer grid is unaffected.",
     )
     ap.add_argument(
+        "--exclude-exts",
+        type=str,
+        default=None,
+        metavar="EXTS",
+        help="comma-separated extensions to leave OUT of the walk, e.g. "
+        "'.psd,.tga' — the adopt-mode mirror of the app's File Types "
+        "panel (fauxcasa-v46.4): a cache built with the same exclusions "
+        "binds to a catalog walked with them",
+    )
+    ap.add_argument(
         "--sidecar-only",
         action="store_true",
         help="rewrite the JSON sidecar from a fresh library walk; "
@@ -270,9 +282,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"library not found: {args.library}", file=sys.stderr)
         return 2
 
+    exts = set(EXTS)
+    if args.exclude_exts:
+        drop = {e if e.startswith(".") else "." + e
+                for e in (s.strip().lower()
+                          for s in args.exclude_exts.split(",")) if e}
+        unknown = drop - exts
+        if unknown:
+            print("--exclude-exts: unsupported extension(s): "
+                  + ", ".join(sorted(unknown)), file=sys.stderr)
+            return 2
+        exts -= drop
+
     files = sorted(
         p for p in args.library.rglob("*")
-        if p.suffix.lower() in EXTS and p.is_file()
+        if p.suffix.lower() in exts and p.is_file()
     )
     if not files:
         print("no images found", file=sys.stderr)

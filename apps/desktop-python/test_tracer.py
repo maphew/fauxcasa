@@ -6426,7 +6426,9 @@ def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
     path.write_text(json.dumps(data))
     assert load_catalog(path, root) is None
 
-    assert catmod.CATALOG_VERSION == 8
+    # v9 = TGA/PSD stills joined the walk (fauxcasa-v46.4); bump this pin
+    # with every CATALOG_VERSION change so the rejection below stays real.
+    assert catmod.CATALOG_VERSION == 9
     cat.backfill_state = BACKFILL_COMPLETE
     save_catalog(cat, path)
     data = json.loads(path.read_text())
@@ -7065,3 +7067,388 @@ def test_slideshow_follows_folder_sort_order(tmp_path: Path) -> None:
     assert win._slideshow is not None
     assert win._slideshow.display == [2, 1, 0]
     win._slideshow._exit()
+
+
+# ===========================================================================
+# ---- stills format matrix (fauxcasa-v46.4): TGA, PSD Pillow fallback,
+# ---- File Types panel, non-JPEG regression fixtures
+# ===========================================================================
+
+
+def _load_mtc():
+    """scripts/make-thumbcache.py as a module (hyphenated file name)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+    return mtc
+
+
+def _make_tga(path: Path, w: int = 64, h: int = 48,
+              color: tuple[int, int, int] = (40, 200, 90)) -> Path:
+    """A synthetic TGA via Pillow (Qt's qtga plugin reads, PIL writes)."""
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (w, h), color).save(path, "TGA")
+    return path
+
+
+def test_stills_extensions_in_both_walkers(tmp_path: Path) -> None:
+    """The full §5 stills matrix (JPEG, PNG, TIFF, GIF, BMP, PSD, TGA,
+    WebP) is in BOTH EXTS sets, in lockstep, and both walks pick the
+    v46.4 additions (TGA, PSD) up case-insensitively — the walk-parity
+    contract that keeps caches binding."""
+    import catalog
+
+    mtc = _load_mtc()
+    stills = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
+              ".webp", ".tga", ".psd"}
+    assert stills <= catalog.EXTS
+    assert catalog.EXTS == mtc.EXTS           # the whole lockstep set
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    for name in ("a.TGA", "b.psd", "c.Tga", "d.PSD"):
+        (root / name).write_bytes(b"stub")    # walk checks suffix only
+    make_jpeg(root / "e.jpg")
+    walked = [p.name for p in walk_library(root)]
+    assert sorted(walked) == ["a.TGA", "b.psd", "c.Tga", "d.PSD", "e.jpg"]
+    script_walk = sorted(p for p in root.rglob("*")
+                         if p.suffix.lower() in mtc.EXTS and p.is_file())
+    assert [p.name for p in script_walk] == walked
+
+
+def test_tga_thumbs_through_real_indexer(tmp_path: Path) -> None:
+    """A TGA rides the ordinary QImageReader decode (the pinned PySide6
+    build ships qtga): the REAL _index_one path produces a color-correct
+    thumb, not an error tile — and the standalone PIL builder reads the
+    same file natively (cache-content parity)."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    _make_tga(root / "t.tga")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    (_o, length, w, h), = cache.entries
+    assert length > 0 and (w, h) == (64, 48)
+    px = _thumb_qimage(cache, 0).pixelColor(32, 24)
+    assert abs(px.red() - 40) < 30 and abs(px.green() - 200) < 30 \
+        and abs(px.blue() - 90) < 30
+
+    (blob, w, h), = _load_mtc()._make_thumb(root / "t.tga", [256])
+    assert blob and (w, h) == (64, 48)        # PIL reads TGA natively
+
+
+def _make_psd(path: Path, w: int = 64, h: int = 48,
+              color: tuple[int, int, int] = (200, 60, 120),
+              truncate: bool = False) -> Path:
+    """A synthetic 'maximize compatibility' PSD: hand-built to the
+    documented framing (Pillow READS PSD but cannot write it) — 8BPS v1
+    header, empty color-mode/resources/layer sections, then the raw-
+    compression flattened composite as planar RGB. Privacy-safe like the
+    hand-built APP segments above. `truncate=True` cuts the composite
+    planes short: the synthetic stand-in for a PSD saved WITHOUT
+    maximize-compatibility (no usable composite -> legitimately an
+    error tile, never a crash)."""
+    r, g, b = color
+    out = (b"8BPS" + struct.pack(">H", 1) + b"\x00" * 6
+           + struct.pack(">H", 3)            # channels
+           + struct.pack(">II", h, w)        # rows, columns
+           + struct.pack(">HH", 8, 3))       # 8-bit, mode 3 = RGB
+    out += struct.pack(">I", 0)              # color mode data: empty
+    out += struct.pack(">I", 0)              # image resources: empty
+    out += struct.pack(">I", 0)              # layer & mask info: empty
+    planes = (bytes([r]) * (w * h) + bytes([g]) * (w * h)
+              + bytes([b]) * (w * h))
+    data = struct.pack(">H", 0) + planes     # compression 0 = raw
+    if truncate:
+        data = data[: 2 + (w * h) // 2]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(out + data)
+    return path
+
+
+def test_psd_composite_decodes_no_composite_error_tiles(tmp_path: Path) -> None:
+    """PSD through the REAL _index_one path: Qt has no PSD plugin, so the
+    Pillow fallback (pillowload) must decode the flattened composite —
+    color-correct, right dims — while a PSD whose composite is unusable
+    yields the standard zero-length error tile and never sinks the batch.
+    The standalone PIL builder agrees on both (cache-content parity)."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    _make_psd(root / "good.psd")
+    _make_psd(root / "nocomposite.psd", truncate=True)
+    make_jpeg(root / "ok.jpg")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    ent = {rel: e for rel, e in zip(cache.files, cache.entries)}
+    _o, length, w, h = ent["good.psd"]
+    assert length > 0 and (w, h) == (64, 48)
+    idx = cache.files.index("good.psd")
+    px = _thumb_qimage(cache, idx).pixelColor(32, 24)
+    assert abs(px.red() - 200) < 30 and abs(px.green() - 60) < 30 \
+        and abs(px.blue() - 120) < 30
+    assert ent["nocomposite.psd"][1] == 0     # error tile, by design
+    assert ent["ok.jpg"][1] > 0               # neighbors unharmed
+
+    mtc = _load_mtc()
+    (blob, w, h), = mtc._make_thumb(root / "good.psd", [256])
+    assert blob and (w, h) == (64, 48)        # PIL reads the composite
+    assert mtc._make_thumb(root / "nocomposite.psd", [256]) == [(b"", 0, 0)]
+
+
+def test_viewer_load_original_psd(tmp_path: Path) -> None:
+    """The viewer's full-decode path (shared by the slideshow prefetch):
+    a composite-bearing PSD renders via the Pillow fallback, the Picasa
+    rotate= turns compose on top exactly like any format, and a PSD with
+    no usable composite returns a null QImage (the viewer paints its
+    honest 'could not decode this file' text — fail-soft contract)."""
+    _offscreen_app()
+    from viewer import load_original
+
+    good = _make_psd(tmp_path / "g.psd")
+    img = load_original(str(good), 0)
+    assert (img.width(), img.height()) == (64, 48)
+    px = img.pixelColor(32, 24)
+    assert abs(px.red() - 200) < 30 and abs(px.blue() - 120) < 30
+    img = load_original(str(good), 1)         # rotate= composes on top
+    assert (img.width(), img.height()) == (48, 64)
+
+    broken = _make_psd(tmp_path / "b.psd", truncate=True)
+    assert load_original(str(broken), 0).isNull()
+
+
+def test_file_types_cache_key_and_walk_seam(tmp_path: Path) -> None:
+    """The File Types choice folds into cache identity exactly like
+    ScanFilter.cache_key: the default choice keys "" (existing cache dirs
+    keep binding), an exclusion keys a deterministic string, and toggling
+    an extension off and back on derives the SAME cache dir. The walk
+    seam honors the effective set; unknown names subtract nothing."""
+    from filetypes import effective_exts, exts_cache_key
+
+    assert exts_cache_key(set()) == ""
+    assert exts_cache_key({".xyz"}) == ""        # unknown: not a real choice
+    key = exts_cache_key({".tga", ".psd"})
+    assert key == "exts:no=.psd,.tga"            # deterministic, sorted
+    assert exts_cache_key({".psd", ".tga"}) == key
+    import catalog as catmod
+    assert effective_exts({".xyz"}) == frozenset(catmod.EXTS)
+    assert ".tga" not in effective_exts({".tga"})
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    sf = ScanFilter()
+    croot = tmp_path / "cr"
+    base = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key(set()))
+    off = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key({".tga"}))
+    back = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key(set()))
+    assert off != base                           # a changed set: its own dir
+    assert back == base                          # off-and-on: the SAME dir
+
+    make_jpeg(lib / "a.jpg")
+    _make_tga(lib / "b.tga")
+    assert [p.name for p in walk_library(lib)] == ["a.jpg", "b.tga"]
+    assert [p.name for p in
+            walk_library(lib, exts=effective_exts({".tga"}))] == ["a.jpg"]
+
+
+def test_file_types_toggle_returns_to_same_warm_cache(tmp_path: Path) -> None:
+    """End-to-end warm coherence (the CRITICAL property): build the
+    DEFAULT cache once; excluding an extension derives a different (cold)
+    cache dir whose walk the default cache must NOT bind (cache-order
+    parity would silently misalign tiles); re-enabling derives the
+    ORIGINAL dir again, where the persisted catalog still loads and the
+    original cache still binds — the user gets their warm start back."""
+    from filetypes import effective_exts, exts_cache_key
+
+    lib = tmp_path / "lib"
+    make_jpeg(lib / "a.jpg")
+    _make_tga(lib / "b.tga")
+    croot = tmp_path / "cr"
+    sf = ScanFilter()
+    base_dir = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key(set()))
+    cat = scan_library(lib)
+    thumbcache.build_cache(cat, base_dir)
+    save_catalog(cat, base_dir / "catalog.json")
+
+    excluded = {".tga"}
+    off_dir = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key(excluded))
+    assert off_dir != base_dir
+    assert not (off_dir / "thumbs.fcache").exists()   # cold, its own dir
+    cat_off = scan_library(lib, exts=effective_exts(excluded))
+    assert [p.rel for p in cat_off.photos] == ["a.jpg"]
+    with pytest.raises(thumbcache.CacheError):
+        thumbcache.bind(
+            thumbcache.load_cache(base_dir / "thumbs.fcache"), cat_off)
+
+    on_dir = thumbcache.cache_dir_for(
+        lib, croot, sf.cache_key() + exts_cache_key(set()))
+    assert on_dir == base_dir                    # back to the SAME dir...
+    loaded = load_catalog(on_dir / "catalog.json", lib)
+    assert loaded is not None                    # ...whose catalog loads...
+    cache = thumbcache.load_cache(on_dir / "thumbs.fcache")
+    thumbcache.bind(cache, loaded)               # ...and whose cache binds
+
+
+def test_file_types_config_roundtrip(tmp_path: Path) -> None:
+    """Per-library persistence in config.json: save/load round-trips,
+    other libraries' entries and the remembered-library key are
+    preserved, clearing an exclusion removes the entry (default = no
+    entry at all), and a garbage file, unknown names, or undotted case
+    variants all fail soft / normalize."""
+    from filetypes import load_excluded_exts, save_excluded_exts
+
+    croot = tmp_path / "cr"
+    croot.mkdir()
+    lib_a = tmp_path / "A"
+    lib_a.mkdir()
+    lib_b = tmp_path / "B"
+    lib_b.mkdir()
+    cfg = croot / "config.json"
+    cfg.write_text(json.dumps({"library": "keepme"}))
+
+    assert load_excluded_exts(croot, lib_a) == set()
+    assert save_excluded_exts(croot, lib_a, {".psd", ".tga"})
+    assert save_excluded_exts(croot, lib_b, {".gif"})
+    assert load_excluded_exts(croot, lib_a) == {".psd", ".tga"}
+    assert load_excluded_exts(croot, lib_b) == {".gif"}
+    data = json.loads(cfg.read_text())
+    assert data["library"] == "keepme"           # other keys preserved
+
+    assert save_excluded_exts(croot, lib_a, set())   # back to default
+    data = json.loads(cfg.read_text())
+    assert str(lib_a.resolve()) not in data.get("exclude_exts", {})
+    assert load_excluded_exts(croot, lib_b) == {".gif"}  # B untouched
+
+    cfg.write_text("not json at all")
+    assert load_excluded_exts(croot, lib_b) == set()     # fail-soft
+    assert save_excluded_exts(croot, lib_b, {".bmp"})    # rebuilds the file
+    assert load_excluded_exts(croot, lib_b) == {".bmp"}
+
+    cfg.write_text(json.dumps(
+        {"exclude_exts": {str(lib_b.resolve()): [".nope", "TGA", 7]}}))
+    assert load_excluded_exts(croot, lib_b) == {".tga"}  # normalized+filtered
+
+
+def test_file_types_dialog_checkboxes() -> None:
+    """The panel lists every supported extension exactly once (grouped
+    Stills / RAW / Video in EXTS lockstep by construction), reflects the
+    persisted exclusions, and edits round-trip through excluded() — the
+    set the accept handler persists and folds into the cache key."""
+    _offscreen_app()
+    import catalog as catmod
+    from filetypes import STILL_EXTS, FileTypesDialog
+    from rawload import RAW_EXTS
+    from videoload import VIDEO_EXTS
+
+    assert STILL_EXTS | RAW_EXTS | VIDEO_EXTS == frozenset(catmod.EXTS)
+    dlg = FileTypesDialog({".psd"})
+    assert set(dlg.boxes) == set(catmod.EXTS)    # one box per extension
+    assert not dlg.boxes[".psd"].isChecked()     # persisted exclusion shown
+    assert dlg.boxes[".jpg"].isChecked()
+    dlg.boxes[".tga"].setChecked(False)
+    dlg.boxes[".psd"].setChecked(True)
+    assert dlg.excluded() == {".tga"}
+
+
+def test_make_thumbcache_exclude_exts(tmp_path: Path) -> None:
+    """--exclude-exts mirrors the panel for adopt-mode parity, driven
+    through the pool-free --sidecar-only path: the excluded walk matches
+    a cache built over the same effective set (count + files agree), the
+    same invocation WITHOUT the flag sees the extra file and refuses, and
+    an unsupported name is a hard usage error (exit 2), never a silent
+    no-op."""
+    from filetypes import effective_exts
+
+    mtc = _load_mtc()
+    lib = tmp_path / "lib"
+    make_jpeg(lib / "a.jpg")
+    _make_tga(lib / "b.tga")
+    cat = scan_library(lib, exts=effective_exts({".tga"}))
+    out = thumbcache.build_cache(cat, tmp_path / "c").path
+
+    assert mtc.main(["--library", str(lib), "--out", str(out),
+                     "--sidecar-only", "--exclude-exts", ".tga"]) == 0
+    meta = json.loads(out.with_suffix(".fcache.json").read_text())
+    assert meta["files"] == ["a.jpg"]            # the excluded walk
+    thumbcache.bind(thumbcache.load_cache(out), cat)  # adopt-mode parity
+
+    # without the flag the fresh walk sees b.tga too: count mismatch
+    assert mtc.main(["--library", str(lib), "--out", str(out),
+                     "--sidecar-only"]) == 2
+    assert mtc.main(["--library", str(lib), "--out", str(out),
+                     "--exclude-exts", ".bogus"]) == 2
+
+
+def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
+    """The §5 stills-matrix regression sweep (fauxcasa-v46.4): before
+    this, 5 of the 6 claimed formats were 'done' only by construction —
+    the corpus was all Qt-generated baseline JPEG. One library, one REAL
+    build_cache/_index_one pass, every fixture generated in-test
+    (synthetic per the privacy rule); each asserts the right PIXELS —
+    catching CMYK channel inversion and wrong-GIF-frame bugs, not just
+    non-null — or the intended error tile:
+
+      cmyk.jpg    Adobe CMYK JPEG        -> decodes RED (never inverted)
+      prog.jpg    progressive JPEG       -> decodes
+      gray16.tif  16-bit grayscale TIFF  -> decodes mid-gray (not clipped)
+      anim.gif    2-frame animated GIF   -> the FIRST frame is the thumb
+      t.tga       TGA                    -> decodes
+      good.psd    PSD with composite     -> decodes (Pillow fallback)
+      nocomp.psd  PSD, unusable composite-> error tile, by design
+
+    (Verified against the pinned PySide6 build: Qt itself decodes the
+    first five; PSD is the Pillow fallback's. If a Qt upgrade ever drops
+    one, the fallback rescues it and this matrix still pins the pixels.)"""
+    from PIL import Image
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    Image.new("CMYK", (64, 48), (0, 255, 255, 0)).save(
+        lib / "cmyk.jpg", "JPEG", quality=95)
+    Image.new("RGB", (64, 48), (20, 60, 220)).save(
+        lib / "prog.jpg", "JPEG", quality=95, progressive=True)
+    Image.new("I;16", (64, 48), 40000).save(lib / "gray16.tif", "TIFF")
+    first = Image.new("RGB", (64, 48), (30, 200, 40))
+    second = Image.new("RGB", (64, 48), (220, 30, 200))
+    first.save(lib / "anim.gif", "GIF", save_all=True,
+               append_images=[second], duration=200, loop=0)
+    _make_tga(lib / "t.tga")
+    _make_psd(lib / "good.psd")
+    _make_psd(lib / "nocomp.psd", truncate=True)
+
+    cat = scan_library(lib)
+    assert len(cat.photos) == 7                  # every fixture walked
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    ent = {rel: (i, e)
+           for i, (rel, e) in enumerate(zip(cache.files, cache.entries))}
+
+    def color_at(rel: str):
+        i, (_o, length, w, h) = ent[rel]
+        assert length > 0, f"{rel} error-tiled"
+        assert (w, h) == (64, 48), rel
+        return _thumb_qimage(cache, i).pixelColor(32, 24)
+
+    px = color_at("cmyk.jpg")                    # CMYK red, NOT cyan
+    assert px.red() > 200 and px.green() < 60 and px.blue() < 60
+    px = color_at("prog.jpg")
+    assert px.blue() > 170 and px.red() < 80
+    px = color_at("gray16.tif")                  # 40000/65535 ~ 156 gray
+    assert abs(px.red() - 156) < 30 and abs(px.red() - px.blue()) < 10
+    px = color_at("anim.gif")                    # FIRST frame green...
+    assert px.green() > 150 and px.red() < 90    # ...never frame-2 magenta
+    px = color_at("t.tga")
+    assert abs(px.green() - 200) < 30
+    px = color_at("good.psd")
+    assert abs(px.red() - 200) < 30 and abs(px.blue() - 120) < 30
+    assert ent["nocomp.psd"][1][1] == 0          # the ONE intended error tile
