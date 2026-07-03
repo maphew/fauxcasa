@@ -78,6 +78,7 @@ from catalog import (  # noqa: E402
     default_contacts_xml,
     default_pal_dir,
     format_date_taken,
+    format_file_size,
     format_geotag,
     load_catalog,
     load_contacts_xml,
@@ -1745,6 +1746,10 @@ class MainWindow(QMainWindow):
             parts.append(f"“{p.caption}”")
         if p.keywords:
             parts.append("#" + " #".join(p.keywords))
+        if p.dims is not None:
+            parts.append(f"{p.dims[0]}x{p.dims[1]}")
+        if p.size >= 0:
+            parts.append(format_file_size(p.size))
         self.meta_label.setText("   ".join(parts) + "  ")
 
     def _build_progress(self, done: int, total: int) -> None:
