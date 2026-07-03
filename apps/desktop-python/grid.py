@@ -19,6 +19,7 @@ import queue
 import threading
 from bisect import bisect_right
 from dataclasses import dataclass, field
+from datetime import datetime
 from time import perf_counter
 
 from PySide6.QtCore import QObject, QPointF, QRect, Qt, Signal
@@ -140,6 +141,64 @@ _MOD_OF = {Qt.Key.Key_Control: Qt.KeyboardModifier.ControlModifier,
            Qt.Key.Key_Alt: Qt.KeyboardModifier.AltModifier}
 
 
+# ---- per-folder sort modes (fauxcasa-q6l.11) ------------------------------
+# Spec §5 names date / name / size / manual; manual (display of Picasa's
+# persisted manual order) is blocked on the missing db3 oracle fixture and
+# deliberately absent here. Modes apply to the folder-grouped DEFAULT view
+# only (All photos / folder navigation — one continuous surface); explicit
+# display sets keep their given order: album order is membership order
+# (manual/membership order per Picasa — out of scope for this feature),
+# search/starred/recent stay in catalog order.
+SORT_NAME = "name"
+SORT_DATE = "date"
+SORT_SIZE = "size"
+SORT_MODES = (SORT_NAME, SORT_DATE, SORT_SIZE)
+# The DEFAULT is "name", named honestly: walk_library yields sorted(Path)
+# — path-COMPONENT order — so within one folder (a shared prefix) catalog
+# order IS filename order per pathlib's platform norms (case-insensitive
+# on Windows, case-sensitive on POSIX). "Sort by name" therefore keeps the
+# group's catalog slice untouched, which both preserves the exact
+# pre-q6l.11 display order as the default and avoids inventing a second,
+# subtly different name collation next to the walk rule's.
+DEFAULT_SORT_MODE = SORT_NAME
+
+
+def _date_sort_key(photo) -> tuple:
+    """Date-mode key: date_taken (canonical 'YYYY-MM-DDTHH:MM:SS' — sorts
+    lexically for ANY zero-padded year, pre-1903 included, per §6 footgun
+    16: never a year floor), else the file mtime rendered in the same
+    canonical local-time form so dated and mtime-only photos interleave
+    chronologically, else sink below every dated photo. The (0, str) /
+    (1,) shapes compare cleanly and the sunk tail stays deterministic:
+    sort stability keeps its incoming name/walk order."""
+    if photo.date_taken:
+        return (0, photo.date_taken)
+    if photo.mtime >= 0:
+        try:  # Windows rejects pre-epoch timestamps (OSError); sink those
+            stamp = datetime.fromtimestamp(photo.mtime)
+        except (OSError, OverflowError, ValueError):
+            return (1,)
+        return (0, stamp.strftime("%Y-%m-%dT%H:%M:%S"))
+    return (1,)
+
+
+def sort_folder_items(items: list[int], photos, mode: str) -> list[int]:
+    """One folder group's catalog indices, reordered per `mode`. Always a
+    pure PERMUTATION of `items`: only display order changes, so the
+    catalog/fcache index binding (tiles, decode jobs, selection — all
+    keyed by catalog index) is untouched by construction. Ascending only
+    (v1 keeps direction out of the persisted state — remembering a
+    direction is cheap to add at M2 if wanted); ties and unsortable
+    entries (no date, unindexed size -1) keep their incoming name/walk
+    order via sort stability, the unsortable tail sinking to the end."""
+    if mode == SORT_DATE:
+        return sorted(items, key=lambda i: _date_sort_key(photos[i]))
+    if mode == SORT_SIZE:
+        return sorted(items, key=lambda i: (0, photos[i].size)
+                      if photos[i].size >= 0 else (1,))
+    return list(items)  # SORT_NAME (or unknown): the walk's name order
+
+
 def _star_polygon(cx: float, cy: float, r: float) -> QPolygonF:
     poly = QPolygonF()
     for i in range(10):
@@ -238,6 +297,12 @@ class GridView(QAbstractScrollArea):
         # also shows hidden=yes photos and stash-folder files, veiled so
         # they read as not-normally-shown. Owned/driven by MainWindow.
         self.reveal = False
+        # Per-folder sort modes (fauxcasa-q6l.11): folder rel-path ->
+        # SORT_* constant; an absent key means DEFAULT_SORT_MODE (name =
+        # walk order). Loaded/persisted by MainWindow (machine-local
+        # per-library config — see main._set_folder_sort); the grid only
+        # consumes it when set_filter builds the default view's groups.
+        self.sort_modes: dict[str, str] = {}
         # Hover-peek state (fauxcasa-q6l.5): the last known viewport hover
         # position (mouse tracking below feeds it button-free, so a later
         # Ctrl+Alt press can trigger without a move — Picasa's actual
@@ -383,7 +448,8 @@ class GridView(QAbstractScrollArea):
         if self.catalog is None:
             return
         cat = self.catalog
-        if indices is None:
+        default_view = indices is None
+        if default_view:
             indices = [i for i, p in enumerate(cat.photos)
                        if p.visible or self.reveal]
         self.filter_label = label
@@ -396,6 +462,16 @@ class GridView(QAbstractScrollArea):
                 g = by_folder[f] = _Group(folder=f, title=title, items=[])
             g.items.append(i)
         self.groups = list(by_folder.values())
+        # Per-folder sort modes (fauxcasa-q6l.11): reorder each group's
+        # DISPLAY slice — never the catalog — on the folder-grouped default
+        # view only. Explicit display sets keep their given order (albums =
+        # membership order, search/starred/recent = catalog order); the
+        # module constants block up top records the scoping rationale.
+        if default_view and self.sort_modes:
+            for g in self.groups:
+                mode = self.sort_modes.get(g.folder, DEFAULT_SORT_MODE)
+                if mode != DEFAULT_SORT_MODE:
+                    g.items = sort_folder_items(g.items, cat.photos, mode)
         self.display = []
         self.loc = {}
         for gi, g in enumerate(self.groups):
