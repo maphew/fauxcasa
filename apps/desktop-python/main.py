@@ -383,16 +383,35 @@ def _choose_library_from_dialog(cache_root: Path, parent=None,
         return library
 
 
-def _restart_command(library: Path, cache_root: Path) -> tuple[str, list[str]]:
-    """Command used by the in-app Open action to switch libraries.
+def _restart_command(
+    library: Path,
+    cache_root: Path,
+    scan_filter: "ScanFilter | None" = None,
+    thumbs: "Path | None" = None,
+) -> tuple[str, list[str]]:
+    """Command used by the in-app Open and File Types actions to relaunch.
 
     Relaunching keeps startup's warm/cold/adopt logic single-sourced in main().
+    Pass-through flags reproduce the original scan constraints on relaunch:
+    --min-image-size / --max-image-size are always forwarded when set;
+    --thumbs is forwarded only for same-library relaunches (File Types apply)
+    — it is library-specific so Open... (different library) must not carry it.
     """
+    extra: list[str] = []
+    if scan_filter is not None:
+        if scan_filter.min_width and scan_filter.min_height:
+            extra += ["--min-image-size",
+                      f"{scan_filter.min_width}x{scan_filter.min_height}"]
+        if scan_filter.max_width and scan_filter.max_height:
+            extra += ["--max-image-size",
+                      f"{scan_filter.max_width}x{scan_filter.max_height}"]
+    if thumbs is not None:
+        extra += ["--thumbs", str(thumbs)]
     if FROZEN:
-        return sys.executable, [str(library), "--cache-root", str(cache_root)]
+        return sys.executable, [str(library), "--cache-root", str(cache_root)] + extra
     return sys.executable, [
         str(APP_DIR / "main.py"), str(library), "--cache-root", str(cache_root)
-    ]
+    ] + extra
 
 
 def _explain_not_a_library(root: Path) -> None:
@@ -579,11 +598,16 @@ class MainWindow(QMainWindow):
                  cache_root: Path | None = None,
                  contacts: dict[str, str] | None = None,
                  pal_dir: Path | None = None,
-                 excluded_exts: set[str] | None = None):
+                 excluded_exts: set[str] | None = None,
+                 thumbs_path: Path | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
         self.scan_filter = scan_filter
+        # --thumbs path kept for same-library relaunch (File Types apply):
+        # an adopted external cache remains valid after an extension change on
+        # the same library, so its path must round-trip through _restart_command.
+        self.thumbs_path = thumbs_path
         # File Types panel choice (fauxcasa-v46.4): the persisted excluded
         # set and the effective walk set derived from it, kept so every
         # background rescan/reconcile walks exactly what startup walked —
@@ -1028,7 +1052,10 @@ class MainWindow(QMainWindow):
             self.cache_root, self, self.catalog.root)
         if root is None:
             return
-        program, args = _restart_command(root, self.cache_root)
+        # Different library: forward scan-size constraints but NOT --thumbs
+        # (the adopted cache is specific to the previous library).
+        program, args = _restart_command(root, self.cache_root,
+                                         scan_filter=self.scan_filter)
         started = QProcess.startDetached(program, args)
         ok = started[0] if isinstance(started, tuple) else started
         if not ok:
@@ -1062,7 +1089,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "could not save the file-type choice — see the log", 8000)
             return
-        program, args = _restart_command(self.catalog.root, self.cache_root)
+        # Same library: forward scan-size constraints AND --thumbs (the
+        # adopted cache remains valid — it was built over this same library).
+        program, args = _restart_command(self.catalog.root, self.cache_root,
+                                         scan_filter=self.scan_filter,
+                                         thumbs=self.thumbs_path)
         started = QProcess.startDetached(program, args)
         ok = started[0] if isinstance(started, tuple) else started
         if not ok:
@@ -1977,7 +2008,8 @@ def main() -> int:
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
                      contacts=contacts, pal_dir=pal_dir,
-                     excluded_exts=excluded_exts)
+                     excluded_exts=excluded_exts,
+                     thumbs_path=args.thumbs)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)

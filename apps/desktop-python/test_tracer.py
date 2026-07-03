@@ -1997,6 +1997,161 @@ def test_restart_command_source_vs_frozen(monkeypatch, tmp_path: Path) -> None:
     )
 
 
+def test_restart_command_scan_filter_flags(monkeypatch, tmp_path: Path) -> None:
+    """--min-image-size and --max-image-size are forwarded when set, absent
+    when the filter is inactive — fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    library = tmp_path / "lib"
+    cache_root = tmp_path / "cr"
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(main.sys, "executable", "/usr/bin/fauxcasa")
+
+    # No filter — neither flag appears.
+    _prog, args = main._restart_command(library, cache_root, scan_filter=None)
+    assert "--min-image-size" not in args
+    assert "--max-image-size" not in args
+
+    # Inactive filter (all zeros) — same: no flags.
+    _prog, args = main._restart_command(
+        library, cache_root, scan_filter=ScanFilter())
+    assert "--min-image-size" not in args
+    assert "--max-image-size" not in args
+
+    # Active min filter only.
+    sf = ScanFilter(min_width=100, min_height=75)
+    _prog, args = main._restart_command(library, cache_root, scan_filter=sf)
+    idx = args.index("--min-image-size")
+    assert args[idx + 1] == "100x75"
+    assert "--max-image-size" not in args
+
+    # Active max filter only.
+    sf = ScanFilter(max_width=8000, max_height=6000)
+    _prog, args = main._restart_command(library, cache_root, scan_filter=sf)
+    assert "--min-image-size" not in args
+    idx = args.index("--max-image-size")
+    assert args[idx + 1] == "8000x6000"
+
+    # Both min and max set.
+    sf = ScanFilter(min_width=100, min_height=75,
+                    max_width=8000, max_height=6000)
+    _prog, args = main._restart_command(library, cache_root, scan_filter=sf)
+    assert args[args.index("--min-image-size") + 1] == "100x75"
+    assert args[args.index("--max-image-size") + 1] == "8000x6000"
+
+
+def test_restart_command_thumbs_flag(monkeypatch, tmp_path: Path) -> None:
+    """--thumbs is forwarded only when supplied — fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    library = tmp_path / "lib"
+    cache_root = tmp_path / "cr"
+    thumbs_path = tmp_path / "bench.fcache"
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(main.sys, "executable", "/usr/bin/fauxcasa")
+
+    # thumbs=None — flag absent.
+    _prog, args = main._restart_command(library, cache_root, thumbs=None)
+    assert "--thumbs" not in args
+
+    # thumbs supplied — flag present with the correct path.
+    _prog, args = main._restart_command(library, cache_root, thumbs=thumbs_path)
+    idx = args.index("--thumbs")
+    assert args[idx + 1] == str(thumbs_path)
+
+
+def test_restart_command_open_drops_thumbs(monkeypatch, tmp_path: Path) -> None:
+    """_change_library (Open...) does NOT carry --thumbs to a different
+    library — the adopted cache is specific to the original library.
+    fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication, QFileDialog
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    current = tmp_path / "Current"
+    chosen = tmp_path / "Chosen"
+    make_jpeg(current / "a.jpg")
+    make_jpeg(chosen / "b.jpg")
+    cache_root = tmp_path / "cr"
+    thumbs_path = tmp_path / "bench.fcache"
+
+    cat = scan_library(current)
+    sf = ScanFilter(min_width=50, min_height=50)
+    win = main.MainWindow(cat, None, cache_root / "cache", None,
+                          scan_filter=sf, cache_root=cache_root,
+                          thumbs_path=thumbs_path)
+
+    captured: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(chosen)))
+    monkeypatch.setattr(QProcess, "startDetached",
+                        staticmethod(lambda prog, argv:
+                                     captured.append((prog, argv)) or True))
+
+    win._change_library()
+
+    assert captured, "expected startDetached to be called"
+    _prog, argv = captured[0]
+    # Scan-size constraint preserved.
+    assert "--min-image-size" in argv
+    # --thumbs must NOT appear for a different-library relaunch.
+    assert "--thumbs" not in argv
+
+
+def test_restart_command_file_types_preserves_thumbs(
+        monkeypatch, tmp_path: Path) -> None:
+    """_show_file_types (same library) DOES carry --thumbs — the adopted
+    cache remains valid after an extension change on the same library.
+    fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication
+    from filetypes import FileTypesDialog, save_excluded_exts
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    lib = tmp_path / "lib"
+    make_jpeg(lib / "a.jpg")
+    cache_root = tmp_path / "cr"
+    thumbs_path = tmp_path / "bench.fcache"
+
+    cat = scan_library(lib)
+    sf = ScanFilter(min_width=50, min_height=50)
+    win = main.MainWindow(cat, None, cache_root / "cache", None,
+                          scan_filter=sf, cache_root=cache_root,
+                          thumbs_path=thumbs_path)
+
+    captured: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(QProcess, "startDetached",
+                        staticmethod(lambda prog, argv:
+                                     captured.append((prog, argv)) or True))
+    # Simulate user toggling a file type (different from current exclusions).
+    monkeypatch.setattr(FileTypesDialog, "exec_", lambda self: True)
+    monkeypatch.setattr(FileTypesDialog, "excluded", lambda self: {".tga"})
+
+    win._show_file_types()
+
+    assert captured, "expected startDetached to be called"
+    _prog, argv = captured[0]
+    # Scan-size constraint preserved.
+    assert "--min-image-size" in argv
+    # --thumbs MUST appear — same library relaunch.
+    assert "--thumbs" in argv
+    assert str(thumbs_path) in argv
+
+
 def test_resolve_library_frozen_first_run(monkeypatch, tmp_path: Path) -> None:
     """Frozen, no library and nothing remembered: a chosen folder is used;
     a cancelled/headless picker yields None (graceful), not a crash."""
@@ -2218,7 +2373,7 @@ def test_mainwindow_open_action_relaunches_with_selected_library(
                      or True),
     )
     monkeypatch.setattr(main, "_restart_command",
-                        lambda root, cr: ("prog", [str(root), str(cr)]))
+                        lambda root, cr, **_kw: ("prog", [str(root), str(cr)]))
 
     win._change_library()
 
@@ -2255,7 +2410,7 @@ def test_mainwindow_open_action_warns_when_relaunch_fails(
         staticmethod(lambda _program, _args: (False, 0)),
     )
     monkeypatch.setattr(main, "_restart_command",
-                        lambda root, cr: ("prog", [str(root), str(cr)]))
+                        lambda root, cr, **_kw: ("prog", [str(root), str(cr)]))
     monkeypatch.setattr(
         QMessageBox,
         "warning",
