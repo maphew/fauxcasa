@@ -142,20 +142,27 @@ def load_original_oriented(path: str, rotate: int) -> tuple[QImage, int]:
         if is_raw_suffix(path):
             img = load_raw_qimage(data)
         else:
-            buf = QBuffer()
-            buf.setData(data)  # setData copies; see thumbcache._index_one
-            buf.open(QIODevice.OpenModeFlag.ReadOnly)
-            reader = QImageReader(buf)
-            reader.setAutoTransform(True)
-            img = reader.read()
-            if img.isNull():
-                # Qt has no decoder for this still (PSD — Pillow reads
-                # the flattened composite, fauxcasa-v46.4): same bytes,
-                # one Pillow attempt, orientation applied exactly once
-                # by exif_transpose there (pillowload module doc).
-                from pillowload import pillow_qimage
+            from pillowload import pillow_qimage, tiff_is_16bit
 
+            # Pre-route 16-bit TIFFs to Pillow on ALL platforms: Qt's
+            # tiff plugin silently clips 16-bit grayscale to white on
+            # Linux (fauxcasa-v46.7). Header sniff only — no pixel decode.
+            _is_tiff = path.lower().endswith((".tif", ".tiff"))
+            if _is_tiff and tiff_is_16bit(data):
                 img = pillow_qimage(data)
+            else:
+                buf = QBuffer()
+                buf.setData(data)  # setData copies; see thumbcache._index_one
+                buf.open(QIODevice.OpenModeFlag.ReadOnly)
+                reader = QImageReader(buf)
+                reader.setAutoTransform(True)
+                img = reader.read()
+                if img.isNull():
+                    # Qt has no decoder for this still (PSD — Pillow reads
+                    # the flattened composite, fauxcasa-v46.4): same bytes,
+                    # one Pillow attempt, orientation applied exactly once
+                    # by exif_transpose there (pillowload module doc).
+                    img = pillow_qimage(data)
     if not img.isNull() and rotate:
         from PySide6.QtGui import QTransform
 

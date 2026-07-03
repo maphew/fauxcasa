@@ -7688,6 +7688,34 @@ def test_make_thumbcache_exclude_exts(tmp_path: Path) -> None:
                      "--exclude-exts", ".bogus"]) == 2
 
 
+def test_tiff_is_16bit_header_sniff(tmp_path: Path) -> None:
+    """tiff_is_16bit: pure TIFF header sniff, four boundary cases
+    (fauxcasa-v46.7):
+      16-bit grayscale TIFF  -> True
+      8-bit grayscale TIFF   -> False
+      non-TIFF bytes         -> False
+      truncated bytes        -> False, never raises
+    """
+    from PIL import Image
+    from pillowload import tiff_is_16bit
+
+    g16 = tmp_path / "g16.tif"
+    Image.new("I;16", (4, 4), 40000).save(g16, "TIFF")
+    assert tiff_is_16bit(g16.read_bytes()) is True
+
+    g8 = tmp_path / "g8.tif"
+    Image.new("L", (4, 4), 128).save(g8, "TIFF")
+    assert tiff_is_16bit(g8.read_bytes()) is False
+
+    assert tiff_is_16bit(b"not a tiff") is False  # non-TIFF magic
+    assert tiff_is_16bit(b"II") is False           # truncated before magic
+    assert tiff_is_16bit(b"") is False             # empty
+
+    # Truncated: valid II header but cut before IFD content
+    full = g16.read_bytes()
+    assert tiff_is_16bit(full[:8]) is False        # header only, no IFD
+
+
 def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
     """The §5 stills-matrix regression sweep (fauxcasa-v46.4): before
     this, 5 of the 6 claimed formats were 'done' only by construction —
@@ -7705,9 +7733,10 @@ def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
       good.psd    PSD with composite     -> decodes (Pillow fallback)
       nocomp.psd  PSD, unusable composite-> error tile, by design
 
-    (Verified against the pinned PySide6 build: Qt itself decodes the
-    first five; PSD is the Pillow fallback's. If a Qt upgrade ever drops
-    one, the fallback rescues it and this matrix still pins the pixels.)"""
+    (Verified against the pinned PySide6 build: Qt decodes most of these;
+    16-bit TIFF and PSD go through the Pillow route. If a Qt upgrade ever
+    drops one of the Qt-decoded formats, the fallback rescues it and this
+    matrix still pins the pixels.)"""
     from PIL import Image
 
     lib = tmp_path / "lib"
@@ -7743,14 +7772,7 @@ def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
     px = color_at("prog.jpg")
     assert px.blue() > 170 and px.red() < 80
     px = color_at("gray16.tif")                  # 40000/65535 ~ 156 gray
-    if sys.platform == "win32" or sys.platform == "darwin":
-        assert abs(px.red() - 156) < 30 and abs(px.red() - px.blue()) < 10
-    else:
-        # Linux Qt's tiff plugin CLIPS 16-bit grayscale to white — a real
-        # fidelity defect users would see (fauxcasa-v46.7), not a test
-        # artifact. Pin decode-succeeds + gray-ness here; the mid-gray
-        # value assertion returns when the Pillow routing lands.
-        assert abs(px.red() - px.blue()) < 10
+    assert abs(px.red() - 156) < 30 and abs(px.red() - px.blue()) < 10
     px = color_at("anim.gif")                    # FIRST frame green...
     assert px.green() > 150 and px.red() < 90    # ...never frame-2 magenta
     px = color_at("t.tga")

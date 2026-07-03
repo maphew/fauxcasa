@@ -31,6 +31,77 @@ QImage (error tile), never an exception.
 from __future__ import annotations
 
 import io
+import struct
+
+
+def tiff_is_16bit(data: bytes) -> bool:
+    """Return True when `data` is a TIFF whose BitsPerSample tag (258)
+    contains any value >= 16 — the signal to pre-route to pillow_qimage
+    before Qt's tiff plugin, which silently clips 16-bit grayscale to
+    white on Linux (fauxcasa-v46.7).
+
+    Pure header parse: walks the byte-order mark (II/MM), verifies the
+    magic 42, seeks the first IFD, and reads tag 258 inline or at its
+    offset. Returns False for non-TIFF bytes, truncated input, or a
+    missing BitsPerSample tag; never raises."""
+    if len(data) < 8:
+        return False
+    bom = data[:2]
+    if bom == b"II":
+        bo = "<"
+    elif bom == b"MM":
+        bo = ">"
+    else:
+        return False
+    try:
+        magic = struct.unpack_from(f"{bo}H", data, 2)[0]
+        if magic != 42:
+            return False
+        ifd_off = struct.unpack_from(f"{bo}I", data, 4)[0]
+        if ifd_off + 2 > len(data):
+            return False
+        n_entries = struct.unpack_from(f"{bo}H", data, ifd_off)[0]
+        entry_off = ifd_off + 2
+        for _ in range(n_entries):
+            if entry_off + 12 > len(data):
+                return False
+            tag = struct.unpack_from(f"{bo}H", data, entry_off)[0]
+            if tag == 258:  # BitsPerSample
+                dtype = struct.unpack_from(f"{bo}H", data, entry_off + 2)[0]
+                count = struct.unpack_from(f"{bo}I", data, entry_off + 4)[0]
+                if dtype == 3:  # SHORT — 2 bytes per value
+                    if count * 2 <= 4:  # fits inline in the 4-byte field
+                        vals = struct.unpack_from(
+                            f"{bo}{count}H", data, entry_off + 8)
+                    else:
+                        offset = struct.unpack_from(
+                            f"{bo}I", data, entry_off + 8)[0]
+                        if offset + count * 2 > len(data):
+                            return False
+                        vals = struct.unpack_from(
+                            f"{bo}{count}H", data, offset)
+                    return any(v >= 16 for v in vals)
+                elif dtype == 4:  # LONG — 4 bytes per value
+                    if count == 1:  # fits inline
+                        vals = (struct.unpack_from(
+                            f"{bo}I", data, entry_off + 8)[0],)
+                    else:
+                        offset = struct.unpack_from(
+                            f"{bo}I", data, entry_off + 8)[0]
+                        if offset + count * 4 > len(data):
+                            return False
+                        vals = struct.unpack_from(
+                            f"{bo}{count}I", data, offset)
+                    return any(v >= 16 for v in vals)
+                return False  # unrecognised dtype for BitsPerSample
+            if tag > 258:
+                # IFD entries are sorted ascending by tag (TIFF spec);
+                # nothing past 258 can be BitsPerSample.
+                break
+            entry_off += 12
+    except (struct.error, OverflowError):
+        return False
+    return False
 
 
 def pillow_qimage(data: bytes, max_edge: int | None = None):
@@ -47,6 +118,14 @@ def pillow_qimage(data: bytes, max_edge: int | None = None):
 
         with Image.open(io.BytesIO(data)) as im:
             im = ImageOps.exif_transpose(im)  # the ONE orientation apply
+            # Normalise high-bit-depth integer modes before any conversion:
+            # convert('RGB') clips values > 255 for 'I' and 'I;*' modes
+            # rather than scaling them, so a 16-bit grayscale sample of
+            # 40000 would arrive as white instead of mid-gray. convert('I')
+            # handles endian variants (e.g. 'I;16B'); point(x/256,'L') maps
+            # the 16-bit range [0,65535] → 8-bit [0,255] (fauxcasa-v46.7).
+            if im.mode in ("I", "I;16", "I;16B", "I;32", "I;32B"):
+                im = im.convert("I").point(lambda x: x / 256, "L")
             if max_edge is not None:
                 im.thumbnail((max_edge, max_edge))
             has_alpha = "A" in im.getbands() or im.mode == "P" \
