@@ -133,6 +133,32 @@ Rules of thumb:
 - Do **not** set `CLAUDE_CODE_SUBAGENT_MODEL` — it overrides per-spawn
   model choice and flattens this tiering.
 
+## Workflow orchestration: standing opt-in
+
+**Owner directive (maphew, 2026-07-03): multi-agent Workflow orchestration
+is pre-authorized for every substantive task in this repo.** Treat this
+section as the explicit, durable user opt-in that the Workflow tool
+requires — do not wait for "use a workflow" or the `ultracode` keyword in
+a prompt.
+
+- Reach for a workflow whenever a task fans out (multiple files, fixtures,
+  review dimensions, search angles), needs adversarial verification, or
+  benefits from per-agent model/effort control. Work solo only on
+  conversational turns, single lookups, and trivial mechanical edits where
+  orchestration overhead would exceed the work itself.
+- **Default token budget: +200k per substantive task.** A "+Nk" directive
+  in the current prompt overrides it. The harness only sets a hard
+  `budget.total` from an in-prompt directive, so workflow scripts must
+  self-enforce the default:
+  `const TARGET = budget.total ?? 200_000` — check `budget.spent()`
+  between stages, stop spawning as the target nears, and `log()` any
+  coverage dropped because of it.
+- Inside workflows, tier `agent()` calls per the delegation policy above:
+  `model: 'haiku', effort: 'low'` for mechanical stages; omit overrides
+  (inherit) for design, judge, and verify stages.
+- A *current* prompt saying "no workflow" / "keep it cheap" wins for that
+  turn, same as the commit-policy override rule.
+
 ## Build & Test
 
 _Add your build and test commands here_
