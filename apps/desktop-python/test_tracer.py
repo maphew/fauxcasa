@@ -2570,6 +2570,45 @@ def test_pcts_nearest_rank() -> None:
     assert r["p99"] < 100.0            # the trap: must NOT collapse onto max
 
 
+# ---------- bench_scroll: occlusion_clean platform gate (fauxcasa-ed5.10) ---
+
+def test_occlusion_clean_timeout_frames_ignored_on_windows() -> None:
+    """On Windows a paint-bound run produces ~100 ms intervals that alias with
+    the Wayland frame-callback-timeout signature.  timeout_frames must NOT
+    disqualify occlusion_clean on win32."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import bench_scroll as bs
+
+    # Simulate: visible, no fill stalls, but 25 timeout-band intervals.
+    assert bs._occlusion_clean(0, 0, 25, platform="win32") is True
+    assert bs._occlusion_clean(0, 0, 25, platform="cygwin") is True
+
+
+def test_occlusion_clean_timeout_frames_disqualify_on_linux() -> None:
+    """On Linux the ~100 ms cluster is the Wayland compositor occlusion
+    signature; timeout_frames > 0 must disqualify occlusion_clean."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import bench_scroll as bs
+
+    assert bs._occlusion_clean(0, 0, 1, platform="linux") is False
+    assert bs._occlusion_clean(0, 0, 25, platform="linux2") is False
+
+
+def test_occlusion_clean_other_tells_still_apply_on_all_platforms() -> None:
+    """not_visible_ticks and fill_timeouts disqualify occlusion_clean
+    regardless of platform."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import bench_scroll as bs
+
+    for plat in ("win32", "linux", "darwin"):
+        assert bs._occlusion_clean(1, 0, 0, platform=plat) is False  # not_visible
+        assert bs._occlusion_clean(0, 1, 0, platform=plat) is False  # fill_timeout
+        assert bs._occlusion_clean(0, 0, 0, platform=plat) is True   # all clean
+
+
 # ---------- diagnostics: log file survives console=False (fauxcasa-pqw) ----
 
 def test_applog_writes_logfile_and_mirrors_stderr(tmp_path: Path, capsys) -> None:
