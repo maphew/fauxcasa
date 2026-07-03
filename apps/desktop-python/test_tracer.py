@@ -3048,7 +3048,11 @@ def test_refresh_tile_native_dpr_and_invalidation(monkeypatch) -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    # Forward CLI args so `uv run test_tracer.py -k X -x` selects tests
+    # instead of silently running the whole suite (fauxcasa-q6l.17 — this
+    # cost four separate sessions a bisect detour before being fixed).
+    # Default -v only when the caller passed nothing.
+    sys.exit(pytest.main([__file__] + (sys.argv[1:] or ["-v"])))
 
 
 # ---------------------------------------------------------------------------
@@ -6845,6 +6849,224 @@ def test_face_overlay_hidden_on_peek_and_slideshow(tmp_path: Path) -> None:
         assert not s.faces_visible           # F could never switch it on
         s.faces_visible = True               # even forced...
         assert s._face_rects() == []         # ...the paint gate holds
+
+
+# ---------------------------------------------------------------------------
+# Per-folder sort modes: date / name / size (fauxcasa-q6l.11).
+# Manual mode (display of Picasa's persisted db3 order) is blocked on the
+# missing oracle fixture and deliberately untested/unimplemented here.
+# ---------------------------------------------------------------------------
+
+def _photo(name: str, folder: str = "f", **kw):
+    from catalog import Photo
+    return Photo(rel=f"{folder}/{name}", folder=folder, name=name, **kw)
+
+
+def test_sort_modes_persistence_roundtrip(tmp_path: Path) -> None:
+    """save/load round-trip: non-default modes survive, default-mode and
+    unknown-mode entries are dropped on BOTH sides, and every degraded
+    input (no cache dir, missing file, garbage, non-object JSON) reads as
+    {} — view prefs are a convenience, never a gate."""
+    from main import load_sort_modes, save_sort_modes
+
+    save_sort_modes(tmp_path, {"a": "date", "b": "name",  # name = default
+                               "c": "size", "d": "bogus"})
+    assert load_sort_modes(tmp_path) == {"a": "date", "c": "size"}
+    cfg = tmp_path / "config.json"
+    assert cfg.is_file()
+    doc = json.loads(cfg.read_text())
+    assert doc["sort_modes"] == {"a": "date", "c": "size"}
+
+    save_sort_modes(None, {"a": "date"})           # no cache dir: no-op
+    assert load_sort_modes(None) == {}
+    assert load_sort_modes(tmp_path / "nowhere") == {}   # missing file
+    cfg.write_text("{not json")                          # garbage
+    assert load_sort_modes(tmp_path) == {}
+    cfg.write_text("42")                                 # non-object doc
+    assert load_sort_modes(tmp_path) == {}
+    cfg.write_text('{"sort_modes": {"a": "date", "b": 3, "c": "up"}}')
+    assert load_sort_modes(tmp_path) == {"a": "date"}    # bad values drop
+
+
+def test_sort_folder_items_date_mixed_and_pre1903() -> None:
+    """Date mode over the three data classes at once: canonical date_taken
+    strings (an UNBOUNDED pre-1903 year included — §6 footgun 16) sort
+    lexically-chronologically, an mtime-only photo interleaves at its
+    local wall-clock time, dateless+unindexed photos sink to the end in
+    name order, and a date_taken tie breaks by name (stability over the
+    name-ordered input)."""
+    from datetime import datetime
+
+    from grid import SORT_DATE, sort_folder_items
+
+    mt = int(datetime(2010, 1, 2, 3, 4, 5).timestamp())  # local, DST-safe
+    photos = [
+        _photo("a.jpg"),                                       # sinks
+        _photo("b.jpg"),                                       # sinks
+        _photo("c.jpg", mtime=mt),                             # 2010 via mtime
+        _photo("d.jpg", date_taken="1899-06-01T00:00:00"),     # pre-1903
+        _photo("e.jpg", date_taken="2020-05-01T10:00:00"),
+        _photo("f.jpg", date_taken="2020-05-01T10:00:00"),     # tie with e
+    ]
+    items = list(range(len(photos)))                # name/walk order
+    got = sort_folder_items(items, photos, SORT_DATE)
+    assert got == [3, 2, 4, 5, 0, 1]
+    assert items == list(range(len(photos)))        # input never mutated
+
+
+def test_sort_folder_items_size_unindexed_sinks_and_ties() -> None:
+    """Size mode: ascending Photo.size, unindexed (-1) photos sink to the
+    end, and both equal sizes and the sunk tail keep name order."""
+    from grid import SORT_SIZE, sort_folder_items
+
+    photos = [
+        _photo("a.jpg", size=-1),
+        _photo("b.jpg", size=500),
+        _photo("c.jpg", size=100),
+        _photo("d.jpg", size=100),   # tie with c: name order holds
+        _photo("e.jpg", size=-1),
+    ]
+    got = sort_folder_items(list(range(5)), photos, SORT_SIZE)
+    assert got == [2, 3, 1, 0, 4]
+
+
+def test_sort_default_name_is_walk_order(tmp_path: Path) -> None:
+    """The honest-default claim: within one folder the walk already yields
+    filename order, so SORT_NAME (the default) is the identity permutation
+    and a modeless grid displays exactly catalog order."""
+    _offscreen_app()
+    from grid import DEFAULT_SORT_MODE, SORT_NAME, GridView, sort_folder_items
+
+    assert DEFAULT_SORT_MODE == SORT_NAME
+    root = tmp_path / "lib"
+    for name in ("zed.jpg", "mid.jpg", "abc.jpg"):   # created out of order
+        make_jpeg(root / "f" / name)
+    cat = scan_library(root)
+    assert [p.name for p in cat.photos] == ["abc.jpg", "mid.jpg", "zed.jpg"]
+    items = list(range(len(cat.photos)))
+    assert sort_folder_items(items, cat.photos, SORT_NAME) == items
+    grid = GridView()
+    grid.set_data(cat, None)
+    assert grid.display == items                     # pre-q6l.11 behavior
+
+
+def test_grid_sort_is_display_permutation_index_parity(tmp_path: Path) -> None:
+    """The invariant that keeps the fcache binding safe: a sort mode only
+    PERMUTES the default view's display list. Same index set as unsorted,
+    catalog order untouched, loc/display_pos consistent, cache entries
+    still keyed by catalog index (identical before/after), other folders'
+    groups untouched — and an explicit display set (album/search/starred)
+    ignores the mode entirely."""
+    _offscreen_app()
+    from grid import GridView
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "big.jpg", 256, 192)      # name order: big < small
+    make_jpeg(root / "f" / "small.jpg", 16, 12)      # size order: small < big
+    make_jpeg(root / "g" / "one.jpg")
+    cat, cache = _bound_cache(tmp_path, root)
+    assert cat.photos[0].name == "big.jpg" and cat.photos[0].size > 0
+    assert cat.photos[0].size > cat.photos[1].size   # bytes follow pixels
+
+    grid = GridView()
+    grid.set_data(cat, cache)
+    baseline = list(grid.display)
+    assert baseline == [0, 1, 2]
+    entries_before = [cache.entry(i) for i in range(3)]   # primary level
+
+    grid.sort_modes = {"f": "size"}
+    grid.set_filter(None, "")
+    assert grid.display == [1, 0, 2]                 # f re-sorted, g untouched
+    assert sorted(grid.display) == sorted(baseline)  # pure permutation
+    assert [p.name for p in cat.photos] == ["big.jpg", "small.jpg", "one.jpg"]
+    assert [cache.entry(i) for i in range(3)] == entries_before
+    for pos, idx in enumerate(grid.display):         # display maps consistent
+        assert grid.display_pos[idx] == pos
+        gi, n = grid.loc[idx]
+        assert grid.groups[gi].items[n] == idx
+
+    grid.set_filter([0, 1], "album-ish")             # explicit set: given
+    assert grid.display == [0, 1]                    # order wins, mode ignored
+
+
+def test_folder_sort_context_menu_wiring(tmp_path: Path) -> None:
+    """The sidebar folder context menu end to end: three checkable actions
+    (current mode checked, name by default), triggering one applies the
+    sort to the live view immediately and persists it to the per-library
+    config.json, the rebuilt menu shows the new checkmark, and a second
+    window over the same cache dir wakes up with the mode already applied
+    (the persistence round-trip through the real load path)."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        make_jpeg(root / "f" / name)
+    cache_dir = tmp_path / "cachedir"
+    cache_dir.mkdir()
+
+    def dated_catalog():
+        cat = scan_library(root)
+        for p, day in zip(cat.photos, ("03", "02", "01")):
+            p.date_taken = f"2021-06-{day}T12:00:00"  # reverse of name order
+        return cat
+
+    win = MainWindow(dated_catalog(), None, cache_dir=cache_dir,
+                     build_dir=None)
+    assert win.grid.display == [0, 1, 2]
+    menu = win._folder_sort_menu("f")
+    acts = {a.data(): a for a in menu.actions() if a.isCheckable()}
+    assert set(acts) == {"name", "date", "size"}
+    assert acts["name"].isChecked()                  # default, honestly named
+
+    acts["date"].trigger()
+    assert win.grid.sort_modes == {"f": "date"}
+    assert win.grid.display == [2, 1, 0]             # applied immediately
+    doc = json.loads((cache_dir / "config.json").read_text())
+    assert doc["sort_modes"] == {"f": "date"}
+    remenu = {a.data(): a for a in win._folder_sort_menu("f").actions()
+              if a.isCheckable()}
+    assert remenu["date"].isChecked() and not remenu["name"].isChecked()
+
+    # While a search view is up the mode change is stored, not applied —
+    # the search set keeps its own order (folder-scoped feature).
+    win.search.setText(".jpg")
+    search_display = list(win.grid.display)
+    win._set_folder_sort("f", "size")
+    assert win.grid.display == search_display
+    win._set_folder_sort("f", "date")                # restore for the reopen
+    win.search.setText("")
+
+    # Back to name: the default is dropped from the dict and the file.
+    win._set_folder_sort("f", "name")
+    assert win.grid.sort_modes == {} and win.grid.display == [0, 1, 2]
+    assert json.loads(
+        (cache_dir / "config.json").read_text())["sort_modes"] == {}
+
+    win._set_folder_sort("f", "date")
+    win2 = MainWindow(dated_catalog(), None, cache_dir=cache_dir,
+                      build_dir=None)
+    assert win2.grid.sort_modes == {"f": "date"}
+    assert win2.grid.display == [2, 1, 0]            # sorted from first paint
+
+
+def test_slideshow_follows_folder_sort_order(tmp_path: Path) -> None:
+    """The slideshow (and viewer activation) consume grid.display, so a
+    folder's sort mode carries through with no code of its own: Play on a
+    date-sorted folder view starts the show over the SORTED display list."""
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(_show_library(tmp_path))
+    for p, day in zip(cat.photos, ("03", "02", "01")):
+        p.date_taken = f"2021-06-{day}T12:00:00"     # reverse of name order
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._set_folder_sort("show", "date")
+    assert win.grid.display == [2, 1, 0]
+    win._start_slideshow()
+    assert win._slideshow is not None
+    assert win._slideshow.display == [2, 1, 0]
+    win._slideshow._exit()
 
 
 # ===========================================================================

@@ -46,13 +46,14 @@ from pathlib import Path
 T0 = time.perf_counter()
 
 from PySide6.QtCore import QObject, QProcess, Qt, QTimer, Signal
-from PySide6.QtGui import QPalette
+from PySide6.QtGui import QActionGroup, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QSlider,
     QSplitter,
     QStackedWidget,
@@ -93,7 +94,7 @@ from filetypes import (  # noqa: E402
     load_excluded_exts,
     save_excluded_exts,
 )
-from grid import GridView  # noqa: E402
+from grid import DEFAULT_SORT_MODE, SORT_MODES, GridView  # noqa: E402
 from thumbcache import (  # noqa: E402
     CacheError,
     ThumbCache,
@@ -239,6 +240,72 @@ def _remember_library(cache_root: Path, library: Path) -> None:
         os.replace(tmp, cfg)
     except OSError as e:
         log.warning("could not remember library choice: %s", e)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+# Per-folder sort modes (fauxcasa-q6l.11) — DURABLE-HOME DECISION
+# (2026-07-02): a per-folder sort mode is a VIEW preference of a read-only
+# app, so it lives MACHINE-LOCAL in a per-LIBRARY config.json inside that
+# library's own cache dir (beside catalog.json — cache_dir_for() names the
+# dir by a digest of the library path, so the prefs follow the library
+# without touching it, N1). N3 says durable state lives in the library, and
+# Picasa's MANUAL sort order is on the rebuild-loss regression list — but
+# v1's date/name/size modes are recomputable views, not user-authored
+# order (manual mode IS user-authored, and is blocked on the missing db3
+# oracle fixture — out of scope here), so losing this file costs one
+# right-click, not data. REVISIT AT M2: when tier-2 library-home state
+# lands (the albums order file), sort modes may move there so a library
+# carries its view prefs between machines.
+def _library_config_path(cache_dir: Path) -> Path:
+    """Machine-local per-library view prefs, beside catalog.json. The name
+    'config.json' is collision-free in the cache dir (catalog.json,
+    thumbs.fcache, import-report.json) and mirrors the per-user config.json
+    at the cache ROOT (_config_path) in shape and fail-soft handling."""
+    return cache_dir / "config.json"
+
+
+def load_sort_modes(cache_dir: Path | None) -> dict[str, str]:
+    """The persisted per-folder sort modes (folder rel-path -> mode), or {}.
+    Tolerates a missing/garbage file, a non-object document, and unknown
+    mode values (dropped) — view prefs are a convenience, never a gate.
+    Default-mode entries are dropped too: absent == DEFAULT_SORT_MODE."""
+    if cache_dir is None:
+        return {}
+    try:
+        data = json.loads(_library_config_path(cache_dir).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    modes = data.get("sort_modes")
+    if not isinstance(modes, dict):
+        return {}
+    return {rel: mode for rel, mode in modes.items()
+            if isinstance(rel, str) and mode in SORT_MODES
+            and mode != DEFAULT_SORT_MODE}
+
+
+def save_sort_modes(cache_dir: Path | None, modes: dict[str, str]) -> None:
+    """Persist the non-default per-folder sort modes. Best-effort (a write
+    failure never breaks the session — the in-memory modes still apply) and
+    torn-proof via the same temp-sibling + os.replace dance as
+    _remember_library. Rewrites the whole document: sort_modes is its only
+    key today; a future second view pref must merge, not clobber."""
+    if cache_dir is None:
+        return  # no cache dir (tests, degraded runs): session-only modes
+    keep = {rel: mode for rel, mode in sorted(modes.items())
+            if mode in SORT_MODES and mode != DEFAULT_SORT_MODE}
+    cfg = _library_config_path(cache_dir)
+    tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({"sort_modes": keep}))
+        os.replace(tmp, cfg)
+    except OSError as e:
+        log.warning("could not persist sort modes: %s", e)
         try:
             tmp.unlink()
         except OSError:
@@ -551,6 +618,11 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
 
         self.grid = GridView()
+        # Per-folder sort modes (fauxcasa-q6l.11), loaded BEFORE the first
+        # set_data/set_filter builds the display so a remembered mode shapes
+        # the very first paint. cache_dir=None (tests, degraded runs) means
+        # session-only modes; durable-home decision at _library_config_path.
+        self.grid.sort_modes = load_sort_modes(cache_dir)
         # The viewer shares the grid's cache pair: it paints an instant cached
         # preview (the nearest v2 level) while the full original loads
         # (fauxcasa-9pp). thumbs is None on a cold start until the build lands.
@@ -1074,6 +1146,11 @@ class MainWindow(QMainWindow):
         # sidebar selection (q6l.2). Connection order makes this run second.
         tree.itemClicked.connect(
             lambda *_a: self._refresh_tray_readout())
+        # Folder context menu (fauxcasa-q6l.11): per-folder sort modes.
+        # Wired HERE so every swapped-in rebuild tree (the gfz fresh-widget
+        # pattern) carries the menu, not just the first one.
+        tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tree.customContextMenuRequested.connect(self._sidebar_menu)
         return tree
 
     def _rebuild_sidebar(self) -> None:
@@ -1292,6 +1369,60 @@ class MainWindow(QMainWindow):
             if kind == "folder":
                 self.grid.scroll_to_folder(key)
             self._show_counts("All photos", self._shown_count())
+
+    # ---------- per-folder sort modes (fauxcasa-q6l.11) ----------
+
+    def _sidebar_menu(self, point) -> None:
+        """Right-click on the sidebar: FOLDER items get the sort-mode menu
+        (spec §5 per-folder sort; the manual mode is blocked on the db3
+        oracle fixture and absent). Every other item kind — albums keep
+        membership order, auto-collections keep catalog order — has no
+        menu, which is the folder-scoped contract made visible."""
+        item = self.tree.itemAt(point)
+        if item is None:
+            return
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data or data[0] != "folder":
+            return
+        menu = self._folder_sort_menu(data[1])
+        menu.exec(self.tree.viewport().mapToGlobal(point))
+
+    def _folder_sort_menu(self, rel: str) -> QMenu:
+        """Build (without exec'ing — the seam tests drive) the context menu
+        for one folder: a checkable, mutually exclusive action per sort
+        mode, the folder's current mode checked."""
+        menu = QMenu(self.tree)
+        menu.addSection("Sort by")
+        group = QActionGroup(menu)
+        current = self.grid.sort_modes.get(rel, DEFAULT_SORT_MODE)
+        for mode in SORT_MODES:
+            act = menu.addAction(mode.capitalize())
+            act.setCheckable(True)
+            act.setChecked(mode == current)
+            act.setData(mode)
+            group.addAction(act)
+            act.triggered.connect(
+                lambda _checked=False, m=mode: self._set_folder_sort(rel, m))
+        return menu
+
+    def _set_folder_sort(self, rel: str, mode: str) -> None:
+        """Apply + persist one folder's sort mode. The mode reshapes the
+        folder-grouped default view only, so 'apply immediately' means:
+        when that view is showing (no search, All-photos/folder selection),
+        rebuild it and bring the re-sorted folder into view; an active
+        search/album/starred view keeps its own order by design and picks
+        the mode up on the next return to the folder view."""
+        if mode == DEFAULT_SORT_MODE:
+            self.grid.sort_modes.pop(rel, None)
+        else:
+            self.grid.sort_modes[rel] = mode
+        save_sort_modes(self.cache_dir, self.grid.sort_modes)
+        if self.search.text().strip():
+            return
+        kind, key = self._selected_view()
+        if kind in ("all", "folder"):
+            self._apply_view(kind, key)
+            self.grid.scroll_to_folder(rel)
 
     # ---------- search ----------
 
