@@ -1598,21 +1598,39 @@ class MainWindow(QMainWindow):
         """A held thumb was clicked: show that photo in the grid — back
         on the browser page, falling back to the All-photos view when
         the active filter doesn't show it (a held photo is cross-folder
-        by design, so a search/album/starred view may not contain it)."""
+        by design, so a search/album/starred view may not contain it).
+        Hidden photos auto-reveal when reveal is off (q6l.18)."""
         idx = self.tray.index_of(rel)
         if idx is None:
             return
         self.pages.setCurrentWidget(self.pages.widget(0))
+        revealed = False
         if idx not in self.grid.display_pos:
-            self.search.blockSignals(True)
-            self.search.clear()
-            self.search.blockSignals(False)
-            self.grid.set_filter(None, "")
-            self._reselect_view("all", "")
-            self._show_counts("All photos", self._shown_count())
+            # Hidden photo with reveal off: auto-reveal before falling back
+            # to All photos — avoids a silent no-op (N7) when the only
+            # absence reason is the hidden flag.
+            photo = self.catalog.photos[idx]
+            if not self.grid.reveal and not photo.visible:
+                self.reveal_box.setChecked(True)   # triggers _toggle_reveal
+                revealed = True
+            if idx not in self.grid.display_pos:
+                # Still absent (filter reason or reveal didn't surface it):
+                # clear to All photos as the last resort.
+                self.search.blockSignals(True)
+                self.search.clear()
+                self.search.blockSignals(False)
+                self.grid.set_filter(None, "")
+                self._reselect_view("all", "")
+                self._show_counts("All photos", self._shown_count())
         if idx in self.grid.display_pos:
             self.grid._select(idx)
             self.grid._ensure_visible(idx)
+            if revealed:
+                self.statusBar().showMessage(
+                    "Hidden photos revealed to show this photo", 4000)
+        else:
+            self.statusBar().showMessage(
+                "Photo not visible in any view", 4000)
         self.grid.setFocus()
         self._refresh_tray_readout()
 

@@ -5776,6 +5776,35 @@ def test_tray_click_navigates_grid_with_view_fallback(
     assert win.search.text() == "d" and g.current == d[3]
 
 
+def test_tray_navigate_hidden_photo_auto_reveals(library: Path) -> None:
+    """Navigating to a held photo that is hidden auto-reveals rather than
+    silently falling back to All photos (q6l.18, N7 compliance).
+    reveal_box is set so UI state stays consistent; the photo is selected;
+    a status message names the action."""
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    g = win.grid
+
+    # library fixture: "2020-01-01 Trip/b.jpg" carries hidden=yes
+    hidden_rel = "2020-01-01 Trip/b.jpg"
+    idx = next(i for i, p in enumerate(cat.photos) if p.rel == hidden_rel)
+    assert not cat.photos[idx].visible            # confirm fixture
+    assert not win.grid.reveal                    # reveal starts off
+    assert idx not in g.display_pos              # absent without reveal
+
+    win.tray.hold([hidden_rel])                   # hold the hidden photo
+    win._tray_navigate(hidden_rel)
+
+    assert win.grid.reveal                        # auto-revealed via reveal_box
+    assert win.reveal_box.isChecked()             # checkbox UI in sync
+    assert idx in g.display_pos                  # photo now in grid
+    assert g.current == idx                       # photo selected
+    assert "revealed" in win.statusBar().currentMessage().lower()
+
+
 def test_tray_clear_and_per_item_remove(tmp_path: Path) -> None:
     """Clear empties the tray (button enablement follows); middle-click
     on a thumb removes exactly that item, keeping the rest in order."""
