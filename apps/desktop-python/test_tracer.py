@@ -6426,9 +6426,9 @@ def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
     path.write_text(json.dumps(data))
     assert load_catalog(path, root) is None
 
-    # v9 = TGA/PSD stills joined the walk (fauxcasa-v46.4); bump this pin
+    # v10 = edit recipes (fauxcasa-cam.15; v9 was TGA/PSD); bump this pin
     # with every CATALOG_VERSION change so the rejection below stays real.
-    assert catmod.CATALOG_VERSION == 9
+    assert catmod.CATALOG_VERSION == 10
     cat.backfill_state = BACKFILL_COMPLETE
     save_catalog(cat, path)
     data = json.loads(path.read_text())
@@ -7452,3 +7452,406 @@ def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
     px = color_at("good.psd")
     assert abs(px.red() - 200) < 30 and abs(px.blue() - 120) < 30
     assert ent["nocomp.psd"][1][1] == 0          # the ONE intended error tile
+
+
+# ---------------------------------------------------------------------------
+# Edit-recipe ingest + crop-applied display (fauxcasa-cam.15): §4 "ini wins
+# for edit recipes", and M1 "see your library again" means a cropped photo
+# shows CROPPED — Picasa itself rendered unsaved recipes applied (oracle
+# fixture 004: the crop lives in the ini ALONE — crop=rect64(..) plus its
+# filters= crop64 twin — JPEG untouched, no db3 change). Ingest: the crop
+# rect is resolved for display (crop= wins over the chain; conflicts land on
+# the import report) and every recipe key/value is preserved RAW on
+# Photo.edits (N3 losslessness; full recipe rendering is M3). Display: the
+# crop bakes into thumbnails at index time — like the EXIF bake, and UNLIKE
+# rotate=, because a crop changes WHICH pixels are shown — and applies to
+# the viewer's decoded original, composing crop -> EXIF orientation ->
+# rotate= (rect64 fractions are STORED-frame: the format doc pins that
+# rotate= does not transform crop coords; cropmap.py holds the derivation).
+# Faces on a cropped photo rebase through the crop first — they still
+# reference stored pixels. Fixtures are synthetic (privacy rule).
+# ---------------------------------------------------------------------------
+
+# Oracle fixture 004's exact value: rect64(dc3369dc570a51e), zero-stripped
+# 15-hex — the padded split is 0dc3 369d c570 a51e.
+_FIXTURE_004_CROP = "rect64(dc3369dc570a51e)"
+_FIXTURE_004_RECT = (0x0DC3 / 65536, 0x369D / 65536,
+                     0xC570 / 65536, 0xA51E / 65536)
+
+
+def test_crop_ingest_fixture_004_shape(tmp_path: Path) -> None:
+    """The observed unsaved-crop ini shape (oracle fixture 004): crop= and
+    the agreeing filters= crop64 twin parse to the exact rect64 fractions,
+    both raw lines are preserved in ini order on Photo.edits (backuphash=
+    is NOT a recipe key), has_edits is on, and the agreeing pair raises NO
+    crop_conflict import note — Picasa always writes both."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "photo03.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[photo03.jpg]\r\n"
+        "backuphash=64082\r\n"
+        f"crop={_FIXTURE_004_CROP}\r\n"
+        "filters=crop64=1,dc3369dc570a51e;\r\n")
+    cat = scan_library(root)
+    p = cat.photos[0]
+    assert p.crop == _FIXTURE_004_RECT
+    assert p.edits == (("crop", _FIXTURE_004_CROP),
+                       ("filters", "crop64=1,dc3369dc570a51e;"))
+    assert p.has_edits
+    assert not [e for e in cat.report.entries if e.kind == "crop_conflict"]
+
+
+def test_crop_source_precedence(tmp_path: Path) -> None:
+    """_resolve_crop's source ladder: a filters=-only chain fills in (its
+    LAST crop64 wins — the chain is ordered history and a re-crop
+    appends); a disagreeing crop= WINS and surfaces a crop_conflict import
+    note (§4: never silently resolved); a malformed crop= falls through to
+    the chain; a standalone gist-era crop64= key is the last resort; a
+    degenerate rect is no crop at all — but the raw junk is still
+    preserved and still reads as edited (honest marker)."""
+    root = tmp_path / "lib"
+    for name in "abcde":
+        make_jpeg(root / "f" / f"{name}.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        # chain only; two crop64 ops -> the LAST one wins
+        "[a.jpg]\r\n"
+        "filters=crop64=1,10001000;crop64=1,400080008000c000;\r\n"
+        # crop= disagrees with the chain -> crop= wins + import note
+        "[b.jpg]\r\n"
+        "crop=rect64(40004000c000c000)\r\n"
+        "filters=crop64=1,10001000;\r\n"
+        # malformed crop= -> the chain fills the gap, no conflict
+        "[c.jpg]\r\n"
+        "crop=rect64(not-hex)\r\n"
+        "filters=crop64=1,40004000c000c000;\r\n"
+        # standalone crop64= key (gist-era), op-param shape
+        "[d.jpg]\r\n"
+        "crop64=1,40004000c000c000\r\n"
+        # degenerate rect (right < left, bottom < top): unusable
+        "[e.jpg]\r\n"
+        "crop=rect64(c000c00040004000)\r\n")
+    cat = scan_library(root)
+    by = {p.name: p for p in cat.photos}
+    assert by["a.jpg"].crop == (0.25, 0.5, 0.5, 0.75)          # last crop64
+    assert by["b.jpg"].crop == (0.25, 0.25, 0.75, 0.75)        # crop= wins
+    assert by["c.jpg"].crop == (0.25, 0.25, 0.75, 0.75)        # chain fills
+    assert by["d.jpg"].crop == (0.25, 0.25, 0.75, 0.75)        # bare crop64=
+    assert by["e.jpg"].crop is None
+    assert by["e.jpg"].edits and by["e.jpg"].has_edits         # raw survives
+    conflicts = [e for e in cat.report.entries if e.kind == "crop_conflict"]
+    assert len(conflicts) == 1 and conflicts[0].subject == "f/b.jpg"
+
+
+def test_edit_recipe_raw_preservation_and_marker(tmp_path: Path) -> None:
+    """N3 losslessness: every recipe key/value survives verbatim, in ini
+    order, DUPLICATES kept (crashed-mid-write files have them) — and
+    rotate= is excluded (parsed field of its own, composes live). The
+    has_edits marker: redo= alone counts (recipe state present even if
+    every op is undone), text=/textactive=1 count, but textactive=0 alone
+    does NOT (Picasa's overlay-off record — fixture 005 writes it into the
+    post-bake stash ini), nor does rotate= alone."""
+    root = tmp_path / "lib"
+    for name in ("a", "b", "c", "d"):
+        make_jpeg(root / "f" / f"{name}.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\n"
+        "rotate=rotate(1)\r\n"
+        "redo=unsharp=1,0.5;\r\n"
+        "textactive=1\r\n"
+        "text=1;10;20;hello;Arial;0.1;0.2;0.3;0.4;v1,ffffffff;;\r\n"
+        "flipped=1\r\n"
+        "redo=unsharp=1,0.7;\r\n"          # duplicate key, kept in order
+        "[b.jpg]\r\n"
+        "textactive=0\r\n"                  # overlay-off alone: NOT edited
+        "[c.jpg]\r\n"
+        "rotate=rotate(2)\r\n"              # rotate alone: NOT a recipe
+        "[d.jpg]\r\n"
+        "redo=unsharp=1,0.5;\r\n")          # undone ops still carry state
+    cat = scan_library(root)
+    by = {p.name: p for p in cat.photos}
+    assert by["a.jpg"].edits == (
+        ("redo", "unsharp=1,0.5;"),
+        ("textactive", "1"),
+        ("text", "1;10;20;hello;Arial;0.1;0.2;0.3;0.4;v1,ffffffff;;"),
+        ("flipped", "1"),
+        ("redo", "unsharp=1,0.7;"),
+    )
+    assert by["a.jpg"].rotate == 1 and by["a.jpg"].has_edits
+    assert by["b.jpg"].edits == (("textactive", "0"),)
+    assert not by["b.jpg"].has_edits
+    assert by["c.jpg"].edits == () and not by["c.jpg"].has_edits
+    assert by["d.jpg"].has_edits
+
+
+def test_catalog_v10_crop_roundtrip_and_version_gate(tmp_path: Path) -> None:
+    """CATALOG_VERSION is 10 (edit recipes + the crop-baked thumbs it
+    implies; v9 was TGA/PSD), the crop rect and raw recipe strings
+    round-trip exactly through the persisted catalog (n/65536 fractions
+    are exact in JSON; has_edits re-derives), and a pre-v10 file is
+    rejected -> the caller cold-rebuilds (nothing in the size/mtime drift
+    check could notice an ini-only interpretation change)."""
+    from catalog import CATALOG_VERSION
+
+    assert CATALOG_VERSION == 10
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\n"
+        f"crop={_FIXTURE_004_CROP}\r\n"
+        "filters=crop64=1,dc3369dc570a51e;\r\n"
+        "redo=unsharp=1,0.5;\r\n")
+    cat = scan_library(root)
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+    loaded = load_catalog(path, root)
+    assert loaded is not None
+    a, b = loaded.photos[0], loaded.photos[1]
+    assert a.crop == _FIXTURE_004_RECT
+    assert a.edits == cat.photos[0].edits
+    assert a.has_edits and not b.has_edits
+    assert b.crop is None and b.edits == ()
+    data = json.loads(path.read_text())
+    assert data["version"] == 10
+    data["version"] = 9                          # pre-edit-recipe format
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, root) is None
+
+
+def _quadrant_jpeg(path: Path, edge: int = 1024) -> None:
+    """A 4-quadrant marker image: TL red, TR green, BL blue, BR white."""
+    from PySide6.QtGui import QColor, QImage, QPainter
+
+    img = QImage(edge, edge, QImage.Format.Format_RGB32)
+    half = edge // 2
+    p = QPainter(img)
+    p.fillRect(0, 0, half, half, QColor(255, 0, 0))
+    p.fillRect(half, 0, half, half, QColor(0, 200, 0))
+    p.fillRect(0, half, half, half, QColor(0, 0, 255))
+    p.fillRect(half, half, half, half, QColor(255, 255, 255))
+    p.end()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    assert img.save(str(path), "JPEG", 95)
+
+
+def test_thumb_bakes_crop_before_downscale(tmp_path: Path) -> None:
+    """The indexer bakes the crop into the cached thumbnail, and it crops
+    BEFORE the downscale in resolution terms: cropping a 1024px source to
+    its 512px top-right quadrant must yield a 256px thumb (the scaled-
+    decode target is computed for the SUB-RECT) — the naive decode-to-256-
+    then-crop order would yield 128px, so the dimension assertion pins the
+    order. Pixel probes confirm WHICH quadrant survived. The uncropped
+    sibling behaves exactly as before."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+
+    root = tmp_path / "lib"
+    _quadrant_jpeg(root / "f" / "cropped.jpg")
+    _quadrant_jpeg(root / "f" / "plain.jpg")
+    # top-right quadrant: (0.5, 0.0, ~1.0, 0.5) — 1.0 is not encodable in
+    # a u16 fraction, so Picasa writes 0xffff (0.999985), as here
+    (root / "f" / ".picasa.ini").write_text(
+        "[cropped.jpg]\r\ncrop=rect64(80000000ffff8000)\r\n")
+    cat, cache = _bound_cache(tmp_path, root)
+    by = {p.name: i for i, p in enumerate(cat.photos)}
+
+    def thumb(idx: int) -> QImage:
+        offset, length, _w, _h = cache.entries[idx]
+        assert length > 0
+        with open(cache.path, "rb") as f:
+            f.seek(offset)
+            img = QImage.fromData(f.read(length), "JPEG")
+        assert not img.isNull()
+        return img
+
+    ci = by["cropped.jpg"]
+    img = thumb(ci)
+    assert (img.width(), img.height()) == (256, 256)   # NOT 128: see doc
+    assert cache.entries[ci][2:] == (256, 256)
+    for fx, fy in ((0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)):
+        c = img.pixelColor(int(fx * img.width()), int(fy * img.height()))
+        assert c.green() > 150 and c.red() < 90 and c.blue() < 90, (fx, fy)
+    plain = thumb(by["plain.jpg"])
+    assert (plain.width(), plain.height()) == (256, 256)
+    tl = plain.pixelColor(64, 64)
+    assert tl.red() > 150 and tl.green() < 90          # TL still red
+
+
+def test_thumb_crop_composes_with_exif_orientation(tmp_path: Path) -> None:
+    """crop= coordinates are STORED-frame while the baked thumb is
+    EXIF-upright, so the bake must map the rect through the orientation
+    tag: on a 90-CW-stored (orientation 6) photo, cropping exactly the
+    marked stored rect yields a thumb of the region's SWAPPED dims that is
+    all marker — an unmapped rect would crop gray. Uses _index_one
+    directly (the bake seam)."""
+    _offscreen_app()
+    from PySide6.QtCore import QBuffer, QIODevice
+
+    import metareader
+
+    root = tmp_path / "lib"
+    img = _marked_stored_image()          # 96x64, red at (.25,.5,.5,.75)
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert img.save(buf, "JPEG", 95)
+    (root / "f").mkdir(parents=True)
+    (root / "f" / "a.jpg").write_bytes(
+        metareader.embed_test_metadata(bytes(buf.data()), orientation=6))
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\ncrop=rect64(400080008000c000)\r\n")  # == the red patch
+    cat = scan_library(root)
+    assert cat.photos[0].crop == (0.25, 0.5, 0.5, 0.75)
+    _idx, blobs, *_rest, primary = thumbcache._index_one(
+        root, cat.photos[0], 0, [thumbcache.THUMB_EDGE])
+    # stored region 24x16 -> orientation 6 swaps -> 16x24 upright, < 256
+    # so never upscaled
+    assert (primary.width(), primary.height()) == (16, 24)
+    assert blobs[0][1:] == (16, 24)
+    c = primary.pixelColor(8, 12)
+    assert c.red() > 150 and c.green() < 100 and c.blue() < 100
+
+
+def test_viewer_crop_exif_rotate_composition_order(tmp_path: Path) -> None:
+    """The viewer's decode composes crop -> EXIF orientation -> rotate=,
+    against REAL EXIF bytes: with orientation 6 and a stored-frame crop
+    whose top-left quadrant is the red patch, the patch must land top-
+    RIGHT at rotate=0 (one 90 CW) and bottom-right at rotate=1 (180
+    total), with the dims transformed to match. Wrong order — cropping
+    the upright pixels with the UNMAPPED stored rect, or cropping after
+    rotate= — moves the patch and fails the probes."""
+    _offscreen_app()
+    from PySide6.QtCore import QBuffer, QIODevice
+
+    import metareader
+    from viewer import load_original_oriented
+
+    img = _marked_stored_image()          # 96x64, red at (.25,.5,.5,.75)
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert img.save(buf, "JPEG", 95)
+    p = tmp_path / "a.jpg"
+    p.write_bytes(
+        metareader.embed_test_metadata(bytes(buf.data()), orientation=6))
+    # stored-frame crop (0.25, 0.5, 0.75, 1.0): a 48x32 region whose
+    # LEFT-TOP quadrant is exactly the red patch
+    crop = (0.25, 0.5, 0.75, 1.0)
+
+    def red(shown, fx: float, fy: float) -> bool:
+        c = shown.pixelColor(int(fx * shown.width()),
+                             int(fy * shown.height()))
+        return c.red() > 150 and c.green() < 100 and c.blue() < 100
+
+    shown, got = load_original_oriented(str(p), 0, crop)
+    assert got == 6 and not shown.isNull()
+    assert (shown.width(), shown.height()) == (32, 48)  # 90 CW swaps
+    assert red(shown, 0.75, 0.25) and not red(shown, 0.25, 0.75)
+
+    shown, got = load_original_oriented(str(p), 1, crop)
+    assert got == 6
+    assert (shown.width(), shown.height()) == (48, 32)  # 180 total
+    assert red(shown, 0.75, 0.75) and not red(shown, 0.25, 0.25)
+
+
+def test_face_rect_rebase_through_crop() -> None:
+    """Faces on a cropped photo still reference STORED pixels, so the
+    overlay rebases each rect into the crop sub-rect FIRST, then applies
+    the same EXIF x rotate mapping as the pixels. Pure-math contract:
+    identity (face == crop fills the frame), clamping (a straddling face
+    shows its visible part), rejection (a cropped-out face has no
+    on-screen pixels), degenerate crops, and the composition with the
+    orientation map afterwards."""
+    from cropmap import map_fraction_rect, rebase_fraction_rect
+
+    crop = (0.25, 0.25, 0.75, 0.75)
+    assert rebase_fraction_rect(crop, crop) == (0.0, 0.0, 1.0, 1.0)
+    got = rebase_fraction_rect((0.4, 0.4, 0.6, 0.6), (0.5, 0.25, 1.0, 0.75))
+    assert got == pytest.approx((0.0, 0.3, 0.2, 0.7))
+    assert rebase_fraction_rect((0.0, 0.0, 0.1, 0.1), (0.5, 0.5, 1.0, 1.0)) \
+        is None
+    assert rebase_fraction_rect((0.4, 0.4, 0.6, 0.6), (0.5, 0.5, 0.5, 1.0)) \
+        is None                                        # degenerate crop
+    # composed: a face filling the crop fills the displayed frame under
+    # ANY orientation x rotate (the mapping of (0,0,1,1) is (0,0,1,1))
+    for orientation in range(1, 9):
+        for rotate in range(4):
+            assert map_fraction_rect(
+                rebase_fraction_rect(crop, crop), orientation, rotate
+            ) == (0.0, 0.0, 1.0, 1.0)
+
+
+def test_viewer_face_rects_on_cropped_photo(tmp_path: Path) -> None:
+    """End-to-end overlay-on-crop: a face tag coinciding with the crop
+    fills the shown rect exactly, and a face the crop cut out produces NO
+    box (its pixels are not on screen) — the mapping goes rebase -> EXIF x
+    rotate -> _shown_rect, all through the real viewer plumbing."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+
+    from viewer import ViewerPage, face_widget_rect
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[Contacts2]\r\nabcdef0123456789=Pat Named;;\r\n"
+        "[a.jpg]\r\n"
+        "crop=rect64(40004000c000c000)\r\n"
+        "faces=rect64(40004000c000c000),abcdef0123456789;"
+        "rect64(10001000),ffffffffffffffff\r\n")
+    cat = scan_library(root)
+    p = cat.photos[0]
+    assert p.crop == (0.25, 0.25, 0.75, 0.75) and len(p.faces) == 2
+    v = ViewerPage(cat, None)
+    v.resize(1280, 800)
+    v.show_photo([0], 0)
+    v._serial += 1                        # stale the async decode job
+    orig = QImage(640, 480, QImage.Format.Format_RGB32)  # cropped decode
+    orig.fill(0x336699)
+    v._on_loaded(v._serial, orig, 1)
+    v.faces_visible = True
+    rects = v._face_rects()
+    # the (0,0,.0625,.0625) face lies wholly outside the crop: dropped
+    assert len(rects) == 1 and rects[0][1] == "Pat Named"
+    shown = v._shown_rect(1280, 800, orig)
+    assert rects[0][0] == face_widget_rect((0.0, 0.0, 1.0, 1.0), 1, 0, shown)
+
+
+def test_viewer_info_bar_edited_chip(tmp_path: Path) -> None:
+    """The honest M1 'edited' cue: a photo carrying a recipe shows the
+    chip in the viewer info bar; a plain photo (and a textactive=0-only
+    one) does not. The unsaved-vs-baked state cue is M3 — presence only."""
+    _offscreen_app()
+    from viewer import ViewerPage
+
+    root = tmp_path / "lib"
+    for name in ("a", "b", "c"):
+        make_jpeg(root / "f" / f"{name}.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\nfilters=tilt=1,0.280632,0.000000;\r\n"
+        "[c.jpg]\r\ntextactive=0\r\n")
+    cat = scan_library(root)
+    by = {p.name: p for p in cat.photos}
+    v = ViewerPage(cat, None)
+    v.display, v.pos = [0, 1, 2], 0
+    assert "edited" in v._info_text(by["a.jpg"])
+    assert "edited" not in v._info_text(by["b.jpg"])
+    assert "edited" not in v._info_text(by["c.jpg"])
+
+
+def test_ingest_parity_gate_passes() -> None:
+    """The M1 ingest-parity gate (spec §9 clause 2) end-to-end: with
+    edit-recipe ingest landed (fauxcasa-cam.15) the expectation table has
+    ZERO expected-missing classes, so the gate must PASS fully ingested —
+    zero loss across every class it tracks. Runs the real script in its
+    own uv env (exactly CI's tests.yml job); skips when uv is absent."""
+    import shutil
+    import subprocess
+
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv not on PATH")
+    proc = subprocess.run(
+        [uv, "run", str(REPO / "scripts" / "check-ingest-parity.py")],
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=600)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "fully ingested (0 expected-missing)" in proc.stdout

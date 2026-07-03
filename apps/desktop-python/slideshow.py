@@ -181,12 +181,13 @@ class SlideshowPage(ViewerPage):
         photo = self.catalog.photos[nxt]
         path = str(self.catalog.root / photo.rel)
         rotate = photo.rotate
+        crop = photo.crop  # unsaved crop recipe rides along (cam.15)
 
         def work() -> None:
             with self._prefetch_lock:
                 if serial != self._prefetch_serial:
                     return             # superseded before it even started
-            img = load_original(path, rotate)
+            img = load_original(path, rotate, crop)
             with self._prefetch_lock:
                 if serial != self._prefetch_serial:
                     return             # superseded by a newer kick
