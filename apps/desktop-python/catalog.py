@@ -74,12 +74,14 @@ from rawload import RAW_EXTS, is_raw_suffix  # noqa: E402
 from videoload import VIDEO_EXTS, is_video_suffix  # noqa: E402
 
 # Must match scripts/make-thumbcache.py EXTS exactly (cache-order parity):
-# the stills set below PLUS Picasa's documented 16-vendor RAW extension
+# the stills set below — the full §5 stills matrix incl. TGA (Qt's qtga
+# plugin decodes it) and PSD (Pillow flattened-composite fallback,
+# fauxcasa-v46.4) — PLUS Picasa's documented 16-vendor RAW extension
 # list (rawload.RAW_EXTS, fauxcasa-v46.1) PLUS Picasa's documented video
 # list (videoload.VIDEO_EXTS, fauxcasa-v46.2) — any change to any part
 # lands in BOTH files or caches stop binding.
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
-        ".webp"} | RAW_EXTS | VIDEO_EXTS
+        ".webp", ".tga", ".psd"} | RAW_EXTS | VIDEO_EXTS
 
 INI_NAMES = (".picasa.ini", "Picasa.ini", "picasa.ini")
 
@@ -947,7 +949,11 @@ def scan_library(root: Path,
 # = complete). A v7 adopt catalog carries neither the key nor any way to
 # tell "never backfilled" from "complete", so it is rejected and the cold
 # walk re-adopts with an explicit NOT_STARTED state — which then backfills.
-CATALOG_VERSION = 8
+# v9: TGA and PSD stills join the walk (§5 stills matrix, fauxcasa-v46.4)
+# — a v8 catalog was walked without them, so a warm start would silently
+# hide every TGA/PSD in the library until some unrelated drift; reject
+# and cold-rebuild (the same shape as the v7 video bump).
+CATALOG_VERSION = 9
 
 # The import report's file name, written beside catalog.json (same cache
 # dir) by save_report and re-attached on warm starts via load_report.

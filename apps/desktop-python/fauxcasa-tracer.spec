@@ -6,11 +6,11 @@
 # austerity on resident memory + cold start, not installer megabytes.
 #
 # Build from the repo root (ONE invocation produces BOTH variants below;
-# rawpy AND av MUST be in the build env or the artifact silently ships
-# without RAW/video decode — rawload.py and videoload.py import them
-# lazily, so nothing fails at build):
+# rawpy, av AND pillow MUST be in the build env or the artifact silently
+# ships without RAW/video/PSD decode — rawload.py, videoload.py and
+# pillowload.py import them lazily, so nothing fails at build):
 #   uv run --with "PySide6-Essentials==6.11.1" --with "pyinstaller==6.20.0" \
-#       --with "rawpy==0.27.0" --with "av==18.0.0" \
+#       --with "rawpy==0.27.0" --with "av==18.0.0" --with "pillow==12.3.0" \
 #       pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 #
 # Decisions (see the synthesis in the §7-validation report):
@@ -53,15 +53,17 @@ _repo = os.path.dirname(os.path.dirname(_here))
 # top-level modules after sys.path.insert(parent) — they are NOT a package,
 # so PyInstaller's module graph needs them named explicitly. "exiv2" (the
 # python-exiv2 binding behind metareader), "rawpy" (the LibRaw wheel
-# behind the rawload seam, fauxcasa-v46.1) and "av" (the PyAV/libav wheel
-# behind the videoload poster seam, fauxcasa-v46.2) are imported lazily
-# inside functions with fail-soft fallbacks that would otherwise let a
-# missed collection ship a build that silently reads no dates/GPS/Rating,
-# error-tiles every RAW, or error-tiles every video poster — named here
-# so the graph can never drop them. Wheels only, no system libs.
+# behind the rawload seam, fauxcasa-v46.1), "av" (the PyAV/libav wheel
+# behind the videoload poster seam, fauxcasa-v46.2) and "PIL" (the Pillow
+# wheel behind the pillowload PSD/still fallback, fauxcasa-v46.4) are
+# imported lazily inside functions with fail-soft fallbacks that would
+# otherwise let a missed collection ship a build that silently reads no
+# dates/GPS/Rating, error-tiles every RAW, error-tiles every video
+# poster, or error-tiles every PSD — named here so the graph can never
+# drop them. Wheels only, no system libs.
 _hidden = ["catalog", "grid", "thumbcache", "viewer", "slideshow", "peek",
            "picasa_db", "applog", "metareader", "exiv2", "rawload", "rawpy",
-           "videoload", "av"]
+           "videoload", "av", "pillowload", "PIL", "PIL.Image", "PIL.ImageOps"]
 
 # Qt modules the tracer never touches (QtCore/QtGui/QtWidgets only). Mostly
 # no-ops under PySide6-Essentials, but they make the build self-documenting

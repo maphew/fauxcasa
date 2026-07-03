@@ -94,8 +94,10 @@ VIDEO_EXTS = frozenset({
 # Poster grab point, seconds — mirror of videoload.POSTER_SEEK_S.
 POSTER_SEEK_S = 1.0
 # Must match apps/desktop-python/catalog.py EXTS exactly (cache-order parity).
+# TGA/PSD joined the stills set with fauxcasa-v46.4; PIL reads both natively
+# (PSD = the flattened composite, matching the app's Pillow fallback).
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
-        ".webp"} | RAW_EXTS | VIDEO_EXTS
+        ".webp", ".tga", ".psd"} | RAW_EXTS | VIDEO_EXTS
 # Mirror of apps/desktop-python/thumbcache.py.RECOMMENDED_LEVELS — 512 is the
 # hi-DPI/loupe payload, 256 is the grid's primary, 128 a cheap low-DPI level.
 RECOMMENDED_LEVELS = (512, THUMB_EDGE, 128)

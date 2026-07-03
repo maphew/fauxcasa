@@ -6422,7 +6422,9 @@ def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
     path.write_text(json.dumps(data))
     assert load_catalog(path, root) is None
 
-    assert catmod.CATALOG_VERSION == 8
+    # v9 = TGA/PSD stills joined the walk (fauxcasa-v46.4); bump this pin
+    # with every CATALOG_VERSION change so the rejection below stays real.
+    assert catmod.CATALOG_VERSION == 9
     cat.backfill_state = BACKFILL_COMPLETE
     save_catalog(cat, path)
     data = json.loads(path.read_text())
@@ -6843,3 +6845,156 @@ def test_face_overlay_hidden_on_peek_and_slideshow(tmp_path: Path) -> None:
         assert not s.faces_visible           # F could never switch it on
         s.faces_visible = True               # even forced...
         assert s._face_rects() == []         # ...the paint gate holds
+
+
+# ===========================================================================
+# ---- stills format matrix (fauxcasa-v46.4): TGA, PSD Pillow fallback,
+# ---- File Types panel, non-JPEG regression fixtures
+# ===========================================================================
+
+
+def _load_mtc():
+    """scripts/make-thumbcache.py as a module (hyphenated file name)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "mtc", REPO / "scripts" / "make-thumbcache.py")
+    mtc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mtc)
+    return mtc
+
+
+def _make_tga(path: Path, w: int = 64, h: int = 48,
+              color: tuple[int, int, int] = (40, 200, 90)) -> Path:
+    """A synthetic TGA via Pillow (Qt's qtga plugin reads, PIL writes)."""
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (w, h), color).save(path, "TGA")
+    return path
+
+
+def test_stills_extensions_in_both_walkers(tmp_path: Path) -> None:
+    """The full §5 stills matrix (JPEG, PNG, TIFF, GIF, BMP, PSD, TGA,
+    WebP) is in BOTH EXTS sets, in lockstep, and both walks pick the
+    v46.4 additions (TGA, PSD) up case-insensitively — the walk-parity
+    contract that keeps caches binding."""
+    import catalog
+
+    mtc = _load_mtc()
+    stills = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
+              ".webp", ".tga", ".psd"}
+    assert stills <= catalog.EXTS
+    assert catalog.EXTS == mtc.EXTS           # the whole lockstep set
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    for name in ("a.TGA", "b.psd", "c.Tga", "d.PSD"):
+        (root / name).write_bytes(b"stub")    # walk checks suffix only
+    make_jpeg(root / "e.jpg")
+    walked = [p.name for p in walk_library(root)]
+    assert sorted(walked) == ["a.TGA", "b.psd", "c.Tga", "d.PSD", "e.jpg"]
+    script_walk = sorted(p for p in root.rglob("*")
+                         if p.suffix.lower() in mtc.EXTS and p.is_file())
+    assert [p.name for p in script_walk] == walked
+
+
+def test_tga_thumbs_through_real_indexer(tmp_path: Path) -> None:
+    """A TGA rides the ordinary QImageReader decode (the pinned PySide6
+    build ships qtga): the REAL _index_one path produces a color-correct
+    thumb, not an error tile — and the standalone PIL builder reads the
+    same file natively (cache-content parity)."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    _make_tga(root / "t.tga")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    (_o, length, w, h), = cache.entries
+    assert length > 0 and (w, h) == (64, 48)
+    px = _thumb_qimage(cache, 0).pixelColor(32, 24)
+    assert abs(px.red() - 40) < 30 and abs(px.green() - 200) < 30 \
+        and abs(px.blue() - 90) < 30
+
+    (blob, w, h), = _load_mtc()._make_thumb(root / "t.tga", [256])
+    assert blob and (w, h) == (64, 48)        # PIL reads TGA natively
+
+
+def _make_psd(path: Path, w: int = 64, h: int = 48,
+              color: tuple[int, int, int] = (200, 60, 120),
+              truncate: bool = False) -> Path:
+    """A synthetic 'maximize compatibility' PSD: hand-built to the
+    documented framing (Pillow READS PSD but cannot write it) — 8BPS v1
+    header, empty color-mode/resources/layer sections, then the raw-
+    compression flattened composite as planar RGB. Privacy-safe like the
+    hand-built APP segments above. `truncate=True` cuts the composite
+    planes short: the synthetic stand-in for a PSD saved WITHOUT
+    maximize-compatibility (no usable composite -> legitimately an
+    error tile, never a crash)."""
+    r, g, b = color
+    out = (b"8BPS" + struct.pack(">H", 1) + b"\x00" * 6
+           + struct.pack(">H", 3)            # channels
+           + struct.pack(">II", h, w)        # rows, columns
+           + struct.pack(">HH", 8, 3))       # 8-bit, mode 3 = RGB
+    out += struct.pack(">I", 0)              # color mode data: empty
+    out += struct.pack(">I", 0)              # image resources: empty
+    out += struct.pack(">I", 0)              # layer & mask info: empty
+    planes = (bytes([r]) * (w * h) + bytes([g]) * (w * h)
+              + bytes([b]) * (w * h))
+    data = struct.pack(">H", 0) + planes     # compression 0 = raw
+    if truncate:
+        data = data[: 2 + (w * h) // 2]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(out + data)
+    return path
+
+
+def test_psd_composite_decodes_no_composite_error_tiles(tmp_path: Path) -> None:
+    """PSD through the REAL _index_one path: Qt has no PSD plugin, so the
+    Pillow fallback (pillowload) must decode the flattened composite —
+    color-correct, right dims — while a PSD whose composite is unusable
+    yields the standard zero-length error tile and never sinks the batch.
+    The standalone PIL builder agrees on both (cache-content parity)."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    _make_psd(root / "good.psd")
+    _make_psd(root / "nocomposite.psd", truncate=True)
+    make_jpeg(root / "ok.jpg")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    ent = {rel: e for rel, e in zip(cache.files, cache.entries)}
+    _o, length, w, h = ent["good.psd"]
+    assert length > 0 and (w, h) == (64, 48)
+    idx = cache.files.index("good.psd")
+    px = _thumb_qimage(cache, idx).pixelColor(32, 24)
+    assert abs(px.red() - 200) < 30 and abs(px.green() - 60) < 30 \
+        and abs(px.blue() - 120) < 30
+    assert ent["nocomposite.psd"][1] == 0     # error tile, by design
+    assert ent["ok.jpg"][1] > 0               # neighbors unharmed
+
+    mtc = _load_mtc()
+    (blob, w, h), = mtc._make_thumb(root / "good.psd", [256])
+    assert blob and (w, h) == (64, 48)        # PIL reads the composite
+    assert mtc._make_thumb(root / "nocomposite.psd", [256]) == [(b"", 0, 0)]
+
+
+def test_viewer_load_original_psd(tmp_path: Path) -> None:
+    """The viewer's full-decode path (shared by the slideshow prefetch):
+    a composite-bearing PSD renders via the Pillow fallback, the Picasa
+    rotate= turns compose on top exactly like any format, and a PSD with
+    no usable composite returns a null QImage (the viewer paints its
+    honest 'could not decode this file' text — fail-soft contract)."""
+    _offscreen_app()
+    from viewer import load_original
+
+    good = _make_psd(tmp_path / "g.psd")
+    img = load_original(str(good), 0)
+    assert (img.width(), img.height()) == (64, 48)
+    px = img.pixelColor(32, 24)
+    assert abs(px.red() - 200) < 30 and abs(px.blue() - 120) < 30
+    img = load_original(str(good), 1)         # rotate= composes on top
+    assert (img.width(), img.height()) == (48, 64)
+
+    broken = _make_psd(tmp_path / "b.psd", truncate=True)
+    assert load_original(str(broken), 0).isNull()
