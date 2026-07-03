@@ -49,7 +49,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -87,34 +86,41 @@ def _load_generator():
 
 @dataclass
 class Reference:
-    survey: dict[str, Any]        # picasa_db._survey_ini_tree(library)
-    photos_fs: int                # media files under library/ (tracer walk rule)
-    videos_fs: int                # the VIDEO_EXTS subset (fauxcasa-v46.2)
-    folders_fs: int               # dirs containing >=1 media file
-    pal_files: int                # albums/*.pal
-    contacts_xml: int             # <contact> entries in contacts/contacts.xml
+    # survey: picasa_db._survey_ini_tree(library, image_exts=..., video_exts=...)
+    # — the whole reference side is survey-owned (fauxcasa-ed5.11); callers
+    # no longer walk the filesystem independently.
+    survey: dict[str, Any]
+    photos_fs: int                # survey["media"]["files"]
+    videos_fs: int                # survey["media"]["videos"] (fauxcasa-v46.2)
+    folders_fs: int               # survey["media"]["folders"]
+    pal_files: int                # picasa_db._count_pal_files(corpus/albums)
+    contacts_xml: int             # picasa_db._count_contacts_xml(contacts.xml)
     manifest: dict[str, Any]      # generator ground truth
 
 
 def build_reference(corpus: Path) -> Reference:
+    """Build the reference side of the gate from picasa_db survey functions.
+
+    All filesystem counts (photos, videos, folders, .pal files, contacts)
+    are owned by picasa_db._survey_ini_tree / _count_pal_files /
+    _count_contacts_xml so a bug in the reference readers fails loudly
+    (condition (d)) rather than silently masking ingest loss.
+    """
     library = corpus / "library"
-    survey = picasa_db._survey_ini_tree(library)
-    images = [
-        p for p in library.rglob("*")
-        if p.suffix.lower() in EXTS and p.is_file()
-    ]
-    contacts_xml = 0
-    cx = corpus / "contacts" / "contacts.xml"
-    if cx.is_file():
-        contacts_xml = len(re.findall(r"<contact\b", cx.read_text("utf-8")))
+    # Pass the tracer's own extension sets so the survey walk rule and the
+    # tracer walk rule are identical by construction.
+    survey = picasa_db._survey_ini_tree(
+        library, image_exts=EXTS, video_exts=VIDEO_EXTS)
+    media = survey["media"]
     manifest = json.loads((corpus / "manifest.json").read_text("utf-8"))
     return Reference(
         survey=survey,
-        photos_fs=len(images),
-        videos_fs=sum(1 for p in images if p.suffix.lower() in VIDEO_EXTS),
-        folders_fs=len({p.parent for p in images}),
-        pal_files=len(list((corpus / "albums").glob("*.pal"))),
-        contacts_xml=contacts_xml,
+        photos_fs=media["files"],
+        videos_fs=media["videos"],
+        folders_fs=media["folders"],
+        pal_files=picasa_db._count_pal_files(corpus / "albums"),
+        contacts_xml=picasa_db._count_contacts_xml(
+            corpus / "contacts" / "contacts.xml"),
         manifest=manifest,
     )
 
@@ -199,11 +205,12 @@ CLASSES: list[ParityClass] = [
         "folders", lambda r: r.folders_fs,
         lambda c, r: len(c.folders), manifest_key="folders"),
     ParityClass(
-        # video files walked + kinded (fauxcasa-v46.2): the fs count of
-        # VIDEO_EXTS suffixes vs the catalog's media=='video' photos —
-        # losing one silently is exactly the ingest-loss this gate exists
-        # to catch. Their ini star/caption/albums attach by filename like
-        # any photo, so those flow through the classes below untouched.
+        # video files walked + kinded (fauxcasa-v46.2 / ed5.11): the
+        # survey-owned fs count of VIDEO_EXTS suffixes vs the catalog's
+        # media=='video' photos — losing one silently is exactly the
+        # ingest-loss this gate exists to catch.  Their ini star/caption/
+        # albums attach by filename like any photo, so those flow through
+        # the classes below untouched.
         "videos", lambda r: r.videos_fs,
         lambda c, r: sum(1 for p in c.photos if p.media == "video"),
         manifest_key="videos"),
@@ -307,6 +314,18 @@ CLASSES: list[ParityClass] = [
         lambda r: r.manifest["expected"]["placeholder_album_uids"],
         lambda c, r: sum(1 for a in c.albums.values() if a.placeholder),
         manifest_key="placeholder_album_uids"),
+    # ---- TODO(fauxcasa-cam.6/cam.7): db3 parity classes ---------------------
+    # The Picasa .pmp column files and thumbindex.db hold per-image
+    # dimensions, filetype codes, and (redundantly) captions as written by
+    # Picasa's indexer.  Parity classes for these fields require the
+    # pmp-reader → catalog bridge (cam.6) and the thumbindex join +
+    # filetype → media-kind mapping (cam.7) to land first.  When those
+    # beads land, add ingested ParityClass entries here for at minimum:
+    #   - imagedata width/height  (dims round-trip after index)
+    #   - imagedata filetype      (corroborate media=='video' for db3-indexed
+    #                              clips against THUMBINDEX_FILE_TYPES 0x08/09)
+    #   - imagedata caption       (db3 wins §4 precedence over ini caption)
+    # Move them into the "ingested today" block and close/annotate the beads.
     # ---- expected-missing: owned, probed, ratchets forward -----------------
     ParityClass(
         "edit_keys_other",
