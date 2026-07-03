@@ -45,7 +45,10 @@ contacts.xml (see load_contacts_xml / default_contacts_xml) wins over
 [Contacts2] on name conflicts per §4. A face whose contact id is
 UNKNOWN_CONTACT (unconfirmed suggestion) or that no source names stays
 unnamed (name None) — the suggested-vs-confirmed distinction this
-read-only slice carries.
+read-only slice carries — unless a machine-local db3's person albums name
+it: the §4 rescue importer (db3rescue.rescue_people, fauxcasa-cam.6/.7)
+gap-fills ONLY those still-unnamed ids, source-flagged on
+Catalog.db3_contacts, with every conflict/residue on the ImportReport.
 
 Remaining tracer-scope gaps (see apps/desktop-python/README.md): EXIF orientation is
 applied at decode (Qt/PIL auto-transform, composed with the rotate= user
@@ -70,6 +73,7 @@ _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "scripts"))
 
 import picasa_db  # noqa: E402
+from db3rescue import rescue_people  # noqa: E402
 from rawload import RAW_EXTS, is_raw_suffix  # noqa: E402
 from videoload import VIDEO_EXTS, is_video_suffix  # noqa: E402
 
@@ -249,6 +253,12 @@ class Catalog:
     # folder inheritance chain instead, so they stay right even where
     # folders disagree; this registry is the flat, persistable union.
     contacts: dict[str, str] = field(default_factory=dict)
+    # Contact ids whose display name came from the db3 rescue import
+    # (fauxcasa-cam.6/.7): people albums exist only in db3, so a name no
+    # ini [Contacts2] or contacts.xml provided is gap-filled from there
+    # (§4) and source-flagged here — the People sidebar surfaces the
+    # provenance, and the flag persists so warm starts keep it.
+    db3_contacts: set[str] = field(default_factory=set)
     # Import diagnostics collected while this catalog was built (§4; empty
     # on a warm load until main() re-attaches the persisted report).
     report: ImportReport = field(default_factory=ImportReport)
@@ -695,15 +705,20 @@ def scan_library(root: Path,
                  scan_filter: ScanFilter | None = None,
                  contacts: dict[str, str] | None = None,
                  pal_dir: Path | None = None,
-                 exts: frozenset[str] | set[str] | None = None) -> Catalog:
+                 exts: frozenset[str] | set[str] | None = None,
+                 db3_dir: Path | None = None) -> Catalog:
     """Walk `root` and build the catalog. `contacts` is the machine-local
     contacts.xml id->name map (load_contacts_xml); per §4 it wins over the
     ini [Contacts2] tables when both name a contact. `pal_dir` is a
     Picasa2Albums directory of .pal album files, merged per §4 (ini wins
-    membership; .pal fills gaps only — see _merge_pal_albums). Conflicts
-    and unknown-uid placeholders land on the catalog's ImportReport, never
-    resolved silently (fauxcasa-cam.13/.8). `exts` is the effective
-    extension set from the File Types panel (walk_library docstring)."""
+    membership; .pal fills gaps only — see _merge_pal_albums). `exts` is
+    the effective extension set from the File Types panel (walk_library
+    docstring). `db3_dir` is a machine-local Picasa db3 directory: its
+    person albums gap-fill contact names the ini/contacts.xml never
+    provided, source-flagged on Catalog.db3_contacts
+    (db3rescue.rescue_people, fauxcasa-cam.6/.7). Conflicts and
+    unknown-uid placeholders land on the catalog's ImportReport, never
+    resolved silently (fauxcasa-cam.13/.8)."""
     root = root.resolve()
     files = walk_library(root, scan_filter, exts)
     contacts = contacts or {}
@@ -904,8 +919,17 @@ def scan_library(root: Path,
                        f"wins (§4)")
     registry.update(contacts)
 
+    # db3 rescue (fauxcasa-cam.6/.7), LAST so every other source had its
+    # say: person-album names fill only the ids still unnamed (§4 rank
+    # ini/contacts.xml > db3), and db3 face rows are checked against the
+    # ini-parsed faces for residue surfacing — never membership.
+    db3_contacts: set[str] = set()
+    if db3_dir is not None:
+        db3_contacts = rescue_people(db3_dir, root, photos, registry, report)
+
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
-                   contacts=registry, report=report)
+                   contacts=registry, db3_contacts=db3_contacts,
+                   report=report)
 
 
 # ---- persistent catalog (load-without-walking, §7 cold start) ------------
@@ -964,7 +988,13 @@ def scan_library(root: Path,
 # — a v8 catalog was walked without them, so a warm start would silently
 # hide every TGA/PSD in the library until some unrelated drift; reject
 # and cold-rebuild (the same shape as the v7 video bump).
-CATALOG_VERSION = 9
+# v10: the db3 rescue import (fauxcasa-cam.6/.7) gap-fills contact names
+# from db3 person albums at scan and persists the rescued ids as a
+# top-level `db3_contacts` list (the People-sidebar source flag). A v9
+# catalog scanned before the rescue carries neither the rescued names nor
+# the flag, so a warm start would silently un-name rescued people; reject
+# and cold-rebuild.
+CATALOG_VERSION = 10
 
 # The import report's file name, written beside catalog.json (same cache
 # dir) by save_report and re-attached on warm starts via load_report.
@@ -1054,6 +1084,9 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
         # contact id -> display name registry (already contacts.xml-merged
         # at scan time; the warm path never re-reads inis or contacts.xml)
         "contacts": catalog.contacts,
+        # v9: which registry ids the db3 rescue named (sorted for a
+        # deterministic file; the warm path never re-reads db3)
+        "db3_contacts": sorted(catalog.db3_contacts),
         "albums": [
             {"uid": a.uid, "name": a.name, "date": a.date,
              "description": a.description, "members": a.members,
@@ -1161,6 +1194,11 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
         if not isinstance(contacts, dict):
             contacts = {}
 
+        db3_contacts = data.get("db3_contacts", [])
+        if not isinstance(db3_contacts, list):
+            db3_contacts = []
+        db3_contacts = {str(c) for c in db3_contacts}
+
         # Backfill progress (cam.12): an absent key means complete (the
         # indexer-built shape — save_catalog omits it then). A non-dict
         # value raises here (AttributeError -> the defensive net); an
@@ -1184,7 +1222,8 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
         return None
 
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
-                   contacts=contacts, backfill_state=backfill_state,
+                   contacts=contacts, db3_contacts=db3_contacts,
+                   backfill_state=backfill_state,
                    backfill_cursor=backfill_cursor)
 
 

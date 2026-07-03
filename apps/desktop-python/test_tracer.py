@@ -5408,6 +5408,434 @@ def test_catalog_v6_roundtrips_album_flags(
 
 
 # ---------------------------------------------------------------------------
+# db3 rescue import (fauxcasa-cam.6/.7): the §4 plumbing (locate db3,
+# translate machine paths, thumbindex/pmp joins) + the class-4 rescue
+# (person albums -> contacts-only face names). Synthetic fixtures only
+# (privacy rule): the MINIMAL writer below emits the byte formats documented
+# in docs/research/picasa-db3-validated.md — TESTS ONLY, never product code
+# — and the validated picasa_db readers are the arbiter (round-trip test).
+# Rescue classes 1-3 (ignored faces, manual sort, video overrides) have no
+# pinned byte format yet (fauxcasa-ed5.9) and stay out of scope here.
+# ---------------------------------------------------------------------------
+
+CID_DB3 = "ca5c88ca60f42c0b"           # oracle-014's contact-id shape
+PERSON_DB3 = "Synthetic Person 1200"
+
+_PMP_TYPE_CODES = {"string": 0x0, "uint32": 0x1, "uint8": 0x3, "uint64": 0x4}
+_PMP_PACK = {0x1: "<I", 0x3: "<B", 0x4: "<Q"}
+
+
+def _write_pmp(path: Path, type_name: str, values: list) -> Path:
+    """One .pmp column file to the documented layout (constants written
+    literally from picasa-db3-validated.md, NOT taken from the reader, so
+    the round-trip test proves the parser against independent bytes):
+    u32 magic 0x3fcccccd | u16 type | u16 0x1332 | u32 2 | u16 type |
+    u16 0x1332 | u32 count | payload (NUL-terminated strings or packed
+    little-endian fixed-width values)."""
+    code = _PMP_TYPE_CODES[type_name]
+    out = bytearray(struct.pack("<IHHIHHI", 0x3FCCCCCD, code, 0x1332, 2,
+                                code, 0x1332, len(values)))
+    for v in values:
+        if code == 0x0:
+            out += v.encode("utf-8") + b"\x00"
+        else:
+            out += struct.pack(_PMP_PACK[code], v)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(out))
+    return path
+
+
+def _write_thumbindex(path: Path, entries: list) -> Path:
+    """thumbindex.db to the documented layout: u32 magic 0x40466666 |
+    u32 count | per entry NUL-terminated name + <u64 taken, u64 mtime,
+    u32 size, u8 ftype, u32 flags, u8 valid, u32 parent>. `entries` is
+    (name, ftype, parent-index-or-None); timestamps/sizes stay 0 (the
+    oracle's face-crop records carry 0 there too) and valid is 1."""
+    out = bytearray(struct.pack("<II", 0x40466666, len(entries)))
+    for name, ftype, parent in entries:
+        out += name.encode("utf-8") + b"\x00"
+        out += struct.pack("<QQIBIBI", 0, 0, 0, ftype, 0, 1,
+                           0xFFFFFFFF if parent is None else parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(out))
+    return path
+
+
+def _db3_machine_path(folder: Path, drive: str = "Q:") -> str:
+    """The db3 spelling of `folder`: absolute, backslashes, trailing
+    separator (folder thumbindex entries carry one), and a DIFFERENT
+    drive letter than the live one — §8 says drive letters are
+    translated, so every join in these tests must survive the swap."""
+    parts = [c for c in str(folder).replace("\\", "/").split("/") if c]
+    if len(parts[0]) == 2 and parts[0][1] == ":":
+        parts = parts[1:]
+    return drive + "\\" + "\\".join(parts) + "\\"
+
+
+def _make_person_db3(db3: Path, folder_abs: str, photos: list[str],
+                     contact_id: str = CID_DB3,
+                     person_name: str = PERSON_DB3,
+                     face_parent: int | None = None) -> Path:
+    """A minimal synthetic db3 in the oracle-014 shape: thumbindex row 0
+    is the folder (absolute machine path), rows 1..n the photos, plus —
+    when face_parent (a photo's thumbindex row) is given — a virtual
+    face-crop record whose imagedata row is filetype 1001 joined via
+    personalbumid to a category-8 person album. albumdata carries the
+    stock no-contact-id people bucket too, which the rescue must skip."""
+    if not folder_abs.endswith(("\\", "/")):
+        folder_abs += "\\"
+    ti = [(folder_abs, 0x01, None)]
+    for name in photos:
+        ti.append((name, 0x02, 0))
+    filetype = [1] + [2] * len(photos)
+    personalbumid = [0] * (1 + len(photos))
+    if face_parent is not None:
+        ti.append(("", 0xE9, face_parent))    # ftype = low byte of 0x3e9
+        filetype.append(1001)                 # the virtual face-crop row
+        personalbumid.append(2)               # -> the person-album row
+    _write_thumbindex(db3 / "thumbindex.db", ti)
+    # albumdata rows: [0] the watched folder (category 2), [1] the stock
+    # people bucket (category 8, NO contact id — skipped by the rescue),
+    # [2] the person album (category 8, name + albumcontactids).
+    _write_pmp(db3 / "albumdata_category.pmp", "uint32", [2, 8, 8])
+    _write_pmp(db3 / "albumdata_name.pmp", "string",
+               [folder_abs, "Unnamed people", person_name])
+    _write_pmp(db3 / "albumdata_albumcontactids.pmp", "uint64",
+               [0, 0, int(contact_id, 16)])
+    _write_pmp(db3 / "albumdata_token.pmp", "string",
+               ["", "]unknownface", "]facealbum:2"])
+    _write_pmp(db3 / "imagedata_filetype.pmp", "uint32", filetype)
+    _write_pmp(db3 / "imagedata_personalbumid.pmp", "uint32", personalbumid)
+    return db3
+
+
+@pytest.fixture()
+def db3_library(tmp_path: Path) -> Path:
+    """One folder, two photos: a.jpg carries an ini faces= region whose
+    contact id NO ini/contacts.xml source names — the exact gap the db3
+    person-album rescue exists to fill; b.jpg carries no faces= at all."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "a.jpg")
+    make_jpeg(root / "Trip" / "b.jpg")
+    (root / "Trip" / ".picasa.ini").write_text(
+        "[a.jpg]\r\n"
+        f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n")
+    return root
+
+
+def test_db3_writer_roundtrip_via_validated_parsers(tmp_path: Path) -> None:
+    """The synthetic writer's bytes read back through the VALIDATED
+    parsers under strict mode: pmp string/uint32/uint64 columns (values,
+    filename-derived table/column, exact-fit payload) and thumbindex
+    (folder/file/face-crop discrimination, parent linkage, full-path
+    join) — so every db3 test below runs on oracle-shaped bytes."""
+    import picasa_db
+
+    db3 = tmp_path / "db3"
+    col = picasa_db.read_pmp(
+        _write_pmp(db3 / "albumdata_name.pmp", "string", ["a", "", "sí"]))
+    assert (col.table, col.column) == ("albumdata", "name")
+    assert col.values == ["a", "", "sí"] and col.count == 3
+
+    col = picasa_db.read_pmp(
+        _write_pmp(db3 / "imagedata_filetype.pmp", "uint32", [1, 2, 1001]))
+    assert col.values == [1, 2, 1001] and col.type_name == "uint32"
+
+    col = picasa_db.read_pmp(
+        _write_pmp(db3 / "albumdata_albumcontactids.pmp", "uint64",
+                   [0, int(CID_DB3, 16)]))
+    assert col.values == [0, 0xCA5C88CA60F42C0B]
+
+    entries = picasa_db.read_thumbindex(_write_thumbindex(
+        db3 / "thumbindex.db", [
+            ("C:\\lib\\Trip\\", 0x01, None),
+            ("a.jpg", 0x02, 0),
+            ("", 0xE9, 1),
+        ]))
+    assert [e.is_folder for e in entries] == [True, False, False]
+    assert entries[1].parent == 0 and entries[1].ftype_name == "jpeg"
+    assert entries[2].is_facecrop and entries[2].parent == 1
+    assert picasa_db.thumbindex_full_paths(entries) == [
+        "C:\\lib\\Trip\\", "C:\\lib\\Trip\\a.jpg", ""]
+
+
+def test_translate_db3_path_drives_case_and_misses(tmp_path: Path) -> None:
+    """§8 path translation: drive letters compare stripped (a library
+    moved from C: to Q: still joins), separators normalize, components
+    match case-insensitively while the returned key keeps the db3
+    spelling, the root itself is "", and a path outside the library —
+    or shorter than it — is None (import-report material, never an
+    error)."""
+    from db3rescue import translate_db3_path
+
+    root = tmp_path / "lib"
+    trip = _db3_machine_path(root / "Trip")        # Q:-drive spelling
+    assert translate_db3_path(trip + "a.jpg", root) == "Trip/a.jpg"
+    assert translate_db3_path(trip, root) == "Trip"
+    assert translate_db3_path(_db3_machine_path(root), root) == ""
+    assert translate_db3_path(trip.upper() + "A.JPG", root) == "TRIP/A.JPG"
+    assert translate_db3_path("Q:\\elsewhere\\Trip\\a.jpg", root) is None
+    assert translate_db3_path("Q:\\", root) is None
+
+
+def test_default_db3_dir_discovery(monkeypatch, tmp_path: Path) -> None:
+    """default_db3_dir finds %LocalAppData%\\Google\\Picasa2\\db3 when it
+    exists and returns None (not a phantom path) when the env var or the
+    directory is absent — same fail-soft shape as contacts/.pal."""
+    from db3rescue import default_db3_dir
+
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    assert default_db3_dir() is None
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert default_db3_dir() is None               # dir absent
+    d = tmp_path / "Google" / "Picasa2" / "db3"
+    d.mkdir(parents=True)
+    assert default_db3_dir() == d
+
+
+def test_db3_person_album_rescue_end_to_end(db3_library: Path,
+                                            tmp_path: Path) -> None:
+    """The class-4 rescue end to end: a db3 person album (category 8,
+    name + albumcontactids) names a contact id the ini faces= carries
+    but nothing else names — the name fills the gap (§4), resolves the
+    face, joins the registry source-flagged, and the rescue is an
+    import-report entry; the agreeing virtual face row produces NO
+    residue note. Without the db3 the same scan leaves the gap."""
+    import picasa_db
+
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)         # the face is on a.jpg
+    cat = scan_library(db3_library, db3_dir=db3)
+
+    a = next(p for p in cat.photos if p.rel == "Trip/a.jpg")
+    assert a.faces == ((picasa_db.parse_rect64("6800600097ff9fff"),
+                        CID_DB3, PERSON_DB3),)
+    assert cat.contacts[CID_DB3] == PERSON_DB3
+    assert cat.db3_contacts == {CID_DB3}
+    kinds = [(e.kind, e.subject) for e in cat.report.entries]
+    assert ("db3_person_rescued", CID_DB3) in kinds
+    assert not any(k == "db3_face_residue" for k, _s in kinds)
+    assert not any(k == "db3_path_unresolved" for k, _s in kinds)
+    rescued = next(e for e in cat.report.entries
+                   if e.kind == "db3_person_rescued")
+    assert rescued.source == "db3" and PERSON_DB3 in rescued.detail
+
+    plain = scan_library(db3_library)              # no db3: the gap shows
+    ap = next(p for p in plain.photos if p.rel == "Trip/a.jpg")
+    assert ap.faces[0][2] is None and CID_DB3 not in plain.contacts
+
+
+def test_db3_gap_fill_only_never_renames(db3_library: Path,
+                                         tmp_path: Path) -> None:
+    """§4 rank ini/contacts.xml > db3: a name either source already
+    provides NEVER changes — a divergent db3 person album is an
+    import-report entry recording both names, not a rename — and an
+    agreeing db3 produces no notes and no source flag at all."""
+    ini = db3_library / "Trip" / ".picasa.ini"
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+
+    # [Contacts2] already names the id: kept verbatim, conflict reported
+    ini.write_text("[Contacts2]\r\n"
+                   f"{CID_DB3}=Ini Name;;\r\n"
+                   "[a.jpg]\r\n"
+                   f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n")
+    cat = scan_library(db3_library, db3_dir=db3)
+    a = next(p for p in cat.photos if p.rel == "Trip/a.jpg")
+    assert a.faces[0][2] == "Ini Name"
+    assert cat.contacts[CID_DB3] == "Ini Name"
+    assert cat.db3_contacts == set()
+    conf = [e for e in cat.report.entries if e.kind == "db3_name_conflict"]
+    assert len(conf) == 1 and conf[0].subject == CID_DB3
+    assert "Ini Name" in conf[0].detail and PERSON_DB3 in conf[0].detail
+    assert not any(e.kind == "db3_person_rescued"
+                   for e in cat.report.entries)
+
+    # contacts.xml names it: same rule (xml outranks db3 too)
+    ini.write_text("[a.jpg]\r\n"
+                   f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n")
+    cat = scan_library(db3_library, contacts={CID_DB3: "Xml Name"},
+                       db3_dir=db3)
+    a = next(p for p in cat.photos if p.rel == "Trip/a.jpg")
+    assert a.faces[0][2] == "Xml Name"
+    assert cat.db3_contacts == set()
+    assert any(e.kind == "db3_name_conflict" for e in cat.report.entries)
+
+    # agreement is not a conflict: same name everywhere -> no db3 notes
+    ini.write_text("[Contacts2]\r\n"
+                   f"{CID_DB3}={PERSON_DB3};;\r\n"
+                   "[a.jpg]\r\n"
+                   f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n")
+    cat = scan_library(db3_library, db3_dir=db3)
+    assert cat.db3_contacts == set()
+    assert not any(e.kind.startswith("db3_") for e in cat.report.entries)
+
+
+def test_db3_untag_not_resurrected_fixture_026(tmp_path: Path) -> None:
+    """The fixture-026 shape, exactly: Reset Faces removed the ini
+    faces= line but left the [Contacts2] line, the db3 person album, and
+    the virtual face row behind. An absent ini faces= is an
+    AUTHORITATIVE UNTAG — the db3 residue must not resurrect the face
+    (it becomes an import-report entry instead). The pure-db3 variant
+    (no [Contacts2] residue either) still rescues the NAME — people
+    albums exist only in db3 — but the person ends with zero tagged
+    photos: no resurrect through the back door."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "b.jpg")
+    ini = root / "Trip" / ".picasa.ini"
+    ini.write_text("[Contacts2]\r\n"
+                   f"{CID_DB3}={PERSON_DB3};;\r\n"   # 026: line REMAINS
+                   "[b.jpg]\r\n"
+                   "backuphash=22344\r\n")           # rewritten, no faces=
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(root / "Trip"),
+        ["b.jpg"], face_parent=1)
+
+    cat = scan_library(root, db3_dir=db3)
+    b = next(p for p in cat.photos if p.rel == "Trip/b.jpg")
+    assert b.faces == ()                             # NOT resurrected
+    assert cat.contacts[CID_DB3] == PERSON_DB3       # named by the ini...
+    assert cat.db3_contacts == set()                 # ...not by the rescue
+    res = [e for e in cat.report.entries if e.kind == "db3_face_residue"]
+    assert len(res) == 1 and res[0].subject == "Trip/b.jpg"
+    assert "026" in res[0].detail and "not resurrected" in res[0].detail
+
+    ini.write_text("[b.jpg]\r\nbackuphash=1\r\n")    # pure-db3 residue
+    cat = scan_library(root, db3_dir=db3)
+    b = next(p for p in cat.photos if p.rel == "Trip/b.jpg")
+    assert b.faces == ()
+    assert cat.contacts[CID_DB3] == PERSON_DB3       # name rescued...
+    assert cat.db3_contacts == {CID_DB3}             # ...and source-flagged
+    assert not any(p.faces for p in cat.photos)      # zero tagged photos
+    assert any(e.kind == "db3_face_residue" for e in cat.report.entries)
+
+
+def test_db3_unresolvable_paths_reported_not_fatal(db3_library: Path,
+                                                   tmp_path: Path) -> None:
+    """A db3 whose face row sits on a photo OUTSIDE this library (a
+    watched folder we don't browse, or a moved tree): the path fails to
+    translate and becomes an import-report entry — never an error — and
+    the name rescue itself still lands (it needs no path)."""
+    db3 = _make_person_db3(tmp_path / "db3", "Q:\\somewhere\\else",
+                           ["a.jpg", "b.jpg"], face_parent=1)
+    cat = scan_library(db3_library, db3_dir=db3)
+
+    a = next(p for p in cat.photos if p.rel == "Trip/a.jpg")
+    assert a.faces[0][2] == PERSON_DB3               # rescue still lands
+    assert cat.db3_contacts == {CID_DB3}
+    bad = [e for e in cat.report.entries if e.kind == "db3_path_unresolved"]
+    assert len(bad) == 1
+    assert bad[0].subject == "Q:\\somewhere\\else\\a.jpg"
+    assert "cannot join" in bad[0].detail and bad[0].source == "db3"
+
+
+def test_db3_fail_soft_absent_and_corrupt(db3_library: Path,
+                                          tmp_path: Path) -> None:
+    """Fail-soft plumbing: an empty db3 dir (a fresh install has no
+    albumdata) rescues nothing silently; corrupt pmp columns degrade to
+    no rescue without sinking the scan; a corrupt thumbindex still lets
+    the NAME rescue land and surfaces the degraded face join as an
+    import note instead of an exception."""
+    empty = tmp_path / "empty-db3"
+    empty.mkdir()
+    cat = scan_library(db3_library, db3_dir=empty)
+    assert cat.db3_contacts == set() and not cat.report.entries
+
+    broken = tmp_path / "broken-db3"
+    broken.mkdir()
+    (broken / "albumdata_category.pmp").write_bytes(b"\x00\x01 garbage")
+    (broken / "albumdata_name.pmp").write_bytes(b"junk")
+    (broken / "albumdata_albumcontactids.pmp").write_bytes(b"junk")
+    cat = scan_library(db3_library, db3_dir=broken)
+    assert cat.db3_contacts == set() and not cat.report.entries
+
+    half = _make_person_db3(
+        tmp_path / "half-db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+    (half / "thumbindex.db").write_bytes(b"\xde\xad\xbe\xef corrupt")
+    cat = scan_library(db3_library, db3_dir=half)
+    assert cat.contacts[CID_DB3] == PERSON_DB3       # names still rescued
+    assert cat.db3_contacts == {CID_DB3}
+    assert any(e.kind == "db3_unreadable" for e in cat.report.entries)
+
+
+def test_db3_catalog_roundtrip_v10(db3_library: Path,
+                                   tmp_path: Path) -> None:
+    """From CATALOG_VERSION 10 on: rescued names on faces/registry and the
+    db3_contacts source flag survive the persisted catalog, and a v9
+    catalog (scanned before the rescue existed) is rejected so a warm
+    start cold-rebuilds instead of silently un-naming rescued people.
+    (== 10: the newest version-gate test pins the exact value.)"""
+    import catalog as catmod
+
+    assert catmod.CATALOG_VERSION == 10
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+    cat = scan_library(db3_library, db3_dir=db3)
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, db3_library)
+    assert loaded is not None
+    assert loaded.db3_contacts == {CID_DB3}
+    assert [p.faces for p in loaded.photos] == [p.faces for p in cat.photos]
+    assert loaded.contacts == cat.contacts
+
+    data = json.loads(path.read_text())
+    data["version"] = 9                    # pre-db3-rescue format
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, db3_library) is None
+
+
+def test_db3_people_sidebar_source_flag(db3_library: Path,
+                                        tmp_path: Path) -> None:
+    """db3-rescued people join the People sidebar like any named person
+    — live counts, click-to-filter — with their provenance flagged in
+    the tooltip; an ini-named person alongside shows the flag is
+    per-person, not global."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    (db3_library / "Trip" / ".picasa.ini").write_text(
+        "[Contacts2]\r\n"
+        "bbbbbbbbbbbbbbb2=Ini Bob;;\r\n"
+        "[a.jpg]\r\n"
+        f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n"
+        "[b.jpg]\r\n"
+        "faces=rect64(1234),bbbbbbbbbbbbbbb2\r\n")
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+    cat = scan_library(db3_library, db3_dir=db3)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    def item_for(kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    rescued = item_for("person", PERSON_DB3)
+    assert rescued is not None and rescued.text(0).endswith("(1)")
+    assert "db3" in rescued.toolTip(0)
+    named = item_for("person", "Ini Bob")
+    assert named is not None and named.toolTip(0) == ""
+
+    win._sidebar_clicked(rescued, 0)     # counts/filters live like any person
+    assert [cat.photos[i].rel for i in win.grid.display] == ["Trip/a.jpg"]
+
+
+# ---------------------------------------------------------------------------
 # Selection tray (fauxcasa-q6l.2): persistent CROSS-FOLDER Hold/Clear +
 # typed readout (spec §5). Decisions under test (tray.py module doc):
 # identity by REL PATH (survives reconcile index remaps), HOLD ORDER
@@ -6426,9 +6854,9 @@ def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
     path.write_text(json.dumps(data))
     assert load_catalog(path, root) is None
 
-    # v9 = TGA/PSD stills joined the walk (fauxcasa-v46.4); bump this pin
-    # with every CATALOG_VERSION change so the rejection below stays real.
-    assert catmod.CATALOG_VERSION == 9
+    # >= 9 (TGA/PSD stills, fauxcasa-v46.4): the exact current value is
+    # pinned by the newest version-gate test (test_db3_catalog_roundtrip_v10).
+    assert catmod.CATALOG_VERSION >= 9
     cat.backfill_state = BACKFILL_COMPLETE
     save_catalog(cat, path)
     data = json.loads(path.read_text())
