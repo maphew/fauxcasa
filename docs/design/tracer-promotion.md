@@ -65,7 +65,8 @@ promotion epic when promotion starts.
 ## What promotion does NOT require
 
 - No installer/packaging beyond what M1 already ships (the frozen bundle
-  exists; a real installer is M4's "first-class Windows builds" territory).
+  exists; a real installer is later packaging work, not a promotion
+  criterion).
 - No module re-architecture, no test split, no performance work — those are
   ordinary beads, not gate criteria.
 - No name decision. "Fauxcasa" remains provisional; criterion 3 is exactly

@@ -498,7 +498,7 @@ def _harvest_contacts2(secmap: dict, out: dict[str, str]) -> None:
 # (~lines 234-267): dbid, albumid, property elements (uid string, category
 # num, date real64 = OLE automation days, token, name) with a <files> member
 # list of `[C]\path\to\file` volume-token paths nested in the name property.
-# §4 merge rank (assumed ini > .pal > db3 pending spec pin, fauxcasa-79b):
+# §4 merge rank (pinned ini > .pal > db3 — spec §10 item 16, fauxcasa-79b):
 # ini wins membership; .pal fills gaps ONLY — a .pal-only album materializes
 # like a real album flagged pal-sourced, and a divergent .pal's extra members
 # become import-report entries, never membership.
@@ -597,7 +597,7 @@ def default_pal_dir() -> Path | None:
 def _merge_pal_albums(pal_dir: Path, photos: list[Photo],
                       albums: dict[str, Album],
                       report: ImportReport) -> None:
-    """§4 merge, rank assumed ini > .pal > db3 (spec pin: fauxcasa-79b):
+    """§4 merge, rank ini > .pal > db3 (pinned: spec §10 item 16, fauxcasa-79b):
 
     - a uid the ini knows nothing of (no [.album:] definition, no albums=
       token) materializes from its .pal like a real album, flagged

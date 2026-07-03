@@ -454,7 +454,7 @@ Library & navigation
 - Picasa-native auto-collections: **Starred Photos** and **Recently
   Updated** (plus the Exports collection under In & out, and the
   **Rejected** collection under Organize, below). Scoped star views
-  (footgun 17) defined — ⚖ argue (proposed 2026-07-03, fauxcasa-07w; §10
+  (footgun 17) — ⚖ argue (proposed 2026-07-03, fauxcasa-07w; §10
   item 19): scoping reuses the browse dimensions the app already has
   rather than inventing a new one. (a) The star predicate (threshold ≥ N,
   §3) composes with *any* view — folder, album, search, date range — so
@@ -717,7 +717,9 @@ guarantee (N2) — that is a different act and is not gated here.
 - Custom buttons / external-tool API (tray-consuming, export-then-act, with
   a consent gate Picasa lacked).
 - Standalone fast viewer + OS file associations.
-- Full localization (string externalization is already day-one).
+- Full localization (string externalization is a day-one *product*
+  requirement — the tracer is exempt until the promotion gate; §5
+  Maintenance, fauxcasa-64z).
 - **Multi-machine sync, peer-to-peer** (far-range, *owner priority*):
   local-first stays the ethic — no hosted backend, ever (§1) — but
   same-owner multi-machine libraries are a real scenario (the NAS story is
@@ -763,7 +765,7 @@ to a documented failure:
 | 14 | Frozen RAW table; OS-codec dependency | Updatable decode libraries, bundled codecs |
 | 15 | MakerNote corruption on metadata write | In-file writes round-trip-verified or not made (§5 P1) |
 | 16 | UI floor of year 1903 on dates | Unbounded dates (scanned photos predate 1903) |
-| 17 | Starred Photos accretes forever (the V2 tutorial narrator wades through 84 stale stars), degrading the triage loop | Scoped star views + easy bulk-unstar (semantics defined in §5 Library & navigation, fauxcasa-07w) |
+| 17 | Starred Photos accretes forever (the V2 tutorial narrator wades through 84 stale stars), degrading the triage loop | Scoped star views + easy bulk-unstar (semantics proposed in §5 Library & navigation, fauxcasa-07w — ⚖ argue) |
 | 18 | Positional row joins across dozens of per-column .pmp files with no cross-file integrity check — documented failures: thumbnails joined to wrong photos after corruption; a hand-edited column file bricking every category | Catalog cache is a single transactional store with explicit keys; durable state is per-file records |
 | 19 | Users hand-edit state files and brick categories | Tier-2 files human-readable and validated on load; unparseable content is quarantined and surfaced, never rewritten (preserves the §4 byte-faithful rule) |
 
@@ -779,8 +781,9 @@ disk, or SMB over gigabit with ~1 ms RTT). Budgets are per volume class where
 they differ, and each row becomes a CI gate at the milestone where its
 feature lands (§9). Picasa-era baselines appear in parentheses — they are
 *reported or derived* from the corpus (community planning guidance, tutorial
-observations), not measurements, except the catalog-size row, which is
-oracle-measured.
+observations), not measurements — the one oracle-measured figure is the
+catalog-size row's ~50 B/photo *historical baseline* (its gate number is
+re-argued, §10 item 20, not measured).
 
 | Operation | Budget |
 |---|---|
@@ -850,7 +853,8 @@ only check. The build order mirrors the tutorial corpus's own pedagogy:
 organize → edit → faces.
 
 **M0 — Ground truth.** *Done:* format research, validated parsers
-(`picasa_db.py`), Wine oracle + fixtures 001–013, this spec; the **100k
+(`picasa_db.py`), Wine oracle + fixtures 001–033 (a growing corpus — the
+directory is the truth), this spec; the **100k
 synthetic library generator** (`make-synthetic-library.py --benchmark`:
 defined composition — file-size and EXIF-date distributions, folder shapes,
 duplicate files, mixed formats — so §7 numbers are reproducible); and the
@@ -1049,7 +1053,8 @@ scoped star views). Same rule as ever: overturnable by argument.
   generator. Setup, launch, and recipes: `docs/research/wine-oracle.md`.
 - **Fixture / differential fixture** — a committed before/after snapshot pair
   of the oracle's on-disk state around exactly one UI action, with a decoded
-  diff (`fixtures/oracle/NNN-*/`). Thirteen exist as of this writing.
+  diff (`fixtures/oracle/NNN-*/`). Thirty-three exist as of this writing;
+  the directory is the authoritative count.
 - **Differential acceptance** — the M2 gate: Fauxcasa writes a library, real
   Picasa reads it in the oracle, and the resulting diffs are machine-checked
   against expected classes (no rebuild, no rejection, state visible).
