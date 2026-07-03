@@ -56,6 +56,9 @@ def tiff_is_16bit(data: bytes) -> bool:
     try:
         magic = struct.unpack_from(f"{bo}H", data, 2)[0]
         if magic != 42:
+            # Includes BigTIFF (magic 43, 8-byte offsets): not sniffed, so
+            # a 16-bit BigTIFF still takes the Qt path — known gap; no
+            # BigTIFF has shown up in the corpus yet.
             return False
         ifd_off = struct.unpack_from(f"{bo}I", data, 4)[0]
         if ifd_off + 2 > len(data):
@@ -94,10 +97,9 @@ def tiff_is_16bit(data: bytes) -> bool:
                             f"{bo}{count}I", data, offset)
                     return any(v >= 16 for v in vals)
                 return False  # unrecognised dtype for BitsPerSample
-            if tag > 258:
-                # IFD entries are sorted ascending by tag (TIFF spec);
-                # nothing past 258 can be BitsPerSample.
-                break
+            # No sorted-tag early-out: the spec orders entries ascending,
+            # but non-conforming writers exist, and a skipped BitsPerSample
+            # means silent white-clip on Linux — scan every entry.
             entry_off += 12
     except (struct.error, OverflowError):
         return False

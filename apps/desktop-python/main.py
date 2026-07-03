@@ -83,7 +83,6 @@ from catalog import (  # noqa: E402
     load_contacts_xml,
     load_report,
     reconcile_walk,
-    save_catalog,
     save_catalog_retrying,
     save_report,
     scan_library,
@@ -2008,7 +2007,9 @@ def main() -> int:
             # pending: record that, and MainWindow starts the background
             # backfill pass (fauxcasa-cam.12) which persists as it goes.
             catalog.backfill_state = BACKFILL_NOT_STARTED
-            save_catalog(catalog, cat_path)  # warm-start next time
+            # Same transient-reader hazard as the build-thread saves
+            # (fauxcasa-cam.18) — and uncaught here it would crash startup.
+            save_catalog_retrying(catalog, cat_path)  # warm-start next time
             save_report(catalog.report, cache_dir / REPORT_NAME)
         else:
             build_dir = cache_dir  # the build thread persists the catalog

@@ -182,7 +182,11 @@ def _occlusion_clean(not_visible_ticks: int, fill_timeouts: int,
     ~TIMEOUT_MS intervals.  On Windows the same ~100 ms band is produced
     by genuinely paint-bound frames (frame production 100-140 ms => real
     intervals fall in 95-105 ms), so using timeout_frames as a disqualifier
-    there would produce false positives.  Gate it to Linux only.
+    there would produce false positives.  Gate it to Linux only: the
+    mechanism behind the signature is the Wayland compositor, which no
+    other platform has — macOS is deliberately exempt too (no such
+    compositor timeout, and no macOS run has ever fed this gate).
+    timeout_frames stays a reported metric on every platform.
 
     platform defaults to sys.platform; pass an explicit value in tests."""
     plat = platform if platform is not None else sys.platform

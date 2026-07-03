@@ -1089,14 +1089,15 @@ def save_catalog_retrying(catalog: Catalog, path: Path,
     the final OSError if all attempts fail.
     """
     # Linear schedule: 0.1 s, 0.2 s, … up to (attempts-1) * backoff.
+    total = max(1, attempts)  # attempts <= 0 would fall through to raise None
     err: OSError | None = None
-    for attempt in range(attempts):
+    for attempt in range(total):
         try:
             save_catalog(catalog, path)
             return
         except OSError as e:
             err = e
-            if attempt < attempts - 1:
+            if attempt < total - 1:
                 time.sleep(backoff * (attempt + 1))
     raise err  # type: ignore[misc]
 
