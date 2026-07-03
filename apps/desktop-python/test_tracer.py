@@ -27,6 +27,7 @@ from catalog import (
     load_catalog,
     reconcile_walk,
     save_catalog,
+    save_catalog_retrying,
     scan_library,
     walk_library,
 )
@@ -404,6 +405,49 @@ def test_load_catalog_rejects_foreign_format(tmp_path: Path) -> None:
     p.write_text("{ not json")
     assert load_catalog(p, tmp_path) is None
     assert load_catalog(tmp_path / "missing.json", tmp_path) is None
+
+
+def test_save_catalog_retrying_succeeds_after_transient_errors(
+        library: Path, tmp_path: Path) -> None:
+    """save_catalog_retrying retries on OSError and returns on first success."""
+    import unittest.mock as mock
+
+    cat = scan_library(library)
+    path = tmp_path / "catalog.json"
+    call_count = 0
+
+    original = __import__("catalog").save_catalog
+
+    def flaky_save(catalog, p):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:  # fail twice, succeed on third
+            raise OSError("transient sharing violation")
+        original(catalog, p)
+
+    with mock.patch("catalog.save_catalog", side_effect=flaky_save):
+        # backoff=0 avoids real sleeps in tests
+        save_catalog_retrying(cat, path, attempts=5, backoff=0)
+
+    assert call_count == 3
+    assert path.exists()
+    assert load_catalog(path, library) is not None
+
+
+def test_save_catalog_retrying_raises_after_all_attempts_exhausted(
+        library: Path, tmp_path: Path) -> None:
+    """save_catalog_retrying raises OSError when every attempt fails."""
+    import unittest.mock as mock
+
+    cat = scan_library(library)
+    path = tmp_path / "catalog.json"
+    sentinel = OSError("always broken")
+
+    with mock.patch("catalog.save_catalog", side_effect=sentinel):
+        with pytest.raises(OSError, match="always broken"):
+            save_catalog_retrying(cat, path, attempts=3, backoff=0)
+
+    assert not path.exists()  # nothing written on total failure
 
 
 def test_reconcile_detects_drift(library: Path, tmp_path: Path) -> None:
@@ -6464,12 +6508,19 @@ def test_backfill_interrupt_resume_and_periodic_persist(
 
     saves: list[int] = []
     real_save = thumbcache.save_catalog
+    real_save_retrying = thumbcache.save_catalog_retrying
 
     def counting_save(c, p):
         saves.append(c.backfill_cursor)
         real_save(c, p)
 
+    def counting_save_retrying(c, p, attempts=5, backoff=0.1):
+        # terminal (must=True) saves now go through save_catalog_retrying
+        saves.append(c.backfill_cursor)
+        real_save_retrying(c, p, attempts=attempts, backoff=backoff)
+
     monkeypatch.setattr(thumbcache, "save_catalog", counting_save)
+    monkeypatch.setattr(thumbcache, "save_catalog_retrying", counting_save_retrying)
 
     stop = threading.Event()
     assert thumbcache.backfill_catalog(

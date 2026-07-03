@@ -8,10 +8,11 @@ lives under cache/tracer-cache/<digest>/, never inside the library
 so identity is content-hash + library-relative path (N6) and staleness
 is checked by cheap signals (size + mtime) before trusting the cache.
 
-The in-app builder is sequential and unoptimized — fine for fixture
-libraries; the real indexer with its >= 30 photos/s budget (spec §7) is
-deliberately out of tracer scope. Big pre-built caches (the 100k
-benchmark fcache) are adopted via an explicit --thumbs path instead.
+The in-app builder uses a thread pool (INDEX_WORKERS) — adequate for
+fixture libraries; the real indexer with its >= 30 photos/s budget
+(spec §7) is deliberately out of tracer scope. Big pre-built caches
+(the 100k benchmark fcache) are adopted via an explicit --thumbs path
+instead.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from catalog import (
     BACKFILL_IN_PROGRESS,
     Catalog,
     save_catalog,
+    save_catalog_retrying,
 )
 from inmeta import read_jpeg_metadata
 from metareader import read_file_meta
@@ -606,21 +608,17 @@ def backfill_catalog(
         catalog.json — raises a transient PermissionError, and one missed
         checkpoint only costs resume granularity, never the multi-minute
         pass (observed live at photo 96,500 of the 100k benchmark run).
-        The TERMINAL saves (complete / cancel cursor) retry with backoff
+        The TERMINAL saves (complete / cancel cursor) use save_catalog_retrying
         and then raise: silently losing those would strand the on-disk
         state at the last periodic cursor."""
-        err: OSError | None = None
-        for attempt in range(5 if must else 1):
+        if not must:
             try:
                 save_catalog(catalog, catalog_path)
                 return True
-            except OSError as e:
-                err = e
-                if must:
-                    time.sleep(0.1 * (attempt + 1))
-        if must:
-            raise err
-        return False
+            except OSError:
+                return False
+        save_catalog_retrying(catalog, catalog_path)
+        return True
 
     def wait_while_paused() -> None:
         while pause is not None and pause.is_set():

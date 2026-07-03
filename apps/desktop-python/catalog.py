@@ -62,6 +62,7 @@ import json
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1074,6 +1075,30 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
     tmp = path.with_suffix(".catalog.tmp")
     tmp.write_text(json.dumps(data))
     tmp.replace(path)
+
+
+def save_catalog_retrying(catalog: Catalog, path: Path,
+                          attempts: int = 5,
+                          backoff: float = 0.1) -> None:
+    """save_catalog with linear-backoff retry on transient OSError.
+
+    On Windows, os.replace onto catalog.json briefly held open by a reader
+    (antivirus, search indexer, any tool peeking at the file) raises
+    PermissionError (WinError 5 / WinError 32).  Retries up to `attempts`
+    times, sleeping `backoff * attempt` seconds between each pair; raises
+    the final OSError if all attempts fail.
+    """
+    # Linear schedule: 0.1 s, 0.2 s, … up to (attempts-1) * backoff.
+    err: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            save_catalog(catalog, path)
+            return
+        except OSError as e:
+            err = e
+            if attempt < attempts - 1:
+                time.sleep(backoff * (attempt + 1))
+    raise err  # type: ignore[misc]
 
 
 def load_catalog(path: Path, root: Path) -> Catalog | None:

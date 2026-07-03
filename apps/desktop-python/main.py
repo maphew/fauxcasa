@@ -84,6 +84,7 @@ from catalog import (  # noqa: E402
     load_report,
     reconcile_walk,
     save_catalog,
+    save_catalog_retrying,
     save_report,
     scan_library,
 )
@@ -852,7 +853,7 @@ class MainWindow(QMainWindow):
                                      cancel=self.build_cancel)
                 if result is None:
                     return  # cancelled
-                save_catalog(catalog, build_dir / "catalog.json")
+                save_catalog_retrying(catalog, build_dir / "catalog.json")
                 save_report(catalog.report, build_dir / REPORT_NAME)
                 _emit(bridge.finished, result, catalog, False)
             except Exception as e:  # report, never crash the UI
@@ -897,7 +898,7 @@ class MainWindow(QMainWindow):
                                      cancel=self.build_cancel)
                 if result is None:
                     return
-                save_catalog(fresh, cache_dir / "catalog.json")
+                save_catalog_retrying(fresh, cache_dir / "catalog.json")
                 save_report(fresh.report, cache_dir / REPORT_NAME)
                 _emit(bridge.finished, result, fresh, True)
             except Exception as e:
