@@ -847,8 +847,10 @@ def scan_library(root: Path,
     # folder's ini; collect once per uid, then resolve membership tokens.
     # When folders carry diverging duplicate definitions of one uid,
     # first-wins in walk order — a known-arbitrary choice; Picasa's own
-    # resolution rule is unobserved (no oracle fixture yet).
-    for entry in ini_by_folder.values():
+    # resolution rule is unobserved (no oracle fixture yet).  A diverging
+    # second definition is an import-report entry (fauxcasa-cam.17).
+    album_sources: dict[str, str] = {}  # uid -> folder_rel of first definition
+    for folder_key, entry in ini_by_folder.items():
         if entry is None:
             continue
         for sec in entry[0].sections:
@@ -861,6 +863,22 @@ def scan_library(root: Path,
                         date=sec.get("date"),
                         description=sec.get("description"),
                     )
+                    album_sources[uid] = folder_key
+                elif uid:
+                    # duplicate definition: check for divergence and report
+                    existing = albums[uid]
+                    new_name = sec.get("name") or uid[:8]
+                    if (new_name != existing.name
+                            or sec.get("date") != existing.date
+                            or sec.get("description") != existing.description):
+                        first = album_sources.get(uid, folder_key)
+                        report.add(
+                            "ini", "album_redefinition", uid,
+                            f'[.album:{uid}] "{new_name}" in '
+                            f'"{folder_key or "root"}" diverges from '
+                            f'"{existing.name}" first seen in '
+                            f'"{first or "root"}" — first definition wins'
+                        )
 
     # Membership + §3 placeholder albums (fauxcasa-cam.13): an albums=
     # token whose uid has no [.album:] definition anywhere used to be
@@ -901,10 +919,25 @@ def scan_library(root: Path,
     # table (first-wins across folders, like duplicate album definitions),
     # with contacts.xml names overriding on conflict (§4) — each such
     # conflict is an import-report entry, not a silent resolution.
+    # Cross-folder ini disagreements (two folders naming the same cid
+    # differently) are also reported once per conflicting id (fauxcasa-cam.17).
     registry: dict[str, str] = {}
+    registry_source: dict[str, str] = {}  # cid -> folder_rel that first registered
+    reported_cross: set[str] = set()  # cids already reported (one entry per cid)
     for folder_rel in folders:
         for cid, cname in folder_contacts(folder_rel).items():
-            registry.setdefault(cid, cname)
+            if cid not in registry:
+                registry[cid] = cname
+                registry_source[cid] = folder_rel
+            elif registry[cid] != cname and cid not in reported_cross:
+                reported_cross.add(cid)
+                first = registry_source[cid]
+                report.add(
+                    "ini", "contact_name_conflict", cid,
+                    f'cross-folder [Contacts2]: "{registry[cid]}" '
+                    f'(from "{first or "root"}") vs "{cname}" '
+                    f'(from "{folder_rel or "root"}") — first-folder wins'
+                )
     for cid, xml_name in contacts.items():
         ini_name = registry.get(cid)
         if ini_name is not None and ini_name != xml_name:
