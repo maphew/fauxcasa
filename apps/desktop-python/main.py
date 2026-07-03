@@ -689,8 +689,13 @@ class MainWindow(QMainWindow):
         # one toolbar affordance acting on the CURRENT view; F11 is the
         # Picasa-heritage shortcut (fauxcasa-q6l.3).
         self.play_action = bar.addAction("▶ Play")
+        # Chord text is derived from the keymap so the tooltip stays current
+        # when chords are added or changed (ed5.12); never hard-code "F11".
+        _play_chords = " / ".join(s.toString()
+                                  for s in keymap.shortcuts("app.play"))
         self.play_action.setToolTip(
-            "Slideshow of the current view (F11) — Space pauses, Esc exits")
+            f"Slideshow of the current view ({_play_chords})"
+            " — Space pauses, Esc exits")
         # The binding comes from the keymap default scheme (q6l.8).
         self.play_action.setShortcuts(keymap.shortcuts("app.play"))
         self.play_action.triggered.connect(self._start_slideshow)

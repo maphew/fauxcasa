@@ -3398,6 +3398,70 @@ def test_grid_select_all_and_escape(tmp_path: Path) -> None:
     assert g.selection == set() and g.current == -1
 
 
+def test_grid_deselect_ctrl_d(tmp_path: Path) -> None:
+    """Ctrl+D (grid.deselect) clears the entire selection set while keeping
+    the current item as keyboard focus (deselected but still current).
+    Distinct from Esc (grid.clear) which collapses to {current}."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[1])
+    _click(g, d[4], SHIFT)
+    assert len(g.selection) > 1   # range selection assembled
+    _key(g, Qt.Key.Key_D, CTRL)
+    assert g.selection == set()   # all deselected
+    assert g.current == d[4]      # keyboard focus preserved
+    # Ctrl+D with no current item is a clean no-op (no crash)
+    g._select(-1)
+    _key(g, Qt.Key.Key_D, CTRL)
+    assert g.selection == set() and g.current == -1
+
+
+def test_grid_invert_selection_ctrl_i(tmp_path: Path) -> None:
+    """Ctrl+I (grid.invert) flips selection membership over the current
+    view: unselected photos become selected and vice versa. The current
+    item stays as keyboard focus regardless of its new membership state."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[0])
+    _click(g, d[2], SHIFT)         # d[0], d[1], d[2] selected
+    assert g.selection == set(d[:3])
+    _key(g, Qt.Key.Key_I, CTRL)
+    assert g.selection == set(d[3:])    # the other 6 photos are now selected
+    assert g.current == d[2]            # current preserved
+    # Invert of the full set yields empty
+    _key(g, Qt.Key.Key_A, CTRL)        # select all first
+    _key(g, Qt.Key.Key_I, CTRL)
+    assert g.selection == set()
+
+
+def test_grid_home_end_navigation(tmp_path: Path) -> None:
+    """Home (grid.first) jumps to the first photo; End (grid.last) to the
+    last. Both are key_only so they ride the same Shift-extension path as
+    arrows: Shift+Home selects anchor..first, Shift+End anchor..last."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[4])                    # somewhere in the middle
+    _key(g, Qt.Key.Key_Home)
+    assert g.current == d[0] and g.selection == {d[0]}
+    _key(g, Qt.Key.Key_End)
+    assert g.current == d[-1] and g.selection == {d[-1]}
+    # Shift+Home from d[-1] extends the selection to anchor..d[0]
+    _key(g, Qt.Key.Key_Home, SHIFT)
+    assert g.current == d[0] and g.anchor == d[-1]
+    assert g.selection == set(d)
+
+
 def test_grid_selection_signal_payloads(tmp_path: Path) -> None:
     """selection_changed carries a set COPY of catalog indices and fires
     only when the set changes; photo_selected keeps tracking the current
@@ -7706,14 +7770,31 @@ def test_keymap_conflict_checker_is_real() -> None:
 def test_keymap_platform_correctness_rides_qt() -> None:
     """Ctrl/Cmd correctness (spec §8) comes from Qt, not per-OS tables:
     grid.select_all defers to StandardKey.SelectAll (Cmd+A on macOS from
-    Qt's own binding list), and app.play resolves to the F11 heritage
-    binding for QAction.setShortcuts."""
+    Qt's own binding list), and app.play resolves F11 + Ctrl+4 (the
+    Picasa slideshow chord added in ed5.12) for QAction.setShortcuts."""
     import keymap
     from PySide6.QtGui import QKeySequence
 
     assert (keymap.DEFAULT_SCHEME["grid.select_all"].standard
             == QKeySequence.StandardKey.SelectAll)
-    assert [s.toString() for s in keymap.shortcuts("app.play")] == ["F11"]
+    play_strs = [s.toString() for s in keymap.shortcuts("app.play")]
+    assert "F11" in play_strs
+    assert "Ctrl+4" in play_strs
+
+
+def test_play_tooltip_derives_from_keymap(library: Path) -> None:
+    """The ▶ Play tooltip is built from keymap.shortcuts, not a hard-coded
+    string — every chord in the scheme appears in the tooltip text, so
+    adding or removing a chord keeps the UI self-consistent (ed5.12)."""
+    import keymap
+    _offscreen_app()
+    from main import MainWindow
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    tip = win.play_action.toolTip()
+    for seq in keymap.shortcuts("app.play"):
+        assert seq.toString() in tip, (
+            f"{seq.toString()!r} missing from play tooltip: {tip!r}")
 
 
 def test_grid_jk_navigate_next_prev(tmp_path: Path) -> None:
