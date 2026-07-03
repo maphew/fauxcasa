@@ -21,7 +21,9 @@ yield ``FileMeta()`` (all None) — ``read_file_meta`` never raises, because
 one corrupt photo must not abort an index over the whole library.
 
 Scope: exactly the fields inmeta.py does NOT read — capture date
-(fauxcasa-cam.9), GPS (fauxcasa-cam.10), XMP Rating (fauxcasa-cam.11).
+(fauxcasa-cam.9), GPS (fauxcasa-cam.10), XMP Rating (fauxcasa-cam.11),
+plus the raw EXIF Orientation value (read_orientation, fauxcasa-cam.4 —
+a VIEW-time read for the face overlay, not an index-time field).
 inmeta.py remains the caption/keywords reader; the two run side by side on
 the same bytes at index time. Containers: whatever exiv2 sniffs from the
 bytes (JPEG/TIFF/PNG/WebP for the tracer's walk set; GIF/BMP fail soft).
@@ -163,6 +165,36 @@ _EXIF_KEYS = frozenset((
     "Exif.GPSInfo.GPSLongitude", "Exif.GPSInfo.GPSLongitudeRef",
 ))
 _XMP_RATING_KEY = "Xmp.xmp.Rating"
+_ORIENTATION_KEY = "Exif.Image.Orientation"
+
+
+def read_orientation(data: bytes) -> int:
+    """EXIF Orientation (tag 274) from one file's bytes: 1..8, fail-soft 1.
+
+    Exists for the viewer's face overlay (fauxcasa-cam.4): faces= rect64
+    fractions are relative to the STORED pixels, but every display path
+    decodes EXIF-upright (autoTransform), so the overlay must know the
+    stored file's orientation value to map stored-pixel rects into the
+    upright frame. Read at VIEW time from the bytes the viewer already
+    holds — deliberately NOT persisted in the catalog (no schema bump).
+    Anything unusable — missing exiv2 wheel, garbage/empty bytes, an
+    absent tag, a value outside 1..8 — is 1 ("display == stored"), the
+    same fail-soft contract as read_file_meta: a wrong-but-bounded box
+    beats an exception in a paint path."""
+    exiv2 = _module()
+    if exiv2 is None or not data:
+        return 1
+    try:
+        with _LOCK:
+            img = exiv2.ImageFactory.open(data)  # bytes-mode: sniffs the type
+            img.readMetadata()
+            for d in img.exifData():
+                if d.key() == _ORIENTATION_KEY:
+                    v = int(d.toString().strip())
+                    return v if 1 <= v <= 8 else 1
+    except Exception:  # noqa: BLE001 — hostile bytes: exiv2 raises, we shrug
+        return 1
+    return 1
 
 
 def read_file_meta(data: bytes) -> FileMeta:
@@ -219,7 +251,8 @@ def embed_test_metadata(data: bytes, *,
                         date_time_original: str | None = None,
                         date_time: str | None = None,
                         gps: tuple[float, float] | None = None,
-                        rating: object | None = None) -> bytes:
+                        rating: object | None = None,
+                        orientation: int | None = None) -> bytes:
     """Write date/GPS/Rating INTO image bytes — TEST-FIXTURE SUPPORT ONLY.
 
     This is NOT the §5 P1 product writer (no round-trip verification, no
@@ -231,7 +264,9 @@ def embed_test_metadata(data: bytes, *,
 
     date_time_original/date_time are raw EXIF strings (caller controls the
     grammar, so tests can plant garbage); gps is signed decimal (lat, lon);
-    rating is written as str(rating) so tests can plant out-of-range values.
+    rating is written as str(rating) so tests can plant out-of-range values;
+    orientation writes EXIF tag 274 verbatim (tests plant all 8 cases —
+    and out-of-range values to prove read_orientation's fail-soft).
     """
     exiv2 = _module()
     if exiv2 is None:
@@ -252,6 +287,8 @@ def embed_test_metadata(data: bytes, *,
             exif["Exif.GPSInfo.GPSLongitudeRef"] = "E" if lon >= 0 else "W"
         if rating is not None:
             img.xmpData()[_XMP_RATING_KEY] = str(rating)
+        if orientation is not None:
+            exif[_ORIENTATION_KEY] = str(orientation)
         img.writeMetadata()
         bio = img.io()
         view = bio.mmap()
