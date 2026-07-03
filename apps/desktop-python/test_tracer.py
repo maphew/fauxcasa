@@ -3048,7 +3048,11 @@ def test_refresh_tile_native_dpr_and_invalidation(monkeypatch) -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    # Forward CLI args so `uv run test_tracer.py -k X -x` selects tests
+    # instead of silently running the whole suite (fauxcasa-q6l.17 — this
+    # cost four separate sessions a bisect detour before being fixed).
+    # Default -v only when the caller passed nothing.
+    sys.exit(pytest.main([__file__] + (sys.argv[1:] or ["-v"])))
 
 
 # ---------------------------------------------------------------------------
