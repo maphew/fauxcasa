@@ -7165,3 +7165,68 @@ def test_make_thumbcache_exclude_exts(tmp_path: Path) -> None:
                      "--sidecar-only"]) == 2
     assert mtc.main(["--library", str(lib), "--out", str(out),
                      "--exclude-exts", ".bogus"]) == 2
+
+
+def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
+    """The §5 stills-matrix regression sweep (fauxcasa-v46.4): before
+    this, 5 of the 6 claimed formats were 'done' only by construction —
+    the corpus was all Qt-generated baseline JPEG. One library, one REAL
+    build_cache/_index_one pass, every fixture generated in-test
+    (synthetic per the privacy rule); each asserts the right PIXELS —
+    catching CMYK channel inversion and wrong-GIF-frame bugs, not just
+    non-null — or the intended error tile:
+
+      cmyk.jpg    Adobe CMYK JPEG        -> decodes RED (never inverted)
+      prog.jpg    progressive JPEG       -> decodes
+      gray16.tif  16-bit grayscale TIFF  -> decodes mid-gray (not clipped)
+      anim.gif    2-frame animated GIF   -> the FIRST frame is the thumb
+      t.tga       TGA                    -> decodes
+      good.psd    PSD with composite     -> decodes (Pillow fallback)
+      nocomp.psd  PSD, unusable composite-> error tile, by design
+
+    (Verified against the pinned PySide6 build: Qt itself decodes the
+    first five; PSD is the Pillow fallback's. If a Qt upgrade ever drops
+    one, the fallback rescues it and this matrix still pins the pixels.)"""
+    from PIL import Image
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    Image.new("CMYK", (64, 48), (0, 255, 255, 0)).save(
+        lib / "cmyk.jpg", "JPEG", quality=95)
+    Image.new("RGB", (64, 48), (20, 60, 220)).save(
+        lib / "prog.jpg", "JPEG", quality=95, progressive=True)
+    Image.new("I;16", (64, 48), 40000).save(lib / "gray16.tif", "TIFF")
+    first = Image.new("RGB", (64, 48), (30, 200, 40))
+    second = Image.new("RGB", (64, 48), (220, 30, 200))
+    first.save(lib / "anim.gif", "GIF", save_all=True,
+               append_images=[second], duration=200, loop=0)
+    _make_tga(lib / "t.tga")
+    _make_psd(lib / "good.psd")
+    _make_psd(lib / "nocomp.psd", truncate=True)
+
+    cat = scan_library(lib)
+    assert len(cat.photos) == 7                  # every fixture walked
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    ent = {rel: (i, e)
+           for i, (rel, e) in enumerate(zip(cache.files, cache.entries))}
+
+    def color_at(rel: str):
+        i, (_o, length, w, h) = ent[rel]
+        assert length > 0, f"{rel} error-tiled"
+        assert (w, h) == (64, 48), rel
+        return _thumb_qimage(cache, i).pixelColor(32, 24)
+
+    px = color_at("cmyk.jpg")                    # CMYK red, NOT cyan
+    assert px.red() > 200 and px.green() < 60 and px.blue() < 60
+    px = color_at("prog.jpg")
+    assert px.blue() > 170 and px.red() < 80
+    px = color_at("gray16.tif")                  # 40000/65535 ~ 156 gray
+    assert abs(px.red() - 156) < 30 and abs(px.red() - px.blue()) < 10
+    px = color_at("anim.gif")                    # FIRST frame green...
+    assert px.green() > 150 and px.red() < 90    # ...never frame-2 magenta
+    px = color_at("t.tga")
+    assert abs(px.green() - 200) < 30
+    px = color_at("good.psd")
+    assert abs(px.red() - 200) < 30 and abs(px.blue() - 120) < 30
+    assert ent["nocomp.psd"][1][1] == 0          # the ONE intended error tile
