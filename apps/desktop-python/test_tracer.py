@@ -1238,6 +1238,71 @@ def test_infile_metadata_survives_catalog_roundtrip(tmp_path: Path) -> None:
     assert p.caption == "persisted cap" and p.keywords == ("kw1",)
 
 
+# ---- import-report entries for in-file overrides (fauxcasa-cam.17) --------
+
+
+def test_infile_override_reported(tmp_path: Path) -> None:
+    """When an in-file value replaces a DIFFERENT non-empty ini value, an
+    infile_override entry is added to the catalog's import report (§4).
+    Covers caption, keywords, geotag, and star; date_taken has no ini key
+    so it is always a gap-fill and never produces an entry."""
+    root = tmp_path / "lib"
+    write_jpeg_meta(root / "f" / "p.jpg",
+                    xmp=_xmp_app1(caption="file cap", keywords=("fkw",)))
+    (root / "f" / ".picasa.ini").write_text(
+        "[p.jpg]\r\ncaption=ini cap\r\nkeywords=ikw\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    entries = [e for e in cat.report.entries if e.kind == "infile_override"]
+    # both caption and keywords were overridden
+    subjects = {e.subject for e in entries}
+    assert "f/p.jpg" in subjects
+    kinds_detail = {e.subject: e.detail for e in entries}
+    cap_e = next(e for e in entries if "caption" in e.detail)
+    assert 'ini "ini cap"' in cap_e.detail and 'in-file "file cap"' in cap_e.detail
+    assert cap_e.source == "file"
+    kw_e = next(e for e in entries if "keywords" in e.detail)
+    assert '"ikw"' in kw_e.detail and '"fkw"' in kw_e.detail
+
+
+def test_infile_override_geotag_and_star_reported(tmp_path: Path) -> None:
+    """geotag and star overrides (ini geotag=/star=yes beaten by in-file
+    EXIF GPS/XMP Rating) each produce an infile_override entry."""
+    root = tmp_path / "mlib"
+    _meta_jpeg(root / "f" / "a.jpg", gps=WHITEHORSE, rating=3)
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\nstar=yes\r\ngeotag=-33.856800,151.215300\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    overrides = {e.detail.split(":")[0]: e
+                 for e in cat.report.entries if e.kind == "infile_override"}
+    assert "geotag" in overrides
+    assert "star" in overrides
+    assert "ini 1" in overrides["star"].detail and "in-file 3" in overrides["star"].detail
+
+
+def test_infile_override_no_flood(tmp_path: Path) -> None:
+    """Gap-fills — ini had no value, in-file supplies one — must NOT add
+    a report entry; only a genuine replacement of a different non-empty ini
+    value counts as an override (fauxcasa-cam.17 no-flood rule)."""
+    root = tmp_path / "lib"
+    # p: has in-file caption but NO ini caption/keywords -> gap-fill, no entry
+    write_jpeg_meta(root / "f" / "p.jpg",
+                    xmp=_xmp_app1(caption="file only"))
+    # q: in-file caption MATCHES the ini caption -> same value, no entry
+    write_jpeg_meta(root / "f" / "q.jpg",
+                    xmp=_xmp_app1(caption="same"))
+    (root / "f" / ".picasa.ini").write_text(
+        "[q.jpg]\r\ncaption=same\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    overrides = [e for e in cat.report.entries if e.kind == "infile_override"]
+    assert not overrides, f"unexpected override entries: {overrides}"
+
+
 # ---- EXIF orientation baked consistently into the thumbnail cache --------
 
 def test_index_bakes_exif_orientation(tmp_path: Path) -> None:
@@ -6313,6 +6378,96 @@ def test_placeholder_album_materializes_and_reports(
     assert "placeholder" in unknown[0].detail
 
 
+def test_album_redefinition_reported(tmp_path: Path) -> None:
+    """Two folders carrying [.album:<uid>] sections that differ in name (or
+    other fields) produce an album_redefinition import-report entry naming
+    both values and the winner; an identical duplicate does NOT produce one;
+    the first definition always wins (fauxcasa-cam.17)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "A" / "a.jpg")
+    make_jpeg(root / "B" / "b.jpg")
+    uid = "aa" * 16
+    (root / "A" / ".picasa.ini").write_text(
+        f"[.album:{uid}]\r\nname=First Name\r\n"
+        f"[a.jpg]\r\nalbums={uid}\r\n")
+    (root / "B" / ".picasa.ini").write_text(
+        f"[.album:{uid}]\r\nname=Second Name\r\n"
+        f"[b.jpg]\r\nalbums={uid}\r\n")
+    cat = scan_library(root)
+
+    redef = [e for e in cat.report.entries if e.kind == "album_redefinition"]
+    assert len(redef) == 1
+    e = redef[0]
+    assert e.subject == uid and e.source == "ini"
+    assert "First Name" in e.detail and "Second Name" in e.detail
+    assert "first" in e.detail.lower()          # winner named
+    # first definition wins
+    assert cat.albums[uid].name == "First Name"
+
+
+def test_album_redefinition_no_flood_on_identical(tmp_path: Path) -> None:
+    """An identical duplicate definition (same name, date, description)
+    does not produce a report entry — only divergence is reported."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "A" / "a.jpg")
+    make_jpeg(root / "B" / "b.jpg")
+    uid = "bb" * 16
+    ini_block = (f"[.album:{uid}]\r\nname=Same\r\ndate=39272.630035\r\n"
+                 f"description=same desc\r\n")
+    (root / "A" / ".picasa.ini").write_text(ini_block + f"[a.jpg]\r\nalbums={uid}\r\n")
+    (root / "B" / ".picasa.ini").write_text(ini_block + f"[b.jpg]\r\nalbums={uid}\r\n")
+    cat = scan_library(root)
+
+    assert not [e for e in cat.report.entries if e.kind == "album_redefinition"]
+
+
+def test_cross_folder_contact_conflict_reported(tmp_path: Path) -> None:
+    """Two sibling folders whose [Contacts2] sections name the same contact
+    id differently produce a contact_name_conflict entry (source='ini') with
+    both values and the winner named; the first-registered folder wins in the
+    flat registry (fauxcasa-cam.17)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Alpha" / "a.jpg")
+    make_jpeg(root / "Beta" / "b.jpg")
+    cid = "a1b2c3d4e5f6a1b2"
+    (root / "Alpha" / ".picasa.ini").write_text(
+        f"[Contacts2]\r\n{cid}=Alice Alpha;;\r\n")
+    (root / "Beta" / ".picasa.ini").write_text(
+        f"[Contacts2]\r\n{cid}=Alice Beta;;\r\n")
+    cat = scan_library(root)
+
+    cross = [e for e in cat.report.entries
+             if e.kind == "contact_name_conflict" and e.source == "ini"]
+    assert len(cross) == 1
+    e = cross[0]
+    assert e.subject == cid
+    assert "Alice Alpha" in e.detail and "Alice Beta" in e.detail
+    assert "first" in e.detail.lower()          # winner described
+    # the first-registered value is in the registry
+    assert cat.contacts[cid] in ("Alice Alpha", "Alice Beta")
+
+
+def test_cross_folder_contact_conflict_no_duplicate_entry(tmp_path: Path) -> None:
+    """A contact conflict between two folders is reported only ONCE even when
+    a child of the losing folder re-inherits the losing name — the de-dup
+    guard prevents a second entry for the same contact id."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Alpha" / "a.jpg")
+    make_jpeg(root / "Beta" / "b.jpg")
+    make_jpeg(root / "Beta" / "sub" / "c.jpg")
+    cid = "c3d4e5f6a1b2c3d4"
+    (root / "Alpha" / ".picasa.ini").write_text(
+        f"[Contacts2]\r\n{cid}=One;;\r\n")
+    (root / "Beta" / ".picasa.ini").write_text(
+        f"[Contacts2]\r\n{cid}=Two;;\r\n")
+    # Beta/sub inherits "Two" from Beta; no extra ini entry
+    cat = scan_library(root)
+
+    cross = [e for e in cat.report.entries
+             if e.kind == "contact_name_conflict" and e.source == "ini"]
+    assert len(cross) == 1  # only one entry despite three folders
+
+
 def test_contact_name_conflict_reported(
         faces_library: Path, tmp_path: Path) -> None:
     """The §4 conflict PR #37 resolved silently: contacts.xml renaming a
@@ -6324,17 +6479,23 @@ def test_contact_name_conflict_reported(
         _write_faces_contacts_xml(tmp_path / "contacts.xml"))
     cat = scan_library(faces_library, None, contacts)
 
-    conflicts = [e for e in cat.report.entries
-                 if e.kind == "contact_name_conflict"]
-    assert len(conflicts) == 1                 # only Carol truly conflicts
-    e = conflicts[0]
-    assert e.subject == "cccccccccccccccc" and e.source == "contacts"
+    # contacts.xml conflict: source="contacts"; cross-folder ini conflict
+    # for Ada Ancestor vs Ada Local is source="ini" (tested separately below)
+    xml_conflicts = [e for e in cat.report.entries
+                     if e.kind == "contact_name_conflict"
+                     and e.source == "contacts"]
+    assert len(xml_conflicts) == 1             # only Carol has a contacts.xml conflict
+    e = xml_conflicts[0]
+    assert e.subject == "cccccccccccccccc"
     assert "Carol Ini" in e.detail and "Carol Xml" in e.detail
     assert "contacts.xml wins" in e.detail
     # ...and the resolution itself is unchanged (xml wins, §4)
     assert cat.contacts["cccccccccccccccc"] == "Carol Xml"
 
-    assert not scan_library(faces_library).report.entries  # no xml, no notes
+    # without contacts.xml: one cross-folder ini conflict (Ada Ancestor vs Ada Local)
+    ini_cross = [e for e in scan_library(faces_library).report.entries
+                 if e.kind == "contact_name_conflict" and e.source == "ini"]
+    assert len(ini_cross) == 1
 
 
 def test_placeholder_sidebar_marking_and_notes_count(

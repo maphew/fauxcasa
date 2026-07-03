@@ -33,6 +33,7 @@ from catalog import (
     BACKFILL_COMPLETE,
     BACKFILL_IN_PROGRESS,
     Catalog,
+    ImportReport,
     save_catalog,
     save_catalog_retrying,
 )
@@ -365,7 +366,8 @@ def read_photo_meta(src: Path | None, photo):
 
 
 def apply_photo_meta(photo, size: int, mtime: int, sha: str,
-                     meta, fmeta) -> None:
+                     meta, fmeta,
+                     report: ImportReport | None = None) -> None:
     """Apply one read_photo_meta result to the catalog photo IN PLACE —
     identity/staleness signals plus the §4 tier-1 precedence merge. Shared
     by build_cache's completion loop and backfill_catalog so the adopt-mode
@@ -385,17 +387,36 @@ def apply_photo_meta(photo, size: int, mtime: int, sha: str,
     to the star count and WINS over a bare ini star=yes (§3 star
     authority — which carries no count and imported as 1 at scan), but an
     explicit Rating 0 does NOT unstar an ini-starred photo: the ini star=
-    line stays authoritative for zero-vs-nonzero (§3)."""
+    line stays authoritative for zero-vs-nonzero (§3).
+
+    `report`: when supplied, a conflict entry is added for each field where
+    an in-file value REPLACES a DIFFERENT non-empty ini value (fauxcasa-cam.17).
+    A gap-fill — ini had nothing, in-file supplies a value — is NOT reported."""
     photo.size, photo.mtime, photo.sha256 = size, mtime, sha
     if meta.caption:
+        if report is not None and photo.caption and photo.caption != meta.caption:
+            report.add("file", "infile_override", photo.rel,
+                       f'caption: ini "{photo.caption}" -> in-file "{meta.caption}"')
         photo.caption = meta.caption
     if meta.keywords:
+        if report is not None and photo.keywords and photo.keywords != meta.keywords:
+            ini_kw = ", ".join(photo.keywords)
+            new_kw = ", ".join(meta.keywords)
+            report.add("file", "infile_override", photo.rel,
+                       f'keywords: ini "{ini_kw}" -> in-file "{new_kw}"')
         photo.keywords = meta.keywords
     if fmeta.date_taken:
+        # ini has no per-photo date key: always a gap-fill, never a conflict
         photo.date_taken = fmeta.date_taken
     if fmeta.gps is not None:
+        if report is not None and photo.geotag is not None and photo.geotag != fmeta.gps:
+            report.add("file", "infile_override", photo.rel,
+                       f"geotag: ini {photo.geotag} -> in-file {fmeta.gps}")
         photo.geotag = fmeta.gps
     if fmeta.rating:
+        if report is not None and photo.star and photo.star != fmeta.rating:
+            report.add("file", "infile_override", photo.rel,
+                       f"star: ini {photo.star} -> in-file {fmeta.rating}")
         photo.star = fmeta.rating
 
 
@@ -779,7 +800,8 @@ def build_cache(
             # the adopt-mode backfill (see apply_photo_meta) — photos[idx]
             # is the SAME Photo object as in catalog.photos (photos_for_root
             # filters, never copies), so this mutates the real catalog.
-            apply_photo_meta(photos[idx], size, mtime, sha, meta, fmeta)
+            apply_photo_meta(photos[idx], size, mtime, sha, meta, fmeta,
+                             catalog.report)
             if progress:
                 progress(idx, total, img)
     elapsed = time.perf_counter() - t0
@@ -943,7 +965,7 @@ def backfill_catalog(
             idx, fut = window.popleft()
             _data, size, mtime, sha, meta, fmeta = fut.result()
             apply_photo_meta(catalog.photos[idx], size, mtime, sha,
-                             meta, fmeta)
+                             meta, fmeta, catalog.report)
             catalog.backfill_cursor = idx + 1
             done += 1
             since_save += 1
