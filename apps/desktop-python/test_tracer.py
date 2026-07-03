@@ -5411,6 +5411,40 @@ def test_status_readout_stashed_original(library: Path) -> None:
     assert "Picasa-saved original kept" not in win.meta_label.text()
 
 
+def test_status_readout_dims_and_size(library: Path) -> None:
+    """Single-photo status bar includes image dimensions and human file size
+    when present, and omits both cleanly when dims is None (pre-backfill)
+    or size is -1 (unindexed) — fauxcasa-q6l.12."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    cat = scan_library(library)
+    a = next(p for p in cat.photos if p.rel.endswith("Trip/a.jpg"))
+    a.dims = (3648, 2736)
+    a.size = 2_200_000
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    idx = cat.photos.index(a)
+
+    # present: dims and size both populated
+    win._photo_selected(idx)
+    text = win.meta_label.text()
+    assert "3648x2736" in text
+    assert "2.1 MB" in text
+
+    # absent: dims=None, size=-1 — omit cleanly
+    a.dims = None
+    a.size = -1
+    win._photo_selected(idx)
+    text2 = win.meta_label.text()
+    assert "3648x2736" not in text2
+    assert " MB" not in text2
+    assert " KB" not in text2
+
+
 def test_viewer_info_line_paints_metadata(library: Path) -> None:
     """The viewer's info bar composes star count + date + coordinates
     without incident (offscreen paint smoke; the text path is the shared

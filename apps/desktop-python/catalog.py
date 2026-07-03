@@ -667,6 +667,15 @@ def format_date_taken(date_taken: str) -> str:
     return date_taken.replace("T", " ")
 
 
+def format_file_size(size: int) -> str:
+    """Human-readable file size, Picasa-style (1 decimal, binary prefixes).
+    Caller must guard against size < 0 (unindexed sentinel)."""
+    for unit, threshold in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if size >= threshold:
+            return f"{size / threshold:.1f} {unit}"
+    return f"{size} B"
+
+
 # ---- edit recipes (fauxcasa-cam.15) ---------------------------------------
 #
 # §4: ini wins for edit recipes, and M1 "see your library again" means a

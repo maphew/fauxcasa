@@ -84,6 +84,7 @@ from catalog import (  # noqa: E402
     default_contacts_xml,
     default_pal_dir,
     format_date_taken,
+    format_file_size,
     format_geotag,
     load_catalog,
     load_contacts_xml,
@@ -2465,6 +2466,10 @@ class MainWindow(QMainWindow):
             # baked edit with the untouched original still in the stash
             # (fauxcasa-cam.19); restore machinery is M3.
             parts.append("Picasa-saved original kept")
+        if p.dims is not None:
+            parts.append(f"{p.dims[0]}x{p.dims[1]}")
+        if p.size >= 0:
+            parts.append(format_file_size(p.size))
         self.meta_label.setText("   ".join(parts) + "  ")
         if self.info_action.isChecked():
             self._refresh_inspector(p)
