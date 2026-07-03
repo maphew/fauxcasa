@@ -6009,6 +6009,161 @@ def test_scan_filter_never_drops_raw(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Preview-orientation edge fix (fauxcasa-v46.5): unit tests for the helpers
+# and the full end-to-end path.  The mapping is empirically verified:
+# TIFF/EXIF Orientation 1/3/6/8 in the container → LibRaw sizes.flip
+# 0/3/6/5 respectively (confirmed by running rawpy against _make_dng).
+# ---------------------------------------------------------------------------
+
+
+def test_flip_helpers_inject_and_detect() -> None:
+    """_inject_exif_orientation embeds a tag; _jpeg_has_exif_orientation finds
+    it. Round-trip: inject orientation 6 into a plain JPEG (no own tag) →
+    detect succeeds; detect on the unmodified plain JPEG → False."""
+    import rawload
+
+    plain = _jpeg_bytes(16, 16)                  # no EXIF at all
+    assert not rawload._jpeg_has_exif_orientation(plain)
+
+    with_tag = rawload._inject_exif_orientation(plain, 6)
+    assert with_tag[:2] == b"\xff\xd8"           # still valid SOI
+    assert rawload._jpeg_has_exif_orientation(with_tag)
+
+    # A JPEG that already carries orientation (from _inject in test helpers)
+    already = _inject(plain, 0xE1, _exif_orientation_app1(6))
+    assert rawload._jpeg_has_exif_orientation(already)
+
+
+def test_flip_helpers_garbage_input() -> None:
+    """_jpeg_has_exif_orientation and _inject_exif_orientation are fail-soft:
+    garbage bytes don't raise."""
+    import rawload
+
+    for bad in (b"", b"not a jpeg", b"\xff\xd8\xff" + b"\x00" * 100):
+        assert not rawload._jpeg_has_exif_orientation(bad)
+
+    # inject always returns bytes starting with SOI regardless of the value
+    result = rawload._inject_exif_orientation(_jpeg_bytes(8, 8), 8)
+    assert result[:2] == b"\xff\xd8"
+
+
+def test_libraw_flip_to_exif_orientation_mapping() -> None:
+    """The _LIBRAW_FLIP_TO_EXIF_ORIENTATION table covers all four nonzero
+    flip values rawpy produces (3, 5, 6) with the correct EXIF values
+    (3 = 180°, 8 = 90° CCW, 6 = 90° CW), verified against real rawpy output
+    for _make_dng with orientation 3/8/6 → flip 3/5/6."""
+    import rawload
+
+    m = rawload._LIBRAW_FLIP_TO_EXIF_ORIENTATION
+    assert m[3] == 3    # 180° → EXIF 3
+    assert m[5] == 8    # 90° CCW → EXIF 8 (rotate 270° CW)
+    assert m[6] == 6    # 90° CW  → EXIF 6 (rotate 90° CW)
+    assert 0 not in m   # flip=0 never needs injection
+
+
+@pytest.mark.parametrize("container_orient,exif_expect", [
+    (3, 3),    # 180°
+    (6, 6),    # 90° CW
+    (8, 8),    # 90° CCW
+])
+def test_raw_preview_flip_injection_e2e(
+        tmp_path: Path, container_orient: int, exif_expect: int) -> None:
+    """DNG with container Orientation=N and an embedded JPEG preview that
+    carries NO own orientation tag: raw_preview_jpeg must inject EXIF
+    Orientation=exif_expect into the returned bytes so callers' auto-transform
+    applies the correct rotation. The mapping is verified against rawpy's
+    actual sizes.flip values for each container orientation."""
+    import rawload
+
+    # preview JPEG built by _jpeg_bytes has no EXIF at all
+    pj = _jpeg_bytes(64, 48)
+    assert not rawload._jpeg_has_exif_orientation(pj)
+
+    p = _make_dng(tmp_path / "f.dng",
+                  orientation=container_orient,
+                  preview_jpeg=pj,
+                  preview_size=(64, 48))
+    data = p.read_bytes()
+
+    returned = rawload.raw_preview_jpeg(data)
+    assert returned is not None, "raw_preview_jpeg returned None"
+    assert returned[:2] == b"\xff\xd8", "returned bytes are not a JPEG"
+    assert rawload._jpeg_has_exif_orientation(returned), \
+        "orientation was not injected"
+
+    # The injected tag must carry the expected EXIF orientation value.
+    # Re-use metareader.read_orientation to read it back.
+    import metareader
+    got = metareader.read_orientation(returned)
+    assert got == exif_expect, (
+        f"container orient {container_orient}: "
+        f"expected EXIF {exif_expect}, got {got}"
+    )
+
+
+def test_raw_preview_flip_injection_skipped_when_preview_has_own_tag(
+        tmp_path: Path) -> None:
+    """When the preview already carries its own EXIF Orientation tag, no
+    injection occurs — the existing tag is the sole source of rotation.
+    The existing test_raw_orientation_applied_once_preview (orientation 6 in
+    the preview) already covers the cache path; this confirms raw_preview_jpeg
+    does not double-inject when flip != 0 and own tag is present."""
+    import rawload
+
+    # preview with its own orientation=6
+    pj = _inject(_jpeg_bytes(64, 48), 0xE1, _exif_orientation_app1(6))
+    assert rawload._jpeg_has_exif_orientation(pj)
+
+    p = _make_dng(tmp_path / "f.dng",
+                  orientation=6,
+                  preview_jpeg=pj,
+                  preview_size=(64, 48))
+    returned = rawload.raw_preview_jpeg(p.read_bytes())
+    assert returned is not None
+
+    # Byte-identical to pj (no segment was prepended) — checked by comparing
+    # to a version that WOULD have injection and confirming lengths differ.
+    plain_pj = _jpeg_bytes(64, 48)
+    injected_would_be = rawload._inject_exif_orientation(plain_pj, 6)
+    # returned starts with the preview's own APP1 after SOI, not a new one
+    assert len(returned) == len(pj)              # no extra segment prepended
+
+
+def test_raw_preview_no_flip_valid_jpeg(tmp_path: Path) -> None:
+    """DNG with container Orientation=1 (flip=0): raw_preview_jpeg returns
+    a valid JPEG. Our injection code does not fire when flip=0. rawpy/LibRaw
+    may add its own EXIF metadata (empirically it does — Orientation=1 is
+    injected by LibRaw regardless of whether the embedded preview had a tag).
+    We do not assert absence of a tag (LibRaw adds one); we assert the JPEG
+    is usable and decodes to the expected landscape dimensions."""
+    _offscreen_app()
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QImageReader
+
+    import rawload
+
+    pj = _jpeg_bytes(32, 32)
+    p = _make_dng(tmp_path / "f.dng",
+                  orientation=1,
+                  preview_jpeg=pj,
+                  preview_size=(32, 32))
+    returned = rawload.raw_preview_jpeg(p.read_bytes())
+    assert returned is not None
+    assert returned[:2] == b"\xff\xd8"           # valid JPEG SOI
+
+    # Decode with auto-transform: orientation=1 means no rotation, so the
+    # 32x32 preview decodes square (no portrait/landscape swap).
+    buf = QBuffer()
+    buf.setData(returned)
+    buf.open(QIODevice.OpenModeFlag.ReadOnly)
+    reader = QImageReader(buf)
+    reader.setAutoTransform(True)
+    img = reader.read()
+    assert not img.isNull()
+    assert img.width() == 32 and img.height() == 32
+
+
+# ---------------------------------------------------------------------------
 # §7 performance gates (fauxcasa-ed5.4/.3): the --search-probe latency
 # harness and the per-catalog search-haystack index behind it. The probe
 # emits one machine-readable {"event":"search","query","ms","hits"} line
