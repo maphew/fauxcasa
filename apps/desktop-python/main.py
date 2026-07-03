@@ -624,6 +624,7 @@ class _BuildBridge(QObject):
     status = Signal(str)                   # inline status text (reconcile)
     finished = Signal(object, object, bool)  # (IndexResult|None, Catalog, is_reconcile)
     backfill_done = Signal(bool)           # adopt-mode backfill: completed?
+    scan_done = Signal(object)             # (Catalog,) non-blocking walk landed; None on error
 
 
 class MainWindow(QMainWindow):
@@ -865,6 +866,12 @@ class MainWindow(QMainWindow):
         self._build_thread: threading.Thread | None = None
         self._reconcile_thread: threading.Thread | None = None
         self._backfill_thread: threading.Thread | None = None
+        # Non-blocking cold-walk thread (fauxcasa-q6l.13): set on the plain
+        # cold path (non-adopt); None on warm starts and the adopt path.
+        self._scan_thread: threading.Thread | None = None
+        # The build_dir deferred from _start_cold_scan to _on_scan_done.
+        self._scan_build_dir: Path | None = None
+        self._scan_t0: float = 0.0  # perf_counter at scan start (q6l.13)
         # Parks the backfill's readers between photos while set — the
         # low-priority hook (a future consumer can pause on heavy scroll);
         # tests drive it directly.
@@ -875,6 +882,7 @@ class MainWindow(QMainWindow):
         self._bridge.status.connect(self._on_status)
         self._bridge.finished.connect(self._on_index_finished)
         self._bridge.backfill_done.connect(self._on_backfill_done)
+        self._bridge.scan_done.connect(self._on_scan_done)
 
         if build_dir is not None:
             self._start_cold_build(build_dir)
@@ -1029,6 +1037,54 @@ class MainWindow(QMainWindow):
     def _on_status(self, text: str) -> None:
         self.progress_label.setText(("   " + text) if text else "")
 
+    def _start_cold_scan(self, build_dir: Path) -> None:
+        """Non-blocking cold-path walk (fauxcasa-q6l.13): scan_library runs on
+        a daemon thread so the window is interactive during the initial scan.
+        When the walk finishes, scan_done fires on the GUI thread and
+        _on_scan_done swaps in the real catalog via reload_data, then starts
+        the normal thumbnail build thread.
+
+        Restricted to the plain cold path (non-adopt).  The adopt path keeps
+        a synchronous scan because it must bind an external --thumbs cache and
+        run post-scan fixups (backfill_state, catalog save) before the window
+        opens."""
+        self._scan_build_dir = build_dir
+        self._scan_t0 = time.perf_counter()
+        self._on_status(f"Scanning {self.catalog.root.name}…")
+        bridge = self._bridge
+
+        def work() -> None:
+            try:
+                fresh = scan_library(
+                    self.catalog.root, self.scan_filter,
+                    self.contacts, self.pal_dir,
+                    exts=self.exts,
+                    contacts_path=self.contacts_path)
+                _emit(bridge.scan_done, fresh)
+            except Exception as e:
+                log.error("background library scan failed: %s", e)
+                _emit(bridge.scan_done, None)
+
+        self._scan_thread = threading.Thread(target=work, daemon=True)
+        self._scan_thread.start()
+
+    def _on_scan_done(self, catalog) -> None:
+        """Walk landed (fauxcasa-q6l.13): swap in the real catalog via the
+        same atomic-swap path as reconcile, then start the thumbnail build."""
+        self._on_status("")          # clear 'Scanning…'
+        if catalog is None:
+            self.statusBar().showMessage("scan failed — see log", 10000)
+            return
+        scan_ms = (time.perf_counter() - self._scan_t0) * 1000.0
+        log.info("cold-walk: %d photos, %d folders, %d albums in %.0f ms",
+                 len(catalog.photos), len(catalog.folders),
+                 len(catalog.albums), scan_ms)
+        if catalog.report.entries:
+            log.info("import report: %s", catalog.report.summary())
+        self.reload_data(catalog, None)
+        if self._scan_build_dir is not None:
+            self._start_cold_build(self._scan_build_dir)
+
     def _on_index_finished(self, result, catalog, is_reconcile: bool) -> None:
         self.progress_label.setText("")
         if result is None:
@@ -1100,7 +1156,8 @@ class MainWindow(QMainWindow):
 
     def index_busy(self) -> bool:
         return any(t is not None and t.is_alive()
-                   for t in (self._build_thread, self._reconcile_thread))
+                   for t in (self._build_thread, self._reconcile_thread,
+                              self._scan_thread))
 
     def shutdown(self) -> None:
         """Stop and reap the index threads so none is mid-write (or
@@ -1111,7 +1168,7 @@ class MainWindow(QMainWindow):
         self.build_cancel.set()
         self.backfill_pause.clear()  # a paused backfill must see the cancel
         for t in (self._build_thread, self._reconcile_thread,
-                  self._backfill_thread):
+                  self._backfill_thread, self._scan_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=5.0)
 
@@ -2120,10 +2177,13 @@ def main() -> int:
             except (CacheError, OSError) as e:
                 log.warning("persisted cache unusable (%s); rescanning", e)
 
+    cold_scan_needed = False  # non-adopt cold path: scan deferred to background
     if catalog is None:  # cold path
-        catalog = scan_library(root, scan_filter, contacts, pal_dir,
-                               exts=exts, contacts_path=contacts_path)
         if adopt:
+            # Adopt path: scan synchronously — must bind the external cache
+            # and run post-scan fixups before the window opens (unchanged).
+            catalog = scan_library(root, scan_filter, contacts, pal_dir,
+                                   exts=exts, contacts_path=contacts_path)
             try:
                 thumbs = load_cache(args.thumbs)
                 bind(thumbs, catalog)
@@ -2139,7 +2199,16 @@ def main() -> int:
             save_catalog_retrying(catalog, cat_path)  # warm-start next time
             save_report(catalog.report, cache_dir / REPORT_NAME)
         else:
-            build_dir = cache_dir  # the build thread persists the catalog
+            # Non-adopt cold path (fauxcasa-q6l.13): open immediately with
+            # an empty catalog; _start_cold_scan defers the walk + build to
+            # a background thread so first paint is not blocked.
+            # SEMANTIC CHANGE vs prior art: on cold start, READY now fires
+            # with photos=0 (window interactive before walk lands); the
+            # 'indexed' event still marks the completed build.
+            # --finish-build continues to wait for the full scan + build.
+            # prep_ms measures this near-instant phase, not the async walk.
+            catalog = Catalog(root=root, photos=[], folders={}, albums={})
+            cold_scan_needed = True
 
     if adopt and thumbs is not None and thumbs.library \
             and Path(thumbs.library).resolve() != root:
@@ -2150,15 +2219,18 @@ def main() -> int:
                     thumbs.library, str(root))
 
     prep_ms = (time.perf_counter() - t_prep) * 1000.0
-    mode = "warm-load" if warm else ("adopt" if adopt else "cold-walk")
-    log.info("%s: %d photos, %d folders, %d albums in %.0f ms",
-             mode, len(catalog.photos), len(catalog.folders),
-             len(catalog.albums), prep_ms)
-    if catalog.report.entries:
-        # §4: conflicts are surfaced, never silent — the applog line plus
-        # the status-bar count are the minimal v1 surface (full inspector
-        # is N7/M2). Details live in the persisted import-report.json.
-        log.info("import report: %s", catalog.report.summary())
+    if cold_scan_needed:
+        log.info("cold-walk: deferring scan of %s to background thread", root)
+    else:
+        mode = "warm-load" if warm else ("adopt" if adopt else "cold-walk")
+        log.info("%s: %d photos, %d folders, %d albums in %.0f ms",
+                 mode, len(catalog.photos), len(catalog.folders),
+                 len(catalog.albums), prep_ms)
+        if catalog.report.entries:
+            # §4: conflicts are surfaced, never silent — the applog line plus
+            # the status-bar count are the minimal v1 surface (full inspector
+            # is N7/M2). Details live in the persisted import-report.json.
+            log.info("import report: %s", catalog.report.summary())
 
     # A frozen first-run picker may already have created the app.
     app = QApplication.instance() or QApplication([])
@@ -2173,6 +2245,10 @@ def main() -> int:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
     win.show()
+    if cold_scan_needed:
+        # Non-blocking cold walk (fauxcasa-q6l.13): start after show() so
+        # the window is visible before the scan occupies the OS scheduler.
+        win._start_cold_scan(cache_dir)
 
     # READY instrumentation (§7 cold start): poll until every visible
     # tile is decoded, then report cold start + RSS on stdout.
@@ -2216,13 +2292,17 @@ def main() -> int:
                 "cold_start_ms": round(cold_ms),
                 "prep_ms": round(prep_ms),
                 "warm": warm,
-                "photos": len(catalog.photos),
-                "visible_photos": catalog.visible_count,
-                "folders": len(catalog.folders),
-                "albums": len(catalog.albums),
+                # Use win.catalog for live counts: on the non-blocking cold
+                # path READY fires before the walk lands (photos=0 honestly
+                # reflects the empty initial catalog); on warm/adopt paths
+                # win.catalog equals the pre-constructed catalog as before.
+                "photos": len(win.catalog.photos),
+                "visible_photos": win.catalog.visible_count,
+                "folders": len(win.catalog.folders),
+                "albums": len(win.catalog.albums),
                 "catalog_bytes": cat_bytes,
                 "catalog_bytes_per_photo": round(
-                    cat_bytes / max(1, len(catalog.photos)), 1),
+                    cat_bytes / max(1, len(win.catalog.photos)), 1),
                 "vm_rss_mb": round(rss, 1),
                 "vm_hwm_mb": round(hwm, 1),
             }), flush=True)

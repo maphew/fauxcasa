@@ -7634,6 +7634,73 @@ def test_mainwindow_adopt_backfill_end_to_end(tmp_path: Path) -> None:
     win.shutdown()
 
 
+def test_cold_scan_nonblocking(tmp_path: Path, monkeypatch) -> None:
+    """Non-blocking first run (fauxcasa-q6l.13): _start_cold_scan defers
+    scan_library to a daemon thread so the window is interactive (and
+    processEvents works) before the walk returns.  When the walk lands,
+    _on_scan_done swaps the real catalog in via reload_data and starts
+    the cold build thread."""
+    import threading as _threading
+    import time as _time
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    import main
+    from catalog import Catalog
+
+    app = QApplication.instance() or QApplication([])
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "F" / "a.jpg")
+    make_jpeg(root / "F" / "b.jpg")
+    cache_dir = tmp_path / "cachedir"
+    cache_dir.mkdir()
+
+    # Gate: hold the background scan until the test asserts on the empty state.
+    scan_gate = _threading.Event()
+    real_scan = scan_library
+
+    def gated_scan(r, *args, **kwargs):
+        scan_gate.wait()           # block until test releases
+        return real_scan(r, *args, **kwargs)
+
+    monkeypatch.setattr(main, "scan_library", gated_scan)
+
+    empty = Catalog(root=root, photos=[], folders={}, albums={})
+    win = main.MainWindow(empty, None, cache_dir=cache_dir, build_dir=None)
+    win.show()
+    app.processEvents()
+
+    # No scan started yet; window shows the empty catalog.
+    assert win._scan_thread is None
+    assert len(win.catalog.photos) == 0
+
+    win._start_cold_scan(cache_dir)
+    app.processEvents()
+
+    # Scan thread is alive; window still interactive (not blocked).
+    assert win._scan_thread is not None and win._scan_thread.is_alive()
+    assert "Scanning" in win.progress_label.text()
+    assert len(win.catalog.photos) == 0    # empty until walk lands
+
+    # Release the gate and wait for the walk to finish.
+    scan_gate.set()
+    deadline = _time.time() + 15
+    while win._scan_thread.is_alive() and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    assert not win._scan_thread.is_alive(), "scan thread did not finish"
+    app.processEvents()          # deliver scan_done -> _on_scan_done
+
+    # Real catalog swapped in; build thread started.
+    assert len(win.catalog.photos) == 2, (
+        f"expected 2 photos after scan; got {len(win.catalog.photos)}")
+    assert win.grid.display == list(range(2))   # grid repopulated
+    assert win._build_thread is not None        # thumbnail build kicked off
+    assert not win.progress_label.text().startswith("   Scanning")
+
+    win.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # Face-region overlay (fauxcasa-cam.4): faces= rect64 fractions are relative
 # to the STORED pixels (picasa-ini-format.md "faces=": rotate= does NOT
