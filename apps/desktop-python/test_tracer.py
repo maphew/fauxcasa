@@ -2151,10 +2151,12 @@ def test_restart_command_open_drops_thumbs(monkeypatch, tmp_path: Path) -> None:
     assert "--thumbs" not in argv
 
 
-def test_restart_command_file_types_preserves_thumbs(
+def test_restart_command_file_types_drops_thumbs(
         monkeypatch, tmp_path: Path) -> None:
-    """_show_file_types (same library) DOES carry --thumbs — the adopted
-    cache remains valid after an extension change on the same library.
+    """_show_file_types must NOT carry --thumbs: a File-Types change alters
+    the effective walk (exts), so an adopted cache no longer matches the new
+    file set — bind() would raise CacheError and the relaunched process exits
+    2 with no UI.  The relaunch must cold-rebuild instead.
     fauxcasa-q6l.19."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -2191,9 +2193,9 @@ def test_restart_command_file_types_preserves_thumbs(
     _prog, argv = captured[0]
     # Scan-size constraint preserved.
     assert "--min-image-size" in argv
-    # --thumbs MUST appear — same library relaunch.
-    assert "--thumbs" in argv
-    assert str(thumbs_path) in argv
+    # --thumbs must NOT appear: the extension change alters the file set,
+    # so an adopted cache would fail bind() — the relaunch cold-rebuilds.
+    assert "--thumbs" not in argv
 
 
 def test_resolve_library_frozen_first_run(monkeypatch, tmp_path: Path) -> None:
@@ -5950,6 +5952,44 @@ def test_tray_navigate_hidden_photo_auto_reveals(library: Path) -> None:
     assert idx in g.display_pos                  # photo now in grid
     assert g.current == idx                       # photo selected
     assert "revealed" in win.statusBar().currentMessage().lower()
+
+
+def test_tray_navigate_hidden_reveals_but_still_missing(
+        monkeypatch, library: Path) -> None:
+    """When reveal is toggled ON during tray navigation but the photo is
+    still absent after the fallback, the status message names BOTH facts:
+    reveal was toggled AND the photo was not found — reveal is never a
+    silent side effect (q6l.18, N7).
+
+    The edge case is simulated by patching set_filter to a no-op so
+    display_pos is never updated, keeping the photo absent throughout."""
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    g = win.grid
+
+    hidden_rel = "2020-01-01 Trip/b.jpg"
+    idx = next(i for i, p in enumerate(cat.photos) if p.rel == hidden_rel)
+    assert not cat.photos[idx].visible   # confirm fixture
+    assert not win.grid.reveal           # reveal starts off
+    assert idx not in g.display_pos      # absent without reveal
+
+    win.tray.hold([hidden_rel])
+
+    # Patch set_filter so display_pos is never updated — simulates the
+    # edge case where reveal toggled but the photo is still not shown.
+    monkeypatch.setattr(g, "set_filter", lambda *a, **k: None)
+
+    win._tray_navigate(hidden_rel)
+
+    # reveal flag was set as a side effect of the navigation attempt
+    assert win.grid.reveal
+    msg = win.statusBar().currentMessage()
+    # message must name the reveal action AND acknowledge the failure
+    assert "revealed" in msg.lower()
+    assert "not visible" in msg.lower()
 
 
 def test_tray_clear_and_per_item_remove(tmp_path: Path) -> None:

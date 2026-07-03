@@ -395,8 +395,9 @@ def _restart_command(
     Relaunching keeps startup's warm/cold/adopt logic single-sourced in main().
     Pass-through flags reproduce the original scan constraints on relaunch:
     --min-image-size / --max-image-size are always forwarded when set;
-    --thumbs is forwarded only for same-library relaunches (File Types apply)
-    — it is library-specific so Open... (different library) must not carry it.
+    --thumbs is forwarded only when the caller explicitly passes it — an adopted
+    cache binds to a specific walk; callers must only pass it when the relaunch
+    walks the same files.
     """
     extra: list[str] = []
     if scan_filter is not None:
@@ -605,9 +606,9 @@ class MainWindow(QMainWindow):
         self.catalog = catalog
         self.cache_dir = cache_dir
         self.scan_filter = scan_filter
-        # --thumbs path kept for same-library relaunch (File Types apply):
-        # an adopted external cache remains valid after an extension change on
-        # the same library, so its path must round-trip through _restart_command.
+        # --thumbs path preserved for any relaunch that walks the same file
+        # set as this run; a File-Types change changes the walk and must not
+        # forward it — that relaunch cold-rebuilds (see _show_file_types).
         self.thumbs_path = thumbs_path
         # File Types panel choice (fauxcasa-v46.4): the persisted excluded
         # set and the effective walk set derived from it, kept so every
@@ -1095,11 +1096,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "could not save the file-type choice — see the log", 8000)
             return
-        # Same library: forward scan-size constraints AND --thumbs (the
-        # adopted cache remains valid — it was built over this same library).
+        # Same library: forward scan-size constraints only. An adopted cache
+        # binds to a specific walk; a File-Types change changes the walk, so
+        # the relaunch must cold-rebuild the cache.
         program, args = _restart_command(self.catalog.root, self.cache_root,
-                                         scan_filter=self.scan_filter,
-                                         thumbs=self.thumbs_path)
+                                         scan_filter=self.scan_filter)
         started = QProcess.startDetached(program, args)
         ok = started[0] if isinstance(started, tuple) else started
         if not ok:
@@ -1635,8 +1636,13 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     "Hidden photos revealed to show this photo", 4000)
         else:
-            self.statusBar().showMessage(
-                "Photo not visible in any view", 4000)
+            # reveal may have been toggled ON as a side effect of this
+            # navigation; name that action in the message so state and
+            # message agree (N7 — no silent side effects).
+            msg = ("Hidden photos revealed, but the photo is not visible "
+                   "in any view" if revealed
+                   else "Photo not visible in any view")
+            self.statusBar().showMessage(msg, 4000)
         self.grid.setFocus()
         self._refresh_tray_readout()
 
