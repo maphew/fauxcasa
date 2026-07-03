@@ -102,6 +102,36 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
 
+## Delegation policy: tier subagent models by task complexity
+
+**Owner directive (maphew, 2026-07-03).** Sessions start on a smart model to
+understand the problem and build the plan; execution is then delegated to
+subagents on the cheapest model adequate for each piece. When spawning
+subagents, pick the tier deliberately — do not default everything to the
+session model.
+
+Named tiers live in `.claude/agents/` — prefer them over ad-hoc spawns:
+
+- **scout** (haiku, read-only) — searches, file inventories, "where is X",
+  summarizing files, running tests/commands and reporting output verbatim.
+- **builder** (sonnet, can edit) — well-scoped implementation with a clear
+  spec: exact files named, acceptance criteria stated. Give it a spec, not
+  a problem.
+- **reviewer** (opus, read-only) — correctness review of diffs and designs
+  before integration, especially builder output.
+
+Keep in the orchestrator session (no delegation, or `inherit`): design
+decisions, ambiguous debugging, anything where the spec doesn't exist yet.
+
+Rules of thumb:
+- Prefer several precisely-scoped delegations over one vague one — a
+  subagent that must rediscover context you already hold wastes more than
+  its model tier saves.
+- Escalate rather than retry: if a scout/builder result is wrong or the
+  task proved harder than scoped, redo it at a higher tier or in-session
+  instead of re-spawning the same tier.
+- Do **not** set `CLAUDE_CODE_SUBAGENT_MODEL` — it overrides per-spawn
+  model choice and flattens this tiering.
 
 ## Build & Test
 
