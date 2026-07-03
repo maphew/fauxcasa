@@ -235,7 +235,12 @@ SELECT = QColor(64, 140, 255)
 STAR_GOLD = QColor(255, 200, 40)
 GEO_TEAL = QColor(64, 205, 175)  # geotag badge (fauxcasa-cam.10)
 PLAY_WHITE = QColor(235, 235, 235)  # video play badge (fauxcasa-v46.2)
+HEADER_PLAY = QColor(80, 200, 80)   # group header play button (fauxcasa-q6l.16)
 HIDDEN_VEIL = QColor(0, 0, 0, 110)  # reveal mode: dim hidden/stash tiles
+# Width (px) of the play-glyph hit area at the right end of every group header
+# (fauxcasa-q6l.16). Chosen to be comfortably clickable while leaving enough
+# label space; constant so hit-test and draw use the same geometry.
+HEADER_PLAY_W = 22
 # Selection pens, hoisted out of the paint loop (fauxcasa-q6l.1): every
 # member of the selection set gets the thin rect; the CURRENT item gets the
 # stronger border; a current item the user Ctrl-toggled OUT of the set keeps
@@ -380,6 +385,11 @@ class GridView(QAbstractScrollArea):
     # the CURRENT selection set to the selection tray. The grid only
     # emits; the tray (rel-path identity, hold order) is MainWindow's.
     hold_requested = Signal()
+    # Per-group play button (fauxcasa-q6l.16): emitted when the user
+    # clicks the triangle glyph in a group header; payload is the folder
+    # key (g.folder) so the owner can look up the group's items and start
+    # a slideshow over that group specifically.
+    play_group = Signal(str)  # folder key
     # Space — MainWindow applies Picasa's add/remove-star semantics and owns
     # the machine-local persistence.
     star_toggle_requested = Signal()
@@ -957,6 +967,37 @@ class GridView(QAbstractScrollArea):
                 return idx
         return -1
 
+    def _header_glyph_rect(self, y_vp: int, width: int) -> QRect:
+        """The play-button hit rect for a header whose top is at viewport y
+        y_vp (fauxcasa-q6l.16). Matches the drawn glyph area in
+        _draw_header: the rightmost HEADER_PLAY_W px of the header band."""
+        return QRect(width - PAD - HEADER_PLAY_W, y_vp,
+                     HEADER_PLAY_W, HEADER_H)
+
+    def _header_glyph_at(self, vx: int, vy: int) -> str | None:
+        """If (vx, vy) is within the play glyph of a group header, return
+        that group's folder key; otherwise return None (fauxcasa-q6l.16).
+        Checks the sticky pinned header first, then in-flow visible
+        headers; mirrors the two-path logic in photo_at."""
+        w = self.viewport().width()
+        top = self.verticalScrollBar().value()
+        st = self._sticky(top)
+        if st is not None:
+            g, y_vp = st
+            if self._header_glyph_rect(y_vp, w).contains(vx, vy):
+                return g.folder
+        # In-flow headers: g.y is the content-coord top; convert to
+        # viewport y, then check the glyph rect.
+        content_y = vy + top
+        for g in self._visible_groups(top, top + self.viewport().height()):
+            if g.y < top:
+                continue  # pinned (sticky) — already handled above
+            if g.y <= content_y < g.y + HEADER_H:
+                y_vp = g.y - top
+                if self._header_glyph_rect(y_vp, w).contains(vx, vy):
+                    return g.folder
+        return None
+
     def all_visible_decoded(self) -> bool:
         """READY instrumentation: every strictly-visible tile decoded
         (or marked error). Empty view counts as decoded."""
@@ -1153,8 +1194,18 @@ class GridView(QAbstractScrollArea):
         painter.fillRect(0, y, width, HEADER_H, HEADER_BG)
         painter.setPen(HEADER_FG)
         label = f"{g.title}   ·   {len(g.items)}"
-        painter.drawText(QRect(PAD, y, width - 2 * PAD, HEADER_H),
+        # Reserve room for the play glyph so the label never overlaps it
+        # (fauxcasa-q6l.16).
+        label_w = width - 2 * PAD - HEADER_PLAY_W - PAD
+        painter.drawText(QRect(PAD, y, label_w, HEADER_H),
                          Qt.AlignmentFlag.AlignVCenter, label)
+        # Play glyph: right-pointing triangle at the right of the header
+        cx = width - PAD - HEADER_PLAY_W // 2
+        cy = y + HEADER_H // 2
+        r = HEADER_H * 0.32
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(HEADER_PLAY)
+        painter.drawPolygon(_play_polygon(cx, cy, r))
 
     # ---------- hover peek trigger (fauxcasa-q6l.5) ----------
 
@@ -1226,8 +1277,14 @@ class GridView(QAbstractScrollArea):
             # chord drops; the click then does its normal selection work.
             self._peek_suppressed = True
             self._end_peek()
-        idx = self.photo_at(int(event.position().x()),
-                            int(event.position().y()))
+        vx, vy = int(event.position().x()), int(event.position().y())
+        # Header play-glyph check (fauxcasa-q6l.16): intercept before the
+        # photo/selection machinery; a glyph click never alters selection.
+        folder_key = self._header_glyph_at(vx, vy)
+        if folder_key is not None:
+            self.play_group.emit(folder_key)
+            return
+        idx = self.photo_at(vx, vy)
         mods = event.modifiers()
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)

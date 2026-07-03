@@ -1272,6 +1272,8 @@ class MainWindow(QMainWindow):
             lambda _sel: self._refresh_tray_readout())
         self.search.textChanged.connect(
             lambda _t: self._refresh_tray_readout())
+        # Per-group play button (fauxcasa-q6l.16)
+        self.grid.play_group.connect(self._play_group)
 
         self.grid.set_data(catalog, thumbs)
         self._refresh_tray_readout()
@@ -2636,6 +2638,25 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         current = self.pages.currentWidget()
         (self.viewer if current is self.viewer else self.grid).setFocus()
+
+    def _play_group(self, folder_key: str) -> None:
+        """Start a slideshow over a specific folder group's items
+        (fauxcasa-q6l.16 — per-group play button in the grid header).
+        Looks up the group by folder key in the current grid and plays
+        its items from position 0; no-op if the group is missing or
+        empty (can happen when the grid view just changed)."""
+        group = next(
+            (g for g in self.grid.groups if g.folder == folder_key), None)
+        if group is None or not group.items:
+            return
+        display = list(group.items)
+        if self._slideshow is None:
+            self._slideshow = SlideshowPage(self.catalog, self.grid.thumbs)
+            self._slideshow.closed.connect(self._slideshow_closed)
+        else:
+            self._slideshow.catalog = self.catalog
+            self._slideshow.set_thumbs(self.grid.thumbs)
+        self._slideshow.start(display, 0)
 
     # ---------- hover peek (fauxcasa-q6l.5) ----------
 

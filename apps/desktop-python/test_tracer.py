@@ -3496,6 +3496,106 @@ def test_mainwindow_slideshow_surface_reused_and_repointed(
     win.reload_data(cat3, cache2)
     assert first.isHidden()                            # ...closes the show
     assert not first._timer.isActive()
+
+
+# ---- grid header play glyph (fauxcasa-q6l.16) --------------------------------
+
+def _header_click(g_widget, vx: float, vy: float) -> None:
+    """Deliver a plain left-button press at viewport (vx, vy)."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    pos = QPointF(vx, vy)
+    ev = QMouseEvent(QEvent.Type.MouseButtonPress, pos, pos, pos,
+                     Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier)
+    g_widget.mousePressEvent(ev)
+
+
+def _two_folder_library(root):
+    """Synthetic library with two folders (2 + 1 photos) for play-glyph
+    tests — no real Picasa data."""
+    make_jpeg(root / "folder_a" / "img1.jpg")
+    make_jpeg(root / "folder_a" / "img2.jpg")
+    make_jpeg(root / "folder_b" / "img3.jpg")
+
+
+def test_grid_header_glyph_click_emits_play_group(tmp_path: Path) -> None:
+    """Click on the play triangle in a group header emits play_group with
+    the matching folder key; clicking the label area of the same header
+    does NOT emit the signal (fauxcasa-q6l.16)."""
+    _offscreen_app()
+    from grid import GridView, HEADER_H, HEADER_PLAY_W, PAD
+
+    root = tmp_path / "lib"
+    _two_folder_library(root)
+    cat = scan_library(root)
+
+    g = GridView()
+    g.resize(400, 640)
+    g.show()
+    g.set_data(cat, None)
+    assert len(g.groups) == 2
+
+    emitted: list[str] = []
+    g.play_group.connect(emitted.append)
+
+    w = g.viewport().width()
+    top = g.verticalScrollBar().value()   # 0 (not scrolled)
+
+    # First group header: viewport y = 0
+    glyph0 = g._header_glyph_rect(g.groups[0].y - top, w)
+    _header_click(g, glyph0.center().x(), glyph0.center().y())
+    assert emitted == [g.groups[0].folder], "glyph click must emit play_group"
+
+    # Click the label side of the SAME header — must NOT emit
+    emitted.clear()
+    _header_click(g, float(PAD + 4), float(HEADER_H // 2))
+    assert emitted == [], "label-area click must not emit play_group"
+
+    # Second group header
+    emitted.clear()
+    y_vp_g1 = g.groups[1].y - top
+    glyph1 = g._header_glyph_rect(y_vp_g1, w)
+    _header_click(g, glyph1.center().x(), glyph1.center().y())
+    assert emitted == [g.groups[1].folder]
+
+
+def test_mainwindow_play_group_starts_slideshow_for_group(
+        tmp_path: Path) -> None:
+    """_play_group starts the slideshow over THAT group's items from
+    position 0; a second call with a different key replays that group;
+    an unknown key is a no-op (fauxcasa-q6l.16)."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    _two_folder_library(root)
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    ga = next(g for g in win.grid.groups if "folder_a" in g.folder)
+    gb = next(g for g in win.grid.groups if "folder_b" in g.folder)
+
+    # Play folder_a
+    win._play_group(ga.folder)
+    assert win._slideshow is not None and win._slideshow.isFullScreen()
+    assert list(win._slideshow.display) == ga.items
+    assert win._slideshow.pos == 0
+    _press(win._slideshow, Qt.Key.Key_Escape)
+
+    # Play folder_b — same surface, different display set
+    win._play_group(gb.folder)
+    assert win._slideshow.isFullScreen()
+    assert list(win._slideshow.display) == gb.items
+    assert win._slideshow.pos == 0
+    _press(win._slideshow, Qt.Key.Key_Escape)
+
+    # Unknown folder key is a silent no-op
+    win._play_group("no-such-folder")
+    assert win._slideshow is None or win._slideshow.isHidden()
+
+
 # ---- search upgrades: multi-word AND, -term negation, folder names --------
 # (fauxcasa-q6l.6) §5: instant search over filenames, captions, keywords and
 # folder names, with '-term' negation. Positive terms AND together (each may
