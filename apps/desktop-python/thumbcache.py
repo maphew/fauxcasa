@@ -41,7 +41,7 @@ from inmeta import read_jpeg_metadata
 from metareader import read_file_meta
 from pillowload import pillow_qimage, tiff_is_16bit
 from rawload import is_raw_suffix, raw_demosaic_qimage, raw_preview_jpeg
-from videoload import is_video_suffix, poster_qimage
+from videoload import is_video_suffix, poster_qimage, probe_creation_time
 
 MAGIC = b"FCTC"
 THUMB_EDGE = 256
@@ -260,6 +260,19 @@ class IndexResult:
         return self.photos / self.elapsed_s if self.elapsed_s > 0 else 0.0
 
 
+def _sha256_path(path: Path, chunk: int = 1 << 20) -> str:
+    """sha256 of a file by streaming in 1 MiB chunks; no whole-file load.
+    Used for videos where loading multi-GB into memory is unacceptable."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            buf = fh.read(chunk)
+            if not buf:
+                break
+            h.update(buf)
+    return h.hexdigest()
+
+
 def read_photo_meta(root: Path, photo):
     """The READ side of indexing one photo — bytes, identity signals, and
     in-file metadata — shared by the indexer (_index_one continues into the
@@ -272,6 +285,21 @@ def read_photo_meta(root: Path, photo):
     XMP Rating (metareader, the exiv2 seam, all carriers). An unreadable
     file fails soft: empty bytes, -1 signals, empty metadata."""
     src = root / photo.rel
+    if is_video_suffix(photo.rel):
+        # Videos: stream the sha256 (no whole-file load — multi-GB clips
+        # would spike RSS); poster_qimage takes the path, not bytes.
+        # probe_creation_time fills date_taken via the container metadata
+        # (exiv2's video support is patchy; ini values stay in force for
+        # all other fields). Applies to indexer AND backfill identically.
+        try:
+            st = src.stat()
+            size, mtime = st.st_size, int(st.st_mtime)
+            sha = _sha256_path(src)
+        except OSError:
+            size, mtime, sha = -1, -1, hashlib.sha256(b"").hexdigest()
+        dt = probe_creation_time(src)
+        fmeta = metareader.FileMeta(date_taken=dt) if dt else metareader.EMPTY
+        return b"", size, mtime, sha, inmeta.EMPTY, fmeta
     try:
         data = src.read_bytes()
         st = src.stat()
@@ -279,14 +307,8 @@ def read_photo_meta(root: Path, photo):
     except OSError:
         data, size, mtime = b"", -1, -1
     sha = hashlib.sha256(data).hexdigest()
-    if is_video_suffix(photo.rel):
-        # No in-file piggyback for video (exiv2 video support is patchy —
-        # see the docstring); ini values already set at scan stay in force.
-        # Applies to indexer AND backfill identically (fauxcasa-v46.2).
-        meta, fmeta = inmeta.EMPTY, metareader.EMPTY
-    else:
-        meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG)
-        fmeta = read_file_meta(data)     # in-file date/GPS/Rating
+    meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG)
+    fmeta = read_file_meta(data)     # in-file date/GPS/Rating
     return data, size, mtime, sha, meta, fmeta
 
 
@@ -330,8 +352,10 @@ def apply_photo_meta(photo, size: int, mtime: int, sha: str,
             report.add("file", "infile_override", photo.rel,
                        f'keywords: ini "{ini_kw}" -> in-file "{new_kw}"')
         photo.keywords = meta.keywords
-    if fmeta.date_taken:
-        # ini has no per-photo date key: always a gap-fill, never a conflict
+    if fmeta.date_taken and not photo.date_taken:
+        # ini has no per-photo date key; probe_creation_time also fills only
+        # when absent — §4: any existing value (ini-seeded or prior index)
+        # takes precedence; gap-fill only, never a conflict.
         photo.date_taken = fmeta.date_taken
     if fmeta.gps is not None:
         if report is not None and photo.geotag is not None and photo.geotag != fmeta.gps:
@@ -372,11 +396,12 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     frame (videoload module doc) becomes the image and rides the ordinary
     downscale/encode path below; a clip PyAV cannot decode yields the
     same error tile. The in-file metadata piggyback (inmeta + metareader)
-    is deliberately SKIPPED for video — exiv2's video support is patchy
-    (metadata-library-decision.md), so ini sidecar values stay the tier-1
-    source for video in M1. sha256/size/mtime identity is as usual: the
-    bytes are read whole for the N6 content hash and the same in-memory
-    bytes feed the poster decode (seekable, so moov-at-end MP4s work)."""
+    is deliberately SKIPPED for video (exiv2's video support is patchy;
+    probe_creation_time fills date_taken via container metadata instead).
+    sha256/size/mtime identity: videos use a streaming hash (_sha256_path)
+    so multi-GB clips never spike RSS; the poster decode receives the file
+    PATH, not bytes (PyAV reads seekably from disk — moov-at-end MP4s
+    work, and the path is reusable without reloading)."""
     from PySide6.QtCore import QBuffer, QIODevice, QSize, Qt
     from PySide6.QtGui import QImageReader
 
@@ -387,10 +412,11 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     is_video = is_video_suffix(photo.rel)
 
     img = None
-    if data and is_video:
-        # Poster frame via PyAV (videoload): a QImage that rides the
-        # ordinary downscale/encode below; null on failure -> error tile.
-        img = poster_qimage(data)
+    if is_video:
+        # Path-based poster: read_photo_meta no longer loads video bytes
+        # (streaming hash only); poster_qimage accepts a path directly and
+        # PyAV opens it seekably — moov-at-end MP4s work the same way.
+        img = poster_qimage(root / photo.rel)
     elif data and is_raw_suffix(photo.rel):
         jpeg = raw_preview_jpeg(data)
         if jpeg is not None:
