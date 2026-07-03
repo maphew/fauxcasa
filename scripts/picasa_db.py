@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import locale
 import math
 import re
 import struct
@@ -625,6 +626,21 @@ class PicasaIni:
         return None
 
 
+def _has_utf8_marker(raw: bytes) -> bool:
+    """Return True if the bytes contain an [encoding] section with utf8=1.
+    Uses an ASCII-safe scan; the marker itself is always pure ASCII."""
+    in_encoding = False
+    for line in raw.decode("ascii", "replace").splitlines():
+        stripped = line.strip()
+        if stripped.lower() == "[encoding]":
+            in_encoding = True
+        elif stripped.startswith("["):
+            in_encoding = False
+        elif in_encoding and stripped.lower() == "utf8=1":
+            return True
+    return False
+
+
 def read_picasa_ini(path: Path | str) -> PicasaIni:
     """Parse a .picasa.ini (or legacy Picasa.ini / picasa.ini) file.
 
@@ -643,14 +659,36 @@ def read_picasa_ini(path: Path | str) -> PicasaIni:
     Encoding: Picasa 3.x writes UTF-8 and marks it with an `[encoding]`
     section (`utf8=1`, may appear anywhere); older versions wrote the
     system codepage, and mixed-encoding files exist in the wild (sections
-    appended by different Picasa versions). We decode UTF-8 with
-    surrogateescape so every byte survives a round trip either way.
+    appended by different Picasa versions).
+
+    Priority:
+    - Bytes that ARE valid strict UTF-8: surrogateescape (round-trip safe).
+    - Bytes with [encoding] utf8=1 marker but not valid strict UTF-8
+      (mixed-encoding file): surrogateescape keeps every byte intact.
+    - Bytes that are NOT valid strict UTF-8 AND have no utf8=1 marker:
+      decode with the locale codepage (pre-UTF8 Picasa wrote the system
+      codepage), fail-soft back to surrogateescape if the codepage errors.
     """
     path = Path(path)
     raw = path.read_bytes()
     if raw.startswith(b"\xef\xbb\xbf"):
         raw = raw[3:]
-    text = raw.decode("utf-8", "surrogateescape")
+    # Fast path: valid strict UTF-8 always uses surrogateescape.
+    try:
+        raw.decode("utf-8")
+        text = raw.decode("utf-8", "surrogateescape")
+    except UnicodeDecodeError:
+        if _has_utf8_marker(raw):
+            # UTF-8 marked but bytes contain non-UTF-8 sequences (mixed-
+            # encoding file); surrogateescape preserves every byte.
+            text = raw.decode("utf-8", "surrogateescape")
+        else:
+            # Pre-UTF8 Picasa: try the locale codepage.
+            enc = locale.getpreferredencoding(False) or "mbcs"
+            try:
+                text = raw.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                text = raw.decode("utf-8", "surrogateescape")
 
     sections: list[IniSection] = []
     anomalies: list[str] = []

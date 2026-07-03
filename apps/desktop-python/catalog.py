@@ -259,6 +259,13 @@ class Catalog:
     # pending; main()'s adopt path flips a fresh catalog to NOT_STARTED.
     backfill_state: str = BACKFILL_COMPLETE
     backfill_cursor: int = 0  # photos [0, cursor) done (IN_PROGRESS only)
+    # Per-folder .picasa.ini (size, mtime) at scan time, keyed by folder_rel
+    # ("" = root). Missing key = no ini in that folder at scan. Used by
+    # reconcile_walk to detect externally-edited ini files without re-reading
+    # them (§3 cohabitation; fauxcasa-cam.14).
+    ini_sigs: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Machine-local contacts.xml (size, mtime) at scan time; None if absent.
+    contacts_sig: tuple[int, int] | None = None
 
     @property
     def visible_count(self) -> int:
@@ -428,8 +435,9 @@ _HIDDEN_FOLDERS_CATEGORY = "hidden folders"
 def _is_folder_hidden(psec: picasa_db.IniSection | None) -> bool:
     if psec is None:
         return False
-    return (psec.get("P2category") or "").strip().lower() \
-        == _HIDDEN_FOLDERS_CATEGORY
+    # P2category= is Picasa 3.x; category= is the legacy Picasa 2 spelling.
+    val = (psec.get("P2category") or psec.get("category") or "").strip().lower()
+    return val == _HIDDEN_FOLDERS_CATEGORY
 
 
 # ---- faces/people: contacts.xml + [Contacts2] harvest --------------------
@@ -705,10 +713,13 @@ def scan_library(root: Path,
                  scan_filter: ScanFilter | None = None,
                  contacts: dict[str, str] | None = None,
                  pal_dir: Path | None = None,
-                 exts: frozenset[str] | set[str] | None = None) -> Catalog:
+                 exts: frozenset[str] | set[str] | None = None,
+                 contacts_path: Path | None = None) -> Catalog:
     """Walk `root` and build the catalog. `contacts` is the machine-local
     contacts.xml id->name map (load_contacts_xml); per §4 it wins over the
-    ini [Contacts2] tables when both name a contact. `pal_dir` is a
+    ini [Contacts2] tables when both name a contact. `contacts_path` is the
+    contacts.xml file path (for ini-freshness tracking in reconcile —
+    fauxcasa-cam.14); it is statted but not re-read here. `pal_dir` is a
     Picasa2Albums directory of .pal album files, merged per §4 (ini wins
     membership; .pal fills gaps only — see _merge_pal_albums). Conflicts
     and unknown-uid placeholders land on the catalog's ImportReport, never
@@ -947,8 +958,28 @@ def scan_library(root: Path,
                        f"wins (§4)")
     registry.update(contacts)
 
+    # Ini freshness signatures (fauxcasa-cam.14): stat each ini file that was
+    # read during the walk so reconcile_walk can detect external edits.
+    ini_sigs: dict[str, tuple[int, int]] = {}
+    for folder_rel, entry in ini_by_folder.items():
+        if entry is not None:
+            try:
+                st = entry[0].path.stat()
+                ini_sigs[folder_rel] = (st.st_size, int(st.st_mtime))
+            except OSError:
+                pass  # unreadable — omit; reconcile will treat absence as no sig
+
+    contacts_sig: tuple[int, int] | None = None
+    if contacts_path is not None:
+        try:
+            st = contacts_path.stat()
+            contacts_sig = (st.st_size, int(st.st_mtime))
+        except OSError:
+            pass
+
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
-                   contacts=registry, report=report)
+                   contacts=registry, report=report,
+                   ini_sigs=ini_sigs, contacts_sig=contacts_sig)
 
 
 # ---- persistent catalog (load-without-walking, §7 cold start) ------------
@@ -1007,7 +1038,12 @@ def scan_library(root: Path,
 # — a v8 catalog was walked without them, so a warm start would silently
 # hide every TGA/PSD in the library until some unrelated drift; reject
 # and cold-rebuild (the same shape as the v7 video bump).
-CATALOG_VERSION = 9
+# v10: per-folder .picasa.ini and contacts.xml size+mtime signatures are
+# persisted (ini_sigs / contacts_sig — fauxcasa-cam.14 §3 cohabitation),
+# so reconcile_walk can detect externally-edited ini/contacts without
+# re-reading them. A v9 catalog lacks these fields; bump so a warm start
+# cold-rebuilds once, populating the sigs so checks work immediately.
+CATALOG_VERSION = 10
 
 # The import report's file name, written beside catalog.json (same cache
 # dir) by save_report and re-attached on warm starts via load_report.
@@ -1097,6 +1133,11 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
         # contact id -> display name registry (already contacts.xml-merged
         # at scan time; the warm path never re-reads inis or contacts.xml)
         "contacts": catalog.contacts,
+        # Ini freshness signatures (fauxcasa-cam.14): folder_rel -> [size, mtime]
+        # pairs for each folder that had a .picasa.ini at scan time.
+        "ini_sigs": {k: list(v) for k, v in catalog.ini_sigs.items()},
+        **({"contacts_sig": list(catalog.contacts_sig)}
+           if catalog.contacts_sig is not None else {}),
         "albums": [
             {"uid": a.uid, "name": a.name, "date": a.date,
              "description": a.description, "members": a.members,
@@ -1248,12 +1289,35 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
                 backfill_state = state
             elif state != BACKFILL_COMPLETE:
                 return None
+
+        # Ini freshness signatures (fauxcasa-cam.14): absent in old catalogs
+        # (v9 and earlier) — default to empty dicts, silently disabling the
+        # freshness check until the next cold walk rebuilds with sigs.
+        raw_ini_sigs = data.get("ini_sigs", {})
+        ini_sigs: dict[str, tuple[int, int]] = {}
+        if isinstance(raw_ini_sigs, dict):
+            for k, v in raw_ini_sigs.items():
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    try:
+                        ini_sigs[k] = (int(v[0]), int(v[1]))
+                    except (TypeError, ValueError):
+                        pass
+
+        contacts_sig: tuple[int, int] | None = None
+        raw_csig = data.get("contacts_sig")
+        if isinstance(raw_csig, (list, tuple)) and len(raw_csig) == 2:
+            try:
+                contacts_sig = (int(raw_csig[0]), int(raw_csig[1]))
+            except (TypeError, ValueError):
+                pass
+
     except (KeyError, IndexError, TypeError, AttributeError, ValueError):
         return None
 
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
                    contacts=contacts, backfill_state=backfill_state,
-                   backfill_cursor=backfill_cursor)
+                   backfill_cursor=backfill_cursor,
+                   ini_sigs=ini_sigs, contacts_sig=contacts_sig)
 
 
 @dataclass
@@ -1263,20 +1327,30 @@ class Drift:
     added: int = 0
     removed: int = 0
     modified: int = 0
+    # Any .picasa.ini or contacts.xml sig changed since the catalog was built
+    # (§3 cohabitation; fauxcasa-cam.14).
+    ini_changed: bool = False
 
     @property
     def changed(self) -> bool:
-        return bool(self.added or self.removed or self.modified)
+        return bool(self.added or self.removed or self.modified
+                    or self.ini_changed)
 
     def summary(self) -> str:
-        return (f"+{self.added} added, -{self.removed} removed, "
-                f"~{self.modified} modified")
+        parts = []
+        if self.added or self.removed or self.modified:
+            parts.append(f"+{self.added} added, -{self.removed} removed, "
+                         f"~{self.modified} modified")
+        if self.ini_changed:
+            parts.append("ini/contacts changed")
+        return "; ".join(parts) if parts else "no drift"
 
 
 def reconcile_walk(catalog: Catalog, root: Path,
                    scan_filter: ScanFilter | None = None,
                    cancel=None,
-                   exts: frozenset[str] | set[str] | None = None
+                   exts: frozenset[str] | set[str] | None = None,
+                   contacts_path: Path | None = None,
                    ) -> Drift | None:
     """Fresh walk + stat, compared to the catalog's stored signals.
     Photos whose stored signal is absent (-1) can't be compared and are
@@ -1285,7 +1359,9 @@ def reconcile_walk(catalog: Catalog, root: Path,
     reap the background thread promptly instead of waiting out a 100k
     stat-walk on the join timeout. `exts` must be the SAME effective
     extension set the catalog was walked with (walk_library docstring),
-    or every excluded file would read as phantom drift."""
+    or every excluded file would read as phantom drift.
+    `contacts_path` is the machine-local contacts.xml; when None,
+    default_contacts_xml() is used for the freshness check."""
     root = root.resolve()
     files = walk_library(root, scan_filter, exts)
     fresh: dict[str, tuple[int, int]] = {}
@@ -1307,4 +1383,42 @@ def reconcile_walk(catalog: Catalog, root: Path,
     for rel in old:
         if rel not in fresh:
             drift.removed += 1
+
+    # Ini freshness: detect externally-edited .picasa.ini files (§3 cohabitation).
+    for folder_rel, old_sig in catalog.ini_sigs.items():
+        folder_path = root / folder_rel if folder_rel else root
+        found_ini = False
+        for name in INI_NAMES:
+            p = folder_path / name
+            if p.is_file():
+                found_ini = True
+                try:
+                    st = p.stat()
+                    if (st.st_size, int(st.st_mtime)) != old_sig:
+                        drift.ini_changed = True
+                except OSError:
+                    drift.ini_changed = True
+                break
+        if not found_ini:
+            drift.ini_changed = True  # ini present at scan, now gone
+
+    # Contacts.xml freshness (fauxcasa-cam.14 rider).
+    effective_contacts = contacts_path or default_contacts_xml()
+    if catalog.contacts_sig is not None:
+        if effective_contacts is None:
+            drift.ini_changed = True  # was there, now undiscoverable
+        else:
+            try:
+                st = effective_contacts.stat()
+                if (st.st_size, int(st.st_mtime)) != catalog.contacts_sig:
+                    drift.ini_changed = True
+            except OSError:
+                drift.ini_changed = True  # gone
+    elif effective_contacts is not None:
+        try:
+            effective_contacts.stat()
+            drift.ini_changed = True  # new contacts.xml appeared
+        except OSError:
+            pass  # still absent
+
     return drift

@@ -204,9 +204,11 @@ catalog version bump.
 - `hidden=yes` photos and stash folders (`.picasaoriginals/`, legacy
   `Originals/`) are hidden by default; a **"Show hidden"** toggle reveals
   them (drawn veiled) across the All/Folders/Starred/Search views. Album
-  membership stays visible-only, and the folder-level "Hidden Folders"
-  category is still ignored — it needs an oracle fixture for its
-  `category=` value. No faces, no edits, no writes.
+  membership stays visible-only. The folder-level "Hidden Folders" category
+  is honored: `P2category=Hidden Folders` (Picasa 3.x) or `category=Hidden
+  Folders` (legacy Picasa 2) in a folder's [Picasa] section forces every
+  photo in that folder invisible (oracle fixture 032-hide-folder). No
+  faces, no edits, no writes.
 - In-file metadata: JPEG captions/keywords via the hand-rolled
   `inmeta.py` (XMP `dc:description`/`dc:subject`, IPTC 2:120/2:25), plus
   capture date / GPS / XMP Rating via `metareader.py` — the python-exiv2

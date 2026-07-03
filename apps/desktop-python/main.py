@@ -633,6 +633,7 @@ class MainWindow(QMainWindow):
                  warm: bool = False, adopt: bool = False,
                  cache_root: Path | None = None,
                  contacts: dict[str, str] | None = None,
+                 contacts_path: Path | None = None,
                  pal_dir: Path | None = None,
                  excluded_exts: set[str] | None = None,
                  thumbs_path: Path | None = None):
@@ -653,6 +654,8 @@ class MainWindow(QMainWindow):
         # machine-local contacts.xml names, kept so a reconcile rebuild's
         # rescan resolves faces the same way the startup scan did
         self.contacts = contacts or {}
+        # contacts.xml path for reconcile ini-freshness checks (cam.14)
+        self.contacts_path = contacts_path
         # Picasa2Albums .pal directory, kept for the same reason: a
         # reconcile rescan must merge albums the way the startup scan did
         self.pal_dir = pal_dir
@@ -931,7 +934,8 @@ class MainWindow(QMainWindow):
             try:
                 drift = reconcile_walk(old, old.root, self.scan_filter,
                                        cancel=self.build_cancel,
-                                       exts=self.exts)
+                                       exts=self.exts,
+                                       contacts_path=self.contacts_path)
             except Exception as e:
                 log.error("reconcile walk failed: %s", e)
                 return
@@ -950,7 +954,8 @@ class MainWindow(QMainWindow):
             try:
                 fresh = scan_library(old.root, self.scan_filter,
                                      self.contacts, self.pal_dir,
-                                     exts=self.exts)
+                                     exts=self.exts,
+                                     contacts_path=self.contacts_path)
                 result = build_cache(fresh, cache_dir, None,
                                      cancel=self.build_cancel)
                 if result is None:
@@ -1316,7 +1321,10 @@ class MainWindow(QMainWindow):
                 item = QTreeWidgetItem(
                     folders_root, [f"{leaf}  ({fcount(folder)})"])
                 item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
-                item.setToolTip(0, str(cat.root / rel))
+                tip = str(cat.root / rel)
+                if folder.description:
+                    tip += "\n" + folder.description
+                item.setToolTip(0, tip)
         else:
             # Tree mode (default): hierarchical, with full-path tooltips.
             nodes: dict[str, QTreeWidgetItem] = {"": folders_root}
@@ -1337,6 +1345,9 @@ class MainWindow(QMainWindow):
                     continue  # empty (off-reveal: stash/hidden-only) folders out
                 item = node_for(rel)
                 item.setText(0, f"{folder.title}  ({fcount(folder)})")
+                if folder.description:
+                    item.setToolTip(0, str(cat.root / rel)
+                                    + "\n" + folder.description)
 
         folders_root.setExpanded(True)
 
@@ -1368,6 +1379,15 @@ class MainWindow(QMainWindow):
                 elif album.pal_sourced:
                     item.setToolTip(
                         0, "Album definition from a Picasa2Albums .pal file")
+                else:
+                    # Regular album: show date and/or description if present.
+                    tip_parts = []
+                    if album.date:
+                        tip_parts.append(album.date)
+                    if album.description:
+                        tip_parts.append(album.description)
+                    if tip_parts:
+                        item.setToolTip(0, "\n".join(tip_parts))
             albums_root.setExpanded(True)
 
         # People (read-only v1 slice, fauxcasa-cam.3): named people with
@@ -2102,7 +2122,7 @@ def main() -> int:
 
     if catalog is None:  # cold path
         catalog = scan_library(root, scan_filter, contacts, pal_dir,
-                               exts=exts)
+                               exts=exts, contacts_path=contacts_path)
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
@@ -2145,7 +2165,8 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
-                     contacts=contacts, pal_dir=pal_dir,
+                     contacts=contacts, contacts_path=contacts_path,
+                     pal_dir=pal_dir,
                      excluded_exts=excluded_exts,
                      thumbs_path=args.thumbs)
     if args.zoom != 160:

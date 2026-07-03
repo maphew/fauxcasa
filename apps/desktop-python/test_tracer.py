@@ -470,6 +470,50 @@ def test_reconcile_walk_cancels(library: Path) -> None:
     assert reconcile_walk(cat, library, cancel=ev) is None
 
 
+def test_reconcile_detects_ini_drift(tmp_path: Path) -> None:
+    """An externally-edited .picasa.ini triggers ini_changed drift even when
+    no photo files changed (fauxcasa-cam.14 §3 cohabitation)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "trip" / "a.jpg")
+    ini = root / "trip" / ".picasa.ini"
+    ini.write_text("[Picasa]\r\nname=Trip\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")  # fills photo signals
+
+    assert not reconcile_walk(cat, root).changed  # nothing changed yet
+
+    # Externally edit the ini (rewrite with new content)
+    ini.write_text("[Picasa]\r\nname=Trip Edited\r\n")
+    drift = reconcile_walk(cat, root)
+    assert drift.ini_changed
+    assert drift.changed
+    # No photo drift — only the ini changed
+    assert drift.added == 0 and drift.removed == 0 and drift.modified == 0
+
+
+def test_reconcile_detects_contacts_drift(tmp_path: Path) -> None:
+    """An edited contacts.xml triggers ini_changed drift (fauxcasa-cam.14
+    rider: names bake into the catalog at scan; freshness check catches edits
+    without re-reading the file)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    contacts_file = tmp_path / "contacts.xml"
+    contacts_file.write_text(
+        '<contacts><contact id="0000000000000001" name="Alice"/></contacts>')
+    cat = scan_library(root, contacts_path=contacts_file)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    assert not reconcile_walk(cat, root,
+                              contacts_path=contacts_file).changed
+
+    # Edit contacts.xml
+    contacts_file.write_text(
+        '<contacts><contact id="0000000000000001" name="Alice Smith"/></contacts>')
+    drift = reconcile_walk(cat, root, contacts_path=contacts_file)
+    assert drift.ini_changed
+    assert drift.changed
+
+
 def test_set_data_invalidates_tiles() -> None:
     """The reconcile swap goes through grid.set_data; it must invalidate
     the decoded-tile cache or a rebuilt catalog paints stale thumbnails
@@ -1850,6 +1894,37 @@ def test_folder_hidden_matcher_is_defensive() -> None:
     assert not catalog._is_folder_hidden(mk(""))
     assert not catalog._is_folder_hidden(IniSection(name="Picasa"))  # no key
     assert not catalog._is_folder_hidden(None)  # no [Picasa] section at all
+
+
+def test_folder_hidden_legacy_category_key() -> None:
+    """Legacy Picasa 2 used category= (not P2category=); _is_folder_hidden
+    accepts both so pre-3.x folders are hidden correctly (fauxcasa-cam.14)."""
+    import catalog
+    from picasa_db import IniSection
+
+    def mk_legacy(v: str) -> IniSection:
+        return IniSection(name="Picasa", items=[("category", v)])
+
+    assert catalog._is_folder_hidden(mk_legacy("Hidden Folders"))
+    assert catalog._is_folder_hidden(mk_legacy("hidden folders"))
+    assert not catalog._is_folder_hidden(mk_legacy("Folders on Disk"))
+    assert not catalog._is_folder_hidden(mk_legacy(""))
+
+
+def test_scan_folder_hidden_legacy_category(tmp_path: Path) -> None:
+    """A folder with [Picasa] category=Hidden Folders (legacy spelling) is
+    also hidden — same result as P2category= (fauxcasa-cam.14)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "visible" / "a.jpg")
+    (root / "visible" / ".picasa.ini").write_text(
+        "[Picasa]\r\nP2category=Folders on Disk\r\n")
+    make_jpeg(root / "hidden" / "b.jpg")
+    (root / "hidden" / ".picasa.ini").write_text(
+        "[Picasa]\r\ncategory=Hidden Folders\r\n")
+    cat = scan_library(root)
+    assert not cat.folders["visible"].folder_hidden
+    assert cat.folders["hidden"].folder_hidden
+    assert cat.visible_count == 1
 
 
 def test_folder_hidden_survives_catalog_roundtrip(
@@ -6006,6 +6081,107 @@ def test_catalog_v6_roundtrips_album_flags(
     assert load_catalog(path, album_library) is None
 
 
+def test_album_tooltip_date_description(tmp_path: Path) -> None:
+    """A regular album with date and/or description surfaces those as sidebar
+    tooltip lines; placeholder and pal-sourced albums keep their own tooltips
+    (fauxcasa-cam.14)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    uid_dated = "aaaabbbbccccdddd" * 2
+    uid_nodesc = "0000111122223333" * 2
+    (root / "f" / ".picasa.ini").write_text(
+        f"[.album:{uid_dated}]\r\n"
+        "name=Summer Trip\r\n"
+        "date=2022-07-15\r\n"
+        "description=Beach holiday\r\n"
+        f"token=]album:{uid_dated}\r\n"
+        f"[.album:{uid_nodesc}]\r\n"
+        "name=No Desc\r\n"
+        f"token=]album:{uid_nodesc}\r\n"
+        "[a.jpg]\r\n"
+        f"albums={uid_dated},{uid_nodesc}\r\n"
+    )
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    def item_for(kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    dated = item_for("album", uid_dated)
+    assert dated is not None
+    tip = dated.toolTip(0)
+    assert "2022-07-15" in tip
+    assert "Beach holiday" in tip
+
+    no_desc = item_for("album", uid_nodesc)
+    assert no_desc is not None
+    # No date/description — no tooltip set (empty string)
+    assert no_desc.toolTip(0) == ""
+
+
+def test_folder_tooltip_description(tmp_path: Path) -> None:
+    """Folder sidebar items gain the ini description (if present) appended
+    to their disk-path tooltip, in both flat and tree modes (fauxcasa-cam.14)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "trip" / "a.jpg")
+    (root / "trip" / ".picasa.ini").write_text(
+        "[Picasa]\r\ndescription=Summer 2020\r\n")
+    make_jpeg(root / "plain" / "b.jpg")  # no ini, no description
+
+    def folder_item(win, rel: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == ("folder", rel):
+                return it.value()
+            it += 1
+        return None
+
+    cat = scan_library(root)
+
+    # Tree mode (default)
+    win_tree = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    trip_item = folder_item(win_tree, "trip")
+    assert trip_item is not None
+    tip = trip_item.toolTip(0)
+    assert "Summer 2020" in tip
+    assert str(root / "trip") in tip
+
+    plain_item = folder_item(win_tree, "plain")
+    assert plain_item is not None
+    # No description — tooltip is just the path (no extra newline)
+    assert plain_item.toolTip(0) == str(root / "plain")
+
+    # Flat mode
+    win_flat = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win_flat._flat_check.setChecked(True)
+    # _toggle_folder_view fires on check change; rebuild happened
+    trip_flat = folder_item(win_flat, "trip")
+    assert trip_flat is not None
+    tip_flat = trip_flat.toolTip(0)
+    assert "Summer 2020" in tip_flat
+
+
 # ---------------------------------------------------------------------------
 # Selection tray (fauxcasa-q6l.2): persistent CROSS-FOLDER Hold/Clear +
 # typed readout (spec §5). Decisions under test (tray.py module doc):
@@ -7099,9 +7275,9 @@ def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
     path.write_text(json.dumps(data))
     assert load_catalog(path, root) is None
 
-    # v9 = TGA/PSD stills joined the walk (fauxcasa-v46.4); bump this pin
+    # v10 = ini/contacts.xml freshness sigs (fauxcasa-cam.14); bump this pin
     # with every CATALOG_VERSION change so the rejection below stays real.
-    assert catmod.CATALOG_VERSION == 9
+    assert catmod.CATALOG_VERSION == 10
     cat.backfill_state = BACKFILL_COMPLETE
     save_catalog(cat, path)
     data = json.loads(path.read_text())
