@@ -8036,3 +8036,11 @@ def test_add_root_on_legacy_raises(tmp_path: Path) -> None:
     assert cfg.is_legacy
     with pytest.raises(ValueError):
         libmod.add_root(cfg, tmp_path / "other")
+
+
+def test_save_library_on_legacy_raises(tmp_path: Path) -> None:
+    """save_library refuses a legacy config (no home; never written to disk)."""
+    d = tmp_path / "photos"
+    d.mkdir()
+    with pytest.raises(ValueError):
+        libmod.save_library(libmod.legacy_config(d))
