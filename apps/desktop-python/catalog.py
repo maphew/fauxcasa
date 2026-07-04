@@ -70,6 +70,7 @@ _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "scripts"))
 
 import picasa_db  # noqa: E402
+from library import LIBRARY_DIR, ROOT_MARKER  # noqa: E402
 from rawload import RAW_EXTS, is_raw_suffix  # noqa: E402
 from videoload import VIDEO_EXTS, is_video_suffix  # noqa: E402
 
@@ -313,6 +314,10 @@ def walk_library(root: Path,
     change here must also land in scripts/make-thumbcache.py or caches
     stop binding (the shipped benchmark cache uses this order).
 
+    .fauxcasa/ library-state dirs and the .fauxcasa-root id marker are
+    excluded from the walk (multiroot .a, fauxcasa-ed5.7.1); this change
+    lands in lockstep with the script twin in scripts/make-thumbcache.py.
+
     `exts` is the EFFECTIVE extension set (None = the full EXTS): the
     File Types panel's per-library include/exclude (fauxcasa-v46.4,
     filetypes.py). Because the walk rule is load-bearing for cache-order
@@ -320,8 +325,12 @@ def walk_library(root: Path,
     by the caller (filetypes.exts_cache_key, the ScanFilter.cache_key
     shape) so each set gets its own cache dir and warm starts cohere."""
     pool = EXTS if exts is None else exts
+    nroot = len(root.parts)  # rglob children extend root's own parts
     files = sorted(
-        p for p in root.rglob("*") if p.suffix.lower() in pool and p.is_file()
+        p for p in root.rglob("*")
+        if p.suffix.lower() in pool and p.is_file()
+        and LIBRARY_DIR not in p.parts[nroot:]  # .fauxcasa/ library state
+        and p.name != ROOT_MARKER               # .fauxcasa-root id marker
     )
     if scan_filter is None or not scan_filter.active:
         return files
