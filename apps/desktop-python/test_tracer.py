@@ -338,6 +338,81 @@ def test_duplicate_sections_and_flag_normalization(tmp_path: Path) -> None:
     assert not legacy.visible
 
 
+def test_stashed_original_association(library: Path) -> None:
+    """scan_library links each stash copy to its same-named visible sibling
+    by catalog index (fauxcasa-cam.19, M1 read-only association)."""
+    cat = scan_library(library)
+    a = next(p for p in cat.photos if p.rel == "2020-01-01 Trip/a.jpg")
+    # a.jpg has a same-named copy in .picasaoriginals/ — must be linked
+    assert a.stashed_original is not None
+    assert cat.photos[a.stashed_original].rel == \
+        "2020-01-01 Trip/.picasaoriginals/a.jpg"
+    # b.jpg has no stash copy; c.jpg is in a different folder entirely
+    b = next(p for p in cat.photos if p.rel == "2020-01-01 Trip/b.jpg")
+    assert b.stashed_original is None
+    c = next(p for p in cat.photos if p.rel == "2021-05-05 Picnic/c.jpg")
+    assert c.stashed_original is None
+    # the stash copy itself is never the target of a link
+    stash = next(p for p in cat.photos
+                 if p.rel == "2020-01-01 Trip/.picasaoriginals/a.jpg")
+    assert stash.stashed_original is None
+
+
+def test_stashed_original_legacy_orphan_and_dotfolder(tmp_path: Path) -> None:
+    """Legacy Originals/ name links the same way as .picasaoriginals/;
+    an orphaned stash file (sibling gone) links nothing; an arbitrary
+    dot-folder is hidden but never associates (fauxcasa-cam.19)."""
+    root = tmp_path / "lib"
+    # legacy name: f/a.jpg + f/Originals/a.jpg => linked
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "Originals" / "a.jpg")
+    # orphaned stash: no sibling => no link, no exception
+    make_jpeg(root / "f" / "Originals" / "orphan.jpg")
+    # arbitrary dot-folder: hides but must NOT associate
+    make_jpeg(root / "g" / "b.jpg")
+    make_jpeg(root / "g" / ".thumbnails" / "b.jpg")
+    # root-level pair: folder="" edge case
+    make_jpeg(root / "r.jpg")
+    make_jpeg(root / ".picasaoriginals" / "r.jpg")
+
+    cat = scan_library(root)
+    a = next(p for p in cat.photos if p.rel == "f/a.jpg")
+    assert a.stashed_original is not None
+    assert "Originals" in cat.photos[a.stashed_original].rel
+
+    orphan = next(p for p in cat.photos if p.rel == "f/Originals/orphan.jpg")
+    assert orphan.stashed_original is None  # it is the stash, not the visible
+    # the visible sibling is gone, so no photo has a stashed_original for orphan
+    assert not any(p.stashed_original is not None and
+                   cat.photos[p.stashed_original].rel == "f/Originals/orphan.jpg"
+                   for p in cat.photos)
+
+    b = next(p for p in cat.photos if p.rel == "g/b.jpg")
+    assert b.stashed_original is None  # .thumbnails must NOT associate
+
+    r = next(p for p in cat.photos if p.rel == "r.jpg")
+    assert r.stashed_original is not None
+    assert cat.photos[r.stashed_original].rel == ".picasaoriginals/r.jpg"
+
+
+def test_stashed_original_survives_catalog_roundtrip(
+        library: Path, tmp_path: Path) -> None:
+    """The stashed_original association survives a save/load cycle — it is
+    re-derived on load_catalog, never persisted (fauxcasa-cam.19)."""
+    cat = scan_library(library)
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, library)
+    assert loaded is not None
+    a = next(p for p in loaded.photos if p.rel == "2020-01-01 Trip/a.jpg")
+    assert a.stashed_original is not None
+    assert loaded.photos[a.stashed_original].rel == \
+        "2020-01-01 Trip/.picasaoriginals/a.jpg"
+    # derived, not stored — the JSON must contain no stashed_original key
+    assert '"stashed_original"' not in path.read_text()
+
+
 def test_build_fills_signals_and_binds(library: Path, tmp_path: Path) -> None:
     cat = scan_library(library)
     cache_dir = tmp_path / "cache"
@@ -4516,6 +4591,31 @@ def test_status_readout_date_coords_and_star_count(library: Path) -> None:
     assert "Starred: 1 photos" in win.counts_label.text()
 
 
+def test_status_readout_stashed_original(library: Path) -> None:
+    """Status bar shows 'Picasa-saved original kept' chip for a photo whose
+    stash copy exists, and nothing for one without (fauxcasa-cam.19)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    cat = scan_library(library)
+    a = next(p for p in cat.photos if p.rel == "2020-01-01 Trip/a.jpg")
+    assert a.stashed_original is not None  # fixture guarantees the pair
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    idx_a = cat.photos.index(a)
+    win.grid._select(idx_a)
+    assert "Picasa-saved original kept" in win.meta_label.text()
+
+    c = next(p for p in cat.photos if p.rel == "2021-05-05 Picnic/c.jpg")
+    idx_c = cat.photos.index(c)
+    win.grid._select(idx_c)
+    assert "Picasa-saved original kept" not in win.meta_label.text()
+
+
 def test_viewer_info_line_paints_metadata(library: Path) -> None:
     """The viewer's info bar composes star count + date + coordinates
     without incident (offscreen paint smoke; the text path is the shared
@@ -4533,6 +4633,25 @@ def test_viewer_info_line_paints_metadata(library: Path) -> None:
     v.show()
     v.show_photo([cat.photos.index(a)], 0)
     assert not v.grab().isNull()   # paints the bar with all fields present
+    v.quiesce()
+
+
+def test_viewer_info_line_stashed_original(library: Path) -> None:
+    """Viewer info line shows 'Picasa-saved original kept' chip for a photo
+    with a stash copy, and not for one without (fauxcasa-cam.19)."""
+    _offscreen_app()
+    from viewer import ViewerPage
+
+    cat = scan_library(library)
+    a = next(p for p in cat.photos if p.rel == "2020-01-01 Trip/a.jpg")
+    assert a.stashed_original is not None  # fixture guarantees the pair
+    c = next(p for p in cat.photos if p.rel == "2021-05-05 Picnic/c.jpg")
+    v = ViewerPage(cat, None)
+    v.resize(320, 240)
+    v.show()
+    v.show_photo([cat.photos.index(a)], 0)
+    assert "Picasa-saved original kept" in v._info_text(a)
+    assert "Picasa-saved original kept" not in v._info_text(c)
     v.quiesce()
 
 
