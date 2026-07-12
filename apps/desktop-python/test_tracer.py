@@ -278,11 +278,12 @@ def test_filtered_cache_dir_is_separate_from_unfiltered(tmp_path: Path) -> None:
     root = tmp_path / "lib"
     root.mkdir()
     cache_root = tmp_path / "cache"
-    plain = cache_dir_for(root, cache_root)
+    key = str(root.resolve())
+    plain = cache_dir_for(key, cache_root)
     filtered = cache_dir_for(
-        root, cache_root, ScanFilter(min_width=100, min_height=100).cache_key())
+        key, cache_root, ScanFilter(min_width=100, min_height=100).cache_key())
     assert plain != filtered
-    assert cache_dir_for(root, cache_root) == plain
+    assert cache_dir_for(key, cache_root) == plain
 
 
 def test_rel_paths_match_relative_to(tmp_path: Path) -> None:
@@ -7242,12 +7243,13 @@ def test_file_types_cache_key_and_walk_seam(tmp_path: Path) -> None:
     lib.mkdir()
     sf = ScanFilter()
     croot = tmp_path / "cr"
+    lib_key = str(lib.resolve())
     base = thumbcache.cache_dir_for(
-        lib, croot, sf.cache_key() + exts_cache_key(set()))
+        lib_key, croot, sf.cache_key() + exts_cache_key(set()))
     off = thumbcache.cache_dir_for(
-        lib, croot, sf.cache_key() + exts_cache_key({".tga"}))
+        lib_key, croot, sf.cache_key() + exts_cache_key({".tga"}))
     back = thumbcache.cache_dir_for(
-        lib, croot, sf.cache_key() + exts_cache_key(set()))
+        lib_key, croot, sf.cache_key() + exts_cache_key(set()))
     assert off != base                           # a changed set: its own dir
     assert back == base                          # off-and-on: the SAME dir
 
@@ -7272,15 +7274,16 @@ def test_file_types_toggle_returns_to_same_warm_cache(tmp_path: Path) -> None:
     _make_tga(lib / "b.tga")
     croot = tmp_path / "cr"
     sf = ScanFilter()
+    lib_key = str(lib.resolve())
     base_dir = thumbcache.cache_dir_for(
-        lib, croot, sf.cache_key() + exts_cache_key(set()))
+        lib_key, croot, sf.cache_key() + exts_cache_key(set()))
     cat = scan_library(lib)
     thumbcache.build_cache(cat, base_dir)
     save_catalog(cat, base_dir / "catalog.json")
 
     excluded = {".tga"}
     off_dir = thumbcache.cache_dir_for(
-        lib, croot, sf.cache_key() + exts_cache_key(excluded))
+        lib_key, croot, sf.cache_key() + exts_cache_key(excluded))
     assert off_dir != base_dir
     assert not (off_dir / "thumbs.fcache").exists()   # cold, its own dir
     cat_off = scan_library(lib, exts=effective_exts(excluded))
@@ -7290,7 +7293,7 @@ def test_file_types_toggle_returns_to_same_warm_cache(tmp_path: Path) -> None:
             thumbcache.load_cache(base_dir / "thumbs.fcache"), cat_off)
 
     on_dir = thumbcache.cache_dir_for(
-        lib, croot, sf.cache_key() + exts_cache_key(set()))
+        lib_key, croot, sf.cache_key() + exts_cache_key(set()))
     assert on_dir == base_dir                    # back to the SAME dir...
     loaded = load_catalog(on_dir / "catalog.json", lib)
     assert loaded is not None                    # ...whose catalog loads...
@@ -8322,3 +8325,296 @@ def test_old_version_compat_single_root_vs_multi_root(
         home=tmp_path,
     )
     assert load_catalog(path, multi_cfg) is None
+
+
+# ---- multiroot cache binding (fauxcasa-ed5.7.3, bead .c) -------------------
+
+
+def test_fcache_name_legacy_and_explicit() -> None:
+    """The implicit legacy root (id "") keeps the unsuffixed 'thumbs.fcache'
+    name — no rename, no rewrite (design §3); every explicit root gets its
+    own 'thumbs-<root_id>.fcache'."""
+    assert thumbcache.fcache_name("") == "thumbs.fcache"
+    assert thumbcache.fcache_name("a1b2c3d4") == "thumbs-a1b2c3d4.fcache"
+
+
+def test_build_cache_legacy_root_id_writes_unsuffixed_name(
+        tmp_path: Path) -> None:
+    """The default root_id (LEGACY_ROOT_ID) writes the unsuffixed
+    'thumbs.fcache' — exactly the pre-multiroot name — and binds via both
+    the plain 2-arg bind() call (today's single-library callers) and the
+    equivalent explicit root_id="" call (design §3/§4)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cat = scan_library(root)
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    assert result.path.name == "thumbs.fcache"
+    cache = thumbcache.load_cache(result.path)
+    thumbcache.bind(cache, cat)               # today's call, unchanged
+    thumbcache.bind(cache, cat, root_id="")   # equivalent per-root call
+
+
+def test_build_cache_per_root_two_explicit_roots(tmp_path: Path) -> None:
+    """Two explicit roots each get their OWN thumbs-<root_id>.fcache (+
+    typed sidecar) — build_cache(root_id=...) builds only that root's
+    slice, never touching the other root's file (design §3), and bind()
+    with a root_id compares only that root's slice, so binding one root's
+    cache against the other root fails loudly instead of silently
+    misaligning tiles."""
+    from catalog import Catalog, Photo
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    make_jpeg(root_a / "1.jpg")
+    make_jpeg(root_b / "2.jpg")
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    lib_id = libmod.mint_library_id()
+
+    cat = Catalog(
+        root=root_a,
+        photos=[
+            Photo(rel="1.jpg", folder="", name="1.jpg", root_id=id_a),
+            Photo(rel="2.jpg", folder="", name="2.jpg", root_id=id_b),
+        ],
+        folders={}, albums={},
+        roots=[libmod.LibraryRoot(id=id_a, path=root_a),
+               libmod.LibraryRoot(id=id_b, path=root_b)],
+        library_id=lib_id,
+    )
+    cache_dir = tmp_path / "c"
+    result_a = thumbcache.build_cache(cat, cache_dir, root_id=id_a)
+    result_b = thumbcache.build_cache(cat, cache_dir, root_id=id_b)
+
+    assert result_a.path.name == f"thumbs-{id_a}.fcache"
+    assert result_b.path.name == f"thumbs-{id_b}.fcache"
+    assert result_a.path != result_b.path
+    assert result_a.photos == 1 and result_b.photos == 1
+
+    cache_a = thumbcache.load_cache(result_a.path)
+    cache_b = thumbcache.load_cache(result_b.path)
+    assert cache_a.files == ["1.jpg"]
+    assert cache_b.files == ["2.jpg"]
+    assert cache_a.library_id == lib_id and cache_b.library_id == lib_id
+    assert cache_a.sidecar_version == 2 and cache_b.sidecar_version == 2
+    meta_a = json.loads(result_a.path.with_suffix(".fcache.json").read_text())
+    assert meta_a["root_id"] == id_a and "library" not in meta_a
+
+    thumbcache.bind(cache_a, cat, root_id=id_a)
+    thumbcache.bind(cache_b, cat, root_id=id_b)
+    with pytest.raises(thumbcache.CacheError):
+        thumbcache.bind(cache_a, cat, root_id=id_b)  # wrong root: mismatch
+
+
+def test_parse_sidecar_entry_typed_shapes() -> None:
+    """Typed sidecar 'files' entries (sidecar_version 2, design §5): a
+    plain string means a root-relative path belonging to THIS root
+    (returned with a None root id — the string form carries none of its
+    own); a two-element [root_id, rel] array is the reserved cross-root
+    shape (unused in M1) — parsed, not delimiter-hacked. Anything else is
+    malformed."""
+    assert thumbcache.parse_sidecar_entry("a/b.jpg") == (None, "a/b.jpg")
+    assert (thumbcache.parse_sidecar_entry(["aaaaaaaa", "a/b.jpg"])
+            == ("aaaaaaaa", "a/b.jpg"))
+    with pytest.raises(thumbcache.CacheError):
+        thumbcache.parse_sidecar_entry(123)
+    with pytest.raises(thumbcache.CacheError):
+        thumbcache.parse_sidecar_entry(["only-one"])
+    with pytest.raises(thumbcache.CacheError):
+        thumbcache.parse_sidecar_entry([1, "not-a-string-id"])
+
+
+def test_load_cache_accepts_mixed_typed_sidecar_entries(
+        tmp_path: Path) -> None:
+    """load_cache parses a sidecar_version 2 'files' array that mixes
+    plain strings and the reserved 2-element cross-root shape (unused in
+    M1) without raising, taking the rel from either shape."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    make_jpeg(root / "b.jpg")
+    cat = scan_library(root)
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    sidecar_path = result.path.with_suffix(".fcache.json")
+    data = json.loads(sidecar_path.read_text())
+    data["sidecar_version"] = 2
+    data["files"] = [data["files"][0], ["ffffffff", data["files"][1]]]
+    sidecar_path.write_text(json.dumps(data))
+
+    cache = thumbcache.load_cache(result.path)
+    assert cache.files == ["a.jpg", "b.jpg"]
+    assert cache.sidecar_version == 2
+
+
+def test_legacy_sidecar_shape_has_no_new_keys(tmp_path: Path) -> None:
+    """A legacy (implicit-root) sidecar carries none of the new keys —
+    'sidecar_version', 'library_id' — and every 'files' entry stays a
+    plain string; this is the shape the shipped benchmark cache's sidecar
+    has, and the new reader accepts it exactly as-is."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cat = scan_library(root)
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    raw = json.loads(result.path.with_suffix(".fcache.json").read_text())
+    assert "sidecar_version" not in raw and "library_id" not in raw
+    assert "library" in raw and all(isinstance(f, str) for f in raw["files"])
+
+    cache = thumbcache.load_cache(result.path)
+    assert cache.sidecar_version == 1 and cache.library_id == ""
+
+
+def test_frozen_v1_legacy_rebuild_is_byte_identical(tmp_path: Path) -> None:
+    """FROZEN-V1 byte-identity regression (bead .c acceptance criterion):
+    a synthetic v1-style fixture built with the CURRENT (pre-multiroot)
+    writer semantics — the exact dict/key-order thumbcache.build_cache
+    wrote before this bead — is (a) read successfully by the new reader
+    with zero rewrite, and (b) reproduced BYTE-FOR-BYTE (both the packed
+    .fcache and the .fcache.json sidecar) by a legacy-mode rebuild through
+    the new code (default root_id, no library_id). This is the portable,
+    privacy-safe stand-in for diffing against the real (gitignored,
+    machine-local) 100k benchmark cache at
+    A:/dev/fauxcasa/cache/benchmark-thumbs.fcache, which was spot-checked
+    by hand to still load through thumbcache.load_cache unchanged."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg", 40, 30)
+    make_jpeg(root / "sub" / "b.jpg", 50, 20)
+    cat = scan_library(root)
+    assert len(cat.photos) == 2
+    assert cat.library_id == ""  # legacy: the branch under test
+
+    out_dir = tmp_path / "c"
+    result = thumbcache.build_cache(cat, out_dir)
+    assert result.path.name == "thumbs.fcache"
+
+    # The pre-multiroot dict literal, key order and all (thumbcache.py's
+    # build_cache before fauxcasa-ed5.7.3): {count, library, thumb_edge,
+    # files} for a single-level (v1) build — no "levels" key.
+    expected_sidecar = {
+        "count": len(cat.photos),
+        "library": str(cat.root),
+        "thumb_edge": thumbcache.THUMB_EDGE,
+        "files": [p.rel for p in cat.photos],
+    }
+    # Path.write_text (both the real writer and this expected-fixture path)
+    # applies platform newline translation on Windows (\n -> \r\n); compare
+    # via the SAME write_text/read_bytes round trip on both sides so the
+    # byte-identity assertion is about JSON content/key-order, not an
+    # incidental platform newline mismatch.
+    expected_path = tmp_path / "expected.fcache.json"
+    expected_path.write_text(json.dumps(expected_sidecar, indent=1))
+    expected_bytes = expected_path.read_bytes()
+    actual_bytes = result.path.with_suffix(".fcache.json").read_bytes()
+    assert actual_bytes == expected_bytes
+
+    # The packed .fcache header is the frozen v1 layout regardless of this
+    # bead's changes (this bead never touched _write_fcache).
+    hdr = result.path.read_bytes()[:16]
+    assert hdr == thumbcache.MAGIC + struct.pack(
+        "<III", 1, len(cat.photos), 0)
+
+    # New reader, zero rewrite: reads straight through, binds normally.
+    cache = thumbcache.load_cache(result.path)
+    assert cache.files == [p.rel for p in cat.photos]
+    assert cache.library == str(cat.root)
+    assert cache.library_id == "" and cache.sidecar_version == 1
+    thumbcache.bind(cache, cat)
+
+
+def test_cache_dir_for_legacy_digest_is_pinned() -> None:
+    """cache_dir_for's legacy key formula — sha256(str(path.resolve()))[:16]
+    — is UNCHANGED by the multiroot signature change (design §7: the
+    function now takes the key string directly, callers own the
+    str(path.resolve()) choice). This literal digest was computed
+    independently (sha256 of the fixed key below, truncated to 16 hex
+    chars) BEFORE any of this bead's edits, so a formula or truncation
+    regression fails loudly — every existing single-root library's cache
+    dir depends on this staying fixed forever."""
+    key = r"A:\some\fixed\library\path"
+    assert thumbcache.cache_dir_for(key, Path("cr")) == \
+        Path("cr") / "b997252540498434"
+
+
+def test_cache_dir_for_library_id_distinct_from_legacy_and_variant(
+        tmp_path: Path) -> None:
+    """An explicit library's key (library_id, a uuid) never collides with
+    an implicit legacy library's key (a resolved path string) even if one
+    happened to look like the other, and a variant (ScanFilter/File Types
+    cache_key) always derives its own dir, deterministically (design §7)."""
+    croot = tmp_path / "cr"
+    legacy_key = str((tmp_path / "lib").resolve())
+    lib_id = libmod.mint_library_id()
+
+    d_legacy = thumbcache.cache_dir_for(legacy_key, croot)
+    d_explicit = thumbcache.cache_dir_for(lib_id, croot)
+    assert d_legacy != d_explicit
+
+    d_variant = thumbcache.cache_dir_for(lib_id, croot, "v1")
+    assert d_variant != d_explicit
+    assert thumbcache.cache_dir_for(lib_id, croot, "v1") == d_variant
+
+
+def test_make_thumbcache_library_home_two_roots(tmp_path: Path) -> None:
+    """--library-home mode (multiroot .c, design §11 — named --library-home
+    here rather than the design doc's --library to avoid colliding with
+    this script's existing single-directory --library flag) reads
+    library.json and builds one thumbs-<root_id>.fcache (+ typed sidecar)
+    per watched root."""
+    # A ProcessPoolExecutor build (--library-home is NOT --sidecar-only, so
+    # it always builds through the pool) can't run through a module loaded
+    # via importlib under an alias ("mtc"): Windows spawn workers can't
+    # re-import a module by that fake name (see test_main_bad_library_exits_2
+    # for the same real-process pattern used elsewhere in this file for
+    # exactly this reason).
+    import os
+    import subprocess
+
+    script = REPO / "scripts" / "make-thumbcache.py"
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    make_jpeg(root_a / "1.jpg")
+    make_jpeg(root_b / "2.jpg")
+    home = tmp_path / "home"
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    lib_id = libmod.mint_library_id()
+    cfg = libmod.LibraryConfig(
+        library_id=lib_id, name="Test",
+        roots=[libmod.LibraryRoot(id=id_a, path=root_a),
+               libmod.LibraryRoot(id=id_b, path=root_b)],
+        home=home,
+    )
+    libmod.save_library(cfg)
+
+    out_dir = tmp_path / "cache-out"
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    proc = subprocess.run(
+        [sys.executable, str(script), "--library-home", str(home),
+         "--out-dir", str(out_dir), "--jobs", "1"],
+        capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+
+    fa = out_dir / f"thumbs-{id_a}.fcache"
+    fb = out_dir / f"thumbs-{id_b}.fcache"
+    assert fa.is_file() and fb.is_file()
+    meta_a = json.loads(fa.with_suffix(".fcache.json").read_text())
+    meta_b = json.loads(fb.with_suffix(".fcache.json").read_text())
+    assert meta_a["library_id"] == lib_id and meta_a["root_id"] == id_a
+    assert meta_b["library_id"] == lib_id and meta_b["root_id"] == id_b
+    assert meta_a["files"] == ["1.jpg"]
+    assert meta_b["files"] == ["2.jpg"]
+    assert meta_a["sidecar_version"] == 2 and meta_b["sidecar_version"] == 2
+
+    # in-app reader loads either per-root cache directly
+    cache_a = thumbcache.load_cache(fa)
+    assert cache_a.files == ["1.jpg"] and cache_a.library_id == lib_id
+
+
+def test_make_thumbcache_library_home_default_out_dir_formula(
+        tmp_path: Path, monkeypatch) -> None:
+    """--library-home with no --out-dir derives the SAME digest dir as
+    thumbcache.cache_dir_for(library_id, cache_root) with no variant
+    (design §7), so a script-built cache lands exactly where the app's
+    warm-start path looks for it. Checked as a pure formula (no process
+    pool involved) — see the sibling smoke test's docstring for why a real
+    --library-home build must go through a subprocess."""
+    mtc = _load_mtc()
+    monkeypatch.setattr(mtc, "CACHE", tmp_path / "cache")
+
+    lib_id = libmod.mint_library_id()
+    expected = thumbcache.cache_dir_for(lib_id, tmp_path / "cache")
+    assert mtc._default_out_dir(lib_id) == expected

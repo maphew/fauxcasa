@@ -1908,7 +1908,11 @@ def main() -> int:
     # always derived from the library root, so even an adopted-cache run
     # persists its catalog and warm-starts next time.
     adopt = args.thumbs is not None
-    cache_dir = cache_dir_for(root, args.cache_root,
+    # An implicit legacy single-root open keys on the resolved path itself
+    # (multiroot .c, design §7) — reproduces every existing cache dir's
+    # digest exactly; main.py doesn't open explicit multi-root libraries
+    # yet (that's bead .d/.g), so this is always the legacy key here.
+    cache_dir = cache_dir_for(str(root.resolve()), args.cache_root,
                               scan_filter.cache_key()
                               + exts_cache_key(excluded_exts))
     cat_path = cache_dir / "catalog.json"

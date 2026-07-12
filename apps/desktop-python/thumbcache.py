@@ -35,6 +35,7 @@ from catalog import (
     save_catalog,
 )
 from inmeta import read_jpeg_metadata
+from library import LEGACY_ROOT_ID
 from metareader import read_file_meta
 from pillowload import pillow_qimage
 from rawload import is_raw_suffix, raw_demosaic_qimage, raw_preview_jpeg
@@ -95,6 +96,39 @@ def _is_v1(levels: list[int]) -> bool:
     return levels == [THUMB_EDGE]
 
 
+def fcache_name(root_id: str) -> str:
+    """Per-root fcache file base name (multiroot .c, design §3): the
+    implicit legacy root (id "") keeps the unsuffixed 'thumbs.fcache' name
+    — no rename, no rewrite, so the shipped benchmark cache keeps binding
+    exactly where it is today. Every explicit root gets its own
+    'thumbs-<root_id>.fcache' (+ '.fcache.json' sidecar, via
+    Path.with_suffix as usual) so root add/remove/reorder never touches
+    another root's cache."""
+    return "thumbs.fcache" if root_id == LEGACY_ROOT_ID \
+        else f"thumbs-{root_id}.fcache"
+
+
+def parse_sidecar_entry(entry: object) -> tuple[str | None, str]:
+    """Typed sidecar 'files' entry (sidecar_version 2, design §5): a plain
+    STRING means a root-relative path belonging to THIS root — returned as
+    (None, rel), None meaning "the cache's own root" since the string form
+    carries no id of its own. A two-element array [root_id, rel] is
+    reserved for a future CROSS-root reference (unused in M1, but parsed
+    now so the shape is defined before any consumer needs it) — returned
+    as (root_id, rel). No ':' delimiter parsing anywhere: the array is a
+    real JSON list, never a packed string.
+
+    The legacy single-root sidecar (every entry a plain string) parses
+    unchanged under this reader — that is the whole point of defining the
+    typed shape additively rather than replacing the string form."""
+    if isinstance(entry, str):
+        return None, entry
+    if (isinstance(entry, (list, tuple)) and len(entry) == 2
+            and isinstance(entry[0], str) and isinstance(entry[1], str)):
+        return entry[0], entry[1]
+    raise CacheError(f"malformed sidecar 'files' entry: {entry!r}")
+
+
 @dataclass
 class ThumbCache:
     path: Path
@@ -104,14 +138,22 @@ class ThumbCache:
     # time (error tile). A v1 cache has one level so this is the only level; a
     # v2 cache exposes every level via `level_entries` / `entry()`.
     entries: list[tuple[int, int, int, int]]
-    files: list[str]  # library-relative POSIX paths, ONE per photo (entry order)
-    library: str
+    files: list[str]  # root-relative POSIX paths, ONE per photo (entry order)
+    library: str  # legacy header path string; "" for an explicit library
     # Long-edge of each cached level, largest first (a v1 cache -> [256]).
     levels: list[int] = field(default_factory=lambda: [THUMB_EDGE])
     primary: int = 0  # index into `levels` that `entries` mirrors
     # Full per-level index: level_entries[level_idx][photo_idx]. Defaults to
     # the single primary level so v1 constructors need not supply it.
     level_entries: list[list[tuple[int, int, int, int]]] | None = None
+    # Multiroot plumbing (fauxcasa-ed5.7.3, bead .c, design §5/§7). An
+    # explicit library's sidecar carries "library_id" instead of "library";
+    # "" here means the sidecar was legacy-shaped (or this cache predates
+    # sidecar_version). sidecar_version mirrors CATALOG_VERSION's role: 1
+    # (absent) is the frozen legacy shape, 2 is the additive typed-entries
+    # shape (§5) — both are accepted by this one reader, unchanged.
+    library_id: str = ""
+    sidecar_version: int = 1
 
     def __post_init__(self) -> None:
         if self.level_entries is None:
@@ -187,29 +229,44 @@ def load_cache(path: Path) -> ThumbCache:
         raise CacheError(f"{sidecar}: sidecar is not a JSON object")
     files = meta.get("files")
     # files[] is ONE per photo (levels never multiply it), so a v2 cache binds
-    # to the catalog exactly like a v1 one.
+    # to the catalog exactly like a v1 one. Typed entries (sidecar_version 2,
+    # design §5): parse_sidecar_entry accepts both the legacy plain-string
+    # shape and the [root_id, rel] cross-root shape (unused in M1) — every
+    # legacy sidecar is ALL plain strings, so it parses unrewritten.
     if not isinstance(files, list) or len(files) != count:
         raise CacheError(
             f"{sidecar}: no per-entry 'files' array (old sidecar?) — "
             f"regenerate with scripts/make-thumbcache.py --sidecar-only"
         )
+    rels = [parse_sidecar_entry(f)[1] for f in files]
     return ThumbCache(
         path=path,
         count=count,
         entries=level_entries[primary],
-        files=[str(f) for f in files],
+        files=rels,
         library=str(meta.get("library", "")),
+        library_id=str(meta.get("library_id", "")),
+        sidecar_version=int(meta.get("sidecar_version", 1)),
         levels=levels,
         primary=primary,
         level_entries=level_entries,
     )
 
 
-def bind(cache: ThumbCache, catalog: Catalog) -> None:
+def bind(cache: ThumbCache, catalog: Catalog, root_id: str | None = None) -> None:
     """Entry i of the cache must be photo i of the catalog. Both sides
     derive their order from the same walk rule, so a mismatch means the
-    library changed since the cache was built."""
-    cat_files = [p.rel for p in catalog.photos]
+    library changed since the cache was built.
+
+    `root_id=None` (default) compares against EVERY photo in the catalog —
+    today's single-library behavior, unchanged, so every existing call
+    site keeps working exactly as before. Passing a `root_id` (multiroot
+    .c, design §3/§4) compares only that root's slice
+    (`catalog.photos_for_root(root_id)`), the per-root bind that lets one
+    root's mismatch trigger that root's reconcile/rebuild without
+    touching the others."""
+    cat_files = ([p.rel for p in catalog.photos] if root_id is None
+                 else [p.rel for p in catalog.photos_for_root(root_id)])
     if cache.files != cat_files:
         if cache.count != len(cat_files):
             why = f"{cache.count} entries cached vs {len(cat_files)} found"
@@ -224,8 +281,17 @@ def bind(cache: ThumbCache, catalog: Catalog) -> None:
         )
 
 
-def cache_dir_for(library: Path, cache_root: Path, variant: str = "") -> Path:
-    key = str(library.resolve()).encode()
+def cache_dir_for(library_key: str, cache_root: Path,
+                  variant: str = "") -> Path:
+    """Cache dir keyed on a library identity, not a root path (multiroot
+    .c, design §7): `library_key` is `library_id` (a uuid) for an explicit
+    library, or `str(path.resolve())` for an implicit legacy single-root
+    open — callers own that choice; this function only hashes whatever
+    string it is handed. Passing the SAME implicit-legacy key this
+    function always hashed (a resolved path string) reproduces every
+    existing cache dir's digest exactly — day-zero upgrade cost for a
+    single-root library is zero."""
+    key = library_key.encode()
     if variant:
         key += b"\0" + variant.encode()
     digest = hashlib.sha256(key).hexdigest()[:16]
@@ -481,11 +547,21 @@ def build_cache(
     progress: Callable[[int, int, object], None] | None = None,
     cancel: threading.Event | None = None,
     levels: Sequence[int] | None = None,
+    root_id: str = LEGACY_ROOT_ID,
 ) -> IndexResult | None:
-    """Build thumbs.fcache for a (small) library and fill each photo's
+    """Build a thumb cache for a (small) library and fill each photo's
     identity/staleness signals (size, mtime, sha256) into the catalog in
     place; the caller persists the catalog. Returns an IndexResult with
     the measured throughput, or None if cancelled.
+
+    `root_id` (multiroot .c, design §3/§14) selects which root's photo
+    slice to build: the default LEGACY_ROOT_ID builds every photo whose
+    `root_id` is "" — the whole catalog for an unpromoted single-root
+    library, byte-identical to before this parameter existed — and writes
+    the unsuffixed `thumbs.fcache` (`fcache_name`). Passing an explicit
+    root id builds ONLY that root's slice into its own
+    `thumbs-<root_id>.fcache`, so one root's rebuild never touches
+    another's cache file.
 
     `levels` is the set of thumbnail long-edges to cache (default: the single
     256 px level, i.e. a v1 cache byte-identical to the legacy format). Pass a
@@ -502,8 +578,9 @@ def build_cache(
     levels = _normalize_levels(levels)
     primary = _primary_level(levels)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    out = cache_dir / "thumbs.fcache"
-    total = len(catalog.photos)
+    out = cache_dir / fcache_name(root_id)
+    photos = catalog.photos_for_root(root_id)
+    total = len(photos)
     photo_levels: list[list[tuple[bytes, int, int]]] = \
         [[(b"", 0, 0)] * len(levels) for _ in range(total)]
 
@@ -514,7 +591,7 @@ def build_cache(
         # missing/offline gets None and _index_one/read_photo_meta fail
         # soft on it (error tile), same as an unreadable file today.
         futs = [pool.submit(_index_one, catalog.abs(p), p, i, levels)
-                for i, p in enumerate(catalog.photos)]
+                for i, p in enumerate(photos)]
         for fut in as_completed(futs):
             if cancel is not None and cancel.is_set():
                 pool.shutdown(wait=False, cancel_futures=True)
@@ -523,9 +600,10 @@ def build_cache(
                 fut.result()
             photo_levels[idx] = level_blobs
             # identity signals + §4 tier-1 precedence merge, shared with
-            # the adopt-mode backfill (see apply_photo_meta)
-            apply_photo_meta(catalog.photos[idx], size, mtime, sha,
-                             meta, fmeta)
+            # the adopt-mode backfill (see apply_photo_meta) — photos[idx]
+            # is the SAME Photo object as in catalog.photos (photos_for_root
+            # filters, never copies), so this mutates the real catalog.
+            apply_photo_meta(photos[idx], size, mtime, sha, meta, fmeta)
             if progress:
                 progress(idx, total, img)
     elapsed = time.perf_counter() - t0
@@ -534,12 +612,29 @@ def build_cache(
         return None
     _write_fcache(out, levels, photo_levels)
 
-    sidecar = {
-        "count": total,
-        "library": str(catalog.root),
-        "thumb_edge": levels[primary],
-        "files": [p.rel for p in catalog.photos],
-    }
+    if catalog.library_id:
+        # Explicit library (multiroot .c, design §5): "library_id" instead
+        # of "library", plus sidecar_version 2 and (for a non-first root)
+        # the owning root_id — brand new shape, no byte-identity
+        # constraint on key order.
+        sidecar: dict = {
+            "sidecar_version": 2,
+            "count": total,
+            "library_id": catalog.library_id,
+            "root_id": root_id,
+            "thumb_edge": levels[primary],
+            "files": [p.rel for p in photos],
+        }
+    else:
+        # Implicit legacy library: UNCHANGED shape/key-order — this branch
+        # must stay byte-identical to the pre-multiroot writer forever (the
+        # frozen-v1 regression test pins this).
+        sidecar = {
+            "count": total,
+            "library": str(catalog.root),
+            "thumb_edge": levels[primary],
+            "files": [p.rel for p in photos],
+        }
     if len(levels) > 1:  # informational; the header is authoritative
         sidecar["levels"] = levels
     out.with_suffix(".fcache.json").write_text(json.dumps(sidecar, indent=1))
