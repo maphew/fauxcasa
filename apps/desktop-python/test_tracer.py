@@ -6769,9 +6769,12 @@ def test_load_original_oriented_matches_qimagereader_autotransform(
     decode must still produce pixel-identical output to the OLD
     QBuffer + QImageReader.setAutoTransform decode, for every EXIF
     Orientation value — built here as a reference, on the main thread
-    (safe; the deadlock is a worker-thread/main-thread race, fauxcasa-5dk),
-    over a REAL oriented-JPEG fixture (exiv2-written EXIF, the same fixture
-    builder test_index_bakes_exif_orientation uses)."""
+    (safe; the deadlock is a worker-thread/main-thread race, fauxcasa-5dk).
+    The fixture is _marked_stored_image() (distinct content in each
+    corner), NOT a solid color: a solid fixture would let this pass even
+    if a mirror axis or a rotation direction were swapped, since every
+    pixel is identical either way — the marked corners are what actually
+    pin the pixel ARRANGEMENT, not just the dimensions."""
     _offscreen_app()
     from PySide6.QtCore import QBuffer, QIODevice
     from PySide6.QtGui import QImage, QImageReader
@@ -6781,9 +6784,14 @@ def test_load_original_oriented_matches_qimagereader_autotransform(
     fmt = QImage.Format.Format_ARGB32  # settle rotate()-vs-untouched format
     # differences (premultiplied ARGB32 vs RGB32) before comparing pixels.
     for orientation in range(1, 9):
+        img = _marked_stored_image()
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        assert img.save(buf, "JPEG", 95)
+        data = _inject(bytes(buf.data()), 0xE1,
+                       _exif_orientation_app1(orientation))
         p = tmp_path / f"o{orientation}.jpg"
-        write_jpeg_meta(p, w=64, h=48, exif_orientation=orientation)
-        data = p.read_bytes()
+        p.write_bytes(data)
 
         ref_buf = QBuffer()
         ref_buf.setData(data)

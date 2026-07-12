@@ -70,8 +70,8 @@ EMPTY = InMeta()
 
 def apply_orientation(img, orientation: int):
     """Apply an EXIF Orientation value (1..8) to a decoded QImage, returning
-    the display-upright result (a no-op copy for 1 or any value outside
-    1..8).
+    the display-upright result (the same image object, unchanged, for 1 or
+    any value outside 1..8).
 
     Why this lives here instead of QImageReader.setAutoTransform: a
     proven GIL <-> Qt-mutex lock inversion (fauxcasa-5dk, live py-spy
@@ -93,11 +93,13 @@ def apply_orientation(img, orientation: int):
     from PySide6.QtGui import QTransform
 
     if orientation == 2:
-        return img.mirrored(True, False)
+        # QImage.mirrored(bool, bool) is deprecated in PySide6; an
+        # equivalent QTransform scale keeps the same pixel semantics.
+        return img.transformed(QTransform().scale(-1, 1))
     if orientation == 3:
         return img.transformed(QTransform().rotate(180))
     if orientation == 4:
-        return img.mirrored(False, True)
+        return img.transformed(QTransform().scale(1, -1))
     if orientation == 5:
         return img.transformed(QTransform(0, 1, 1, 0, 0, 0))
     if orientation == 6:
