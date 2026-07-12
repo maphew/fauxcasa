@@ -68,6 +68,49 @@ class InMeta:
 EMPTY = InMeta()
 
 
+def apply_orientation(img, orientation: int):
+    """Apply an EXIF Orientation value (1..8) to a decoded QImage, returning
+    the display-upright result (a no-op copy for 1 or any value outside
+    1..8).
+
+    Why this lives here instead of QImageReader.setAutoTransform: a
+    proven GIL <-> Qt-mutex lock inversion (fauxcasa-5dk, live py-spy
+    native dump). QImageReader's format-probe loop holds Qt's image-plugin
+    factory mutex and calls device.read()/peek() per candidate plugin; when
+    the device is a Python-created QBuffer, every virtual read() call goes
+    through shiboken's Sbk_GetPyOverride, which blocks acquiring the GIL --
+    WHILE HOLDING THE QT MUTEX. A concurrent QImage.fromData on another
+    thread (PySide does not release the GIL for it) can then block on that
+    same factory mutex, and the two threads deadlock. The fix is to keep
+    the invariant "no thread ever needs the GIL while holding Qt's
+    image-plugin factory mutex": decode with QImage.fromData (an internal
+    C++ buffer, no Python device, no plugin-mutex GIL reentry) and apply
+    EXIF orientation ourselves afterward, here.
+
+    This function MUST stay in lockstep with viewer._ORIENT_MAP, which
+    documents (and the face-overlay math depends on) the exact same eight
+    transforms applied to fractional coordinates rather than pixels."""
+    from PySide6.QtGui import QTransform
+
+    if orientation == 2:
+        return img.mirrored(True, False)
+    if orientation == 3:
+        return img.transformed(QTransform().rotate(180))
+    if orientation == 4:
+        return img.mirrored(False, True)
+    if orientation == 5:
+        return img.transformed(QTransform(0, 1, 1, 0, 0, 0))
+    if orientation == 6:
+        # Qt's y-down coordinate space makes a positive rotate() angle a
+        # clockwise turn.
+        return img.transformed(QTransform().rotate(90))
+    if orientation == 7:
+        return img.transformed(QTransform(0, -1, -1, 0, 0, 0))
+    if orientation == 8:
+        return img.transformed(QTransform().rotate(-90))
+    return img  # 1, or any out-of-range value: identity
+
+
 def _decode(raw: bytes) -> str:
     """IPTC strings are UTF-8 in modern Picasa output (XMP confirms it);
     fall back to latin-1 so legacy bytes still round-trip rather than vanish."""

@@ -123,9 +123,7 @@ def load_original_oriented(path: str, rotate: int) -> tuple[QImage, int]:
     decode-service §3c sandbox-valve ruling). PyAV opens the path
     seekably, so a multi-GB video is never read whole here; a decoded
     poster carries no EXIF orientation, so it reports 1."""
-    from PySide6.QtCore import QBuffer, QIODevice
-    from PySide6.QtGui import QImageReader
-
+    from inmeta import apply_orientation
     from metareader import read_orientation
     from rawload import is_raw_suffix, load_raw_qimage
     from videoload import is_video_suffix, poster_qimage
@@ -142,12 +140,15 @@ def load_original_oriented(path: str, rotate: int) -> tuple[QImage, int]:
         if is_raw_suffix(path):
             img = load_raw_qimage(data)
         else:
-            buf = QBuffer()
-            buf.setData(data)  # setData copies; see thumbcache._index_one
-            buf.open(QIODevice.OpenModeFlag.ReadOnly)
-            reader = QImageReader(buf)
-            reader.setAutoTransform(True)
-            img = reader.read()
+            # QImage.fromData decodes into an internal C++ buffer — no
+            # Python-created QIODevice for QImageReader to probe, so no
+            # thread can be caught needing the GIL while holding Qt's
+            # image-plugin factory mutex (the fauxcasa-5dk deadlock).
+            # Orientation is therefore applied manually, once, right here,
+            # instead of via QImageReader.setAutoTransform.
+            img = QImage.fromData(data)
+            if not img.isNull():
+                img = apply_orientation(img, orientation)
             if img.isNull():
                 # Qt has no decoder for this still (PSD — Pillow reads
                 # the flattened composite, fauxcasa-v46.4): same bytes,

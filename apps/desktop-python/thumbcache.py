@@ -364,11 +364,12 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     is_video = is_video_suffix(photo.rel)
 
     img = None
+    is_raw = is_raw_suffix(photo.rel)
     if data and is_video:
         # Poster frame via PyAV (videoload): a QImage that rides the
         # ordinary downscale/encode below; null on failure -> error tile.
         img = poster_qimage(data)
-    elif data and is_raw_suffix(photo.rel):
+    elif data and is_raw:
         jpeg = raw_preview_jpeg(data)
         if jpeg is not None:
             data = jpeg  # ride the ordinary scaled-JPEG decode below
@@ -384,7 +385,26 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
         buf = QBuffer()
         buf.setData(data)
         buf.open(QIODevice.OpenModeFlag.ReadOnly)
-        reader = QImageReader(buf)
+        # An EXPLICIT format (never leaving QImageReader to sniff the
+        # device) is load-bearing here, not cosmetic: with no format hint
+        # Qt's format-probe loop holds the image-plugin factory mutex
+        # across a device.read()/peek() call per candidate plugin, and
+        # this QBuffer is a Python-created QIODevice, so each of those
+        # calls re-enters the GIL via shiboken's virtual-override dispatch
+        # WHILE holding that mutex — the fauxcasa-5dk lock inversion. A
+        # format name maps straight to one plugin, so the probe loop (and
+        # its device reads) never runs. The RAW-embedded-preview branch
+        # above is guaranteed JPEG; an ordinary still is named by its file
+        # extension. QImageReader itself stays (its setScaledSize does a
+        # libjpeg DCT scaled decode that is load-bearing for indexing
+        # throughput, and must keep producing byte-identical thumbs) --
+        # only the format lookup changes.
+        if is_raw:
+            fmt = b"jpeg"
+        else:
+            suffix = Path(photo.rel).suffix.lower().lstrip(".")
+            fmt = {"jpg": "jpeg", "tif": "tiff"}.get(suffix, suffix).encode()
+        reader = QImageReader(buf, fmt)
         # Apply EXIF orientation at decode (handles all 8 cases, mirrors
         # too); the thumbnail is stored display-upright. setScaledSize is in
         # pre-transform pixels — for a 90/270 image the box edges swap but
@@ -399,10 +419,14 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
         img = reader.read()
         if img.isNull() and data:
             # Qt yielded null for a still (no PSD plugin ships with Qt;
-            # exotic TIFF/JPEG variants): one Pillow attempt on the same
-            # bytes before the error tile (fauxcasa-v46.4). Extension-
-            # routed RAW/video never reach this branch — their decode
-            # above hands back a QImage, null or not (pillowload doc).
+            # exotic TIFF/JPEG variants; or a mis-extensioned file whose
+            # suffix names the wrong plugin, e.g. a PNG saved as .jpg — the
+            # explicit format above can only ask for the named plugin, not
+            # sniff around it): one Pillow attempt on the same bytes, which
+            # sniffs content itself, before the error tile (fauxcasa-v46.4).
+            # Extension-routed RAW/video never reach this branch — their
+            # decode above hands back a QImage, null or not (pillowload
+            # doc).
             img = pillow_qimage(data, top)
     if img.isNull():
         return (idx, [(b"", 0, 0) for _ in levels], size, mtime, sha,
@@ -427,6 +451,11 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
+        # This QBuffer is SAFE (unlike the decode-side one above): save()
+        # uses an explicit "JPEG" handler, so there is no plugin-probe
+        # sniff loop, and encode writes to the device happen without ever
+        # needing the GIL under Qt's factory mutex — no fauxcasa-5dk
+        # exposure here.
         out = QBuffer()
         out.open(QIODevice.OpenModeFlag.WriteOnly)
         lvl.save(out, "JPEG", JPEG_QUALITY)
