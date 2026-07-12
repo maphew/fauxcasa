@@ -1100,8 +1100,13 @@ class GridView(QAbstractScrollArea):
             # in the OS file manager (q6l.8). Checked BEFORE grid.open's
             # key_only Return so the chord reveals instead of activating.
             if self.current >= 0 and self.catalog is not None:
-                reveal_in_file_manager(
-                    self.catalog.root / self.catalog.photos[self.current].rel)
+                # Catalog.abs() is the single choke point for absolute-path
+                # composition (multiroot .b, design §6); None means the
+                # photo's root is missing/offline — nothing to reveal (the
+                # offline placeholder/badge is bead .e's job).
+                target = self.catalog.abs(self.catalog.photos[self.current])
+                if target is not None:
+                    reveal_in_file_manager(target)
             return
         if keymap.matches(event, "grid.clear"):
             # Esc: collapse the set to the current item only (clears all

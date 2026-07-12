@@ -54,6 +54,16 @@ The folder-level Hidden Folders category IS now honored: a folder whose
 own [Picasa] section carries `P2category=Hidden Folders` hides all of its
 photos, mirroring per-photo hidden=yes (oracle fixture 017) and the stash
 treatment — see _is_folder_hidden.
+
+Multiroot plumbing (fauxcasa-ed5.7.2, bead .b of the multi-root design):
+Photo.root_id and Folder.root_id identify which library root a row belongs
+to ("" = the implicit legacy root); Catalog.roots + Catalog.abs(photo) are
+the single choke point for absolute-path composition (see abs()'s
+docstring); walk_roots() is the N-root walk primitive. ALBUM MEMBERSHIP IS
+ROOT-LOCAL: Album.members are Catalog.photos indices, and each root's
+photos form a contiguous slice of that list (design §4/§6/§14) — see the
+freeze comment on Album.members. Root reorder is forbidden until M2 remaps
+album indices across a regroup.
 """
 
 from __future__ import annotations
@@ -70,7 +80,14 @@ _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "scripts"))
 
 import picasa_db  # noqa: E402
-from library import LIBRARY_DIR, ROOT_MARKER  # noqa: E402
+from library import (  # noqa: E402
+    LEGACY_ROOT_ID,
+    LIBRARY_DIR,
+    ROOT_MARKER,
+    LibraryConfig,
+    LibraryRoot,
+    legacy_config,
+)
 from rawload import RAW_EXTS, is_raw_suffix  # noqa: E402
 from videoload import VIDEO_EXTS, is_video_suffix  # noqa: E402
 
@@ -129,6 +146,12 @@ class Photo:
     rel: str  # library-relative POSIX path
     folder: str  # library-relative POSIX folder path ("" = root)
     name: str
+    # Which root this photo belongs to (multiroot .b, fauxcasa-ed5.7.2 —
+    # design §6 identity key). "" (LEGACY_ROOT_ID) is the reserved id of
+    # the implicit legacy root and is the default for every single-root
+    # catalog — day-zero behavior is unaffected. `rel` stays ROOT-relative
+    # POSIX, untouched by this field; identity is (sha256, root_id, rel).
+    root_id: str = LEGACY_ROOT_ID
     # Media kind, 'image' | 'video' (fauxcasa-v46.2): pure extension
     # routing (videoload.VIDEO_EXTS), so it is DERIVED — set at scan and
     # re-derived from rel on catalog load, never persisted (it could only
@@ -183,6 +206,14 @@ class Folder:
     # invisible (like a stash folder), so the sidebar can surface it only
     # under reveal mode and distinguish it from a normal folder.
     folder_hidden: bool = False
+    # Which root this folder belongs to (multiroot .b): mirrors
+    # Photo.root_id. Needed because Catalog.folders is a flat dict and
+    # `rel` alone collides across roots (two roots can each have a
+    # "2019" folder) — the dict KEY carries the disambiguation via
+    # _folder_json_key (bare rel for roots[0], "<root_id>/<rel>"
+    # otherwise), while this field records which root a given Folder
+    # value actually is.
+    root_id: str = LEGACY_ROOT_ID
 
 
 @dataclass
@@ -192,6 +223,19 @@ class Album:
     date: str | None = None
     description: str | None = None
     members: list[int] = field(default_factory=list)  # catalog photo indices
+    # ALBUM-INDEX FREEZE (multiroot design §6/§14 bead .b): members are
+    # indices into Catalog.photos, not rel strings, so global catalog
+    # ORDER is load-bearing for album identity. With N roots, each root's
+    # photos form a CONTIGUOUS slice of Catalog.photos (per-root walk,
+    # concatenated in library.json roots-list order — design §4); album
+    # indices are therefore root-local to whichever slice they fall in.
+    # Any future operation that reorders roots or otherwise regroups the
+    # catalog's per-root slices MUST remap every album's member indices or
+    # forbid the reorder outright — silently reordering roots corrupts
+    # album membership. M1 offers no root-reorder UI, which sidesteps this;
+    # remapping (or forbidding it) is explicitly M2 territory (design §7
+    # risk 7, §13 open question 7) and must not be broken by any M1
+    # regroup operation (e.g. reconcile's catalog swap).
     # §3: an albums= token naming a uid with no [.album:] definition (and no
     # .pal) materializes as a PLACEHOLDER album — "surfaced in the import
     # diagnostics, never dropped". The sidebar marks these visually.
@@ -259,10 +303,36 @@ class Catalog:
     # pending; main()'s adopt path flips a fresh catalog to NOT_STARTED.
     backfill_state: str = BACKFILL_COMPLETE
     backfill_cursor: int = 0  # photos [0, cursor) done (IN_PROGRESS only)
+    # Multiroot plumbing (fauxcasa-ed5.7.2 — bead .b, design §6/§14). The
+    # roots this catalog spans, in library.json order; empty for a Catalog
+    # built without any library context (e.g. a bare test fixture that
+    # never calls abs()). A single-root scan_library()/load_catalog() call
+    # always populates exactly one entry, id "" (LEGACY_ROOT_ID) for the
+    # implicit legacy library. `root` above is kept unchanged for the many
+    # existing consumers that only need the whole-library path (window
+    # title, cache_dir_for, restart args) — it is NOT a photo-path
+    # composition and is out of this bead's grep-audit scope.
+    roots: list[LibraryRoot] = field(default_factory=list)
+    # "" for the implicit legacy library; a full uuid4 for an explicit one
+    # (mirrors LibraryConfig.library_id — see load_catalog's validation).
+    library_id: str = ""
 
     @property
     def visible_count(self) -> int:
         return sum(1 for p in self.photos if p.visible)
+
+    def abs(self, photo: Photo) -> Path | None:
+        """The single choke point for absolute-path composition (design
+        §6): look up `photo.root_id` among self.roots and join `photo.rel`.
+        Returns None when the root is unknown/offline to this catalog —
+        every consumer of an absolute photo path MUST go through this
+        method and handle None (bead .b's grep-audit requirement; the
+        actual offline-volume placeholder/badge is bead .e — for now, an
+        unresolvable root_id is the only reason this returns None)."""
+        for r in self.roots:
+            if r.id == photo.root_id:
+                return r.path / photo.rel
+        return None
 
 
 def _image_size(path: Path) -> tuple[int, int] | None:
@@ -335,6 +405,30 @@ def walk_library(root: Path,
     if scan_filter is None or not scan_filter.active:
         return files
     return [p for p in files if _passes_scan_filter(p, scan_filter)]
+
+
+def walk_roots(cfg: LibraryConfig,
+               scan_filter: ScanFilter | None = None,
+               exts: frozenset[str] | set[str] | None = None
+               ) -> list[tuple[str, Path]]:
+    """The N-root walk primitive (design §4): walk_library's frozen
+    per-root rule run independently over every root in `cfg.roots`, IN
+    LIBRARY.JSON ROOTS-LIST ORDER, each hit tagged with that root's id.
+    Per-root order is untouched by chaining — the parity invariant this
+    preserves is PER ROOT (§3): entry i of root R's fcache = photo i of
+    the catalog's slice for R, exactly like today's single-root
+    invariant, just decomposed into N independent copies.
+
+    Any change to the walk rule itself still must land in BOTH this
+    module and the twin in scripts/make-thumbcache.py in the same commit
+    (walk_library's docstring) — this function only adds the outer
+    per-root loop and tagging on top of that frozen rule; it does not
+    change it."""
+    hits: list[tuple[str, Path]] = []
+    for r in cfg.roots:
+        for p in walk_library(r.path, scan_filter, exts):
+            hits.append((r.id, p))
+    return hits
 
 
 def _read_folder_ini(folder: Path) -> picasa_db.PicasaIni | None:
@@ -914,7 +1008,8 @@ def scan_library(root: Path,
     registry.update(contacts)
 
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
-                   contacts=registry, report=report)
+                   contacts=registry, report=report,
+                   roots=[LibraryRoot(id=LEGACY_ROOT_ID, path=root)])
 
 
 # ---- persistent catalog (load-without-walking, §7 cold start) ------------
@@ -973,7 +1068,23 @@ def scan_library(root: Path,
 # — a v8 catalog was walked without them, so a warm start would silently
 # hide every TGA/PSD in the library until some unrelated drift; reject
 # and cold-rebuild (the same shape as the v7 video bump).
-CATALOG_VERSION = 9
+# v10: multiroot catalog plumbing (fauxcasa-ed5.7.2, design §5/§14 bead
+# .b) — ADDITIVE, not a walk-rule change: a per-photo row may carry an
+# optional "R" (root_id, ABSENT MEANS roots[0] — see _expand_root_id),
+# folder/hidden_folder keys may carry a "<root_id>/<rel>" prefix for
+# non-first roots (see _folder_json_key), and the header carries either
+# "library_id"+"roots" (explicit libraries) or "library" (implicit
+# legacy, unchanged). COMPAT: a v9 file is still accepted when the
+# library passed to load_catalog has exactly one root (rows/keys are then
+# all implicitly roots[0] — see load_catalog's compat path); a v9 file
+# is rejected outright for a multi-root library (cold walk), since a v9
+# file predates root disambiguation entirely and cannot express it.
+CATALOG_VERSION = 10
+# The last pre-multiroot format (fauxcasa-ed5.7.2, bead .b): load_catalog's
+# ONLY version-compat carve-out, and only when the library has exactly one
+# root (see load_catalog). A fixed number, not "CATALOG_VERSION - 1" — see
+# load_catalog's comment for why that distinction matters going forward.
+PRE_MULTIROOT_VERSION = 9
 
 # The import report's file name, written beside catalog.json (same cache
 # dir) by save_report and re-attached on warm starts via load_report.
@@ -1011,8 +1122,36 @@ def load_report(path: Path) -> ImportReport:
     return ImportReport(entries=entries)
 
 
-def _photo_to_row(p: Photo) -> dict:
+def _expand_root_id(raw: str | None, roots: list[LibraryRoot]) -> str:
+    """THE ONE place the absent-means-roots[0] default (design §5, bead
+    .b) is expanded: an absent/None root id — a photo row's missing "R",
+    or the "what is the first root" question the folder-key convention
+    also needs — resolves to roots[0].id, or LEGACY_ROOT_ID when `roots`
+    is empty (a Catalog built without any library context). This is what
+    keeps a promoted single-root catalog's photo rows byte-identical:
+    roots[0]'s photos never need an explicit "R"."""
+    if raw:
+        return raw
+    return roots[0].id if roots else LEGACY_ROOT_ID
+
+
+def _folder_json_key(folder_rel: str, folder_root_id: str,
+                     first_root_id: str) -> str:
+    """Folder-key convention (design §5): roots[0]'s folders serialize as
+    the bare rel — byte-identical to a pre-multiroot catalog — every other
+    root's folder is prefixed "<root_id>/<rel>" so same-named folders in
+    different roots (e.g. a "2019" folder on two drives) don't collide in
+    the "folders"/"hidden_folders" maps. Same absent-means-roots[0]
+    convention as _expand_root_id, specialized for folder identity."""
+    if folder_root_id == first_root_id:
+        return folder_rel
+    return f"{folder_root_id}/{folder_rel}" if folder_rel else folder_root_id
+
+
+def _photo_to_row(p: Photo, first_root_id: str) -> dict:
     row: dict = {"r": p.rel}
+    if p.root_id != first_root_id:
+        row["R"] = p.root_id  # absent means roots[0] — see _expand_root_id
     if p.star:
         row["s"] = p.star  # 0-5 count since v5 (0 = key absent)
     if p.caption:
@@ -1047,18 +1186,38 @@ def _photo_to_row(p: Photo) -> dict:
 
 
 def save_catalog(catalog: Catalog, path: Path) -> None:
-    """Atomically serialize the catalog to `path` (write-temp-rename)."""
+    """Atomically serialize the catalog to `path` (write-temp-rename).
+
+    Multiroot header (design §5): an explicit library (catalog.library_id
+    set) writes "library_id" + a "roots" snapshot (id/path pairs — paths
+    are informational/debug only, resolution authority is library.json);
+    the implicit legacy library (no library_id) keeps the original
+    "library": str(root) header, UNCHANGED, so a single-root catalog's
+    header — and every photo row, via the absent-"R" convention below —
+    round-trips byte-identical to a pre-multiroot save."""
+    first_root_id = _expand_root_id(None, catalog.roots)
+    if catalog.library_id:
+        header: dict = {
+            "library_id": catalog.library_id,
+            "roots": [{"id": r.id, "path": str(r.path)}
+                      for r in catalog.roots],
+        }
+    else:
+        header = {"library": str(catalog.root)}
     data = {
         "version": CATALOG_VERSION,
-        "library": str(catalog.root),
-        "photos": [_photo_to_row(p) for p in catalog.photos],
-        # only folders that carry a description (title/count are derived)
-        "folders": {f.rel: f.description
-                    for f in catalog.folders.values() if f.description},
+        **header,
+        "photos": [_photo_to_row(p, first_root_id) for p in catalog.photos],
+        # only folders that carry a description (title/count are derived);
+        # the dict KEY already carries the root-id prefix convention (see
+        # _folder_json_key, applied when the folders dict is BUILT in
+        # load_catalog/scan_library) — nothing to recompute here.
+        "folders": {key: f.description
+                    for key, f in catalog.folders.items() if f.description},
         # folder-level "Hidden Folders" membership: can't be re-derived on
         # load (the warm path never re-reads inis), so persist it explicitly
         # — it drives both per-photo visibility and Folder.folder_hidden.
-        "hidden_folders": [f.rel for f in catalog.folders.values()
+        "hidden_folders": [key for key, f in catalog.folders.items()
                            if f.folder_hidden],
         # contact id -> display name registry (already contacts.xml-merged
         # at scan time; the warm path never re-reads inis or contacts.xml)
@@ -1085,7 +1244,7 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
     tmp.replace(path)
 
 
-def load_catalog(path: Path, root: Path) -> Catalog | None:
+def load_catalog(path: Path, cfg: Path | LibraryConfig) -> Catalog | None:
     """Reconstruct a Catalog from a persisted file, or None if absent,
     unreadable, or an older/foreign/corrupt format (-> caller does a cold
     walk). Derives folder/name/visible and folder title/photo_count the
@@ -1094,14 +1253,53 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
     freshly walked-AND-indexed one for every field consumers read — the
     persisted catalog carries the merged in-file caption/keywords that the
     indexer wrote, which a scan-only walk has not yet applied (see the
-    module docstring)."""
+    module docstring).
+
+    `cfg` is a LibraryConfig (multiroot .b, design §5/§6); a bare Path is
+    also accepted and auto-wrapped via library.legacy_config for source
+    compatibility with the many pre-multiroot callers that pass a plain
+    library-root path — behaviorally identical to constructing a legacy
+    config themselves.
+
+    VERSIONING (design §5): the CURRENT format (CATALOG_VERSION) validates
+    "library_id" against `cfg.library_id` for an explicit (non-legacy)
+    library — closing the previous gap where the stored library identity
+    was never checked. COMPAT: the previous CATALOG_VERSION is still
+    accepted, but ONLY when `cfg` has exactly one root — its rows carry no
+    "R" key at all, so every photo is unambiguously roots[0]. A
+    previous-version file for a multi-root library returns None (cold
+    walk): that format cannot express root disambiguation."""
+    if not isinstance(cfg, LibraryConfig):
+        cfg = legacy_config(cfg)
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict) or data.get("version") != CATALOG_VERSION:
+    if not isinstance(data, dict):
         return None
-    root = root.resolve()
+    version = data.get("version")
+    if version == CATALOG_VERSION:
+        current = True
+    elif version == PRE_MULTIROOT_VERSION and len(cfg.roots) == 1:
+        # Compat path (design §5): a v9 file predates root
+        # disambiguation entirely (no "R", no "roots" header) and is
+        # only unambiguous when the library has exactly one root — every
+        # row is then implicitly roots[0]. A HARD-CODED version number,
+        # not "CATALOG_VERSION - 1": this carve-out is specific to the
+        # v9->v10 multiroot transition and must not silently reopen for
+        # some future unrelated bump the same way every prior bump (v1
+        # through v9) rejected its immediate predecessor outright.
+        current = False
+    else:
+        return None
+    if current and not cfg.is_legacy \
+            and data.get("library_id") != cfg.library_id:
+        return None
+    if not cfg.roots:
+        return None
+    root = cfg.roots[0].path
+    root_by_id = {r.id: r for r in cfg.roots}
+    first_root_id = _expand_root_id(None, cfg.roots)
     rows = data.get("photos")
     if not isinstance(rows, list):
         return None
@@ -1121,8 +1319,12 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
             folder, _, name = rel.rpartition("/")
             g = row.get("g")
             wh = row.get("wh")
+            row_root_id = (_expand_root_id(row.get("R"), cfg.roots)
+                           if current else first_root_id)
+            folder_key = _folder_json_key(folder, row_root_id, first_root_id)
             p = Photo(
                 rel=rel, folder=folder, name=name,
+                root_id=row_root_id,
                 # media is DERIVED from the extension, like folder/name
                 media="video" if is_video_suffix(name) else "image",
                 star=int(row.get("s") or 0), caption=row.get("c"),
@@ -1137,7 +1339,7 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
                 sha256=row.get("x"),
             )
             p.visible = (not p.hidden and not _is_stashed(folder)
-                         and folder not in hidden_folders)
+                         and folder_key not in hidden_folders)
             photos.append(p)
 
         folder_desc = data.get("folders", {})
@@ -1145,16 +1347,21 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
             folder_desc = {}
         folders: dict[str, Folder] = {}
         for p in photos:
-            if p.folder not in folders:
+            key = _folder_json_key(p.folder, p.root_id, first_root_id)
+            if key not in folders:
+                p_root = root_by_id.get(p.root_id)
+                root_label = (p_root.path.name or str(p_root.path)) \
+                    if p_root is not None else (root.name or str(root))
                 title = p.folder.rsplit("/", 1)[-1] if p.folder \
-                    else (root.name or str(root))
-                folders[p.folder] = Folder(
+                    else root_label
+                folders[key] = Folder(
                     rel=p.folder, title=title,
-                    description=folder_desc.get(p.folder),
-                    folder_hidden=p.folder in hidden_folders)
-            folders[p.folder].total_count += 1  # reveal-mode count
+                    description=folder_desc.get(key),
+                    folder_hidden=key in hidden_folders,
+                    root_id=p.root_id)
+            folders[key].total_count += 1  # reveal-mode count
             if p.visible:
-                folders[p.folder].photo_count += 1
+                folders[key].photo_count += 1
 
         albums: dict[str, Album] = {}
         for a in data.get("albums", []):
@@ -1194,7 +1401,8 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
 
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
                    contacts=contacts, backfill_state=backfill_state,
-                   backfill_cursor=backfill_cursor)
+                   backfill_cursor=backfill_cursor,
+                   roots=list(cfg.roots), library_id=cfg.library_id)
 
 
 @dataclass
@@ -1217,35 +1425,46 @@ class Drift:
 def reconcile_walk(catalog: Catalog, root: Path,
                    scan_filter: ScanFilter | None = None,
                    cancel=None,
-                   exts: frozenset[str] | set[str] | None = None
+                   exts: frozenset[str] | set[str] | None = None,
+                   root_id: str = LEGACY_ROOT_ID,
                    ) -> Drift | None:
-    """Fresh walk + stat, compared to the catalog's stored signals.
-    Photos whose stored signal is absent (-1) can't be compared and are
-    never counted as modified (only a genuine size/mtime change is).
-    Returns None if the cancel event is set mid-walk, so shutdown can
-    reap the background thread promptly instead of waiting out a 100k
-    stat-walk on the join timeout. `exts` must be the SAME effective
-    extension set the catalog was walked with (walk_library docstring),
-    or every excluded file would read as phantom drift."""
+    """Fresh walk + stat of ONE root, compared to that root's slice of the
+    catalog's stored signals. Photos whose stored signal is absent (-1)
+    can't be compared and are never counted as modified (only a genuine
+    size/mtime change is). Returns None if the cancel event is set
+    mid-walk, so shutdown can reap the background thread promptly instead
+    of waiting out a 100k stat-walk on the join timeout. `exts` must be
+    the SAME effective extension set the catalog was walked with
+    (walk_library docstring), or every excluded file would read as
+    phantom drift.
+
+    `root_id` identifies which library root `root` is (default ""/
+    LEGACY_ROOT_ID — the single-root/legacy case, unchanged). The
+    reconciliation key is (root_id, rel) (design §6): comparing against
+    the catalog subset for THIS root_id only means a photo with the same
+    `rel` on a different root never counts as added/removed/modified here
+    — callers walk each root independently (design §9; looping over all
+    online roots is bead .e's job, out of this function's scope)."""
     root = root.resolve()
     files = walk_library(root, scan_filter, exts)
-    fresh: dict[str, tuple[int, int]] = {}
+    fresh: dict[tuple[str, str], tuple[int, int]] = {}
     for i, (p, rel) in enumerate(zip(files, rel_paths(root, files))):
         if cancel is not None and i % 512 == 0 and cancel.is_set():
             return None
         try:
             st = p.stat()
-            fresh[rel] = (st.st_size, int(st.st_mtime))
+            fresh[(root_id, rel)] = (st.st_size, int(st.st_mtime))
         except OSError:
-            fresh[rel] = (-1, -1)
-    old = {p.rel: (p.size, p.mtime) for p in catalog.photos}
+            fresh[(root_id, rel)] = (-1, -1)
+    old = {(p.root_id, p.rel): (p.size, p.mtime)
+           for p in catalog.photos if p.root_id == root_id}
     drift = Drift()
-    for rel, sig in fresh.items():
-        if rel not in old:
+    for key, sig in fresh.items():
+        if key not in old:
             drift.added += 1
-        elif old[rel] != (-1, -1) and old[rel] != sig:
+        elif old[key] != (-1, -1) and old[key] != sig:
             drift.modified += 1
-    for rel in old:
-        if rel not in fresh:
+    for key in old:
+        if key not in fresh:
             drift.removed += 1
     return drift

@@ -384,7 +384,13 @@ class ViewerPage(QWidget):
             return
         self.image = None
         self.loading = True
-        path = str(self.catalog.root / self.catalog.photos[idx].rel)
+        # Catalog.abs() is the single choke point for absolute-path
+        # composition (multiroot .b, design §6). An offline/unresolvable
+        # root (None) degrades to the existing unreadable-file fail-soft
+        # path below (empty path -> OSError -> null image, error tile) —
+        # the actual offline placeholder/badge is bead .e's job.
+        abs_path = self.catalog.abs(self.catalog.photos[idx])
+        path = str(abs_path) if abs_path is not None else ""
         rotate = self.catalog.photos[idx].rotate
         # Show a cached stand-in NOW — synchronous, but cheap (a <= 512 px
         # JPEG decodes in a couple of ms) — so the viewport is never blank
@@ -684,8 +690,12 @@ class ViewerPage(QWidget):
             # (q6l.8) — reveal the shown photo in the OS file manager.
             idx = self.current_index()
             if idx >= 0:
-                reveal_in_file_manager(
-                    self.catalog.root / self.catalog.photos[idx].rel)
+                # Catalog.abs() is the single choke point for absolute-path
+                # composition (multiroot .b, design §6); None means the
+                # photo's root is missing/offline — nothing to reveal.
+                target = self.catalog.abs(self.catalog.photos[idx])
+                if target is not None:
+                    reveal_in_file_manager(target)
         elif keymap.matches(event, "viewer.faces"):
             # F = face overlay (toggle_faces docstring: our own binding —
             # Picasa documents no view-mode key for face boxes).
