@@ -7576,6 +7576,33 @@ def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
     assert ent["nocomp.psd"][1][1] == 0          # the ONE intended error tile
 
 
+def test_index_one_content_probes_mis_extensioned_still(
+        tmp_path: Path) -> None:
+    """fauxcasa-tlv regression: _index_one's decode-side QImageReader for
+    an ordinary still is now PATH-constructed (QImageReader(str(path)))
+    instead of a QBuffer with an explicit suffix-derived format (the
+    46b0bab revision reverted here after that hunk was attributed to a
+    rare native access violation). A path-constructed reader restores
+    EXACT pre-fix behavior: Qt probes the file's CONTENT to pick a
+    plugin, so a PNG saved with a .jpg extension still decodes correctly
+    (content wins over suffix) rather than failing the (wrong) jpeg
+    handler and falling through to the Pillow fallback."""
+    from PIL import Image
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    Image.new("RGB", (64, 48), (40, 220, 90)).save(
+        lib / "disguised.jpg", "PNG")   # PNG bytes, .jpg extension
+
+    cat = scan_library(lib)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    (_o, length, w, h), = cache.entries
+    assert length > 0 and (w, h) == (64, 48)     # decoded, not error-tiled
+    px = _thumb_qimage(cache, 0).pixelColor(32, 24)
+    assert px.green() > 170 and px.red() < 90 and px.blue() < 140
+
+
 # ---------------------------------------------------------------------------
 # Keymap layer (fauxcasa-q6l.8): keymap.py is the single action->QKeySequence
 # default-scheme table (the spec's Picasa-compatible scheme) that grid /
