@@ -8156,10 +8156,24 @@ def test_photo_rows_byte_identical_with_and_without_roots_header(
     p1, p2 = tmp_path / "bare.json", tmp_path / "with_root.json"
     save_catalog(bare, p1)
     save_catalog(with_root, p2)
-    raw1, raw2 = json.loads(p1.read_text()), json.loads(p2.read_text())
-    assert raw1["photos"] == raw2["photos"]
+    # BYTES, not parsed dicts: dict equality would pass a key-order change
+    # that still breaks the promotion invariant's byte-identity claim.
+    assert p1.read_bytes() == p2.read_bytes()
+    raw1 = json.loads(p1.read_text())
     assert "R" not in raw1["photos"][0]
-    assert raw1["library"] == raw2["library"] == str(tmp_path)
+    assert raw1["library"] == str(tmp_path)
+    # And the row serialization itself: a roots[0] photo in an EXPLICIT
+    # multi-root catalog must emit the same row bytes as the legacy row,
+    # while a non-first-root photo gains exactly the "R" key.
+    from catalog import _photo_to_row
+    legacy_row = json.dumps(_photo_to_row(photos[0], ""))
+    photos[0].root_id = "aaaaaaaa"
+    first_root_row = json.dumps(_photo_to_row(photos[0], "aaaaaaaa"))
+    nonfirst_row = _photo_to_row(photos[0], "bbbbbbbb")
+    photos[0].root_id = ""
+    assert first_root_row == legacy_row
+    assert nonfirst_row.pop("R") == "aaaaaaaa"
+    assert json.dumps(nonfirst_row) == legacy_row
 
 
 def test_reconcile_duplicate_rel_across_roots_disambiguated(
