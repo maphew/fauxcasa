@@ -612,11 +612,15 @@ def build_cache(
         return None
     _write_fcache(out, levels, photo_levels)
 
-    if catalog.library_id:
+    if catalog.library_id or root_id != LEGACY_ROOT_ID:
         # Explicit library (multiroot .c, design §5): "library_id" instead
         # of "library", plus sidecar_version 2 and (for a non-first root)
         # the owning root_id — brand new shape, no byte-identity
-        # constraint on key order.
+        # constraint on key order. The root_id disjunct keys this decision
+        # off the same signal fcache_name() uses for the FILENAME, so a
+        # suffixed cache can never carry a legacy-shaped sidecar (unreachable
+        # by construction today — explicit roots always have a library_id —
+        # but cheap to make impossible).
         sidecar: dict = {
             "sidecar_version": 2,
             "count": total,

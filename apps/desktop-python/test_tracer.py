@@ -8531,6 +8531,23 @@ def test_cache_dir_for_legacy_digest_is_pinned() -> None:
         Path("cr") / "b997252540498434"
 
 
+def test_cache_dir_for_path_derivation_end_to_end(tmp_path: Path) -> None:
+    """The full legacy derivation main.py performs — Path -> str(resolve())
+    -> cache_dir_for — must equal sha256(str(path.resolve()))[:16] exactly
+    (the OLD cache_dir_for(path) formula). The pinned-literal test above
+    guards the hash+truncation; this one guards the path-key derivation
+    that moved from cache_dir_for into the caller, so a future drift there
+    (extra normalization, os.fspath, casefolding) fails on a real Path."""
+    import hashlib
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    expected = hashlib.sha256(
+        str(root.resolve()).encode()).hexdigest()[:16]
+    got = thumbcache.cache_dir_for(str(root.resolve()), tmp_path / "cr")
+    assert got == tmp_path / "cr" / expected
+
+
 def test_cache_dir_for_library_id_distinct_from_legacy_and_variant(
         tmp_path: Path) -> None:
     """An explicit library's key (library_id, a uuid) never collides with

@@ -347,8 +347,14 @@ def _build_one_cache(files: list[Path], walk_root: Path, out: Path,
         f.write(index)
     tmp.replace(out)
 
-    sidecar = dict(header)
-    sidecar["count"] = len(files)
+    # Key order mirrors the app writer (thumbcache.build_cache explicit
+    # branch) — no byte-identity constraint on the v2 shape, but the
+    # script/app twins stay in lockstep everywhere else (EXTS, walk rule),
+    # so keep the sidecars diff-identical too.
+    sidecar = {"sidecar_version": header["sidecar_version"],
+               "count": len(files)}
+    sidecar.update((k, v) for k, v in header.items()
+                   if k != "sidecar_version")
     sidecar["thumb_edge"] = levels[primary]
     sidecar["files"] = [p.relative_to(walk_root).as_posix() for p in files]
     if len(levels) > 1:  # informational; the header is authoritative
