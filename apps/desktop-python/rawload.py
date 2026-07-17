@@ -105,20 +105,27 @@ def raw_demosaic_qimage(data: bytes, half_size: bool):
 def load_raw_qimage(data: bytes):
     """Full RAW decode for the viewer path (viewer.load_original and the
     slideshow prefetch riding it): embedded JPEG preview first — instant
-    and usually full-size — with its own EXIF orientation auto-applied
-    (once), else a full demosaic (flip already baked by LibRaw). Returns
-    a null QImage when neither path can decode the bytes."""
-    from PySide6.QtCore import QBuffer, QIODevice
-    from PySide6.QtGui import QImageReader
+    and usually full-size — with its own EXIF orientation applied (once),
+    else a full demosaic (flip already baked by LibRaw). Returns a null
+    QImage when neither path can decode the bytes.
+
+    The preview is decoded via QImage.fromData (an internal C++ buffer)
+    rather than QBuffer + QImageReader, and its orientation is applied
+    manually with inmeta.apply_orientation instead of
+    QImageReader.setAutoTransform: a Python-created QIODevice handed to
+    QImageReader can deadlock the GIL against Qt's image-plugin factory
+    mutex (fauxcasa-5dk) — see inmeta.apply_orientation's docstring for
+    the full mechanism. The preview is guaranteed JPEG (rawpy only returns
+    ThumbFormat.JPEG here), so the format is passed explicitly."""
+    from PySide6.QtGui import QImage
+
+    from inmeta import apply_orientation
+    from metareader import read_orientation
 
     jpeg = raw_preview_jpeg(data)
     if jpeg is not None:
-        buf = QBuffer()
-        buf.setData(jpeg)  # setData copies; see thumbcache._index_one
-        buf.open(QIODevice.OpenModeFlag.ReadOnly)
-        reader = QImageReader(buf)
-        reader.setAutoTransform(True)  # the preview's OWN tag, applied once
-        img = reader.read()
+        img = QImage.fromData(jpeg, "JPEG")
         if not img.isNull():
-            return img
+            orientation = read_orientation(jpeg)  # the preview's OWN tag
+            return apply_orientation(img, orientation)
     return raw_demosaic_qimage(data, half_size=False)
