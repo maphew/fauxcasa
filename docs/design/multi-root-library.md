@@ -51,7 +51,7 @@ The important calls, in plain words:
 6. **Volume UUIDs self-heal drive-letter changes.** A root on a
    removable drive that remounts at a different letter is found
    automatically. Volume UUID support is deferred past the minimal slice
-   (see §6 and phasing §11), but the resolution chain is designed so UUID
+   (see §8 and phasing §14), but the resolution chain is designed so UUID
    support slots in without changing any other format.
 7. **The binary thumb cache format is frozen forever.** Version 1 and
    version 2 read paths are unchanged. The shipped benchmark cache remains
@@ -67,7 +67,7 @@ reconcile with N roots, the adopt-mode script extension, UI implications,
 and a phased bead-sized implementation plan.
 
 Explicitly not here: the cross-root move-detection algorithm (M2, flagged
-in §7 and the open questions), album order and view-prefs migration to the
+in §9 and the open questions), album order and view-prefs migration to the
 library home (M2 REVISIT already noted at `main.py:250-263`), flat view
 across roots (out of brief scope), hardware-accelerated volume enumeration
 beyond what `volumes.py` provides, and any implementation code — this
@@ -79,7 +79,7 @@ bead is design-first, no code changes.
 live at `cache_root/<sha256(D:/Photos)[:16]>/` containing `catalog.json`,
 `thumbs.fcache`, `thumbs.fcache.json`, `config.json`, `import-report.json`.
 They click "Add folder to library…" for the first time. This triggers
-**promotion** (§8): mint a library-home, rename the cache dir, additively
+**promotion** (§10): mint a library-home, rename the cache dir, additively
 rewrite `catalog.json`'s header. No re-walk, no re-hash, no thumbnail
 rebuild. Reversible by deleting `.fauxcasa/` — worst case is a cold walk,
 which N3 guarantees is lossless.
@@ -114,9 +114,9 @@ Concretely:
   - The walk rule must exclude `.fauxcasa/` — add it to the
     stash/exclusion filter next to `_is_stashed` in `catalog.py` and the
     twin filter in `scripts/make-thumbcache.py`. **These two changes must
-    land in the same commit** (§3 twin-rule invariant).
+    land in the same commit** (§4 twin-rule invariant).
 - **First-run creation: never implicit.** A bare dir opened by path is an
-  **implicit legacy library** (see §4) and stays that way until the user
+  **implicit legacy library** (see §10) and stays that way until the user
   does something that requires a home (adds a second root, or explicitly
   "New Library…"). This keeps Journey A's day-zero behavior bit-identical.
 
@@ -139,7 +139,7 @@ Concretely:
 ```
 
 Written with the same write-temp-rename discipline as `save_catalog`. The
-roots list order is durable and load-bearing (§3). New module:
+roots list order is durable and load-bearing (§4). New module:
 `apps/desktop-python/library.py` — `LibraryRoot`, `LibraryConfig`,
 `load_library(path)`, `save_library(cfg)`, `mint_root_id()`,
 `resolve_open_path(path)`.
@@ -157,7 +157,7 @@ lost or a root is re-adopted after removal. The marker is written on root
 addition, read on adopt-on-remount, and never required — its absence is
 not an error.
 
-**Roots snapshot inside catalog.json:** the catalog header (§4) also
+**Roots snapshot inside catalog.json:** the catalog header (§5) also
 records `roots` as a redundancy against `library.json` loss. The snapshot
 is informational: `library.json` is the resolution authority; the snapshot
 lets recovery tooling reconstruct `library.json` from a catalog alone.
@@ -177,7 +177,7 @@ Arguments for per-root files:
   root appends a new `thumbs-<id>.fcache`; removing a root leaves the
   others untouched. Design 3's "reorder = full rebuild" risk item (its
   risk 6) disappears entirely.
-- The N-mmap cold-start concern (open questions §12) is per-root file, not
+- The N-mmap cold-start concern (open questions §13) is per-root file, not
   global pages — the OS maps only the roots actually opened, and an offline
   root's fcache is opened read-only for browse, not memory-mapped into the
   walk.
@@ -189,7 +189,7 @@ Arguments for per-root files:
 The argue side: the existing fcache test and benchmark infrastructure and
 the frozen format description (`thumbcache.py:150-179`) assume one file per
 library. Migration: the legacy single-root fcache `thumbs.fcache` is the
-fcache for the implicit root (id `""`). Promotion (§8) renames it to
+fcache for the implicit root (id `""`). Promotion (§10) renames it to
 `thumbs-<root_id>.fcache`. The benchmark cache is keyed on the implicit
 legacy root — binding it in a test uses the `""` id convention, which is
 already defined.
@@ -261,7 +261,7 @@ to audit.
 **Migration for existing users:** the version gate at `catalog.py:1093`
 already means "old version → return None → cold walk." That is the N3
 escape hatch. But a cold walk at 100k re-hashes everything (backfilled
-sha256s live only in the catalog), so promotion (§8) does a
+sha256s live only in the catalog), so promotion (§10) does a
 **header-only in-place upgrade**: load old JSON, add `library_id`/`roots`,
 bump version, atomic write with the old file preserved as
 `catalog.json.bak`. Photo rows are untouched — sha256 backfill is
@@ -376,7 +376,7 @@ New module `apps/desktop-python/volumes.py`:
   via `/dev/disk/by-uuid/*` symlinks; macOS: `diskutil info -plist`. **Fail-soft
   `None`** for network shares, exFAT without a UUID, WSL, and cloud-synced
   folders. These paths will exercise the null-UUID fallback heavily — see
-  open question §12 item 4.
+  open question §13 item 3.
 - `mount_for_uuid(uuid) -> Path | None` — inverse enumeration.
 
 Each `LibraryRoot` stores `volume_uuid` + `vol_rel` (path relative to the
@@ -438,7 +438,7 @@ adopt-on-remount fallback that does not require UUID support.
   explicit pre-backfill fallback. **Pre-backfill files that move between
   roots lose per-location state** — spec-consistent but user-visible;
   needs a status-bar warning while backfill is pending. This is documented
-  in §12 open question 5.
+  in §13 open question 5.
 - **Per-root backfill state** is keyed by `root_id`, so an adopted root
   backfills independently of a fresh root's index.
 
@@ -554,7 +554,7 @@ a grep audit confirms no raw `/ photo.rel` composition exists outside
 **7. Catalog regroup on manifest reorder.** If any future operation
 regroups per-root catalog slices (e.g. root reorder in M2), a stable-sort
 bug silently corrupts per-root bind — the fcache entry for photo N is now
-paired with the wrong photo. A per-root bind parity test (§3 twin test)
+paired with the wrong photo. A per-root bind parity test (§4 twin test)
 catches this if it runs after every regroup operation. The test must be CI,
 not optional.
 
