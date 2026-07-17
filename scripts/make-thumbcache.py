@@ -15,6 +15,19 @@ language reads it in a few lines.
     uv run scripts/make-thumbcache.py [--library DIR] [--out FILE]
                                       [--levels 512,256,128]
 
+    uv run scripts/make-thumbcache.py --library-home HOME [--out-dir DIR]
+                                      [--levels 512,256,128]
+
+--library-home HOME (multiroot .c, fauxcasa-ed5.7.3, design §11) reads
+HOME/.fauxcasa/library.json and builds one thumbs-<root_id>.fcache (+ typed
+sidecar, sidecar_version 2 — design §5) per watched root, walked in
+roots-list order via the same frozen per-root walk rule as --library. Named
+--library-home rather than --library to avoid colliding with the existing
+single-directory flag above; mutually exclusive with --library/
+--sidecar-only. Output defaults to cache/<sha256(library_id)[:16]>, the same
+digest apps/desktop-python/thumbcache.py.cache_dir_for derives for an
+explicit library, so the app can warm-start from a script-built cache.
+
 Format (fcthumbs, all little-endian). Two versions share one reader; the
 version field selects the layout, so the shipped v1 benchmark cache keeps
 loading with no rebuild.
@@ -62,6 +75,7 @@ safe if the library has not changed since the cache was built.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import struct
@@ -103,6 +117,8 @@ EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
 # BOTH twins (multiroot .a, fauxcasa-ed5.7.1) or caches stop binding.
 LIBRARY_DIR = ".fauxcasa"
 ROOT_MARKER = ".fauxcasa-root"
+# Mirror of apps/desktop-python/library.py LIBRARY_FILE (multiroot .c).
+LIBRARY_FILE = "library.json"
 # Mirror of apps/desktop-python/thumbcache.py.RECOMMENDED_LEVELS — 512 is the
 # hi-DPI/loupe payload, 256 is the grid's primary, 128 a cheap low-DPI level.
 RECOMMENDED_LEVELS = (512, THUMB_EDGE, 128)
@@ -257,10 +273,178 @@ def _make_thumb(path: Path, levels: list[int]) -> list[tuple[bytes, int, int]]:
         return [(b"", 0, 0) for _ in levels]
 
 
+def fcache_name(root_id: str) -> str:
+    """Mirror of apps/desktop-python/thumbcache.py.fcache_name (multiroot
+    .c, design §3): the implicit legacy root (id "") keeps the unsuffixed
+    'thumbs.fcache' name; every explicit root gets its own
+    'thumbs-<root_id>.fcache'."""
+    return "thumbs.fcache" if root_id == "" else f"thumbs-{root_id}.fcache"
+
+
+def _load_library_home(home: Path) -> tuple[str, list[tuple[str, Path]]]:
+    """Minimal library.json reader (mirror of apps/desktop-python/
+    library.py load_library, multiroot .c, design §2/§11): returns
+    (library_id, [(root_id, root_path), ...]) in roots-list order. Unlike
+    the app's fail-soft loader (a bare dir degrades to an implicit legacy
+    library), this script has no legacy fallback to degrade to, so any
+    parse/format problem is a hard SystemExit."""
+    p = home / LIBRARY_DIR / LIBRARY_FILE
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"cannot read {p}: {e}")
+    if not isinstance(data, dict) or data.get("format") != 1:
+        raise SystemExit(f"{p}: not a format-1 library.json")
+    library_id = data.get("library_id")
+    if not library_id or not isinstance(library_id, str):
+        raise SystemExit(f"{p}: missing library_id")
+    raw_roots = data.get("roots")
+    if not isinstance(raw_roots, list) or not raw_roots:
+        raise SystemExit(f"{p}: missing/empty roots")
+    roots: list[tuple[str, Path]] = []
+    for r in raw_roots:
+        rid, rpath = r.get("id"), r.get("path")
+        if not rid or not rpath:
+            raise SystemExit(f"{p}: malformed root entry {r!r}")
+        roots.append((rid, Path(rpath)))
+    return library_id, roots
+
+
+def _build_one_cache(files: list[Path], walk_root: Path, out: Path,
+                     levels: list[int], jobs: int | None,
+                     header: dict) -> dict:
+    """Build one packed fcache + sidecar for an already-walked `files`
+    list (relative to `walk_root`) — the --library-home per-root worker.
+    `header` supplies the sidecar's identity fields (sidecar_version,
+    library_id, root_id), inserted before 'count'/'thumb_edge'/'files'.
+    Binary layout is identical to the single-root path below (same v1/v2
+    encoder, same ProcessPoolExecutor loop) — only the sidecar header and
+    the per-root file selection differ. Returns the sidecar dict written."""
+    primary = _primary_level(levels)
+    nlevels = len(levels)
+    single = _is_v1(levels)
+    header_len = 16 if single else 16 + 2 * nlevels
+    index = bytearray()
+    offset = header_len + 16 * len(files) * nlevels
+    worker = partial(_make_thumb, levels=levels)
+    tmp = out.with_suffix(".tmp")
+    with tmp.open("wb") as f:
+        f.write(b"\x00" * offset)  # header (+ level table) + index placeholder
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            for n, plist in enumerate(pool.map(worker, files, chunksize=32)):
+                for blob, w, h in plist:  # photo-major: every level of photo n
+                    index += struct.pack("<QIHH", offset, len(blob), w, h)
+                    f.write(blob)
+                    offset += len(blob)
+                if n % 10000 == 0:
+                    print(f"  {n}/{len(files)}", file=sys.stderr)
+        f.seek(0)
+        if single:
+            f.write(MAGIC + struct.pack("<III", 1, len(files), 0))
+        else:
+            f.write(MAGIC + struct.pack("<IIHH", 2, len(files), nlevels, 0))
+            f.write(struct.pack(f"<{nlevels}H", *levels))
+        f.write(index)
+    tmp.replace(out)
+
+    # Key order mirrors the app writer (thumbcache.build_cache explicit
+    # branch) — no byte-identity constraint on the v2 shape, but the
+    # script/app twins stay in lockstep everywhere else (EXTS, walk rule),
+    # so keep the sidecars diff-identical too.
+    sidecar = {"sidecar_version": header["sidecar_version"],
+               "count": len(files)}
+    sidecar.update((k, v) for k, v in header.items()
+                   if k != "sidecar_version")
+    sidecar["thumb_edge"] = levels[primary]
+    sidecar["files"] = [p.relative_to(walk_root).as_posix() for p in files]
+    if len(levels) > 1:  # informational; the header is authoritative
+        sidecar["levels"] = levels
+    out.with_suffix(".fcache.json").write_text(json.dumps(sidecar, indent=1))
+    return sidecar
+
+
+def _default_out_dir(library_id: str) -> Path:
+    """Default --library-home output dir when --out-dir is omitted: matches
+    apps/desktop-python/thumbcache.py.cache_dir_for(library_id, CACHE) with
+    no variant, so a script-built cache lands exactly where the app's
+    warm-start path looks for it."""
+    digest = hashlib.sha256(library_id.encode()).hexdigest()[:16]
+    return CACHE / digest
+
+
+def _main_library_home(args) -> int:
+    """--library-home mode (multiroot .c, design §11): read library.json,
+    walk each root in roots-list order (the two-layer walk — the in-app
+    twin is catalog.walk_roots), and write one thumbs-<root_id>.fcache (+
+    typed sidecar, sidecar_version 2, design §5) per root. Entirely
+    separate code path from the single-directory --library mode below —
+    it never touches that mode's byte-frozen output."""
+    library_id, roots = _load_library_home(args.library_home)
+
+    exts = set(EXTS)
+    if args.exclude_exts:
+        drop = {e if e.startswith(".") else "." + e
+                for e in (s.strip().lower()
+                          for s in args.exclude_exts.split(",")) if e}
+        unknown = drop - exts
+        if unknown:
+            print("--exclude-exts: unsupported extension(s): "
+                  + ", ".join(sorted(unknown)), file=sys.stderr)
+            return 2
+        exts -= drop
+
+    levels = _parse_levels(args.levels)
+    out_dir = args.out_dir if args.out_dir is not None \
+        else _default_out_dir(library_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    built_any = False
+    for root_id, root_path in roots:
+        if not root_path.is_dir():
+            print(f"root not found: {root_path} (id {root_id})",
+                  file=sys.stderr)
+            return 2
+        files = walk_library(root_path, exts)
+        if not files:
+            print(f"root {root_id} ({root_path}): no images found",
+                  file=sys.stderr)
+            continue
+        out = out_dir / fcache_name(root_id)
+        header = {
+            "sidecar_version": 2,
+            "library_id": library_id,
+            "root_id": root_id,
+        }
+        _build_one_cache(files, root_path, out, levels, args.jobs, header)
+        built_any = True
+        print(f"root {root_id}: {len(files)} thumbs -> {out}")
+    if not built_any:
+        print("no images found in any root", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--library", type=Path, default=CACHE / "benchmark-library")
     ap.add_argument("--out", type=Path, default=CACHE / "benchmark-thumbs.fcache")
+    ap.add_argument(
+        "--library-home",
+        type=Path,
+        default=None,
+        help="path to a library-home dir with .fauxcasa/library.json "
+        "(multiroot .c, design §11): build one thumbs-<root_id>.fcache "
+        "per watched root instead of a single-root cache. Overrides "
+        "--library/--out/--sidecar-only.",
+    )
+    ap.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="output directory for --library-home mode (default: "
+        "cache/<sha256(library_id)[:16]>, matching thumbcache.cache_dir_for "
+        "so the app can warm-start from a script-built cache)",
+    )
     ap.add_argument("--jobs", type=int, default=None)
     ap.add_argument(
         "--levels",
@@ -295,6 +479,8 @@ def main(argv: list[str] | None = None) -> int:
         "sidecar's files array disagrees with the fresh walk",
     )
     args = ap.parse_args(argv)
+    if args.library_home is not None:
+        return _main_library_home(args)
     levels = _parse_levels(args.levels)
     primary = _primary_level(levels)
     if not args.library.is_dir():

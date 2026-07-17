@@ -408,6 +408,17 @@ class Catalog:
                 return r.path / photo.rel
         return None
 
+    def photos_for_root(self, root_id: str) -> list[Photo]:
+        """This root's contiguous slice of `photos` (design §3/§4/§7: bead
+        .c's per-root cache binding needs exactly this walk-order subset).
+        Filters on `Photo.root_id` alone — independent of whether `roots`
+        happens to be populated — so it works for both a scan_library()/
+        load_catalog() catalog and a bare test fixture. LEGACY_ROOT_ID
+        ("") is every photo in an unpromoted single-root catalog, so this
+        is a no-op filter for the byte-identical legacy path (design §3's
+        "no rename or rewrite" guarantee)."""
+        return [p for p in self.photos if p.root_id == root_id]
+
 
 def _image_size(path: Path) -> tuple[int, int] | None:
     """Read dimensions without decoding pixels. None means unreadable/unknown,
