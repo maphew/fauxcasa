@@ -87,6 +87,7 @@ from catalog import (  # noqa: E402
     save_report,
     scan_library,
 )
+from db3rescue import default_db3_dir  # noqa: E402
 from filetypes import (  # noqa: E402
     FileTypesDialog,
     effective_exts,
@@ -600,7 +601,8 @@ class MainWindow(QMainWindow):
                  contacts: dict[str, str] | None = None,
                  pal_dir: Path | None = None,
                  excluded_exts: set[str] | None = None,
-                 thumbs_path: Path | None = None):
+                 thumbs_path: Path | None = None,
+                 db3_dir: Path | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
@@ -621,6 +623,9 @@ class MainWindow(QMainWindow):
         # Picasa2Albums .pal directory, kept for the same reason: a
         # reconcile rescan must merge albums the way the startup scan did
         self.pal_dir = pal_dir
+        # machine-local db3 directory (fauxcasa-cam.6/.7), same reason: a
+        # reconcile rescan must rescue person names the way startup did
+        self.db3_dir = db3_dir
         self.cache_root = cache_root or (
             cache_dir.parent if cache_dir is not None else _default_cache_root()
         )
@@ -893,7 +898,7 @@ class MainWindow(QMainWindow):
             try:
                 fresh = scan_library(old.root, self.scan_filter,
                                      self.contacts, self.pal_dir,
-                                     exts=self.exts)
+                                     exts=self.exts, db3_dir=self.db3_dir)
                 result = build_cache(fresh, cache_dir, None,
                                      cancel=self.build_cancel)
                 if result is None:
@@ -1293,6 +1298,12 @@ class MainWindow(QMainWindow):
         # Counts are live: rebuilt with the sidebar on reveal/reconcile.
         people, unnamed = self._people_counts()
         if people or unnamed:
+            # db3-rescued people are source-flagged (fauxcasa-cam.7): the
+            # name exists only because the §4 rescue importer read it from
+            # a machine-local db3 person album — provenance in the tooltip,
+            # like a .pal-sourced album's.
+            db3_names = {cat.contacts[c] for c in cat.db3_contacts
+                         if c in cat.contacts}
             people_root = QTreeWidgetItem(t, ["People"])
             people_root.setFlags(
                 people_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
@@ -1300,6 +1311,11 @@ class MainWindow(QMainWindow):
                 item = QTreeWidgetItem(
                     people_root, [f"{person}  ({people[person]})"])
                 item.setData(0, Qt.ItemDataRole.UserRole, ("person", person))
+                if person in db3_names:
+                    item.setToolTip(
+                        0, "Name rescued from the Picasa db3 database — "
+                           "no .picasa.ini or contacts.xml names this "
+                           "person (see import notes)")
             if unnamed:
                 item = QTreeWidgetItem(
                     people_root, [f"Unnamed faces  ({unnamed})"])
@@ -1874,6 +1890,13 @@ def main() -> int:
                          "membership, .pal fills gaps; default: the "
                          "machine-local Picasa2Albums under "
                          "%%LocalAppData%%\\Google\\Picasa2 when present)")
+    ap.add_argument("--db3", type=Path, default=None,
+                    help="Picasa db3 directory for the §4 rescue import "
+                         "(read-only; person-album names gap-fill contacts "
+                         "the ini/contacts.xml never named; default: the "
+                         "machine-local db3 under "
+                         "%%LocalAppData%%\\Google\\Picasa2 when present — "
+                         "use this flag for PicasaStarter relocations)")
     ap.add_argument("--min-image-size", type=_parse_image_size_arg,
                     metavar="WIDTHxHEIGHT",
                     help="ignore images smaller than WIDTHxHEIGHT during "
@@ -1962,6 +1985,19 @@ def main() -> int:
     if pal_dir is not None:
         log.info("albums: merging .pal files from %s", pal_dir)
 
+    # db3 rescue import (fauxcasa-cam.6/.7): an explicit --db3 wins (the
+    # PicasaStarter-relocation case), else the machine-local db3 default
+    # when present. Same read-only-enrichment posture as contacts.xml /
+    # --pal-dir: absence is never fatal, an explicitly named directory
+    # that doesn't exist earns a warning, not silence.
+    db3_dir = args.db3 or default_db3_dir()
+    if db3_dir is not None and not db3_dir.is_dir():
+        if args.db3 is not None:
+            log.warning("--db3 %s is not a directory; ignored", db3_dir)
+        db3_dir = None
+    if db3_dir is not None:
+        log.info("db3: rescue import from %s", db3_dir)
+
     # Data prep. Try a WARM start first: load the persisted catalog (no
     # walk) and bind it to the thumbnail cache. Else fall back to a COLD
     # walk + build (or adopt an external --thumbs cache). The cache dir is
@@ -1995,7 +2031,7 @@ def main() -> int:
 
     if catalog is None:  # cold path
         catalog = scan_library(root, scan_filter, contacts, pal_dir,
-                               exts=exts)
+                               exts=exts, db3_dir=db3_dir)
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
@@ -2040,7 +2076,7 @@ def main() -> int:
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
                      contacts=contacts, pal_dir=pal_dir,
                      excluded_exts=excluded_exts,
-                     thumbs_path=args.thumbs)
+                     thumbs_path=args.thumbs, db3_dir=db3_dir)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)

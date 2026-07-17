@@ -36,6 +36,7 @@ from catalog import (
     save_catalog,
     save_catalog_retrying,
 )
+from cropmap import crop_pixel_box, crop_qimage_upright
 from inmeta import read_jpeg_metadata
 from metareader import read_file_meta
 from pillowload import pillow_qimage, tiff_is_16bit
@@ -340,6 +341,27 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     quarter-turns are a separate, live display transform composed on top (see
     grid/viewer); a rotate change never invalidates the cache.
 
+    The Picasa crop= recipe is baked here too (fauxcasa-cam.15), like EXIF
+    orientation and UNLIKE rotate= — the asymmetry is the point: a crop
+    changes WHICH stored pixels are shown, so it must change the cached
+    pixels themselves, and a crop CHANGE therefore invalidates the
+    thumbnail (the CATALOG_VERSION v10 rejection forces the cold walk +
+    fcache rebuild that re-bakes it), while rotate= remains a cheap live
+    whole-image transform in paint that never touches the cache. The crop
+    is applied BEFORE the downscale in resolution terms: the scaled-decode
+    target below is computed for the crop SUB-RECT, so a tight crop keeps
+    the full ~`top` px of detail instead of being cut from an
+    already-small thumb; and before the per-level loop, so every fcache
+    level carries it. Coordinates: crop= fractions are STORED-frame while
+    the decoded image is EXIF-upright, so the rect maps through the
+    photo's orientation tag (cropmap.crop_qimage_upright — crop-then-
+    orient by construction; metareader.read_orientation on the same bytes
+    the decode consumed, which for a RAW's embedded preview is the
+    preview's own tag). Adopt-mode caches are prebuilt elsewhere and the
+    backfill does no thumbnail work, so their thumbs show recipe crops
+    only after a rebuild — the shipped benchmark corpus carries no recipe
+    keys, so this is a documented no-op today.
+
     RAW files are routed BY EXTENSION before QImageReader ever sniffs the
     bytes (TIFF-based RAW containers would fool it — rawload module doc):
     the embedded JPEG preview, when present, simply becomes the bytes the
@@ -364,6 +386,9 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
 
     data, size, mtime, sha, meta, fmeta = read_photo_meta(root, photo)
     is_video = is_video_suffix(photo.rel)
+    # The ini crop= recipe to bake (docstring above). getattr keeps the
+    # builder tolerant of pre-v10 Photo objects handed in by tests.
+    crop = getattr(photo, "crop", None)
 
     img = None
     if data and is_video:
@@ -401,10 +426,23 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
             # header that couldn't be pre-sized.
             reader.setAutoTransform(True)
             sz = reader.size()  # header-only; full pixels not decoded yet
-            if sz.isValid() and (sz.width() > top or sz.height() > top):
-                s = min(top / sz.width(), top / sz.height())
-                reader.setScaledSize(QSize(max(1, round(sz.width() * s)),
-                                           max(1, round(sz.height() * s))))
+            if sz.isValid():
+                # The pixels we will KEEP must fit the top-level box. With a
+                # crop= recipe the kept pixels are the crop SUB-RECT, so the
+                # scale factor is chosen for it (both crop and setScaledSize
+                # are in pre-transform/stored pixels): this is what makes the
+                # bake "crop before downscale" — decoding the whole image to
+                # ~top px first and cropping after would throw away exactly
+                # the resolution the crop zooms into.
+                kw, kh = sz.width(), sz.height()
+                if crop is not None:
+                    box = crop_pixel_box(crop, kw, kh)
+                    if box is not None:
+                        kw, kh = box[2], box[3]
+                if kw > top or kh > top:
+                    s = min(top / kw, top / kh)
+                    reader.setScaledSize(QSize(max(1, round(sz.width() * s)),
+                                               max(1, round(sz.height() * s))))
             img = reader.read()
             if img.isNull() and data:
                 # Qt yielded null for a still (no PSD plugin ships with Qt;
@@ -416,7 +454,18 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     if img.isNull():
         return (idx, [(b"", 0, 0) for _ in levels], size, mtime, sha,
                 meta, fmeta, None)
-    # formats whose header size was unreadable skip the scaled decode above
+    if crop is not None:
+        # Bake the crop (docstring): the decoded image is EXIF-upright on
+        # every path (autoTransform / LibRaw / a poster frame's implicit
+        # 1), so map the stored-frame rect through the orientation tag
+        # read from the SAME bytes the decode consumed. Fail-soft by
+        # construction (a degenerate rect leaves the image whole).
+        orientation = 1
+        if data and not is_video:
+            orientation = metareader.read_orientation(data)
+        img = crop_qimage_upright(img, crop, orientation)
+    # formats whose header size was unreadable skip the scaled decode
+    # above; an oversized crop region lands here too and is clamped
     if img.width() > top or img.height() > top:
         img = img.scaled(
             top, top,
