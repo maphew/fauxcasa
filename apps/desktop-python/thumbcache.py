@@ -260,7 +260,7 @@ class IndexResult:
         return self.photos / self.elapsed_s if self.elapsed_s > 0 else 0.0
 
 
-def read_photo_meta(root: Path, photo):
+def read_photo_meta(src: Path | None, photo):
     """The READ side of indexing one photo — bytes, identity signals, and
     in-file metadata — shared by the indexer (_index_one continues into the
     thumbnail decode) and the adopt-mode backfill (backfill_catalog, which
@@ -270,9 +270,17 @@ def read_photo_meta(root: Path, photo):
     the two metadata reads come from the bytes already in hand —
     caption/keywords (inmeta, XMP/IPTC, JPEG only) plus capture date / GPS /
     XMP Rating (metareader, the exiv2 seam, all carriers). An unreadable
-    file fails soft: empty bytes, -1 signals, empty metadata."""
-    src = root / photo.rel
+    file fails soft: empty bytes, -1 signals, empty metadata.
+
+    `src` is the photo's already-resolved absolute path (multiroot .b,
+    design §6) — callers compute it via Catalog.abs(photo), the single
+    choke point for root lookup + path composition, BEFORE dispatching to
+    a worker thread. `src is None` means abs() couldn't resolve the
+    photo's root (missing/offline — bead .e wires the actual offline UX);
+    it fails soft exactly like an unreadable file."""
     try:
+        if src is None:
+            raise OSError("photo's root is unresolved/offline")
         data = src.read_bytes()
         st = src.stat()
         size, mtime = st.st_size, int(st.st_mtime)
@@ -325,7 +333,7 @@ def apply_photo_meta(photo, size: int, mtime: int, sha: str,
         photo.star = fmeta.rating
 
 
-def _index_one(root: Path, photo, idx: int, levels: list[int]):
+def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
     """One photo: read bytes + signals + in-file metadata (read_photo_meta),
     then SCALED-decode ONCE to the top (largest) level's box (libjpeg DCT
     decode — see INDEX_WORKERS), downscale that decoded image to each lower
@@ -384,8 +392,7 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     top = levels[0]  # largest edge (levels are descending)
     primary_li = _primary_level(levels)
 
-    src = root / photo.rel
-    data, size, mtime, sha, meta, fmeta = read_photo_meta(root, photo)
+    data, size, mtime, sha, meta, fmeta = read_photo_meta(src, photo)
     is_video = is_video_suffix(photo.rel)
     # The ini crop= recipe to bake (docstring above). getattr keeps the
     # builder tolerant of pre-v10 Photo objects handed in by tests.
@@ -617,7 +624,11 @@ def build_cache(
 
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=INDEX_WORKERS) as pool:
-        futs = [pool.submit(_index_one, catalog.root, p, i, levels)
+        # Catalog.abs() resolved HERE, in the submitting thread, before
+        # dispatch (design §6 choke point) — a photo whose root is
+        # missing/offline gets None and _index_one/read_photo_meta fail
+        # soft on it (error tile), same as an unreadable file today.
+        futs = [pool.submit(_index_one, catalog.abs(p), p, i, levels)
                 for i, p in enumerate(catalog.photos)]
         for fut in as_completed(futs):
             if cancel is not None and cancel.is_set():
@@ -757,8 +768,11 @@ def backfill_catalog(
         def top_up() -> None:
             nonlocal nxt
             while nxt < total and len(window) < workers:
+                # Catalog.abs() resolved here, in the submitting thread
+                # (design §6 choke point) — see build_cache's comment.
                 window.append(
-                    (nxt, pool.submit(read_photo_meta, catalog.root,
+                    (nxt, pool.submit(read_photo_meta,
+                                      catalog.abs(catalog.photos[nxt]),
                                       catalog.photos[nxt])))
                 nxt += 1
 

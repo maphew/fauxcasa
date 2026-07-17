@@ -180,7 +180,13 @@ class SlideshowPage(ViewerPage):
             serial = self._prefetch_serial
             self._prefetched = None    # drop a stale neighbour
         photo = self.catalog.photos[nxt]
-        path = str(self.catalog.root / photo.rel)
+        # Catalog.abs() is the single choke point for absolute-path
+        # composition (multiroot .b, design §6). An offline/unresolvable
+        # root (None) degrades to the same fail-soft path as an unreadable
+        # file (empty path -> OSError -> null image) — the actual offline
+        # placeholder/badge is bead .e's job.
+        abs_path = self.catalog.abs(photo)
+        path = str(abs_path) if abs_path is not None else ""
         rotate = photo.rotate
         crop = photo.crop  # unsaved crop recipe rides along (cam.15)
 

@@ -6185,10 +6185,11 @@ def test_db3_catalog_roundtrip_v11(db3_library: Path,
     db3_contacts source flag survive the persisted catalog, and a v10
     catalog (scanned before the rescue existed) is rejected so a warm
     start cold-rebuilds instead of silently un-naming rescued people.
-    (== 11: the newest version-gate test pins the exact value.)"""
+    (>= 11: the exact current value is pinned by the newest version-gate
+    test, test_multiroot_two_root_save_load_roundtrip_v12.)"""
     import catalog as catmod
 
-    assert catmod.CATALOG_VERSION == 11
+    assert catmod.CATALOG_VERSION >= 11
     db3 = _make_person_db3(
         tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
         ["a.jpg", "b.jpg"], face_parent=1)
@@ -6912,7 +6913,11 @@ def test_video_catalog_roundtrip_media_and_dims(tmp_path: Path) -> None:
     assert all("media" not in r for r in rows)  # derived, never persisted
 
     data = json.loads(path.read_text())
-    data["version"] = catmod.CATALOG_VERSION - 1
+    # -2, not -1: CATALOG_VERSION - 1 is now the multiroot-compat boundary
+    # (fauxcasa-ed5.7.2 — a single-root library still loads it, see
+    # test_multiroot_old_version_single_root_still_loads), so genuinely
+    # stale/incompatible formats start two versions back.
+    data["version"] = catmod.CATALOG_VERSION - 2
     path.write_text(json.dumps(data))
     assert load_catalog(path, root) is None     # pre-video: cold-rebuild
 
@@ -7348,7 +7353,7 @@ def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
 
     # v9 (TGA/PSD stills, fauxcasa-v46.4) through v10 (edit recipes,
     # fauxcasa-cam.15): the exact current value is pinned by the newest
-    # version-gate test (test_db3_catalog_roundtrip_v11).
+    # version-gate test (test_multiroot_two_root_save_load_roundtrip_v12).
     assert catmod.CATALOG_VERSION >= 9
     cat.backfill_state = BACKFILL_COMPLETE
     save_catalog(cat, path)
@@ -8986,7 +8991,7 @@ def test_catalog_v10_crop_roundtrip_and_version_gate(tmp_path: Path) -> None:
     check could notice an ini-only interpretation change)."""
     from catalog import CATALOG_VERSION
 
-    assert CATALOG_VERSION >= 10  # exact value pinned by the v11 test
+    assert CATALOG_VERSION >= 10  # exact value pinned by the v12 test
     root = tmp_path / "lib"
     make_jpeg(root / "f" / "a.jpg")
     make_jpeg(root / "f" / "b.jpg")
@@ -9094,8 +9099,11 @@ def test_thumb_crop_composes_with_exif_orientation(tmp_path: Path) -> None:
         "[a.jpg]\r\ncrop=rect64(400080008000c000)\r\n")  # == the red patch
     cat = scan_library(root)
     assert cat.photos[0].crop == (0.25, 0.5, 0.5, 0.75)
+    # _index_one's first arg is the ALREADY-RESOLVED absolute path
+    # (multiroot .b, design §6 — Catalog.abs() is the choke point), not
+    # the library root: callers resolve it before dispatch.
     _idx, blobs, *_rest, primary = thumbcache._index_one(
-        root, cat.photos[0], 0, [thumbcache.THUMB_EDGE])
+        cat.abs(cat.photos[0]), cat.photos[0], 0, [thumbcache.THUMB_EDGE])
     # stored region 24x16 -> orientation 6 swaps -> 16x24 upright, < 256
     # so never upscaled
     assert (primary.width(), primary.height()) == (16, 24)
@@ -9678,3 +9686,281 @@ def test_linux_reveal_does_not_block_key_handler(tmp_path: Path,
 
     # Probe must be fully reaped — no live QProcess leaks into the next test.
     assert _spin(app, lambda: not locate._pending)
+
+
+# ---- multiroot catalog plumbing (fauxcasa-ed5.7.2, bead .b) ---------------
+
+
+def test_walk_roots_tags_and_orders_by_root(tmp_path: Path) -> None:
+    """walk_roots (design §4): each root's frozen walk_library order,
+    independently, chained in cfg.roots list order, every hit tagged with
+    that root's id."""
+    from catalog import walk_roots
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    make_jpeg(root_a / "z.jpg")
+    make_jpeg(root_a / "a.jpg")
+    make_jpeg(root_b / "m.jpg")
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    cfg = libmod.LibraryConfig(
+        library_id=libmod.mint_library_id(), name="",
+        roots=[libmod.LibraryRoot(id=id_a, path=root_a),
+               libmod.LibraryRoot(id=id_b, path=root_b)],
+        home=tmp_path,
+    )
+    hits = walk_roots(cfg)
+    assert [rid for rid, _ in hits] == [id_a, id_a, id_b]
+    # per-root order matches walk_library's own frozen (sorted) order
+    assert [p.name for rid, p in hits if rid == id_a] == ["a.jpg", "z.jpg"]
+    assert [p.name for rid, p in hits if rid == id_b] == ["m.jpg"]
+
+
+def test_multiroot_two_root_save_load_roundtrip_v12(tmp_path: Path) -> None:
+    """A 2-root explicit-library catalog round-trips (design §5/§6): the
+    header carries library_id + a roots snapshot, roots[0]'s photo needs
+    no "R" (absent means roots[0]), the second root's photo carries an
+    explicit "R", and Catalog.roots/library_id survive the reload.
+    (== 12: the newest version-gate test pins the exact value.)"""
+    import catalog as catmod
+    from catalog import Catalog, Folder, Photo
+
+    assert catmod.CATALOG_VERSION == 12
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    lib_id = libmod.mint_library_id()
+
+    cat = Catalog(
+        root=root_a,
+        photos=[
+            Photo(rel="1.jpg", folder="", name="1.jpg", root_id=id_a),
+            Photo(rel="2.jpg", folder="", name="2.jpg", root_id=id_b),
+        ],
+        folders={
+            "": Folder(rel="", title="a", photo_count=1, total_count=1,
+                      root_id=id_a),
+            id_b: Folder(rel="", title="b", photo_count=1, total_count=1,
+                         root_id=id_b),
+        },
+        albums={},
+        roots=[libmod.LibraryRoot(id=id_a, path=root_a),
+               libmod.LibraryRoot(id=id_b, path=root_b)],
+        library_id=lib_id,
+    )
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    raw = json.loads(path.read_text())
+    assert raw["library_id"] == lib_id
+    assert raw["roots"] == [{"id": id_a, "path": str(root_a)},
+                            {"id": id_b, "path": str(root_b)}]
+    assert "library" not in raw
+    rows = {r["r"]: r for r in raw["photos"]}
+    assert "R" not in rows["1.jpg"]            # roots[0]: absent means first
+    assert rows["2.jpg"]["R"] == id_b
+
+    cfg = libmod.LibraryConfig(library_id=lib_id, name="",
+                               roots=cat.roots, home=tmp_path)
+    loaded = load_catalog(path, cfg)
+    assert loaded is not None
+    assert loaded.library_id == lib_id
+    assert [r.id for r in loaded.roots] == [id_a, id_b]
+    p1 = next(p for p in loaded.photos if p.rel == "1.jpg")
+    p2 = next(p for p in loaded.photos if p.rel == "2.jpg")
+    assert p1.root_id == id_a and p2.root_id == id_b
+
+    # Wrong library_id -> rejected (closes the old "library field never
+    # checked" gap for explicit libraries, design §5).
+    wrong_cfg = libmod.LibraryConfig(library_id=libmod.mint_library_id(),
+                                     name="", roots=cat.roots, home=tmp_path)
+    assert load_catalog(path, wrong_cfg) is None
+
+
+def test_photo_rows_byte_identical_with_and_without_roots_header(
+        tmp_path: Path) -> None:
+    """Promotion invariant (design §5/§8): a legacy catalog's photo rows
+    are byte-identical whether or not Catalog.roots happens to be
+    populated, as long as every photo's root_id is "" (roots[0] either
+    way) — promotion rewrites ONLY the header, never a photo row."""
+    from catalog import Catalog, Folder, Photo
+
+    photos = [Photo(rel="a.jpg", folder="", name="a.jpg", star=2,
+                    caption="hi", sha256="deadbeef", size=10, mtime=100)]
+    folders = {"": Folder(rel="", title="x", photo_count=1, total_count=1)}
+
+    bare = Catalog(root=tmp_path, photos=photos, folders=folders, albums={})
+    with_root = Catalog(root=tmp_path, photos=photos, folders=folders,
+                        albums={},
+                        roots=[libmod.LibraryRoot(id="", path=tmp_path)])
+
+    p1, p2 = tmp_path / "bare.json", tmp_path / "with_root.json"
+    save_catalog(bare, p1)
+    save_catalog(with_root, p2)
+    # BYTES, not parsed dicts: dict equality would pass a key-order change
+    # that still breaks the promotion invariant's byte-identity claim.
+    assert p1.read_bytes() == p2.read_bytes()
+    raw1 = json.loads(p1.read_text())
+    assert "R" not in raw1["photos"][0]
+    assert raw1["library"] == str(tmp_path)
+    # And the row serialization itself: a roots[0] photo in an EXPLICIT
+    # multi-root catalog must emit the same row bytes as the legacy row,
+    # while a non-first-root photo gains exactly the "R" key.
+    from catalog import _photo_to_row
+    legacy_row = json.dumps(_photo_to_row(photos[0], ""))
+    photos[0].root_id = "aaaaaaaa"
+    first_root_row = json.dumps(_photo_to_row(photos[0], "aaaaaaaa"))
+    nonfirst_row = _photo_to_row(photos[0], "bbbbbbbb")
+    photos[0].root_id = ""
+    assert first_root_row == legacy_row
+    assert nonfirst_row.pop("R") == "aaaaaaaa"
+    assert json.dumps(nonfirst_row) == legacy_row
+
+
+def test_reconcile_duplicate_rel_across_roots_disambiguated(
+        tmp_path: Path) -> None:
+    """Two roots each have "img.jpg" — reconcile_walk's (root_id, rel) key
+    (design §6) means walking one root never sees the other root's
+    same-named photo as added/removed, and each root's drift is tracked
+    independently."""
+    from catalog import Catalog, Photo
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    make_jpeg(root_a / "img.jpg")
+    make_jpeg(root_b / "img.jpg")
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+
+    def sig(p: Path) -> tuple[int, int]:
+        st = p.stat()
+        return st.st_size, int(st.st_mtime)
+
+    sa, sb = sig(root_a / "img.jpg"), sig(root_b / "img.jpg")
+    photos = [
+        Photo(rel="img.jpg", folder="", name="img.jpg", root_id=id_a,
+              size=sa[0], mtime=sa[1]),
+        Photo(rel="img.jpg", folder="", name="img.jpg", root_id=id_b,
+              size=sb[0], mtime=sb[1]),
+    ]
+    cat = Catalog(root=root_a, photos=photos, folders={}, albums={},
+                  roots=[libmod.LibraryRoot(id=id_a, path=root_a),
+                         libmod.LibraryRoot(id=id_b, path=root_b)])
+
+    drift_a = reconcile_walk(cat, root_a, root_id=id_a)
+    drift_b = reconcile_walk(cat, root_b, root_id=id_b)
+    assert drift_a is not None and not drift_a.changed
+    assert drift_b is not None and not drift_b.changed
+
+    # Delete root_b's copy only: root_a's reconcile must still see NO
+    # drift, root_b's must see exactly one removal — never double-counted
+    # or cross-attributed thanks to the (root_id, rel) key.
+    (root_b / "img.jpg").unlink()
+    drift_a2 = reconcile_walk(cat, root_a, root_id=id_a)
+    drift_b2 = reconcile_walk(cat, root_b, root_id=id_b)
+    assert drift_a2 is not None and not drift_a2.changed
+    assert drift_b2 is not None
+    assert drift_b2.removed == 1 and drift_a2.removed == 0
+
+
+def test_catalog_abs_none_for_unknown_root(tmp_path: Path) -> None:
+    """Catalog.abs() is the single choke point for absolute-path
+    composition (design §6): a known root resolves normally; a photo
+    whose root_id isn't in Catalog.roots at all (offline/unresolvable)
+    returns None instead of raising or guessing at a path."""
+    from catalog import Catalog, Photo
+
+    root_a = tmp_path / "a"
+    photo_known = Photo(rel="x.jpg", folder="", name="x.jpg",
+                        root_id="aaaaaaaa")
+    photo_unknown = Photo(rel="y.jpg", folder="", name="y.jpg",
+                          root_id="ffffffff")
+    cat = Catalog(root=root_a, photos=[photo_known, photo_unknown],
+                  folders={}, albums={},
+                  roots=[libmod.LibraryRoot(id="aaaaaaaa", path=root_a)])
+
+    assert cat.abs(photo_known) == root_a / "x.jpg"
+    assert cat.abs(photo_unknown) is None
+
+
+def test_folder_key_prefix_convention_roundtrip(tmp_path: Path) -> None:
+    """Folder identity in the persisted "folders"/"hidden_folders" maps
+    (design §5): roots[0]'s folder keys are bare rel; every other root's
+    folder is prefixed "<root_id>/<rel>" so same-named folders across
+    roots (e.g. a "2019" folder on two drives) don't collide. A root's
+    OWN top-level folder (rel == "") collapses to the bare root_id, no
+    trailing slash."""
+    from catalog import Catalog, Folder, Photo
+
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    photos = [
+        Photo(rel="2019/x.jpg", folder="2019", name="x.jpg", root_id=id_a),
+        Photo(rel="2019/y.jpg", folder="2019", name="y.jpg", root_id=id_b),
+        Photo(rel="z.jpg", folder="", name="z.jpg", root_id=id_b),
+    ]
+    folders = {
+        "2019": Folder(rel="2019", title="2019", description="root A 2019",
+                       photo_count=1, total_count=1, root_id=id_a),
+        f"{id_b}/2019": Folder(rel="2019", title="2019",
+                              description="root B 2019", photo_count=1,
+                              total_count=1, root_id=id_b,
+                              folder_hidden=True),
+        id_b: Folder(rel="", title="b", photo_count=1, total_count=1,
+                     root_id=id_b),
+    }
+    cat = Catalog(root=root_a, photos=photos, folders=folders, albums={},
+                  roots=[libmod.LibraryRoot(id=id_a, path=root_a),
+                         libmod.LibraryRoot(id=id_b, path=root_b)],
+                  library_id=libmod.mint_library_id())
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+    raw = json.loads(path.read_text())
+    assert raw["folders"] == {"2019": "root A 2019",
+                              f"{id_b}/2019": "root B 2019"}
+    assert raw["hidden_folders"] == [f"{id_b}/2019"]
+
+    cfg = libmod.LibraryConfig(library_id=cat.library_id, name="",
+                               roots=cat.roots, home=tmp_path)
+    loaded = load_catalog(path, cfg)
+    assert loaded is not None
+    assert set(loaded.folders) == {"2019", f"{id_b}/2019", id_b}
+    assert loaded.folders["2019"].root_id == id_a
+    assert loaded.folders[f"{id_b}/2019"].root_id == id_b
+    assert loaded.folders[f"{id_b}/2019"].folder_hidden
+    y = next(p for p in loaded.photos if p.rel == "2019/y.jpg")
+    assert not y.visible   # folder_hidden forces invisibility
+
+
+def test_old_version_compat_single_root_vs_multi_root(
+        library: Path, tmp_path: Path) -> None:
+    """Compat rule (design §5): a PRE_MULTIROOT_VERSION (v11 — the last
+    format before root_id/roots plumbing landed) file still loads when
+    the library passed to load_catalog has exactly one root — every row
+    is then implicitly roots[0]. The SAME file is rejected outright (cold
+    walk) when the library has more than one root: a pre-multiroot file
+    predates root disambiguation and cannot express it."""
+    import catalog as catmod
+
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    data = json.loads(path.read_text())
+    assert data["version"] == catmod.CATALOG_VERSION
+    data["version"] = catmod.PRE_MULTIROOT_VERSION
+    path.write_text(json.dumps(data))
+
+    single_root_cfg = libmod.legacy_config(library)
+    loaded = load_catalog(path, single_root_cfg)
+    assert loaded is not None
+    assert all(p.root_id == "" for p in loaded.photos)
+
+    other = tmp_path / "other-root"
+    other.mkdir()
+    multi_cfg = libmod.LibraryConfig(
+        library_id=libmod.mint_library_id(), name="",
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=library),
+               libmod.LibraryRoot(id="bbbbbbbb", path=other)],
+        home=tmp_path,
+    )
+    assert load_catalog(path, multi_cfg) is None
