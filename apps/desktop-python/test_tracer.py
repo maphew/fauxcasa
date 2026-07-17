@@ -7612,6 +7612,121 @@ def test_metareader_read_orientation() -> None:
     assert metareader.read_orientation(b"\xff\xd8 not really a jpeg") == 1
 
 
+# ---------------------------------------------------------------------------
+# fauxcasa-5dk: a proven GIL <-> Qt-mutex lock inversion (live py-spy native
+# dump) made QImageReader-over-a-Python-QBuffer unsafe for decode, so
+# inmeta.apply_orientation now applies EXIF orientation manually after a
+# QImage.fromData decode (viewer.load_original_oriented, rawload.
+# load_raw_qimage) instead of via QImageReader.setAutoTransform. These tests
+# are the regression net: apply_orientation must keep producing the exact
+# same pixels the old setAutoTransform path did.
+# ---------------------------------------------------------------------------
+
+def test_apply_orientation_pixel_transforms() -> None:
+    """Unit-level check of all 8 EXIF Orientation values on a small,
+    doubly-asymmetric (both axes) 2x3 image with a distinct color in each
+    corner. Cross-checked against _qt_display_transform — the independent
+    Qt-transform reference already used to validate the face-overlay math
+    (map_face_fraction) — for a full pixel-exact image comparison at every
+    orientation, plus explicit corner-pixel and dimension-swap assertions
+    per orientation."""
+    _offscreen_app()
+    from PySide6.QtGui import QColor, QImage
+
+    from inmeta import apply_orientation
+
+    w, h = 2, 3
+    img = QImage(w, h, QImage.Format.Format_RGB32)
+    img.fill(QColor(10, 10, 10))
+    tl, tr = QColor(255, 0, 0), QColor(0, 255, 0)
+    bl, br = QColor(0, 0, 255), QColor(255, 255, 0)
+    img.setPixelColor(0, 0, tl)
+    img.setPixelColor(w - 1, 0, tr)
+    img.setPixelColor(0, h - 1, bl)
+    img.setPixelColor(w - 1, h - 1, br)
+
+    fmt = QImage.Format.Format_ARGB32  # rotate()/transformed() promote to
+    # this (or its premultiplied twin) while mirrored() keeps RGB32 — settle
+    # on one common format so `==` compares pixels, not incidental storage.
+    for orientation in range(1, 9):
+        expected = _qt_display_transform(img, orientation)
+        got = apply_orientation(img, orientation)
+        assert (got.width(), got.height()) == \
+            (expected.width(), expected.height())
+        assert got.convertToFormat(fmt) == expected.convertToFormat(fmt)
+
+    assert (apply_orientation(img, 1).width(),
+            apply_orientation(img, 1).height()) == (w, h)
+
+    o2 = apply_orientation(img, 2)         # mirror-H: left/right swap
+    assert o2.pixelColor(0, 0) == tr and o2.pixelColor(w - 1, 0) == tl
+    assert o2.pixelColor(0, h - 1) == br and o2.pixelColor(w - 1, h - 1) == bl
+
+    o3 = apply_orientation(img, 3)         # 180: diagonal swap
+    assert o3.pixelColor(0, 0) == br and o3.pixelColor(w - 1, h - 1) == tl
+    assert o3.pixelColor(w - 1, 0) == bl and o3.pixelColor(0, h - 1) == tr
+
+    o4 = apply_orientation(img, 4)         # mirror-V: top/bottom swap
+    assert o4.pixelColor(0, 0) == bl and o4.pixelColor(0, h - 1) == tl
+    assert o4.pixelColor(w - 1, 0) == br and o4.pixelColor(w - 1, h - 1) == tr
+
+    o6 = apply_orientation(img, 6)         # rotate 90 CW: dims swap
+    assert (o6.width(), o6.height()) == (h, w)
+    o8 = apply_orientation(img, 8)         # rotate 90 CCW: dims swap
+    assert (o8.width(), o8.height()) == (h, w)
+
+    o5 = apply_orientation(img, 5)         # transpose (main diagonal)
+    assert (o5.width(), o5.height()) == (h, w)
+    assert o5.pixelColor(0, 0) == tl       # the main-diagonal fixed corner
+
+    o7 = apply_orientation(img, 7)         # transverse (anti-diagonal)
+    assert (o7.width(), o7.height()) == (h, w)
+    assert o7.pixelColor(0, 0) == br       # the anti-diagonal fixed corner
+
+
+def test_load_original_oriented_matches_qimagereader_autotransform(
+        tmp_path: Path) -> None:
+    """load_original_oriented's new QImage.fromData + apply_orientation
+    decode must still produce pixel-identical output to the OLD
+    QBuffer + QImageReader.setAutoTransform decode, for every EXIF
+    Orientation value — built here as a reference, on the main thread
+    (safe; the deadlock is a worker-thread/main-thread race, fauxcasa-5dk).
+    The fixture is _marked_stored_image() (distinct content in each
+    corner), NOT a solid color: a solid fixture would let this pass even
+    if a mirror axis or a rotation direction were swapped, since every
+    pixel is identical either way — the marked corners are what actually
+    pin the pixel ARRANGEMENT, not just the dimensions."""
+    _offscreen_app()
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QImage, QImageReader
+
+    from viewer import load_original_oriented
+
+    fmt = QImage.Format.Format_ARGB32  # settle rotate()-vs-untouched format
+    # differences (premultiplied ARGB32 vs RGB32) before comparing pixels.
+    for orientation in range(1, 9):
+        img = _marked_stored_image()
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        assert img.save(buf, "JPEG", 95)
+        data = _inject(bytes(buf.data()), 0xE1,
+                       _exif_orientation_app1(orientation))
+        p = tmp_path / f"o{orientation}.jpg"
+        p.write_bytes(data)
+
+        ref_buf = QBuffer()
+        ref_buf.setData(data)
+        ref_buf.open(QIODevice.OpenModeFlag.ReadOnly)
+        ref_reader = QImageReader(ref_buf)
+        ref_reader.setAutoTransform(True)
+        reference = ref_reader.read()
+        assert not reference.isNull()
+
+        shown, got = load_original_oriented(str(p), 0)
+        assert not shown.isNull() and got == orientation
+        assert shown.convertToFormat(fmt) == reference.convertToFormat(fmt)
+
+
 def _face_viewer(tmp_path: Path):
     """A 1280x800 viewer over a 2-photo library where photo 0 carries two
     faces= tags (one named via [Contacts2], one an unconfirmed
@@ -8402,6 +8517,33 @@ def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
     px = color_at("good.psd")
     assert abs(px.red() - 200) < 30 and abs(px.blue() - 120) < 30
     assert ent["nocomp.psd"][1][1] == 0          # the ONE intended error tile
+
+
+def test_index_one_content_probes_mis_extensioned_still(
+        tmp_path: Path) -> None:
+    """fauxcasa-tlv regression: _index_one's decode-side QImageReader for
+    an ordinary still is now PATH-constructed (QImageReader(str(path)))
+    instead of a QBuffer with an explicit suffix-derived format (the
+    46b0bab revision reverted here after that hunk was attributed to a
+    rare native access violation). A path-constructed reader restores
+    EXACT pre-fix behavior: Qt probes the file's CONTENT to pick a
+    plugin, so a PNG saved with a .jpg extension still decodes correctly
+    (content wins over suffix) rather than failing the (wrong) jpeg
+    handler and falling through to the Pillow fallback."""
+    from PIL import Image
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    Image.new("RGB", (64, 48), (40, 220, 90)).save(
+        lib / "disguised.jpg", "PNG")   # PNG bytes, .jpg extension
+
+    cat = scan_library(lib)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    (_o, length, w, h), = cache.entries
+    assert length > 0 and (w, h) == (64, 48)     # decoded, not error-tiled
+    px = _thumb_qimage(cache, 0).pixelColor(32, 24)
+    assert px.green() > 170 and px.red() < 90 and px.blue() < 140
 
 
 # ---------------------------------------------------------------------------

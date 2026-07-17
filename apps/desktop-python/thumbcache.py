@@ -384,6 +384,7 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     top = levels[0]  # largest edge (levels are descending)
     primary_li = _primary_level(levels)
 
+    src = root / photo.rel
     data, size, mtime, sha, meta, fmeta = read_photo_meta(root, photo)
     is_video = is_video_suffix(photo.rel)
     # The ini crop= recipe to bake (docstring above). getattr keeps the
@@ -391,14 +392,18 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     crop = getattr(photo, "crop", None)
 
     img = None
+    is_raw = is_raw_suffix(photo.rel)
+    from_preview = False  # RAW's embedded JPEG preview: in-memory only,
+    # no file path a path-constructed reader could point at (see below).
     if data and is_video:
         # Poster frame via PyAV (videoload): a QImage that rides the
         # ordinary downscale/encode below; null on failure -> error tile.
         img = poster_qimage(data)
-    elif data and is_raw_suffix(photo.rel):
+    elif data and is_raw:
         jpeg = raw_preview_jpeg(data)
         if jpeg is not None:
             data = jpeg  # ride the ordinary scaled-JPEG decode below
+            from_preview = True
         else:
             # No embedded preview: real demosaic at half size (plenty for
             # a <= 512 px thumb). Null on failure -> the error tile below.
@@ -406,24 +411,72 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
     if img is None:
         # Pre-route 16-bit TIFFs to Pillow on ALL platforms: Qt's tiff
         # plugin silently clips 16-bit grayscale to white on Linux
-        # (fauxcasa-v46.7). Header sniff only — no pixel decode.
+        # (fauxcasa-v46.7). Header sniff only — no pixel decode. (Never
+        # true for from_preview: a RAW's embedded preview is always JPEG,
+        # per rawload.raw_preview_jpeg, and photo.rel is the RAW's own
+        # extension, not .tif/.tiff.)
         _tiff = photo.rel.lower().endswith((".tif", ".tiff"))
         if data and _tiff and tiff_is_16bit(data):
             img = pillow_qimage(data, top)
         else:
-            # setData copies into the buffer's own QByteArray; passing a
-            # temporary QByteArray to QBuffer(...) instead leaves a dangling
-            # pointer (PySide6 frees the temporary) and every read silently
-            # fails.
-            buf = QBuffer()
-            buf.setData(data)
-            buf.open(QIODevice.OpenModeFlag.ReadOnly)
-            reader = QImageReader(buf)
-            # Apply EXIF orientation at decode (handles all 8 cases, mirrors
-            # too); the thumbnail is stored display-upright. setScaledSize is
-            # in pre-transform pixels — for a 90/270 image the box edges swap
-            # but both stay <= top, and the post-read clamp below covers any
-            # header that couldn't be pre-sized.
+            if from_preview:
+                # RAW embedded preview: `data` is in-memory bytes extracted
+                # by rawpy, not the file on disk, so there is no path a
+                # reader could open directly -- a QBuffer is the only
+                # option. But the format is guaranteed JPEG (rawpy's
+                # extract_thumb only ever returns ThumbFormat.JPEG here,
+                # checked in rawload.raw_preview_jpeg), so an explicit
+                # "jpeg" format hint is safe: it names one battle-tested
+                # plugin directly, so Qt's format-probe loop (device.read()/
+                # peek() per candidate plugin, serialized under the
+                # image-plugin factory mutex) never runs, and this
+                # Python-created QIODevice never needs the GIL while that
+                # mutex is held (the fauxcasa-5dk lock inversion). None of
+                # the fauxcasa-tlv access violations involved this
+                # jpeg-hinted path -- see the else branch below for why.
+                #
+                # setData copies into the buffer's own QByteArray; passing
+                # a temporary QByteArray to QBuffer(...) instead leaves a
+                # dangling pointer (PySide6 frees the temporary) and every
+                # read silently fails.
+                buf = QBuffer()
+                buf.setData(data)
+                buf.open(QIODevice.OpenModeFlag.ReadOnly)
+                reader = QImageReader(buf, b"jpeg")
+            else:
+                # Ordinary still: `data` IS the file's own bytes (read_
+                # photo_meta above), so a PATH-constructed reader can open
+                # the file itself. Qt opens its own internal C++ QFile for
+                # this -- no Python-wrapped QIODevice for the format-probe
+                # loop to call read()/peek() on, so no thread can be
+                # caught needing the GIL while holding the image-plugin
+                # factory mutex (still the fauxcasa-5dk invariant). This
+                # ALSO restores exact pre-fix decode parity: the same
+                # content-probe picks the same plugin, producing
+                # byte-identical thumbs, including for a mis-extensioned
+                # file (content wins over suffix, as before).
+                #
+                # An earlier revision of this fix (46b0bab) instead passed
+                # an explicit suffix-derived format to a QBuffer here.
+                # Large-scale validation (fauxcasa-tlv) attributed a rare
+                # (~2%) native access violation to that hunk specifically:
+                # the explicit hint made exotic-format (tga/webp/tiff/gif/
+                # bmp) handler creation+use truly parallel across the 4
+                # index-pool workers, where the old format-probe loop's
+                # serialization under the factory mutex had been
+                # (accidentally) masking a native race. The path-
+                # constructed reader below sidesteps the fauxcasa-5dk
+                # deadlock the same way (no Python QIODevice) without
+                # reintroducing that parallelism change: the reads Qt
+                # performs to probe content still serialize under the
+                # factory mutex exactly as they did pre-fix.
+                reader = QImageReader(str(src))
+            # Apply EXIF orientation at decode (handles all 8 cases,
+            # mirrors too); the thumbnail is stored display-upright.
+            # setScaledSize is in pre-transform pixels — for a 90/270
+            # image the box edges swap but both stay <= top, and the
+            # post-read clamp below covers any header that couldn't be
+            # pre-sized.
             reader.setAutoTransform(True)
             sz = reader.size()  # header-only; full pixels not decoded yet
             if sz.isValid():
@@ -485,6 +538,11 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
+        # This QBuffer is SAFE (unlike the decode-side one above): save()
+        # uses an explicit "JPEG" handler, so there is no plugin-probe
+        # sniff loop, and encode writes to the device happen without ever
+        # needing the GIL under Qt's factory mutex — no fauxcasa-5dk
+        # exposure here.
         out = QBuffer()
         out.open(QIODevice.OpenModeFlag.WriteOnly)
         lvl.save(out, "JPEG", JPEG_QUALITY)
