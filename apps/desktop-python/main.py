@@ -100,6 +100,7 @@ from filetypes import (  # noqa: E402
 )
 from grid import DEFAULT_SORT_MODE, SORT_MODES, GridView  # noqa: E402
 import keymap  # noqa: E402
+import library  # noqa: E402
 from thumbcache import (  # noqa: E402
     CacheError,
     ThumbCache,
@@ -475,6 +476,119 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
                   "when prompted")
         return None
     return root
+
+
+# ---------------------------------------------------------------------------
+# Multi-root management CLI actions (fauxcasa-ed5.7.4, bead .d, design §10)
+# ---------------------------------------------------------------------------
+#
+# --promote / --add-root / --import-picasa-watched are management
+# operations, not the normal open path: each validates its arguments,
+# performs the on-disk change via library.py, prints a one-line summary,
+# and returns an exit code WITHOUT proceeding to the normal warm/cold-walk
+# open below — opening an explicit multi-root library through the grid/tree
+# is bead .g's scope (the "tree per root" UI); today's open flow only knows
+# how to browse a single Path. Re-running the app afterwards (implicit
+# legacy open for an un-promoted root, or a future explicit-open path once
+# .g lands) picks up the change.
+
+def _cmd_promote(library_arg: str | None, cache_root: Path) -> int:
+    """--promote: promote the legacy library named by the positional
+    `library` argument in place (design §10). Reuses _resolve_library for
+    the same existence/filesystem-root validation every other invocation
+    gets, so a bad path fails exactly the same way it would on a normal
+    open."""
+    root = _resolve_library(library_arg, cache_root)
+    if root is None:
+        return 2
+    try:
+        cfg = library.promote_library(root, cache_root=cache_root)
+    except Exception as e:
+        log.error("promotion failed (rolled back, %s is still a plain "
+                  "legacy library): %s", root, e)
+        return 2
+    print(f"promoted: library home at {cfg.home}")
+    return 0
+
+
+def _cmd_add_root(library_arg: str | None, cache_root: Path,
+                  new_root: Path) -> int:
+    """--add-root PATH: add PATH as a new watched root to the
+    already-promoted library-home named by the positional `library`
+    argument. Mint + save + fail-soft marker only — no indexing runs here;
+    the new root's empty/mismatched fcache rides the existing bind()
+    mismatch -> reindex path the next time this library is actually
+    opened (design §10: "mint id, append to roots, save library.json, mint
+    a new empty thumbs-<root_id>.fcache -> bind mismatch -> incremental
+    reindex for the new root only")."""
+    home = _resolve_library(library_arg, cache_root)
+    if home is None:
+        return 2
+    cfg = library.resolve_open_path(home)
+    if cfg.is_legacy:
+        log.error("%s is not a library-home (no .fauxcasa/library.json) — "
+                  "run --promote first", home)
+        return 2
+    try:
+        added = library.add_root(cfg, new_root)
+    except ValueError as e:
+        log.error("cannot add root: %s", e)
+        return 2
+    library.write_root_marker(Path(new_root).resolve(), added.id)  # fail-soft
+    library.save_library(cfg)
+    print(f"added root {added.id} ({added.label}) to {home}")
+    return 0
+
+
+def _read_watched_list_file(path: Path) -> list[Path]:
+    """One folder path per line; blank lines and '#'-prefixed comments are
+    skipped. Raises OSError if `path` can't be read — the caller turns
+    that into a friendly CLI error."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [Path(s) for s in (line.strip() for line in lines)
+            if s and not s.startswith("#")]
+
+
+def _cmd_import_picasa_watched(library_arg: str | None,
+                               listfile: str) -> int:
+    """--import-picasa-watched LISTFILE: create a FRESH library-home at the
+    positional `library` argument from a Picasa watched-folders list.
+    `listfile` is a text file (one path per line, '#' comments), or the
+    literal 'registry' to read Picasa's own HKCU watched-folders list
+    (Windows only; library.picasa_watched_from_registry fails soft with a
+    clear RuntimeError when absent/unsupported, caught here)."""
+    if not library_arg:
+        log.error("--import-picasa-watched requires a library-home path "
+                  "as the positional argument")
+        return 2
+    home = Path(library_arg).expanduser().resolve()
+
+    if listfile == "registry":
+        try:
+            folders = library.picasa_watched_from_registry()
+        except RuntimeError as e:
+            log.error(str(e))
+            return 2
+    else:
+        try:
+            folders = _read_watched_list_file(Path(listfile))
+        except OSError as e:
+            log.error("cannot read %s: %s", listfile, e)
+            return 2
+
+    skipped: list[str] = []
+    cfg = library.import_picasa_watched(folders, home, name=home.name,
+                                        skipped=skipped)
+    for msg in skipped:
+        log.warning("picasa import: skipped %s", msg)
+    if not cfg.roots:
+        log.error("no usable watched folders found — nothing imported")
+        return 2
+    library.save_library(cfg)
+    for r in cfg.roots:
+        library.write_root_marker(r.path.resolve(), r.id)  # fail-soft
+    print(f"imported {len(cfg.roots)} root(s) into {cfg.home}")
+    return 0
 
 
 def _parse_image_size_arg(value: str) -> tuple[int, int]:
@@ -1418,14 +1532,19 @@ class MainWindow(QMainWindow):
         # explicit "Unnamed faces" affordance for photos carrying
         # suggested/unresolved face regions (N7: the gap is never silent).
         # Counts are live: rebuilt with the sidebar on reveal/reconcile.
-        people, unnamed = self._people_counts()
+        people, unnamed, name_cids = self._people_counts()
         if people or unnamed:
             # db3-rescued people are source-flagged (fauxcasa-cam.7): the
             # name exists only because the §4 rescue importer read it from
             # a machine-local db3 person album — provenance in the tooltip,
-            # like a .pal-sourced album's.
-            db3_names = {cat.contacts[c] for c in cat.db3_contacts
-                         if c in cat.contacts}
+            # like a .pal-sourced album's. Rekeyed honestly by contact id,
+            # not display name (fauxcasa-7aj.2): two DIFFERENT contacts can
+            # share a display name (one ini-named, one db3-rescued), so a
+            # name is flagged only when EVERY contact id that resolves to
+            # it is db3-rescued — a name also known via a non-db3 contact
+            # id must not be tarred with the rescue flag.
+            db3_names = {name for name, cids in name_cids.items()
+                         if cids and cids <= cat.db3_contacts}
             people_root = QTreeWidgetItem(t, ["People"])
             people_root.setFlags(
                 people_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
@@ -1472,13 +1591,18 @@ class MainWindow(QMainWindow):
                 return
             it += 1
 
-    def _people_counts(self) -> tuple[dict[str, int], int]:
+    def _people_counts(self) -> tuple[dict[str, int], int, dict[str, set]]:
         """Per-person photo tallies for the current reveal state: {name:
         photo count} over named faces, plus how many photos carry at least
         one unnamed (suggested/unresolved) face. Photo counts, not face
-        counts — a photo with the same person tagged twice counts once."""
+        counts — a photo with the same person tagged twice counts once.
+        Also returns {name: {contact ids that resolved to it}} — the
+        db3-rescued sidebar flag (fauxcasa-7aj.2) needs this to rekey by
+        contact id rather than display name, since two DIFFERENT contacts
+        can share a display name."""
         reveal = self.grid.reveal
         people: dict[str, int] = {}
+        name_cids: dict[str, set] = {}
         unnamed = 0
         for p in self.catalog.photos:
             if not (p.visible or reveal) or not p.faces:
@@ -1486,9 +1610,12 @@ class MainWindow(QMainWindow):
             names = {n for _rect, _cid, n in p.faces if n}
             for n in names:
                 people[n] = people.get(n, 0) + 1
+            for _rect, cid, n in p.faces:
+                if n:
+                    name_cids.setdefault(n, set()).add(cid)
             if any(n is None for _rect, _cid, n in p.faces):
                 unnamed += 1
-        return people, unnamed
+        return people, unnamed, name_cids
 
     def _sidebar_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -2006,6 +2133,25 @@ def main() -> int:
                          "a per-user cache dir when run as a frozen bundle)")
     ap.add_argument("--rebuild", action="store_true",
                     help="ignore any existing tracer cache and rebuild")
+    ap.add_argument("--promote", action="store_true",
+                    help="promote the legacy library given as the "
+                         "positional argument to a multi-root-capable "
+                         "library-home in place (design §10: mint "
+                         "identity, rename cache dir, header-upgrade "
+                         "catalog.json — no re-walk/re-hash), print the "
+                         "resulting home, and exit")
+    ap.add_argument("--add-root", type=Path, default=None, metavar="PATH",
+                    help="add PATH as a new watched root to the "
+                         "already-promoted library-home given as the "
+                         "positional argument, then exit")
+    ap.add_argument("--import-picasa-watched", type=str, default=None,
+                    metavar="LISTFILE",
+                    help="create a fresh library-home at the positional "
+                         "argument from a Picasa watched-folders list: "
+                         "LISTFILE is a text file (one path per line, "
+                         "'#' comments), or the literal 'registry' to "
+                         "read Picasa's own watched-folders list from the "
+                         "Windows registry, then exit")
     ap.add_argument("--contacts", type=Path, default=None,
                     help="Picasa contacts.xml for face names (read-only; "
                          "default: the machine-local copy under "
@@ -2063,6 +2209,17 @@ def main() -> int:
     # console=False build still has a record of warnings, Qt messages, and
     # uncaught tracebacks (fauxcasa-pqw).
     applog.setup(args.cache_root)
+
+    # Multi-root management actions (bead .d, design §10): each is a
+    # standalone on-disk operation, never the normal open — see the
+    # docstrings on _cmd_promote/_cmd_add_root/_cmd_import_picasa_watched.
+    if args.promote:
+        return _cmd_promote(args.library, args.cache_root)
+    if args.add_root is not None:
+        return _cmd_add_root(args.library, args.cache_root, args.add_root)
+    if args.import_picasa_watched is not None:
+        return _cmd_import_picasa_watched(args.library,
+                                          args.import_picasa_watched)
 
     root = _resolve_library(args.library, args.cache_root)
     if root is None:

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -343,3 +344,319 @@ def read_root_marker(root_path: Path) -> str | None:
     if _ROOT_ID_RE.fullmatch(content):
         return content
     return None
+
+
+# ---------------------------------------------------------------------------
+# Promotion (Journey A, design §1/§10, bead .d)
+# ---------------------------------------------------------------------------
+#
+# promote_library() is the FIRST "Add folder to library..." (or explicit
+# "Convert to library...") on a legacy single-root library: mint a library
+# identity, rename ONE cache directory, and additively rewrite only
+# catalog.json's header. NO re-walk, no re-hash, no thumbnail rebuild —
+# photo rows and per-root fcache/sidecar CONTENT are byte-untouched, only
+# paths/names change (design §1's "promotion is a rename, not a re-index").
+#
+# Each phase below is its OWN top-level function (not inlined into
+# promote_library) purely so a test can monkeypatch exactly one phase to
+# raise and assert the rest of promote_library rolls back correctly —
+# these are internal helpers, not part of the module's public surface.
+
+class PromotionError(Exception):
+    """Raised by promote_library's own precondition checks (e.g. a target
+    cache dir already exists). Failures from the underlying filesystem
+    calls propagate as their own OSError/ValueError instead — both are
+    caught and rolled back identically by promote_library."""
+
+
+def _promote_rename_cache_dir(old_dir: Path, new_dir: Path) -> bool:
+    """Rename the WHOLE per-library cache dir in one shot (design §7/§10):
+    catalog.json, thumbs.fcache(.json), config.json, import-report.json all
+    move atomically together. Returns False (no-op, not an error) if
+    `old_dir` doesn't exist — a legacy library that was never opened/
+    scanned has no cache dir to migrate; promotion still succeeds and the
+    first open simply does a cold walk into the new digest, like any fresh
+    library. Raises PromotionError if `new_dir` already exists (would
+    silently clobber another library's cache)."""
+    if not old_dir.is_dir():
+        return False
+    if new_dir.exists():
+        raise PromotionError(f"target cache dir already exists: {new_dir}")
+    old_dir.rename(new_dir)
+    return True
+
+
+def _promote_rename_fcache(cache_dir: Path, root_id: str) -> tuple[bool, bool]:
+    """Rename thumbs.fcache -> thumbs-<root_id>.fcache and
+    thumbs.fcache.json -> thumbs-<root_id>.fcache.json WITHIN `cache_dir`.
+    Design §10 point 3: "untouched beyond the rename" — sidecar CONTENT is
+    NOT rewritten (no library_id/root_id/sidecar_version added here); it
+    stays legacy-shaped and still parses fine under the typed-entry reader
+    (thumbcache.parse_sidecar_entry accepts plain-string entries
+    unconditionally) and still binds fine (thumbcache.bind() only compares
+    the files[] list, never a header key). Returns (fcache_renamed,
+    sidecar_renamed) so the caller can roll back precisely what ran —
+    either half may be absent (e.g. a cache dir with no persisted sidecar
+    yet, mid-build)."""
+    old_fcache = cache_dir / "thumbs.fcache"
+    old_sidecar = cache_dir / "thumbs.fcache.json"
+    new_fcache = cache_dir / f"thumbs-{root_id}.fcache"
+    new_sidecar = cache_dir / f"thumbs-{root_id}.fcache.json"
+    fcache_renamed = sidecar_renamed = False
+    if old_fcache.is_file():
+        old_fcache.rename(new_fcache)
+        fcache_renamed = True
+    if old_sidecar.is_file():
+        old_sidecar.rename(new_sidecar)
+        sidecar_renamed = True
+    return fcache_renamed, sidecar_renamed
+
+
+def _promote_upgrade_catalog(cat_path: Path, library_id: str, root_id: str,
+                             root: Path, catalog_version: int) -> bool:
+    """Header-only in-place upgrade of catalog.json (design §5/§10 — the
+    migrator N3 says could be skipped, kept only to preserve expensive
+    sha256 backfill): add "library_id"/"roots", drop "library", bump
+    "version" — PHOTO ROWS (data["photos"]) are copied over VERBATIM, never
+    touched, which is exactly what keeps the promoted-rows-equal-old-rows
+    property true. The original file is preserved as "catalog.json.bak"
+    BEFORE the atomic write-temp-rename, so a crash between the two leaves
+    either the untouched original or the fully-upgraded file, never a
+    half-written one. Returns False (no-op) if `cat_path` doesn't exist yet
+    (a never-scanned legacy library has no catalog to upgrade). Any parse
+    anomaly (malformed JSON, non-dict document) raises — promote_library
+    treats that as a failure of THIS step and rolls the whole promotion
+    back, per design §10 point 4 ("on any failure at any step")."""
+    if not cat_path.is_file():
+        return False
+    old_text = cat_path.read_text(encoding="utf-8")
+    data = json.loads(old_text)  # ValueError on malformed JSON -> caller rolls back
+    if not isinstance(data, dict):
+        raise PromotionError(f"{cat_path}: not a JSON object")
+
+    new_data: dict = {
+        "version": catalog_version,
+        "library_id": library_id,
+        "roots": [{"id": root_id, "path": str(root)}],
+    }
+    for k, v in data.items():
+        if k in ("version", "library", "library_id", "roots"):
+            continue
+        new_data[k] = v  # "photos" et al. copied verbatim, never touched
+
+    bak_path = cat_path.with_name(cat_path.name + ".bak")
+    bak_path.write_text(old_text, encoding="utf-8")
+    tmp = cat_path.with_name(cat_path.name + ".tmp")
+    tmp.write_text(json.dumps(new_data), encoding="utf-8")
+    tmp.replace(cat_path)
+    return True
+
+
+def _promote_rollback(root: Path, home: Path, old_dir: Path, new_dir: Path,
+                      root_id: str, *, library_json_written: bool,
+                      marker_written: bool, cache_dir_renamed: bool) -> None:
+    """Best-effort undo of whatever promote_library got through before it
+    failed, most-recently-attempted-step first. Every sub-step is
+    independently guarded (one failed undo must never stop the rest) —
+    worst case some cruft (a stray .bak/.tmp, an orphaned marker) is left
+    behind, but the library is always left in a state that still opens as
+    implicit-legacy (design §10 point 4's reversal contract: delete
+    `.fauxcasa/` and the app falls back to the original cold walk)."""
+    if cache_dir_renamed:
+        cat_path = new_dir / "catalog.json"
+        bak_path = new_dir / "catalog.json.bak"
+        tmp_path = new_dir / "catalog.json.tmp"
+        try:
+            if bak_path.is_file():
+                cat_path.write_text(bak_path.read_text(encoding="utf-8"),
+                                    encoding="utf-8")
+                bak_path.unlink()
+        except OSError:
+            pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            (new_dir / f"thumbs-{root_id}.fcache.json").rename(
+                new_dir / "thumbs.fcache.json")
+        except OSError:
+            pass
+        try:
+            (new_dir / f"thumbs-{root_id}.fcache").rename(
+                new_dir / "thumbs.fcache")
+        except OSError:
+            pass
+        try:
+            new_dir.rename(old_dir)
+        except OSError:
+            pass
+    if marker_written:
+        try:
+            (root / ROOT_MARKER).unlink(missing_ok=True)
+        except OSError:
+            pass
+    if library_json_written:
+        shutil.rmtree(home / LIBRARY_DIR, ignore_errors=True)
+
+
+def promote_library(root: Path, *, cache_root: Path,
+                    home: Path | None = None) -> LibraryConfig:
+    """Journey A, concretely (design §1/§10): the FIRST "Add folder to
+    library..." (or explicit "Convert to library...") on a legacy
+    single-root library at `root`. Mints a library identity, renames one
+    cache directory, and additively rewrites only catalog.json's header —
+    NO re-walk, no re-hash, no thumbnail rebuild.
+
+    `home` defaults to INSIDE `root` (<root>/.fauxcasa/library.json,
+    design §2's default location rule); pass an explicit `home` OUTSIDE
+    `root` when `root` itself is read-only (the first-class
+    read-only-NAS-root case). `volume_uuid` is left None — capturing it is
+    bead .f (volumes.py does not exist yet); the resolution chain (design
+    §8) tolerates a null UUID by design, so this is a safe deferral.
+
+    On ANY failure, rolls back everything attempted so far (see
+    _promote_rollback) and RE-RAISES the original exception — the caller
+    (and every test here) sees the real error, not a wrapped one. After a
+    failed promote_library call the on-disk state always still opens as
+    implicit-legacy (design §10 point 4's reversal contract)."""
+    root = Path(root).resolve()
+    home = Path(home).resolve() if home is not None else root
+    cache_root = Path(cache_root)
+
+    # Deferred imports: catalog.py imports FROM library.py at module scope
+    # (Photo.root_id, Catalog.roots use LibraryRoot/LibraryConfig), so a
+    # top-level "import catalog"/"import thumbcache" here would be
+    # circular. By the time this FUNCTION runs, library.py has already
+    # finished loading — Python fully executes a module body, including
+    # every `def`, before any external caller can invoke one of its
+    # functions — so catalog.py's own "from library import ..." is
+    # guaranteed already resolved by then; a deferred import here is safe
+    # regardless of which module the caller imported first.
+    from catalog import CATALOG_VERSION
+    from thumbcache import cache_dir_for
+
+    library_id = mint_library_id()
+    root_id = mint_root_id()
+    label = root.name or str(root)
+
+    old_dir = cache_dir_for(str(root), cache_root)
+    new_dir = cache_dir_for(library_id, cache_root)
+
+    library_json_written = False
+    marker_written = False
+    cache_dir_renamed = False
+
+    try:
+        new_root = LibraryRoot(id=root_id, path=root, label=label)
+        cfg = LibraryConfig(library_id=library_id, name=label,
+                            roots=[new_root], home=home)
+        save_library(cfg)
+        library_json_written = True
+        marker_written = write_root_marker(root, root_id)  # fail-soft
+
+        cache_dir_renamed = _promote_rename_cache_dir(old_dir, new_dir)
+        if cache_dir_renamed:
+            _promote_rename_fcache(new_dir, root_id)
+            _promote_upgrade_catalog(new_dir / "catalog.json", library_id,
+                                     root_id, root, CATALOG_VERSION)
+
+        return cfg
+    except Exception:
+        _promote_rollback(
+            root, home, old_dir, new_dir, root_id,
+            library_json_written=library_json_written,
+            marker_written=marker_written,
+            cache_dir_renamed=cache_dir_renamed,
+        )
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Picasa watched-folders import (Journey B, design §1/§10, bead .d)
+# ---------------------------------------------------------------------------
+
+def import_picasa_watched(folders: list[Path], home: Path, name: str = "",
+                          skipped: list[str] | None = None) -> LibraryConfig:
+    """Journey B, concretely (design §1): build a FRESH library-home from a
+    Picasa watched-folders list, one root per folder, in list order.
+    Nested or duplicate folders are SKIPPED rather than aborting the whole
+    import (Picasa users routinely accumulate stale/overlapping watched
+    entries over the years) — reuses add_root's own nested-root validation
+    for the accept/reject rule so it is identical to the interactive
+    add-root rule, not a second copy of it.
+
+    `skipped`, if given, is appended with one human-readable reason per
+    skipped folder (design doesn't prescribe a report shape; main.py's CLI
+    wrapper logs these as warnings)."""
+    cfg = LibraryConfig(library_id=mint_library_id(), name=name, roots=[],
+                        home=Path(home))
+    for folder in folders:
+        path = Path(folder)
+        if not path.is_dir():
+            if skipped is not None:
+                skipped.append(f"{folder}: not a directory")
+            continue
+        try:
+            add_root(cfg, path, label=path.name)
+        except ValueError as e:
+            if skipped is not None:
+                skipped.append(f"{folder}: {e}")
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Picasa watched-folders registry seam (Windows only, bead .d)
+# ---------------------------------------------------------------------------
+#
+# RECON NOTE: docs/research/picasa-binary-notes.md:107 confirms the
+# registry ROOT ("Watched-folder config: Preferences\HotFolders") but NOT
+# the exact value SHAPE (single REG_SZ list vs. a subkey-per-folder tree) —
+# that detail was never recovered from the binary dump. This reader targets
+# the best-known location, HKCU\Software\Google\Picasa\Picasa2\Preferences
+# \HotFolders as a single REG_SZ, and accepts ';'/'|'/newline as a
+# separator defensively since the true delimiter is unconfirmed. If real
+# Picasa installs turn out to use a different shape, only
+# _read_hotfolders_raw needs to change — everything downstream (the
+# separator-tolerant split) is unaffected.
+
+_HOTFOLDERS_KEY = r"Software\Google\Picasa\Picasa2\Preferences"
+_HOTFOLDERS_VALUE = "HotFolders"
+
+
+def _read_hotfolders_raw() -> str | None:
+    """Seam for tests: the raw registry read, isolated in its own function
+    so it can be monkeypatched without touching winreg at all. Returns None
+    when winreg is unavailable (non-Windows) or the key/value is absent —
+    NEVER raises; picasa_watched_from_registry turns an absent value into
+    the user-facing error."""
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _HOTFOLDERS_KEY) as key:
+            value, _type = winreg.QueryValueEx(key, _HOTFOLDERS_VALUE)
+    except OSError:
+        return None
+    return str(value) if value else None
+
+
+def picasa_watched_from_registry() -> list[Path]:
+    """Picasa's watched-folders list from the Windows registry (design §1
+    Journey B; see the RECON NOTE above the seam functions for the exact
+    key and its caveats). Fail-soft would silently hand the user zero
+    roots when they explicitly asked for the registry source — so instead
+    this raises RuntimeError with a clear, actionable message when the
+    key/value is absent, non-Windows, or empty; the CALLER (main.py) is
+    responsible for catching it and printing a friendly error rather than
+    a traceback."""
+    raw = _read_hotfolders_raw()
+    if not raw:
+        raise RuntimeError(
+            "Picasa watched-folders registry value not found "
+            rf"(HKCU\{_HOTFOLDERS_KEY}\{_HOTFOLDERS_VALUE}) — pass a "
+            "list file instead"
+        )
+    parts = re.split(r"[;|\n]+", raw)
+    return [Path(p) for p in (s.strip() for s in parts) if p]

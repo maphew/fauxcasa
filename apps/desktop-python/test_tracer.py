@@ -6255,6 +6255,52 @@ def test_db3_people_sidebar_source_flag(db3_library: Path,
     assert [cat.photos[i].rel for i in win.grid.display] == ["Trip/a.jpg"]
 
 
+def test_db3_people_sidebar_not_flagged_when_name_shared_with_ini_contact(
+        db3_library: Path, tmp_path: Path) -> None:
+    """fauxcasa-7aj.2: the db3-rescued tooltip flag is keyed by CONTACT ID,
+    not display name. b.jpg here names a SECOND, ini-only contact id that
+    happens to share PERSON_DB3's display name with the db3-rescued
+    contact on a.jpg — the display name is therefore known via a non-db3
+    source too, so it must NOT be flagged (the old name-keyed check
+    (`{cat.contacts[c] for c in db3_contacts}` matched by display name)
+    would have wrongly flagged this ini contact as db3-rescued)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    cid_ini = "cccccccccccccccc"
+    (db3_library / "Trip" / ".picasa.ini").write_text(
+        "[Contacts2]\r\n"
+        f"{cid_ini}={PERSON_DB3};;\r\n"
+        "[a.jpg]\r\n"
+        f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n"
+        "[b.jpg]\r\n"
+        f"faces=rect64(1234),{cid_ini}\r\n")
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+    cat = scan_library(db3_library, db3_dir=db3)
+    assert cat.db3_contacts == {CID_DB3}
+    assert cat.contacts[CID_DB3] == cat.contacts[cid_ini] == PERSON_DB3
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    def item_for(kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    shared = item_for("person", PERSON_DB3)
+    assert shared is not None and shared.text(0).endswith("(2)")
+    assert shared.toolTip(0) == ""      # NOT flagged: also ini-named
+
+
 # ---------------------------------------------------------------------------
 # Selection tray (fauxcasa-q6l.2): persistent CROSS-FOLDER Hold/Clear +
 # typed readout (spec §5). Decisions under test (tray.py module doc):
@@ -9078,6 +9124,42 @@ def test_thumb_bakes_crop_before_downscale(tmp_path: Path) -> None:
     assert tl.red() > 150 and tl.green() < 90          # TL still red
 
 
+def test_thumb_tiny_crop_of_large_source_decodes_correctly(
+        tmp_path: Path) -> None:
+    """fauxcasa-7aj.1 (PR #58 decode-cost nit): when the crop's kept region
+    ALREADY fits the top-level box (no downscale needed), _index_one bounds
+    the decode with QImageReader.setClipRect (an ROI decode) instead of
+    reading the whole source at full resolution and cropping after —
+    exercised here on a 1024px source cropped down to a 128x128 corner (well
+    under THUMB_EDGE=256). This pins CORRECTNESS of that ROI path: the wrong
+    quadrant, an off-by-one clip rect, or a double-crop (clip_applied not
+    suppressing the later crop_qimage_upright call) would all fail the
+    pixel/dimension assertions below."""
+    _offscreen_app()
+    root = tmp_path / "lib"
+    _quadrant_jpeg(root / "f" / "cropped.jpg", edge=1024)
+    # fraction rect (0.5, 0.0, 0.625, 0.125) -> pixel box (512, 0, 128, 128)
+    # on the 1024px source: a 128x128 corner entirely inside the TR (green)
+    # quadrant (x in [512,1024), y in [0,512)), and already <= THUMB_EDGE.
+    (root / "f" / ".picasa.ini").write_text(
+        "[cropped.jpg]\r\ncrop=rect64(80000000a0002000)\r\n")
+    cat, cache = _bound_cache(tmp_path, root)
+    ci = next(i for i, p in enumerate(cat.photos) if p.name == "cropped.jpg")
+    assert cat.photos[ci].crop == (0.5, 0.0, 0.625, 0.125)
+    offset, length, w, h = cache.entries[ci]
+    assert length > 0
+    with open(cache.path, "rb") as f:
+        f.seek(offset)
+        from PySide6.QtGui import QImage
+        img = QImage.fromData(f.read(length), "JPEG")
+    assert not img.isNull()
+    # Never upscaled: the crop box was already 128x128, under THUMB_EDGE.
+    assert (img.width(), img.height()) == (128, 128) == (w, h)
+    for fx, fy in ((0.1, 0.1), (0.5, 0.5), (0.9, 0.9)):
+        c = img.pixelColor(int(fx * img.width()), int(fy * img.height()))
+        assert c.green() > 150 and c.red() < 90 and c.blue() < 90, (fx, fy)
+
+
 def test_thumb_crop_composes_with_exif_orientation(tmp_path: Path) -> None:
     """crop= coordinates are STORED-frame while the baked thumb is
     EXIF-upright, so the bake must map the rect through the orientation
@@ -9242,10 +9324,14 @@ def test_viewer_info_bar_edited_chip(tmp_path: Path) -> None:
 
 
 def test_ingest_parity_gate_passes() -> None:
-    """The M1 ingest-parity gate (spec §9 clause 2) end-to-end: with
-    edit-recipe ingest landed (fauxcasa-cam.15) the expectation table has
-    ZERO expected-missing classes, so the gate must PASS fully ingested —
-    zero loss across every class it tracks. Runs the real script in its
+    """The M1 ingest-parity gate (spec §9 clause 2) end-to-end: zero
+    ingest LOSS across every ingested class, always (the gate FAILS on
+    loss/excess/ratchet regardless of expected-missing count — see
+    check-ingest-parity.py's run_gate). fauxcasa-cam.15 took the table to
+    zero expected-missing; fauxcasa-ed5.11 added db3_caption_precedence
+    back (owner fauxcasa-cam.20, db3 caption gap-fill not yet wired), so
+    this asserts PASS with exactly that one expected-missing class rather
+    than the old "fully ingested" wording. Runs the real script in its
     own uv env (exactly CI's tests.yml job); skips when uv is absent."""
     import shutil
     import subprocess
@@ -9258,7 +9344,8 @@ def test_ingest_parity_gate_passes() -> None:
         capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=600)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert "fully ingested (0 expected-missing)" in proc.stdout
+    assert "PASS: zero ingest loss across" in proc.stdout
+    assert "1 expected-missing classes are owned and probed" in proc.stdout
 
 
 # ===========================================================================
@@ -10490,3 +10577,300 @@ def test_sidebar_shows_offline_root_badge(tmp_path: Path) -> None:
                    roots=[libmod.LibraryRoot(id=id_a, path=root_a)])
     win2 = MainWindow(solo, None, cache_dir=None, build_dir=None)
     assert badge_texts(win2) == []
+
+
+# ===========================================================================
+# ---- multi-root journeys (fauxcasa-ed5.7.4, bead .d): promote_library(),
+# ---- add-root / --promote CLI wiring, Picasa watched-folders import
+# ===========================================================================
+
+
+def _promote_fixture(tmp_path: Path) -> tuple[Path, Path, "Catalog", Path]:
+    """A one-photo legacy library with a real, already-built cache dir
+    (catalog + fcache + sidecar) — the on-disk shape promote_library
+    expects to find (Journey A always promotes an already-opened
+    library). Returns (root, cache_root, catalog, old_dir)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cache_root = tmp_path / "cache"
+    cat = scan_library(root)
+    old_dir = thumbcache.cache_dir_for(str(root.resolve()), cache_root)
+    thumbcache.build_cache(cat, old_dir)
+    save_catalog(cat, old_dir / "catalog.json")
+    return root, cache_root, cat, old_dir
+
+
+def test_promote_happy_path(tmp_path: Path) -> None:
+    """promote_library (design §10): library.json exists carrying the
+    minted identity, the cache dir is renamed from the legacy path-digest
+    to the library_id digest (the OLD digest is gone), thumbs.fcache/.json
+    are renamed to the per-root suffixed names, and catalog.json is
+    upgraded in place — version bumped, library_id + roots header, a .bak
+    kept — with photo rows untouched."""
+    import catalog as catmod
+
+    root, cache_root, cat, old_dir = _promote_fixture(tmp_path)
+    assert old_dir.is_dir()
+
+    cfg = libmod.promote_library(root, cache_root=cache_root)
+
+    assert not cfg.is_legacy
+    assert cfg.home == root.resolve()
+    json_path = libmod.library_json_path(cfg.home)
+    assert json_path.is_file()
+    raw = json.loads(json_path.read_text(encoding="utf-8"))
+    assert raw["library_id"] == cfg.library_id
+    assert len(raw["roots"]) == 1
+    root_id = raw["roots"][0]["id"]
+    assert re.fullmatch(r"[0-9a-f]{8}", root_id)
+    assert libmod.read_root_marker(root) == root_id
+
+    new_dir = thumbcache.cache_dir_for(cfg.library_id, cache_root)
+    assert new_dir.is_dir()
+    assert not old_dir.is_dir(), "old digest cache dir must be GONE (renamed)"
+
+    assert (new_dir / f"thumbs-{root_id}.fcache").is_file()
+    assert (new_dir / f"thumbs-{root_id}.fcache.json").is_file()
+    assert not (new_dir / "thumbs.fcache").exists()
+    assert not (new_dir / "thumbs.fcache.json").exists()
+
+    cat_data = json.loads((new_dir / "catalog.json").read_text())
+    assert cat_data["version"] == catmod.CATALOG_VERSION
+    assert cat_data["library_id"] == cfg.library_id
+    assert cat_data["roots"] == [{"id": root_id, "path": str(root.resolve())}]
+    assert "library" not in cat_data
+    assert (new_dir / "catalog.json.bak").is_file()
+
+    # bind() still works: the fcache's own content (files[]) is untouched
+    # by the rename, so it still binds against the promoted catalog's slice
+    loaded_cache = thumbcache.load_cache(new_dir / f"thumbs-{root_id}.fcache")
+    loaded_cat = load_catalog(new_dir / "catalog.json", cfg)
+    assert loaded_cat is not None
+    thumbcache.bind(loaded_cache, loaded_cat, root_id=root_id)
+
+
+def test_promoted_rows_equal_old_rows(tmp_path: Path) -> None:
+    """The bead's named acceptance test (design §10's "promoted-file-
+    equals-old-file" property): a synthetic catalog fixture (real shape,
+    synthetic content, per privacy rules) is promoted and the resulting
+    photo ROWS are byte-identical to the input rows — promotion rewrites
+    ONLY the header; sha256 backfill and every other per-row field
+    (star/caption/keywords included) survive untouched."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "2020" / "a.jpg")
+    make_jpeg(root / "b.jpg")
+    cache_root = tmp_path / "cache"
+
+    cat = scan_library(root)
+    old_dir = thumbcache.cache_dir_for(str(root.resolve()), cache_root)
+    result = thumbcache.build_cache(cat, old_dir)  # fills size/mtime/sha256
+    assert result is not None
+    # Non-default fields widen the byte-identity check past bare defaults.
+    cat.photos[0].star = 3
+    cat.photos[0].caption = "hello"
+    cat.photos[0].keywords = ("x", "y")
+    save_catalog(cat, old_dir / "catalog.json")
+
+    before = json.loads((old_dir / "catalog.json").read_text())["photos"]
+    assert all(p["x"] for p in before), "sha256 backfill must be present pre-promotion"
+
+    cfg = libmod.promote_library(root, cache_root=cache_root)
+    new_dir = thumbcache.cache_dir_for(cfg.library_id, cache_root)
+    after = json.loads((new_dir / "catalog.json").read_text())["photos"]
+
+    assert after == before
+
+
+def test_promote_rollback_on_injected_failure(tmp_path: Path,
+                                              monkeypatch) -> None:
+    """A step monkeypatched to raise mid-promotion rolls EVERYTHING back:
+    the cache dir is renamed back to the legacy digest, thumbs.fcache/.json
+    are un-suffixed again, catalog.json is left exactly as it was (no
+    .bak left dangling), no partial .fauxcasa/ remains — and legacy open
+    still works (design §10 point 4's reversal contract, enforced from
+    inside promote_library itself, not left to the caller)."""
+    import catalog as catmod
+
+    root, cache_root, cat, old_dir = _promote_fixture(tmp_path)
+
+    def boom(*a, **kw):
+        raise RuntimeError("injected failure")
+    monkeypatch.setattr(libmod, "_promote_upgrade_catalog", boom)
+
+    with pytest.raises(RuntimeError, match="injected failure"):
+        libmod.promote_library(root, cache_root=cache_root)
+
+    assert not (root / ".fauxcasa").exists()
+    assert old_dir.is_dir()
+    assert (old_dir / "thumbs.fcache").is_file()
+    assert (old_dir / "thumbs.fcache.json").is_file()
+    assert (old_dir / "catalog.json").is_file()
+    assert not (old_dir / "catalog.json.bak").exists()
+    assert not (old_dir / "catalog.json.tmp").exists()
+
+    loaded = catmod.load_catalog(old_dir / "catalog.json", root)
+    assert loaded is not None
+    assert len(loaded.photos) == 1
+
+
+def test_promote_reversal_delete_fauxcasa_restores_legacy(
+        tmp_path: Path) -> None:
+    """Reversal contract (design §10 point 4): after a SUCCESSFUL
+    promotion, deleting .fauxcasa/ makes resolve_open_path fall back to
+    implicit-legacy — worst case a cold walk (N3), never an error — the
+    user-facing "just delete .fauxcasa/" instruction."""
+    import shutil as _shutil
+
+    root, cache_root, cat, old_dir = _promote_fixture(tmp_path)
+    libmod.promote_library(root, cache_root=cache_root)
+    assert (root / ".fauxcasa").exists()
+
+    _shutil.rmtree(root / ".fauxcasa")
+
+    reopened = libmod.resolve_open_path(root)
+    assert reopened.is_legacy
+
+    # worst case: a fresh cold walk still works fine
+    cat2 = scan_library(root)
+    assert len(cat2.photos) == 1
+
+
+def test_import_picasa_watched_builds_n_root_config(tmp_path: Path) -> None:
+    """import_picasa_watched (design §1 Journey B): one root per watched
+    folder, in list order, fresh library-home, minted unique ids — the N
+    watched folders become N roots with no re-walk beyond the fresh scan
+    each root will naturally need on first open."""
+    home = tmp_path / "home"
+    wf_a, wf_b, wf_c = (tmp_path / n for n in ("wf-a", "wf-b", "wf-c"))
+    for d in (wf_a, wf_b, wf_c):
+        d.mkdir()
+
+    cfg = libmod.import_picasa_watched([wf_a, wf_b, wf_c], home,
+                                       name="Family")
+    assert not cfg.is_legacy
+    assert cfg.home == home
+    assert cfg.name == "Family"
+    assert len(cfg.roots) == 3
+    assert [r.path for r in cfg.roots] == [wf_a, wf_b, wf_c]
+    assert len({r.id for r in cfg.roots}) == 3  # all unique
+
+    libmod.save_library(cfg)
+    loaded = libmod.load_library(home)
+    assert loaded is not None
+    assert len(loaded.roots) == 3
+
+
+def test_import_picasa_watched_rejects_nesting(tmp_path: Path) -> None:
+    """A nested, duplicate, or nonexistent folder is SKIPPED (reported via
+    the `skipped` out-param) rather than aborting the rest of the import —
+    Picasa users routinely accumulate stale/overlapping watched entries."""
+    home = tmp_path / "home"
+    a = tmp_path / "a"
+    a.mkdir()
+    a_sub = a / "sub"
+    a_sub.mkdir()
+    missing = tmp_path / "does-not-exist"
+
+    skipped: list[str] = []
+    cfg = libmod.import_picasa_watched([a, a_sub, a, missing], home,
+                                       skipped=skipped)
+    assert len(cfg.roots) == 1
+    assert cfg.roots[0].path == a
+    assert len(skipped) == 3  # a_sub (nested), a (dup), missing (not a dir)
+
+
+def test_picasa_watched_from_registry_seam(monkeypatch) -> None:
+    """picasa_watched_from_registry() is monkeypatched at the
+    _read_hotfolders_raw seam so tests never touch winreg itself: a
+    present value parses into Paths (';'-separated), and an absent value
+    raises a clear RuntimeError rather than silently returning zero
+    roots (a user who explicitly asked for the registry source should
+    hear why nothing came back)."""
+    monkeypatch.setattr(
+        libmod, "_read_hotfolders_raw",
+        lambda: r"C:\Users\a\Pictures;C:\Users\a\Scans")
+    folders = libmod.picasa_watched_from_registry()
+    assert folders == [Path(r"C:\Users\a\Pictures"),
+                       Path(r"C:\Users\a\Scans")]
+
+    monkeypatch.setattr(libmod, "_read_hotfolders_raw", lambda: None)
+    with pytest.raises(RuntimeError, match="registry"):
+        libmod.picasa_watched_from_registry()
+
+
+def test_main_promote_and_add_root_cli(tmp_path: Path) -> None:
+    """End-to-end --promote then --add-root via subprocess (bead .d): a
+    legacy library is promoted in place, then a second root is added to
+    the resulting home — both print a one-line summary and exit 0 without
+    launching the normal open/grid path (real process — see
+    test_main_bad_library_exits_2 for why these CLI actions run out of
+    process rather than via a direct main() call)."""
+    import os
+    import subprocess
+
+    main_py = Path(__file__).resolve().parent / "main.py"
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cache_root = tmp_path / "cache"
+    root2 = tmp_path / "root2"
+    make_jpeg(root2 / "b.jpg")
+
+    # Cold-walk build first: promote_library expects an already-opened
+    # library's cache dir to migrate (Journey A).
+    proc = subprocess.run(
+        [sys.executable, str(main_py), str(root),
+         "--cache-root", str(cache_root),
+         "--quit-after-ready", "--finish-build"],
+        capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+
+    proc = subprocess.run(
+        [sys.executable, str(main_py), str(root),
+         "--cache-root", str(cache_root), "--promote"],
+        capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "promoted: library home at" in proc.stdout
+
+    proc = subprocess.run(
+        [sys.executable, str(main_py), str(root),
+         "--cache-root", str(cache_root), "--add-root", str(root2)],
+        capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "added root" in proc.stdout
+
+    loaded = libmod.load_library(root)
+    assert loaded is not None
+    assert len(loaded.roots) == 2
+    assert loaded.roots[1].path == root2.resolve()
+
+
+def test_main_import_picasa_watched_listfile_cli(tmp_path: Path) -> None:
+    """--import-picasa-watched LISTFILE via subprocess: creates a fresh
+    library-home with one root per listed folder; '#' comments and blank
+    lines are ignored."""
+    import os
+    import subprocess
+
+    main_py = Path(__file__).resolve().parent / "main.py"
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+
+    home = tmp_path / "home"
+    wf_a, wf_b = tmp_path / "wf-a", tmp_path / "wf-b"
+    wf_a.mkdir()
+    wf_b.mkdir()
+    listfile = tmp_path / "watched.txt"
+    listfile.write_text(f"# comment\n{wf_a}\n\n{wf_b}\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(main_py), str(home),
+         "--cache-root", str(tmp_path / "cache"),
+         "--import-picasa-watched", str(listfile)],
+        capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "imported 2 root(s)" in proc.stdout
+
+    loaded = libmod.load_library(home)
+    assert loaded is not None
+    assert len(loaded.roots) == 2

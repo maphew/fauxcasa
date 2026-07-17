@@ -140,6 +140,12 @@ class SessionData:
     subagent_usage: TokenUsage = field(default_factory=TokenUsage)
     # model → TokenUsage (subagent files)
     usage_by_model: dict[str, TokenUsage] = field(default_factory=dict)
+    # (model, attributionAgent) → TokenUsage (subagent files) — the tier
+    # rollup (fauxcasa-7aj.3) needs the DECLARED role alongside the model,
+    # since the same model backs both a named-tier spawn and a workflow
+    # inherit-model step (see _tier_for_usage).
+    usage_by_model_role: dict[tuple[str, str], TokenUsage] = field(
+        default_factory=dict)
     parse_errors: list[str] = field(default_factory=list)
 
 
@@ -180,19 +186,6 @@ def _wf_name_from_script(script: str) -> str:
     """Try to extract the workflow name from a JS meta block."""
     m = re.search(r"name\s*:\s*['\"]([^'\"]+)['\"]", script)
     return m.group(1) if m else ""
-
-
-def _infer_model_tier(model: str) -> str:
-    """Return 'scout'/'builder'/'reviewer'/'main'/'unknown'."""
-    if not model:
-        return "unknown"
-    ml = model.lower()
-    for prefix, tier in MODEL_TIER.items():
-        if ml.startswith(prefix):
-            return tier
-    if "fable" in ml:
-        return "main"
-    return "unknown"
 
 
 def _entry_timestamp(entry: dict) -> str:
@@ -246,6 +239,18 @@ def _accumulate_subagent_dir(
                 if model not in session.usage_by_model:
                     session.usage_by_model[model] = TokenUsage()
                 session.usage_by_model[model] += usage
+                # entry.attributionAgent (top-level, not inside .message) is
+                # the harness's own declared role for this entry — 'scout'/
+                # 'builder'/'reviewer' for a named-tier spawn, but also
+                # 'general-purpose'/'workflow-subagent' for a workflow step
+                # that inherited the SESSION's own model (often opus) rather
+                # than being spawned as a genuine reviewer. Keyed alongside
+                # the model so _tier_for_usage can tell the two apart.
+                role = entry.get("attributionAgent", "") or ""
+                key = (model, role)
+                if key not in session.usage_by_model_role:
+                    session.usage_by_model_role[key] = TokenUsage()
+                session.usage_by_model_role[key] += usage
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +445,30 @@ def _tier_for_model(model: str) -> str:
     return "other"
 
 
+def _tier_for_usage(model: str, attribution_agent: str) -> str:
+    """Classify one (model, attributionAgent) usage bucket for the cost-
+    by-tier rollup (fauxcasa-7aj.3 nit): prefer the harness's DECLARED role
+    over guessing from the model name. The same model backs both a genuine
+    named-tier spawn and an unrelated role — e.g. claude-opus-4-8 shows up
+    with attributionAgent='reviewer' (a real reviewer spawn) AND
+    attributionAgent='general-purpose' (a workflow step that inherited the
+    session's own model, per CLAUDE.md's `model: inherit` guidance for
+    design/judge/verify stages — opus because the ORCHESTRATING session is
+    on a smart model, not because the step is doing reviewer work).
+    _tier_for_model alone conflated these: every opus usage record landed
+    in 'reviewer' regardless of role. Here, a NAMED_TIERS attributionAgent
+    wins outright; anything else keeps its own role label (so
+    'general-purpose'/'workflow-subagent' surface honestly instead of
+    being folded into 'reviewer'); only a genuinely absent attributionAgent
+    falls back to the model-prefix guess."""
+    aa = (attribution_agent or "").lower().strip()
+    if aa in NAMED_TIERS:
+        return aa
+    if aa:
+        return aa
+    return _tier_for_model(model)
+
+
 # ---------------------------------------------------------------------------
 # Section builders
 # ---------------------------------------------------------------------------
@@ -491,11 +520,16 @@ def _cost(sessions: list[SessionData]) -> dict:
         for model, usage in sess.usage_by_model.items():
             model_usage[model] += usage
 
-    # Per-tier rollup
+    # Per-tier rollup (fauxcasa-7aj.3): classified per (model, role) pair,
+    # NOT per pre-aggregated model total — _tier_for_usage needs the
+    # attributionAgent alongside the model to avoid folding a workflow's
+    # inherit-model steps into 'reviewer' just because they happen to run
+    # on the same model as a real reviewer spawn.
     tier_usage: dict[str, TokenUsage] = defaultdict(TokenUsage)
-    for model, usage in model_usage.items():
-        tier = _tier_for_model(model)
-        tier_usage[tier] += usage
+    for sess in sessions:
+        for (model, role), usage in sess.usage_by_model_role.items():
+            tier = _tier_for_usage(model, role)
+            tier_usage[tier] += usage
 
     # Workflow token totals from subagent dirs
     for sess in sessions:
@@ -749,9 +783,14 @@ def render_text(
     add(f"  [{qual['escalation_note']}]")
     if esc:
         for ev in esc[:10]:
+            # Both descriptions (fauxcasa-7aj.3): the FROM one alone only
+            # shows what got escalated away from, not what it became — the
+            # TO description was computed and put on JSON output all along
+            # but dropped on the way to the text report.
             add(
                 f"  {ev['date']} {ev['session']}... "
-                f"{ev['from_tier']} -> {ev['to_tier']}: '{ev['from_desc']}'"
+                f"{ev['from_tier']} -> {ev['to_tier']}: "
+                f"'{ev['from_desc']}' -> '{ev['to_desc']}'"
             )
         if len(esc) > 10:
             add(f"  ... {len(esc) - 10} more")
