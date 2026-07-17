@@ -27,6 +27,7 @@ from catalog import (
     load_catalog,
     reconcile_walk,
     save_catalog,
+    save_catalog_retrying,
     scan_library,
     walk_library,
 )
@@ -404,6 +405,49 @@ def test_load_catalog_rejects_foreign_format(tmp_path: Path) -> None:
     p.write_text("{ not json")
     assert load_catalog(p, tmp_path) is None
     assert load_catalog(tmp_path / "missing.json", tmp_path) is None
+
+
+def test_save_catalog_retrying_succeeds_after_transient_errors(
+        library: Path, tmp_path: Path) -> None:
+    """save_catalog_retrying retries on OSError and returns on first success."""
+    import unittest.mock as mock
+
+    cat = scan_library(library)
+    path = tmp_path / "catalog.json"
+    call_count = 0
+
+    original = __import__("catalog").save_catalog
+
+    def flaky_save(catalog, p):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:  # fail twice, succeed on third
+            raise OSError("transient sharing violation")
+        original(catalog, p)
+
+    with mock.patch("catalog.save_catalog", side_effect=flaky_save):
+        # backoff=0 avoids real sleeps in tests
+        save_catalog_retrying(cat, path, attempts=5, backoff=0)
+
+    assert call_count == 3
+    assert path.exists()
+    assert load_catalog(path, library) is not None
+
+
+def test_save_catalog_retrying_raises_after_all_attempts_exhausted(
+        library: Path, tmp_path: Path) -> None:
+    """save_catalog_retrying raises OSError when every attempt fails."""
+    import unittest.mock as mock
+
+    cat = scan_library(library)
+    path = tmp_path / "catalog.json"
+    sentinel = OSError("always broken")
+
+    with mock.patch("catalog.save_catalog", side_effect=sentinel):
+        with pytest.raises(OSError, match="always broken"):
+            save_catalog_retrying(cat, path, attempts=3, backoff=0)
+
+    assert not path.exists()  # nothing written on total failure
 
 
 def test_reconcile_detects_drift(library: Path, tmp_path: Path) -> None:
@@ -1997,6 +2041,163 @@ def test_restart_command_source_vs_frozen(monkeypatch, tmp_path: Path) -> None:
     )
 
 
+def test_restart_command_scan_filter_flags(monkeypatch, tmp_path: Path) -> None:
+    """--min-image-size and --max-image-size are forwarded when set, absent
+    when the filter is inactive — fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    library = tmp_path / "lib"
+    cache_root = tmp_path / "cr"
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(main.sys, "executable", "/usr/bin/fauxcasa")
+
+    # No filter — neither flag appears.
+    _prog, args = main._restart_command(library, cache_root, scan_filter=None)
+    assert "--min-image-size" not in args
+    assert "--max-image-size" not in args
+
+    # Inactive filter (all zeros) — same: no flags.
+    _prog, args = main._restart_command(
+        library, cache_root, scan_filter=ScanFilter())
+    assert "--min-image-size" not in args
+    assert "--max-image-size" not in args
+
+    # Active min filter only.
+    sf = ScanFilter(min_width=100, min_height=75)
+    _prog, args = main._restart_command(library, cache_root, scan_filter=sf)
+    idx = args.index("--min-image-size")
+    assert args[idx + 1] == "100x75"
+    assert "--max-image-size" not in args
+
+    # Active max filter only.
+    sf = ScanFilter(max_width=8000, max_height=6000)
+    _prog, args = main._restart_command(library, cache_root, scan_filter=sf)
+    assert "--min-image-size" not in args
+    idx = args.index("--max-image-size")
+    assert args[idx + 1] == "8000x6000"
+
+    # Both min and max set.
+    sf = ScanFilter(min_width=100, min_height=75,
+                    max_width=8000, max_height=6000)
+    _prog, args = main._restart_command(library, cache_root, scan_filter=sf)
+    assert args[args.index("--min-image-size") + 1] == "100x75"
+    assert args[args.index("--max-image-size") + 1] == "8000x6000"
+
+
+def test_restart_command_thumbs_flag(monkeypatch, tmp_path: Path) -> None:
+    """--thumbs is forwarded only when supplied — fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    library = tmp_path / "lib"
+    cache_root = tmp_path / "cr"
+    thumbs_path = tmp_path / "bench.fcache"
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(main.sys, "executable", "/usr/bin/fauxcasa")
+
+    # thumbs=None — flag absent.
+    _prog, args = main._restart_command(library, cache_root, thumbs=None)
+    assert "--thumbs" not in args
+
+    # thumbs supplied — flag present with the correct path.
+    _prog, args = main._restart_command(library, cache_root, thumbs=thumbs_path)
+    idx = args.index("--thumbs")
+    assert args[idx + 1] == str(thumbs_path)
+
+
+def test_restart_command_open_drops_thumbs(monkeypatch, tmp_path: Path) -> None:
+    """_change_library (Open...) does NOT carry --thumbs to a different
+    library — the adopted cache is specific to the original library.
+    fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication, QFileDialog
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    current = tmp_path / "Current"
+    chosen = tmp_path / "Chosen"
+    make_jpeg(current / "a.jpg")
+    make_jpeg(chosen / "b.jpg")
+    cache_root = tmp_path / "cr"
+    thumbs_path = tmp_path / "bench.fcache"
+
+    cat = scan_library(current)
+    sf = ScanFilter(min_width=50, min_height=50)
+    win = main.MainWindow(cat, None, cache_root / "cache", None,
+                          scan_filter=sf, cache_root=cache_root,
+                          thumbs_path=thumbs_path)
+
+    captured: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(chosen)))
+    monkeypatch.setattr(QProcess, "startDetached",
+                        staticmethod(lambda prog, argv:
+                                     captured.append((prog, argv)) or True))
+
+    win._change_library()
+
+    assert captured, "expected startDetached to be called"
+    _prog, argv = captured[0]
+    # Scan-size constraint preserved.
+    assert "--min-image-size" in argv
+    # --thumbs must NOT appear for a different-library relaunch.
+    assert "--thumbs" not in argv
+
+
+def test_restart_command_file_types_drops_thumbs(
+        monkeypatch, tmp_path: Path) -> None:
+    """_show_file_types must NOT carry --thumbs: a File-Types change alters
+    the effective walk (exts), so an adopted cache no longer matches the new
+    file set — bind() would raise CacheError and the relaunched process exits
+    2 with no UI.  The relaunch must cold-rebuild instead.
+    fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication
+    from filetypes import FileTypesDialog, save_excluded_exts
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    lib = tmp_path / "lib"
+    make_jpeg(lib / "a.jpg")
+    cache_root = tmp_path / "cr"
+    thumbs_path = tmp_path / "bench.fcache"
+
+    cat = scan_library(lib)
+    sf = ScanFilter(min_width=50, min_height=50)
+    win = main.MainWindow(cat, None, cache_root / "cache", None,
+                          scan_filter=sf, cache_root=cache_root,
+                          thumbs_path=thumbs_path)
+
+    captured: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(QProcess, "startDetached",
+                        staticmethod(lambda prog, argv:
+                                     captured.append((prog, argv)) or True))
+    # Simulate user toggling a file type (different from current exclusions).
+    monkeypatch.setattr(FileTypesDialog, "exec_", lambda self: True)
+    monkeypatch.setattr(FileTypesDialog, "excluded", lambda self: {".tga"})
+
+    win._show_file_types()
+
+    assert captured, "expected startDetached to be called"
+    _prog, argv = captured[0]
+    # Scan-size constraint preserved.
+    assert "--min-image-size" in argv
+    # --thumbs must NOT appear: the extension change alters the file set,
+    # so an adopted cache would fail bind() — the relaunch cold-rebuilds.
+    assert "--thumbs" not in argv
+
+
 def test_resolve_library_frozen_first_run(monkeypatch, tmp_path: Path) -> None:
     """Frozen, no library and nothing remembered: a chosen folder is used;
     a cancelled/headless picker yields None (graceful), not a crash."""
@@ -2218,7 +2419,7 @@ def test_mainwindow_open_action_relaunches_with_selected_library(
                      or True),
     )
     monkeypatch.setattr(main, "_restart_command",
-                        lambda root, cr: ("prog", [str(root), str(cr)]))
+                        lambda root, cr, **_kw: ("prog", [str(root), str(cr)]))
 
     win._change_library()
 
@@ -2255,7 +2456,7 @@ def test_mainwindow_open_action_warns_when_relaunch_fails(
         staticmethod(lambda _program, _args: (False, 0)),
     )
     monkeypatch.setattr(main, "_restart_command",
-                        lambda root, cr: ("prog", [str(root), str(cr)]))
+                        lambda root, cr, **_kw: ("prog", [str(root), str(cr)]))
     monkeypatch.setattr(
         QMessageBox,
         "warning",
@@ -2369,6 +2570,45 @@ def test_pcts_nearest_rank() -> None:
     assert r["min"] == 1.0             # s[0]
     assert r["p50"] == 50.0            # nearest-rank lower index
     assert r["p99"] < 100.0            # the trap: must NOT collapse onto max
+
+
+# ---------- bench_scroll: occlusion_clean platform gate (fauxcasa-ed5.10) ---
+
+def test_occlusion_clean_timeout_frames_ignored_on_windows() -> None:
+    """On Windows a paint-bound run produces ~100 ms intervals that alias with
+    the Wayland frame-callback-timeout signature.  timeout_frames must NOT
+    disqualify occlusion_clean on win32."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import bench_scroll as bs
+
+    # Simulate: visible, no fill stalls, but 25 timeout-band intervals.
+    assert bs._occlusion_clean(0, 0, 25, platform="win32") is True
+    assert bs._occlusion_clean(0, 0, 25, platform="cygwin") is True
+
+
+def test_occlusion_clean_timeout_frames_disqualify_on_linux() -> None:
+    """On Linux the ~100 ms cluster is the Wayland compositor occlusion
+    signature; timeout_frames > 0 must disqualify occlusion_clean."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import bench_scroll as bs
+
+    assert bs._occlusion_clean(0, 0, 1, platform="linux") is False
+    assert bs._occlusion_clean(0, 0, 25, platform="linux2") is False
+
+
+def test_occlusion_clean_other_tells_still_apply_on_all_platforms() -> None:
+    """not_visible_ticks and fill_timeouts disqualify occlusion_clean
+    regardless of platform."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import bench_scroll as bs
+
+    for plat in ("win32", "linux", "darwin"):
+        assert bs._occlusion_clean(1, 0, 0, platform=plat) is False  # not_visible
+        assert bs._occlusion_clean(0, 1, 0, platform=plat) is False  # fill_timeout
+        assert bs._occlusion_clean(0, 0, 0, platform=plat) is True   # all clean
 
 
 # ---------- diagnostics: log file survives console=False (fauxcasa-pqw) ----
@@ -3241,6 +3481,70 @@ def test_grid_select_all_and_escape(tmp_path: Path) -> None:
     g._select(-1)
     _key(g, Qt.Key.Key_Escape)    # no current: clears to empty, no crash
     assert g.selection == set() and g.current == -1
+
+
+def test_grid_deselect_ctrl_d(tmp_path: Path) -> None:
+    """Ctrl+D (grid.deselect) clears the entire selection set while keeping
+    the current item as keyboard focus (deselected but still current).
+    Distinct from Esc (grid.clear) which collapses to {current}."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[1])
+    _click(g, d[4], SHIFT)
+    assert len(g.selection) > 1   # range selection assembled
+    _key(g, Qt.Key.Key_D, CTRL)
+    assert g.selection == set()   # all deselected
+    assert g.current == d[4]      # keyboard focus preserved
+    # Ctrl+D with no current item is a clean no-op (no crash)
+    g._select(-1)
+    _key(g, Qt.Key.Key_D, CTRL)
+    assert g.selection == set() and g.current == -1
+
+
+def test_grid_invert_selection_ctrl_i(tmp_path: Path) -> None:
+    """Ctrl+I (grid.invert) flips selection membership over the current
+    view: unselected photos become selected and vice versa. The current
+    item stays as keyboard focus regardless of its new membership state."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[0])
+    _click(g, d[2], SHIFT)         # d[0], d[1], d[2] selected
+    assert g.selection == set(d[:3])
+    _key(g, Qt.Key.Key_I, CTRL)
+    assert g.selection == set(d[3:])    # the other 6 photos are now selected
+    assert g.current == d[2]            # current preserved
+    # Invert of the full set yields empty
+    _key(g, Qt.Key.Key_A, CTRL)        # select all first
+    _key(g, Qt.Key.Key_I, CTRL)
+    assert g.selection == set()
+
+
+def test_grid_home_end_navigation(tmp_path: Path) -> None:
+    """Home (grid.first) jumps to the first photo; End (grid.last) to the
+    last. Both are key_only so they ride the same Shift-extension path as
+    arrows: Shift+Home selects anchor..first, Shift+End anchor..last."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[4])                    # somewhere in the middle
+    _key(g, Qt.Key.Key_Home)
+    assert g.current == d[0] and g.selection == {d[0]}
+    _key(g, Qt.Key.Key_End)
+    assert g.current == d[-1] and g.selection == {d[-1]}
+    # Shift+Home from d[-1] extends the selection to anchor..d[0]
+    _key(g, Qt.Key.Key_Home, SHIFT)
+    assert g.current == d[0] and g.anchor == d[-1]
+    assert g.selection == set(d)
 
 
 def test_grid_selection_signal_payloads(tmp_path: Path) -> None:
@@ -6049,6 +6353,73 @@ def test_tray_click_navigates_grid_with_view_fallback(
     assert win.search.text() == "d" and g.current == d[3]
 
 
+def test_tray_navigate_hidden_photo_auto_reveals(library: Path) -> None:
+    """Navigating to a held photo that is hidden auto-reveals rather than
+    silently falling back to All photos (q6l.18, N7 compliance).
+    reveal_box is set so UI state stays consistent; the photo is selected;
+    a status message names the action."""
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    g = win.grid
+
+    # library fixture: "2020-01-01 Trip/b.jpg" carries hidden=yes
+    hidden_rel = "2020-01-01 Trip/b.jpg"
+    idx = next(i for i, p in enumerate(cat.photos) if p.rel == hidden_rel)
+    assert not cat.photos[idx].visible            # confirm fixture
+    assert not win.grid.reveal                    # reveal starts off
+    assert idx not in g.display_pos              # absent without reveal
+
+    win.tray.hold([hidden_rel])                   # hold the hidden photo
+    win._tray_navigate(hidden_rel)
+
+    assert win.grid.reveal                        # auto-revealed via reveal_box
+    assert win.reveal_box.isChecked()             # checkbox UI in sync
+    assert idx in g.display_pos                  # photo now in grid
+    assert g.current == idx                       # photo selected
+    assert "revealed" in win.statusBar().currentMessage().lower()
+
+
+def test_tray_navigate_hidden_reveals_but_still_missing(
+        monkeypatch, library: Path) -> None:
+    """When reveal is toggled ON during tray navigation but the photo is
+    still absent after the fallback, the status message names BOTH facts:
+    reveal was toggled AND the photo was not found — reveal is never a
+    silent side effect (q6l.18, N7).
+
+    The edge case is simulated by patching set_filter to a no-op so
+    display_pos is never updated, keeping the photo absent throughout."""
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    g = win.grid
+
+    hidden_rel = "2020-01-01 Trip/b.jpg"
+    idx = next(i for i, p in enumerate(cat.photos) if p.rel == hidden_rel)
+    assert not cat.photos[idx].visible   # confirm fixture
+    assert not win.grid.reveal           # reveal starts off
+    assert idx not in g.display_pos      # absent without reveal
+
+    win.tray.hold([hidden_rel])
+
+    # Patch set_filter so display_pos is never updated — simulates the
+    # edge case where reveal toggled but the photo is still not shown.
+    monkeypatch.setattr(g, "set_filter", lambda *a, **k: None)
+
+    win._tray_navigate(hidden_rel)
+
+    # reveal flag was set as a side effect of the navigation attempt
+    assert win.grid.reveal
+    msg = win.statusBar().currentMessage()
+    # message must name the reveal action AND acknowledge the failure
+    assert "revealed" in msg.lower()
+    assert "not visible" in msg.lower()
+
+
 def test_tray_clear_and_per_item_remove(tmp_path: Path) -> None:
     """Clear empties the tray (button enablement follows); middle-click
     on a thumb removes exactly that item, keeping the rest in order."""
@@ -6644,12 +7015,19 @@ def test_backfill_interrupt_resume_and_periodic_persist(
 
     saves: list[int] = []
     real_save = thumbcache.save_catalog
+    real_save_retrying = thumbcache.save_catalog_retrying
 
     def counting_save(c, p):
         saves.append(c.backfill_cursor)
         real_save(c, p)
 
+    def counting_save_retrying(c, p, attempts=5, backoff=0.1):
+        # terminal (must=True) saves now go through save_catalog_retrying
+        saves.append(c.backfill_cursor)
+        real_save_retrying(c, p, attempts=attempts, backoff=backoff)
+
     monkeypatch.setattr(thumbcache, "save_catalog", counting_save)
+    monkeypatch.setattr(thumbcache, "save_catalog_retrying", counting_save_retrying)
 
     stop = threading.Event()
     assert thumbcache.backfill_catalog(
@@ -7818,6 +8196,34 @@ def test_make_thumbcache_exclude_exts(tmp_path: Path) -> None:
                      "--exclude-exts", ".bogus"]) == 2
 
 
+def test_tiff_is_16bit_header_sniff(tmp_path: Path) -> None:
+    """tiff_is_16bit: pure TIFF header sniff, four boundary cases
+    (fauxcasa-v46.7):
+      16-bit grayscale TIFF  -> True
+      8-bit grayscale TIFF   -> False
+      non-TIFF bytes         -> False
+      truncated bytes        -> False, never raises
+    """
+    from PIL import Image
+    from pillowload import tiff_is_16bit
+
+    g16 = tmp_path / "g16.tif"
+    Image.new("I;16", (4, 4), 40000).save(g16, "TIFF")
+    assert tiff_is_16bit(g16.read_bytes()) is True
+
+    g8 = tmp_path / "g8.tif"
+    Image.new("L", (4, 4), 128).save(g8, "TIFF")
+    assert tiff_is_16bit(g8.read_bytes()) is False
+
+    assert tiff_is_16bit(b"not a tiff") is False  # non-TIFF magic
+    assert tiff_is_16bit(b"II") is False           # truncated before magic
+    assert tiff_is_16bit(b"") is False             # empty
+
+    # Truncated: valid II header but cut before IFD content
+    full = g16.read_bytes()
+    assert tiff_is_16bit(full[:8]) is False        # header only, no IFD
+
+
 def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
     """The §5 stills-matrix regression sweep (fauxcasa-v46.4): before
     this, 5 of the 6 claimed formats were 'done' only by construction —
@@ -7835,9 +8241,10 @@ def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
       good.psd    PSD with composite     -> decodes (Pillow fallback)
       nocomp.psd  PSD, unusable composite-> error tile, by design
 
-    (Verified against the pinned PySide6 build: Qt itself decodes the
-    first five; PSD is the Pillow fallback's. If a Qt upgrade ever drops
-    one, the fallback rescues it and this matrix still pins the pixels.)"""
+    (Verified against the pinned PySide6 build: Qt decodes most of these;
+    16-bit TIFF and PSD go through the Pillow route. If a Qt upgrade ever
+    drops one of the Qt-decoded formats, the fallback rescues it and this
+    matrix still pins the pixels.)"""
     from PIL import Image
 
     lib = tmp_path / "lib"
@@ -7873,14 +8280,7 @@ def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
     px = color_at("prog.jpg")
     assert px.blue() > 170 and px.red() < 80
     px = color_at("gray16.tif")                  # 40000/65535 ~ 156 gray
-    if sys.platform == "win32" or sys.platform == "darwin":
-        assert abs(px.red() - 156) < 30 and abs(px.red() - px.blue()) < 10
-    else:
-        # Linux Qt's tiff plugin CLIPS 16-bit grayscale to white — a real
-        # fidelity defect users would see (fauxcasa-v46.7), not a test
-        # artifact. Pin decode-succeeds + gray-ness here; the mid-gray
-        # value assertion returns when the Pillow routing lands.
-        assert abs(px.red() - px.blue()) < 10
+    assert abs(px.red() - 156) < 30 and abs(px.red() - px.blue()) < 10
     px = color_at("anim.gif")                    # FIRST frame green...
     assert px.green() > 150 and px.red() < 90    # ...never frame-2 magenta
     px = color_at("t.tga")
@@ -7951,14 +8351,31 @@ def test_keymap_conflict_checker_is_real() -> None:
 def test_keymap_platform_correctness_rides_qt() -> None:
     """Ctrl/Cmd correctness (spec §8) comes from Qt, not per-OS tables:
     grid.select_all defers to StandardKey.SelectAll (Cmd+A on macOS from
-    Qt's own binding list), and app.play resolves to the F11 heritage
-    binding for QAction.setShortcuts."""
+    Qt's own binding list), and app.play resolves F11 + Ctrl+4 (the
+    Picasa slideshow chord added in ed5.12) for QAction.setShortcuts."""
     import keymap
     from PySide6.QtGui import QKeySequence
 
     assert (keymap.DEFAULT_SCHEME["grid.select_all"].standard
             == QKeySequence.StandardKey.SelectAll)
-    assert [s.toString() for s in keymap.shortcuts("app.play")] == ["F11"]
+    play_strs = [s.toString() for s in keymap.shortcuts("app.play")]
+    assert "F11" in play_strs
+    assert "Ctrl+4" in play_strs
+
+
+def test_play_tooltip_derives_from_keymap(library: Path) -> None:
+    """The ▶ Play tooltip is built from keymap.shortcuts, not a hard-coded
+    string — every chord in the scheme appears in the tooltip text, so
+    adding or removing a chord keeps the UI self-consistent (ed5.12)."""
+    import keymap
+    _offscreen_app()
+    from main import MainWindow
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    tip = win.play_action.toolTip()
+    for seq in keymap.shortcuts("app.play"):
+        assert seq.toString() in tip, (
+            f"{seq.toString()!r} missing from play tooltip: {tip!r}")
 
 
 def test_grid_jk_navigate_next_prev(tmp_path: Path) -> None:

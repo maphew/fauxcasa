@@ -8,10 +8,11 @@ lives under cache/tracer-cache/<digest>/, never inside the library
 so identity is content-hash + library-relative path (N6) and staleness
 is checked by cheap signals (size + mtime) before trusting the cache.
 
-The in-app builder is sequential and unoptimized — fine for fixture
-libraries; the real indexer with its >= 30 photos/s budget (spec §7) is
-deliberately out of tracer scope. Big pre-built caches (the 100k
-benchmark fcache) are adopted via an explicit --thumbs path instead.
+The in-app builder uses a thread pool (INDEX_WORKERS) — adequate for
+fixture libraries; the real indexer with its >= 30 photos/s budget
+(spec §7) is deliberately out of tracer scope. Big pre-built caches
+(the 100k benchmark fcache) are adopted via an explicit --thumbs path
+instead.
 """
 
 from __future__ import annotations
@@ -33,11 +34,12 @@ from catalog import (
     BACKFILL_IN_PROGRESS,
     Catalog,
     save_catalog,
+    save_catalog_retrying,
 )
 from cropmap import crop_pixel_box, crop_qimage_upright
 from inmeta import read_jpeg_metadata
 from metareader import read_file_meta
-from pillowload import pillow_qimage
+from pillowload import pillow_qimage, tiff_is_16bit
 from rawload import is_raw_suffix, raw_demosaic_qimage, raw_preview_jpeg
 from videoload import is_video_suffix, poster_qimage
 
@@ -402,46 +404,53 @@ def _index_one(root: Path, photo, idx: int, levels: list[int]):
             # a <= 512 px thumb). Null on failure -> the error tile below.
             img = raw_demosaic_qimage(data, half_size=True)
     if img is None:
-        # setData copies into the buffer's own QByteArray; passing a
-        # temporary QByteArray to QBuffer(...) instead leaves a dangling
-        # pointer (PySide6 frees the temporary) and every read silently
-        # fails.
-        buf = QBuffer()
-        buf.setData(data)
-        buf.open(QIODevice.OpenModeFlag.ReadOnly)
-        reader = QImageReader(buf)
-        # Apply EXIF orientation at decode (handles all 8 cases, mirrors
-        # too); the thumbnail is stored display-upright. setScaledSize is in
-        # pre-transform pixels — for a 90/270 image the box edges swap but
-        # both stay <= top, and the post-read clamp below covers any header
-        # that couldn't be pre-sized.
-        reader.setAutoTransform(True)
-        sz = reader.size()  # header-only; full pixels not decoded yet
-        if sz.isValid():
-            # The pixels we will KEEP must fit the top-level box. With a
-            # crop= recipe the kept pixels are the crop SUB-RECT, so the
-            # scale factor is chosen for it (both crop and setScaledSize
-            # are in pre-transform/stored pixels): this is what makes the
-            # bake "crop before downscale" — decoding the whole image to
-            # ~top px first and cropping after would throw away exactly
-            # the resolution the crop zooms into.
-            kw, kh = sz.width(), sz.height()
-            if crop is not None:
-                box = crop_pixel_box(crop, kw, kh)
-                if box is not None:
-                    kw, kh = box[2], box[3]
-            if kw > top or kh > top:
-                s = min(top / kw, top / kh)
-                reader.setScaledSize(QSize(max(1, round(sz.width() * s)),
-                                           max(1, round(sz.height() * s))))
-        img = reader.read()
-        if img.isNull() and data:
-            # Qt yielded null for a still (no PSD plugin ships with Qt;
-            # exotic TIFF/JPEG variants): one Pillow attempt on the same
-            # bytes before the error tile (fauxcasa-v46.4). Extension-
-            # routed RAW/video never reach this branch — their decode
-            # above hands back a QImage, null or not (pillowload doc).
+        # Pre-route 16-bit TIFFs to Pillow on ALL platforms: Qt's tiff
+        # plugin silently clips 16-bit grayscale to white on Linux
+        # (fauxcasa-v46.7). Header sniff only — no pixel decode.
+        _tiff = photo.rel.lower().endswith((".tif", ".tiff"))
+        if data and _tiff and tiff_is_16bit(data):
             img = pillow_qimage(data, top)
+        else:
+            # setData copies into the buffer's own QByteArray; passing a
+            # temporary QByteArray to QBuffer(...) instead leaves a dangling
+            # pointer (PySide6 frees the temporary) and every read silently
+            # fails.
+            buf = QBuffer()
+            buf.setData(data)
+            buf.open(QIODevice.OpenModeFlag.ReadOnly)
+            reader = QImageReader(buf)
+            # Apply EXIF orientation at decode (handles all 8 cases, mirrors
+            # too); the thumbnail is stored display-upright. setScaledSize is
+            # in pre-transform pixels — for a 90/270 image the box edges swap
+            # but both stay <= top, and the post-read clamp below covers any
+            # header that couldn't be pre-sized.
+            reader.setAutoTransform(True)
+            sz = reader.size()  # header-only; full pixels not decoded yet
+            if sz.isValid():
+                # The pixels we will KEEP must fit the top-level box. With a
+                # crop= recipe the kept pixels are the crop SUB-RECT, so the
+                # scale factor is chosen for it (both crop and setScaledSize
+                # are in pre-transform/stored pixels): this is what makes the
+                # bake "crop before downscale" — decoding the whole image to
+                # ~top px first and cropping after would throw away exactly
+                # the resolution the crop zooms into.
+                kw, kh = sz.width(), sz.height()
+                if crop is not None:
+                    box = crop_pixel_box(crop, kw, kh)
+                    if box is not None:
+                        kw, kh = box[2], box[3]
+                if kw > top or kh > top:
+                    s = min(top / kw, top / kh)
+                    reader.setScaledSize(QSize(max(1, round(sz.width() * s)),
+                                               max(1, round(sz.height() * s))))
+            img = reader.read()
+            if img.isNull() and data:
+                # Qt yielded null for a still (no PSD plugin ships with Qt;
+                # exotic TIFF/JPEG variants): one Pillow attempt on the same
+                # bytes before the error tile (fauxcasa-v46.4). Extension-
+                # routed RAW/video never reach this branch — their decode
+                # above hands back a QImage, null or not (pillowload doc).
+                img = pillow_qimage(data, top)
     if img.isNull():
         return (idx, [(b"", 0, 0) for _ in levels], size, mtime, sha,
                 meta, fmeta, None)
@@ -655,21 +664,17 @@ def backfill_catalog(
         catalog.json — raises a transient PermissionError, and one missed
         checkpoint only costs resume granularity, never the multi-minute
         pass (observed live at photo 96,500 of the 100k benchmark run).
-        The TERMINAL saves (complete / cancel cursor) retry with backoff
+        The TERMINAL saves (complete / cancel cursor) use save_catalog_retrying
         and then raise: silently losing those would strand the on-disk
         state at the last periodic cursor."""
-        err: OSError | None = None
-        for attempt in range(5 if must else 1):
+        if not must:
             try:
                 save_catalog(catalog, catalog_path)
                 return True
-            except OSError as e:
-                err = e
-                if must:
-                    time.sleep(0.1 * (attempt + 1))
-        if must:
-            raise err
-        return False
+            except OSError:
+                return False
+        save_catalog_retrying(catalog, catalog_path)
+        return True
 
     def wait_while_paused() -> None:
         while pause is not None and pause.is_set():

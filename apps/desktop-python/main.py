@@ -83,7 +83,7 @@ from catalog import (  # noqa: E402
     load_contacts_xml,
     load_report,
     reconcile_walk,
-    save_catalog,
+    save_catalog_retrying,
     save_report,
     scan_library,
 )
@@ -384,16 +384,36 @@ def _choose_library_from_dialog(cache_root: Path, parent=None,
         return library
 
 
-def _restart_command(library: Path, cache_root: Path) -> tuple[str, list[str]]:
-    """Command used by the in-app Open action to switch libraries.
+def _restart_command(
+    library: Path,
+    cache_root: Path,
+    scan_filter: "ScanFilter | None" = None,
+    thumbs: "Path | None" = None,
+) -> tuple[str, list[str]]:
+    """Command used by the in-app Open and File Types actions to relaunch.
 
     Relaunching keeps startup's warm/cold/adopt logic single-sourced in main().
+    Pass-through flags reproduce the original scan constraints on relaunch:
+    --min-image-size / --max-image-size are always forwarded when set;
+    --thumbs is forwarded only when the caller explicitly passes it — an adopted
+    cache binds to a specific walk; callers must only pass it when the relaunch
+    walks the same files.
     """
+    extra: list[str] = []
+    if scan_filter is not None:
+        if scan_filter.min_width and scan_filter.min_height:
+            extra += ["--min-image-size",
+                      f"{scan_filter.min_width}x{scan_filter.min_height}"]
+        if scan_filter.max_width and scan_filter.max_height:
+            extra += ["--max-image-size",
+                      f"{scan_filter.max_width}x{scan_filter.max_height}"]
+    if thumbs is not None:
+        extra += ["--thumbs", str(thumbs)]
     if FROZEN:
-        return sys.executable, [str(library), "--cache-root", str(cache_root)]
+        return sys.executable, [str(library), "--cache-root", str(cache_root)] + extra
     return sys.executable, [
         str(APP_DIR / "main.py"), str(library), "--cache-root", str(cache_root)
-    ]
+    ] + extra
 
 
 def _explain_not_a_library(root: Path) -> None:
@@ -581,11 +601,16 @@ class MainWindow(QMainWindow):
                  contacts: dict[str, str] | None = None,
                  pal_dir: Path | None = None,
                  excluded_exts: set[str] | None = None,
+                 thumbs_path: Path | None = None,
                  db3_dir: Path | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
         self.scan_filter = scan_filter
+        # --thumbs path preserved for any relaunch that walks the same file
+        # set as this run; a File-Types change changes the walk and must not
+        # forward it — that relaunch cold-rebuilds (see _show_file_types).
+        self.thumbs_path = thumbs_path
         # File Types panel choice (fauxcasa-v46.4): the persisted excluded
         # set and the effective walk set derived from it, kept so every
         # background rescan/reconcile walks exactly what startup walked —
@@ -670,8 +695,13 @@ class MainWindow(QMainWindow):
         # one toolbar affordance acting on the CURRENT view; F11 is the
         # Picasa-heritage shortcut (fauxcasa-q6l.3).
         self.play_action = bar.addAction("▶ Play")
+        # Chord text is derived from the keymap so the tooltip stays current
+        # when chords are added or changed (ed5.12); never hard-code "F11".
+        _play_chords = " / ".join(s.toString()
+                                  for s in keymap.shortcuts("app.play"))
         self.play_action.setToolTip(
-            "Slideshow of the current view (F11) — Space pauses, Esc exits")
+            f"Slideshow of the current view ({_play_chords})"
+            " — Space pauses, Esc exits")
         # The binding comes from the keymap default scheme (q6l.8).
         self.play_action.setShortcuts(keymap.shortcuts("app.play"))
         self.play_action.triggered.connect(self._start_slideshow)
@@ -828,7 +858,7 @@ class MainWindow(QMainWindow):
                                      cancel=self.build_cancel)
                 if result is None:
                     return  # cancelled
-                save_catalog(catalog, build_dir / "catalog.json")
+                save_catalog_retrying(catalog, build_dir / "catalog.json")
                 save_report(catalog.report, build_dir / REPORT_NAME)
                 _emit(bridge.finished, result, catalog, False)
             except Exception as e:  # report, never crash the UI
@@ -873,7 +903,7 @@ class MainWindow(QMainWindow):
                                      cancel=self.build_cancel)
                 if result is None:
                     return
-                save_catalog(fresh, cache_dir / "catalog.json")
+                save_catalog_retrying(fresh, cache_dir / "catalog.json")
                 save_report(fresh.report, cache_dir / REPORT_NAME)
                 _emit(bridge.finished, result, fresh, True)
             except Exception as e:
@@ -1033,7 +1063,10 @@ class MainWindow(QMainWindow):
             self.cache_root, self, self.catalog.root)
         if root is None:
             return
-        program, args = _restart_command(root, self.cache_root)
+        # Different library: forward scan-size constraints but NOT --thumbs
+        # (the adopted cache is specific to the previous library).
+        program, args = _restart_command(root, self.cache_root,
+                                         scan_filter=self.scan_filter)
         started = QProcess.startDetached(program, args)
         ok = started[0] if isinstance(started, tuple) else started
         if not ok:
@@ -1067,7 +1100,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "could not save the file-type choice — see the log", 8000)
             return
-        program, args = _restart_command(self.catalog.root, self.cache_root)
+        # Same library: forward scan-size constraints only. An adopted cache
+        # binds to a specific walk; a File-Types change changes the walk, so
+        # the relaunch must cold-rebuild the cache.
+        program, args = _restart_command(self.catalog.root, self.cache_root,
+                                         scan_filter=self.scan_filter)
         started = QProcess.startDetached(program, args)
         ok = started[0] if isinstance(started, tuple) else started
         if not ok:
@@ -1583,21 +1620,44 @@ class MainWindow(QMainWindow):
         """A held thumb was clicked: show that photo in the grid — back
         on the browser page, falling back to the All-photos view when
         the active filter doesn't show it (a held photo is cross-folder
-        by design, so a search/album/starred view may not contain it)."""
+        by design, so a search/album/starred view may not contain it).
+        Hidden photos auto-reveal when reveal is off (q6l.18)."""
         idx = self.tray.index_of(rel)
         if idx is None:
             return
         self.pages.setCurrentWidget(self.pages.widget(0))
+        revealed = False
         if idx not in self.grid.display_pos:
-            self.search.blockSignals(True)
-            self.search.clear()
-            self.search.blockSignals(False)
-            self.grid.set_filter(None, "")
-            self._reselect_view("all", "")
-            self._show_counts("All photos", self._shown_count())
+            # Hidden photo with reveal off: auto-reveal before falling back
+            # to All photos — avoids a silent no-op (N7) when the only
+            # absence reason is the hidden flag.
+            photo = self.catalog.photos[idx]
+            if not self.grid.reveal and not photo.visible:
+                self.reveal_box.setChecked(True)   # triggers _toggle_reveal
+                revealed = True
+            if idx not in self.grid.display_pos:
+                # Still absent (filter reason or reveal didn't surface it):
+                # clear to All photos as the last resort.
+                self.search.blockSignals(True)
+                self.search.clear()
+                self.search.blockSignals(False)
+                self.grid.set_filter(None, "")
+                self._reselect_view("all", "")
+                self._show_counts("All photos", self._shown_count())
         if idx in self.grid.display_pos:
             self.grid._select(idx)
             self.grid._ensure_visible(idx)
+            if revealed:
+                self.statusBar().showMessage(
+                    "Hidden photos revealed to show this photo", 4000)
+        else:
+            # reveal may have been toggled ON as a side effect of this
+            # navigation; name that action in the message so state and
+            # message agree (N7 — no silent side effects).
+            msg = ("Hidden photos revealed, but the photo is not visible "
+                   "in any view" if revealed
+                   else "Photo not visible in any view")
+            self.statusBar().showMessage(msg, 4000)
         self.grid.setFocus()
         self._refresh_tray_readout()
 
@@ -1983,7 +2043,9 @@ def main() -> int:
             # pending: record that, and MainWindow starts the background
             # backfill pass (fauxcasa-cam.12) which persists as it goes.
             catalog.backfill_state = BACKFILL_NOT_STARTED
-            save_catalog(catalog, cat_path)  # warm-start next time
+            # Same transient-reader hazard as the build-thread saves
+            # (fauxcasa-cam.18) — and uncaught here it would crash startup.
+            save_catalog_retrying(catalog, cat_path)  # warm-start next time
             save_report(catalog.report, cache_dir / REPORT_NAME)
         else:
             build_dir = cache_dir  # the build thread persists the catalog
@@ -2013,7 +2075,8 @@ def main() -> int:
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
                      contacts=contacts, pal_dir=pal_dir,
-                     excluded_exts=excluded_exts, db3_dir=db3_dir)
+                     excluded_exts=excluded_exts,
+                     thumbs_path=args.thumbs, db3_dir=db3_dir)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)

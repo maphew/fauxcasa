@@ -171,6 +171,29 @@ def phase_metrics(b: dict, frame_period: float) -> dict:
     }
 
 
+def _occlusion_clean(not_visible_ticks: int, fill_timeouts: int,
+                     timeout_frames: int,
+                     platform: str | None = None) -> bool:
+    """Return True when no occlusion/contention tells are present.
+
+    The ~100 ms frame-callback-timeout cluster (timeout_frames) is a
+    Wayland-compositor signature: the compositor withholds frame callbacks
+    when the surface is occluded or idle, producing a dense band of
+    ~TIMEOUT_MS intervals.  On Windows the same ~100 ms band is produced
+    by genuinely paint-bound frames (frame production 100-140 ms => real
+    intervals fall in 95-105 ms), so using timeout_frames as a disqualifier
+    there would produce false positives.  Gate it to Linux only: the
+    mechanism behind the signature is the Wayland compositor, which no
+    other platform has — macOS is deliberately exempt too (no such
+    compositor timeout, and no macOS run has ever fed this gate).
+    timeout_frames stays a reported metric on every platform.
+
+    platform defaults to sys.platform; pass an explicit value in tests."""
+    plat = platform if platform is not None else sys.platform
+    timeout_tell = timeout_frames > 0 and plat.startswith("linux")
+    return not_visible_ticks == 0 and fill_timeouts == 0 and not timeout_tell
+
+
 def resolve_zoom(arg: str | None) -> int | None:
     """Map a --zoom keyword/value to a target tile size in px, or None to
     leave the grid at its default tile size (today's behavior, so prior
@@ -581,11 +604,14 @@ def main() -> int:
             # NB: QWindow.visibility() reports "Windowed" even when another
             # window covers the surface, so visibility alone can't see
             # occlusion. A stalled fill (fill_timeouts) or a cluster of
-            # ~100 ms intervals (frame-callback timeout) are the real
-            # occlusion/contention tells; require all three to be clean.
-            "occlusion_clean": (state["not_visible_ticks"] == 0
-                                and state["fill_timeouts"] == 0
-                                and timeout_frames == 0),
+            # ~100 ms intervals (frame-callback timeout, Linux only) are the
+            # real occlusion/contention tells.  See _occlusion_clean for why
+            # the timeout tell is gated to Linux.
+            "occlusion_clean": _occlusion_clean(
+                state["not_visible_ticks"],
+                state["fill_timeouts"],
+                timeout_frames,
+            ),
         }
         print(json.dumps(out), flush=True)
         app.quit()
