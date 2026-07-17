@@ -50,6 +50,18 @@ it: the §4 rescue importer (db3rescue.rescue_people, fauxcasa-cam.6/.7)
 gap-fills ONLY those still-unnamed ids, source-flagged on
 Catalog.db3_contacts, with every conflict/residue on the ImportReport.
 
+Edit recipes (§4 "ini wins for edit recipes"; fauxcasa-cam.15):
+scan_library resolves the CURRENT crop from `crop=rect64(..)` (falling
+back to the filters= chain's crop64 op — crop= wins when both parse, a
+disagreement is an import-report entry) into Photo.crop, and preserves
+the raw recipe key/values (filters/crop/redo/text… — EDIT_RECIPE_KEYS)
+on Photo.edits for N3 losslessness. Display paths bake the crop — thumbs
+at index time (thumbcache._index_one), the viewer at decode — composing
+crop -> EXIF orientation -> rotate= (see apps/desktop-python/cropmap.py
+for why that order). Full recipe rendering (tilt, color ops, …) is M3
+and deliberately NOT displayed; Photo.has_edits drives the honest M1
+"edited" cue instead.
+
 Remaining tracer-scope gaps (see apps/desktop-python/README.md): EXIF orientation is
 applied at decode (Qt/PIL auto-transform, composed with the rotate= user
 turns), but faces-in-XMP is not ingested (fauxcasa-cam.5).
@@ -105,6 +117,16 @@ BACKFILL_COMPLETE = "complete"
 # NOT transform them and EXIF orientation is the consumer's job
 # (picasa-ini-format.md "faces="); name None = suggested/unnamed.
 FaceTag = tuple[tuple[float, float, float, float], str, str | None]
+
+# Per-file ini keys that carry Picasa edit-recipe state (fauxcasa-cam.15),
+# PRESERVED raw on Photo.edits. rotate= is deliberately excluded — it has a
+# parsed field of its own and composes live in paint (never a pending
+# recipe). This is the survey's edit-key vocabulary (picasa_db
+# _INI_EDIT_KEYS) minus rotate, plus text= (the text-tool record that
+# travels with textactive=; kept for N3 losslessness even though the survey
+# does not count it).
+EDIT_RECIPE_KEYS = frozenset(
+    "filters crop crop64 flipped redo textactive text".split())
 
 
 @dataclass(frozen=True)
@@ -163,6 +185,18 @@ class Photo:
     # for video files, the tracer's only pre-decode dim source there;
     # harmless extra signal on stills that carry them). None = unknown.
     dims: tuple[int, int] | None = None
+    # Edit recipe (fauxcasa-cam.15). `crop`: the CURRENT crop as (left,
+    # top, right, bottom) fractions of the STORED pixels (rect64 grammar —
+    # the same frame as faces=: rotate= does not transform it and EXIF
+    # orientation is the consumer's job), or None. Resolved at scan:
+    # crop= wins over the filters= chain's crop64 op (_resolve_crop).
+    # Display paths BAKE it: thumbs at index time, the viewer at decode,
+    # composing crop -> EXIF orientation -> rotate= (cropmap.py).
+    crop: tuple[float, float, float, float] | None = None
+    # The RAW edit-recipe key/value pairs, in ini order, duplicates kept —
+    # preserved byte-faithfully for N3 losslessness (full recipe rendering
+    # is M3; only the crop is displayed in M1). Keys: EDIT_RECIPE_KEYS.
+    edits: tuple[tuple[str, str], ...] = ()
     # Picasa stashes pre-edit originals in .picasaoriginals/; those files
     # are catalog entries (cache-order parity) but never shown in the grid.
     visible: bool = True
@@ -172,6 +206,27 @@ class Photo:
     size: int = -1
     mtime: int = -1
     sha256: str | None = None
+
+    @property
+    def has_edits(self) -> bool:
+        """The photo carries pending Picasa edit-recipe state — the M1
+        honest 'edited' cue (viewer info bar). DERIVED from crop/edits so
+        it can never drift from what was persisted. True for a resolved
+        crop or any non-empty recipe value, with two carve-outs:
+        `textactive=0` alone is NOT an edit (Picasa records the
+        overlay-off state — fixture 005 writes it into the post-bake
+        stash ini), and rotate= never counts (it is displayed live, not a
+        pending recipe; it isn't in EDIT_RECIPE_KEYS at all). The
+        unsaved-vs-baked state cue is M3 — this is presence only."""
+        if self.crop is not None:
+            return True
+        for k, v in self.edits:
+            if k.lower() == "textactive":
+                if v.strip() == "1":
+                    return True
+            elif v.strip():
+                return True
+        return False
 
 
 @dataclass
@@ -406,6 +461,88 @@ def format_date_taken(date_taken: str) -> str:
     """Human form of the canonical capture date: the ISO 'T' becomes a
     space; no other reinterpretation (footgun 16: never a year floor)."""
     return date_taken.replace("T", " ")
+
+
+# ---- edit recipes (fauxcasa-cam.15) ---------------------------------------
+#
+# §4: ini wins for edit recipes, and M1 "see your library again" means a
+# cropped photo shows CROPPED — Picasa itself rendered unsaved recipes
+# applied (oracle fixture 004: the crop lives in the ini ALONE, JPEG
+# untouched, no db3 change). This slice ingests the recipe keys (crop
+# parsed for display, everything preserved raw); rendering the rest of the
+# chain (tilt, color ops, …) is M3.
+
+
+def _usable_rect(rect: tuple[float, float, float, float] | None) -> bool:
+    """A crop rect the display can act on: parsed AND non-degenerate
+    (right > left, bottom > top). rect64 values are already in [0, 1]."""
+    return rect is not None and rect[0] < rect[2] and rect[1] < rect[3]
+
+
+def _crop_from_filters(value: str) -> tuple[float, float, float, float] | None:
+    """The crop64 op inside a filters= chain -> its rect, or None.
+    Grammar: ``crop64=1,<bare rect64 hex>;`` (picasa-ini-format.md). The
+    chain is ordered edit history and ops can repeat, so the LAST crop64
+    wins — a re-crop appends. Fail-soft per op: an unparseable crop64
+    param is skipped, never an exception (§4 robustness)."""
+    rect = None
+    for name, params in picasa_db.parse_filters(value):
+        if name.strip().lower() == "crop64" and len(params) >= 2:
+            try:
+                got = picasa_db.parse_rect64(params[1].strip())
+            except ValueError:
+                continue
+            if _usable_rect(got):
+                rect = got
+    return rect
+
+
+def _resolve_crop(sec: picasa_db.IniSection, rel: str,
+                  report: ImportReport) -> tuple[float, float, float, float] | None:
+    """The photo's CURRENT crop rect, or None. Source precedence:
+
+    1. ``crop=rect64(..)`` — authoritative per the format doc ("current
+       crop; history lives in filters= as crop64 op");
+    2. the filters= chain's crop64 op, filling in when crop= is absent or
+       unparseable (Picasa normally writes BOTH — fixture 004);
+    3. a standalone ``crop64=`` key (gist-era shape, ``1,<hex>`` or a
+       bare hex) as the last resort.
+
+    When crop= and the chain both parse and DISAGREE, crop= wins and the
+    conflict is surfaced on the import report (§4: never silently
+    resolved); the normal agreeing pair stays silent. Degenerate or
+    malformed values fail soft per line to the next source."""
+    crop = None
+    raw = sec.get("crop")
+    if raw:
+        try:
+            crop = picasa_db.parse_rect64(raw.strip())
+        except ValueError:
+            crop = None
+        if not _usable_rect(crop):
+            crop = None
+    chain = None
+    fraw = sec.get("filters")
+    if fraw:
+        chain = _crop_from_filters(fraw)
+    if crop is not None:
+        if chain is not None and chain != crop:
+            report.add("ini", "crop_conflict", rel,
+                       f"crop= says {crop} but the filters= chain's crop64 "
+                       f"says {chain} — crop= wins (the format doc's "
+                       f"'current crop'; the chain is history)")
+        return crop
+    if chain is not None:
+        return chain
+    craw = sec.get("crop64")
+    if craw:
+        try:
+            rect = picasa_db.parse_rect64(craw.split(",")[-1].strip())
+        except ValueError:
+            return None
+        if _usable_rect(rect):
+            return rect
+    return None
 
 
 # Picasa hides a WHOLE folder by putting it in the built-in "Hidden Folders"
@@ -841,6 +978,17 @@ def scan_library(root: Path,
                          else contacts.get(cid) or local.get(cid))
                         for rect, cid in parsed
                     )
+            # Edit recipes (fauxcasa-cam.15): every recipe key/value is
+            # preserved RAW, in ini order with duplicates kept (N3
+            # losslessness — Photo.edits); the current crop is resolved
+            # for display (crop= wins over the filters= chain's crop64;
+            # a disagreement lands on the import report). rotate= stays
+            # its own parsed field above.
+            recipe = tuple((k, v) for k, v in sec.items
+                           if k.lower() in EDIT_RECIPE_KEYS)
+            if recipe:
+                photo.edits = recipe
+                photo.crop = _resolve_crop(sec, rel, report)
 
         # A whole folder in the "Hidden Folders" collection hides every
         # photo under it, exactly like per-photo hidden=yes or a stash dir.
@@ -988,13 +1136,24 @@ def scan_library(root: Path,
 # — a v8 catalog was walked without them, so a warm start would silently
 # hide every TGA/PSD in the library until some unrelated drift; reject
 # and cold-rebuild (the same shape as the v7 video bump).
-# v10: the db3 rescue import (fauxcasa-cam.6/.7) gap-fills contact names
+# v10: Picasa edit-recipe keys (fauxcasa-cam.15) are ingested — the crop=
+# rect (or the filters= chain's crop64) drives crop-applied display, the
+# raw recipe strings are preserved (per-photo `cp`/`e` rows) — and the
+# indexer now BAKES the crop into the thumbnail like EXIF orientation. A
+# v9 catalog has neither the fields nor crop-baked thumbs, and nothing in
+# the cheap size/mtime drift check would notice (the recipe lives in the
+# ini sidecar, not the photo file); reject and cold-rebuild, which also
+# rebuilds the machine-local fcache with crops baked. The fcache MAGIC
+# version is untouched (the packed layout is unchanged, and the shipped
+# benchmark cache stays adoptable — its synthetic photos carry no recipe
+# keys, so the bake is a no-op there; same posture as the v2 EXIF bake).
+# v11: the db3 rescue import (fauxcasa-cam.6/.7) gap-fills contact names
 # from db3 person albums at scan and persists the rescued ids as a
-# top-level `db3_contacts` list (the People-sidebar source flag). A v9
+# top-level `db3_contacts` list (the People-sidebar source flag). A v10
 # catalog scanned before the rescue carries neither the rescued names nor
 # the flag, so a warm start would silently un-name rescued people; reject
 # and cold-rebuild.
-CATALOG_VERSION = 10
+CATALOG_VERSION = 11
 
 # The import report's file name, written beside catalog.json (same cache
 # dir) by save_report and re-attached on warm starts via load_report.
@@ -1050,6 +1209,12 @@ def _photo_to_row(p: Photo) -> dict:
         # rect fractions are n/65536 — exact binary fractions, so they
         # round-trip through JSON floats byte-identically.
         row["f"] = [[list(rect), cid, name] for rect, cid, name in p.faces]
+    if p.crop is not None:
+        row["cp"] = list(p.crop)  # n/65536 fractions: exact JSON round-trip
+    if p.edits:
+        # raw edit-recipe strings, verbatim (N3; has_edits derives from
+        # these on load, so no flag is persisted — it could only drift)
+        row["e"] = [[k, v] for k, v in p.edits]
     if p.date_taken:
         row["d"] = p.date_taken
     if p.geotag is not None:
@@ -1084,7 +1249,7 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
         # contact id -> display name registry (already contacts.xml-merged
         # at scan time; the warm path never re-reads inis or contacts.xml)
         "contacts": catalog.contacts,
-        # v9: which registry ids the db3 rescue named (sorted for a
+        # v11: which registry ids the db3 rescue named (sorted for a
         # deterministic file; the warm path never re-reads db3)
         "db3_contacts": sorted(catalog.db3_contacts),
         "albums": [
@@ -1145,6 +1310,7 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
             folder, _, name = rel.rpartition("/")
             g = row.get("g")
             wh = row.get("wh")
+            cp = row.get("cp")
             p = Photo(
                 rel=rel, folder=folder, name=name,
                 # media is DERIVED from the extension, like folder/name
@@ -1157,6 +1323,9 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
                 date_taken=row.get("d"),
                 geotag=(float(g[0]), float(g[1])) if g else None,
                 dims=(int(wh[0]), int(wh[1])) if wh else None,
+                crop=(float(cp[0]), float(cp[1]),
+                      float(cp[2]), float(cp[3])) if cp else None,
+                edits=tuple((str(k), str(v)) for k, v in row.get("e", ())),
                 size=row.get("z", -1), mtime=row.get("m", -1),
                 sha256=row.get("x"),
             )
