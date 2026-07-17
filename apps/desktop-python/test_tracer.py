@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import inmeta
+import library as libmod  # alias avoids shadowing the `library` Path fixture (:173)
 import thumbcache
 from catalog import (
     ScanFilter,
@@ -227,17 +229,10 @@ def test_walk_rule_parity_with_make_thumbcache(library: Path) -> None:
     """catalog order must equal make-thumbcache entry order or caches
     stop binding — compare against the script's own walk."""
     import catalog
-    import importlib.util
 
-    spec = importlib.util.spec_from_file_location(
-        "mtc", REPO / "scripts" / "make-thumbcache.py")
-    mtc = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mtc)
+    mtc = _load_mtc()
     assert mtc.EXTS == catalog.EXTS  # the usual drift vector
-    script_walk = sorted(
-        p for p in library.rglob("*")
-        if p.suffix.lower() in mtc.EXTS and p.is_file()
-    )
+    script_walk = mtc.walk_library(library, mtc.EXTS)
     assert walk_library(library) == script_walk
 
 
@@ -8922,3 +8917,378 @@ def test_ingest_parity_gate_passes() -> None:
         errors="replace", timeout=600)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert "fully ingested (0 expected-missing)" in proc.stdout
+
+
+# ===========================================================================
+# ---- multi-root library model core (fauxcasa-ed5.7.1): library.json,
+# ---- root-id minting, resolve_open_path, .fauxcasa walk exclusion
+# ===========================================================================
+
+
+def test_mint_root_id_shape_and_uniqueness() -> None:
+    """mint_root_id returns 8-char lowercase hex; 200 mints are all unique
+    and never path-derived. mint_library_id returns a parseable uuid4."""
+    import uuid
+
+    ids = [libmod.mint_root_id() for _ in range(200)]
+    for rid in ids:
+        assert re.fullmatch(r"[0-9a-f]{8}", rid), f"bad shape: {rid!r}"
+    assert len(set(ids)) == 200, "collision among 200 mints"
+
+    lid1 = libmod.mint_library_id()
+    lid2 = libmod.mint_library_id()
+    uuid.UUID(lid1)   # must parse without raising
+    uuid.UUID(lid2)
+    assert lid1 != lid2
+
+
+def test_library_json_roundtrip(tmp_path: Path) -> None:
+    """save_library + load_library is a lossless roundtrip; atomic replace
+    works on a second write; no .tmp files left behind."""
+    home = tmp_path / "home"
+    root_a = tmp_path / "photos"
+    root_b = tmp_path / "scans"
+    root_a.mkdir()
+    root_b.mkdir()
+
+    id_a = libmod.mint_root_id()
+    id_b = libmod.mint_root_id()
+    library_id = libmod.mint_library_id()
+
+    cfg = libmod.LibraryConfig(
+        library_id=library_id,
+        name="Test Library",
+        roots=[
+            libmod.LibraryRoot(id=id_a, path=root_a, label="Photos"),
+            libmod.LibraryRoot(id=id_b, path=root_b, label="Scans"),
+        ],
+        home=home,
+    )
+
+    libmod.save_library(cfg)
+
+    json_path = home / ".fauxcasa" / "library.json"
+    assert json_path.is_file()
+
+    raw = json.loads(json_path.read_text(encoding="utf-8"))
+    assert raw["format"] == 1
+    assert raw["library_id"] == library_id
+    assert raw["roots"][0]["path"] == root_a.as_posix()
+    assert raw["roots"][1]["path"] == root_b.as_posix()
+
+    loaded = libmod.load_library(home)
+    assert loaded is not None
+    assert loaded.library_id == cfg.library_id
+    assert loaded.name == cfg.name
+    assert not loaded.is_legacy
+    assert len(loaded.roots) == 2
+    assert loaded.roots[0].id == id_a
+    assert loaded.roots[0].label == "Photos"
+    assert loaded.roots[1].id == id_b
+    assert loaded.roots[1].label == "Scans"
+
+    # Second save: atomic replace over existing file still works
+    libmod.save_library(cfg)
+    loaded2 = libmod.load_library(home)
+    assert loaded2 is not None
+    assert loaded2.library_id == library_id
+
+    # No leftover .tmp files
+    tmp_files = list((home / ".fauxcasa").glob("*.tmp"))
+    assert tmp_files == [], f"leftover tmp files: {tmp_files}"
+
+
+def test_load_library_fail_soft(tmp_path: Path) -> None:
+    """load_library returns None for all invalid inputs."""
+    home = tmp_path / "home"
+    fauxcasa_dir = home / ".fauxcasa"
+    fauxcasa_dir.mkdir(parents=True)
+
+    def write_json(data) -> None:
+        (fauxcasa_dir / "library.json").write_text(
+            json.dumps(data), encoding="utf-8")
+
+    # Missing .fauxcasa/ entirely
+    assert libmod.load_library(tmp_path / "nonexistent") is None
+
+    # Garbage text
+    (fauxcasa_dir / "library.json").write_text("not json!!", encoding="utf-8")
+    assert libmod.load_library(home) is None
+
+    # Wrong format version
+    write_json({"format": 2, "library_id": "abc", "roots": []})
+    assert libmod.load_library(home) is None
+
+    # Empty roots list
+    write_json({"format": 1, "library_id": "test-id", "name": "", "roots": []})
+    assert libmod.load_library(home) is None
+
+    # Duplicate root ids
+    ra = tmp_path / "a"
+    rb = tmp_path / "b"
+    ra.mkdir(); rb.mkdir()
+    write_json({
+        "format": 1, "library_id": "test-id", "name": "",
+        "roots": [
+            {"id": "a1b2c3d4", "path": ra.as_posix(),
+             "volume_uuid": None, "vol_rel": None, "label": ""},
+            {"id": "a1b2c3d4", "path": rb.as_posix(),
+             "volume_uuid": None, "vol_rel": None, "label": ""},
+        ]
+    })
+    assert libmod.load_library(home) is None
+
+    # Root with reserved id ""
+    write_json({
+        "format": 1, "library_id": "test-id", "name": "",
+        "roots": [
+            {"id": "", "path": ra.as_posix(),
+             "volume_uuid": None, "vol_rel": None, "label": ""},
+        ]
+    })
+    assert libmod.load_library(home) is None
+
+    # Nested roots (tmp/a and tmp/a/sub)
+    ra_sub = ra / "sub"
+    ra_sub.mkdir()
+    write_json({
+        "format": 1, "library_id": "test-id", "name": "",
+        "roots": [
+            {"id": "a1b2c3d4", "path": ra.as_posix(),
+             "volume_uuid": None, "vol_rel": None, "label": ""},
+            {"id": "5e6f7a8b", "path": ra_sub.as_posix(),
+             "volume_uuid": None, "vol_rel": None, "label": ""},
+        ]
+    })
+    assert libmod.load_library(home) is None
+
+
+def test_resolve_open_path(tmp_path: Path) -> None:
+    """resolve_open_path: explicit cfg for a valid library.json, legacy
+    fallback for a bare dir or a corrupt library.json."""
+    # (a) dir with a valid library.json -> explicit config
+    home_a = tmp_path / "home_a"
+    root_a = tmp_path / "root_a"
+    root_a.mkdir()
+    lid = libmod.mint_library_id()
+    cfg = libmod.LibraryConfig(
+        library_id=lid, name="Test Library",
+        roots=[libmod.LibraryRoot(
+            id=libmod.mint_root_id(), path=root_a, label="Root A")],
+        home=home_a,
+    )
+    libmod.save_library(cfg)
+    result = libmod.resolve_open_path(home_a)
+    assert not result.is_legacy
+    assert result.library_id == lid
+
+    # (b) bare dir -> degenerate legacy
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    result_b = libmod.resolve_open_path(bare)
+    assert result_b.is_legacy
+    assert result_b.home is None
+    assert len(result_b.roots) == 1
+    assert result_b.roots[0].id == libmod.LEGACY_ROOT_ID
+    assert result_b.roots[0].path == bare.resolve()
+
+    # (c) dir with corrupt library.json -> legacy fallback
+    corrupt = tmp_path / "corrupt"
+    corrupt_fauxcasa = corrupt / ".fauxcasa"
+    corrupt_fauxcasa.mkdir(parents=True)
+    (corrupt_fauxcasa / "library.json").write_text("{ bad json", encoding="utf-8")
+    result_c = libmod.resolve_open_path(corrupt)
+    assert result_c.is_legacy
+
+
+def test_root_marker_roundtrip(tmp_path: Path) -> None:
+    """write_root_marker / read_root_marker: valid id round-trips; absent
+    and garbage content return None; nonexistent parent returns False."""
+    d = tmp_path / "root"
+    d.mkdir()
+
+    # Successful write + read
+    assert libmod.write_root_marker(d, "a1b2c3d4") is True
+    assert libmod.read_root_marker(d) == "a1b2c3d4"
+
+    # Absent marker -> None
+    d2 = tmp_path / "nomarker"
+    d2.mkdir()
+    assert libmod.read_root_marker(d2) is None
+
+    # Garbage content -> None
+    d3 = tmp_path / "bad"
+    d3.mkdir()
+    (d3 / libmod.ROOT_MARKER).write_text("not an id", encoding="utf-8")
+    assert libmod.read_root_marker(d3) is None
+
+    # Write to a nonexistent parent dir -> False, no exception
+    nodir = tmp_path / "does_not_exist" / "also_not_here"
+    result = libmod.write_root_marker(nodir, "a1b2c3d4")
+    assert result is False
+
+
+def test_walk_excludes_fauxcasa_dir_and_marker(tmp_path: Path) -> None:
+    """walk_library excludes .fauxcasa/ content and .fauxcasa-root at any
+    depth; .picasaoriginals (dot-stash) is still walked; scan_library
+    photo count agrees."""
+    root = tmp_path / "root"
+
+    # Two normal jpegs
+    make_jpeg(root / "a.jpg")
+    make_jpeg(root / "sub" / "b.jpg")
+
+    # .fauxcasa library state — extension-bearing file (proved real behavior)
+    (root / ".fauxcasa").mkdir()
+    (root / ".fauxcasa" / "library.json").write_text("{}", encoding="utf-8")
+    (root / ".fauxcasa" / "thumbs").mkdir()
+    make_jpeg(root / ".fauxcasa" / "thumbs" / "leak.jpg")
+
+    # Nested .fauxcasa at a sub-level
+    (root / "f" / ".fauxcasa").mkdir(parents=True)
+    make_jpeg(root / "f" / ".fauxcasa" / "deep.jpg")
+
+    # The root marker file
+    (root / libmod.ROOT_MARKER).write_text("a1b2c3d4", encoding="utf-8")
+
+    # .picasaoriginals dot-stash — should still be walked
+    make_jpeg(root / "f" / ".picasaoriginals" / "orig.jpg")
+
+    result = walk_library(root)
+    result_rels = [p.relative_to(root).as_posix() for p in result]
+
+    assert "a.jpg" in result_rels
+    assert "sub/b.jpg" in result_rels
+    assert "f/.picasaoriginals/orig.jpg" in result_rels
+
+    # Nothing under any .fauxcasa dir
+    for rel in result_rels:
+        assert ".fauxcasa" not in Path(rel).parts, (
+            f"found .fauxcasa path in walk: {rel!r}")
+
+    # The marker file is excluded
+    assert libmod.ROOT_MARKER not in result_rels
+
+    # Exactly the three expected files
+    assert len(result) == 3, f"expected 3 files, got {result_rels!r}"
+
+    # scan_library agrees on photo count
+    cat = scan_library(root)
+    assert len(cat.photos) == 3
+
+
+def test_fauxcasa_exclusion_parity_with_make_thumbcache(tmp_path: Path) -> None:
+    """Both walk twins exclude .fauxcasa/ and .fauxcasa-root identically;
+    constant drift between library.py and the script is caught here."""
+    root = tmp_path / "root"
+
+    make_jpeg(root / "a.jpg")
+    make_jpeg(root / "sub" / "b.jpg")
+    make_jpeg(root / "f" / ".picasaoriginals" / "orig.jpg")
+
+    (root / ".fauxcasa").mkdir()
+    make_jpeg(root / ".fauxcasa" / "leak.jpg")
+    (root / ".fauxcasa" / "sub").mkdir()
+    make_jpeg(root / ".fauxcasa" / "sub" / "deep.jpg")
+    (root / libmod.ROOT_MARKER).write_text("a1b2c3d4", encoding="utf-8")
+
+    mtc = _load_mtc()
+
+    # Constant drift guard (the twin-invariant)
+    assert mtc.LIBRARY_DIR == libmod.LIBRARY_DIR
+    assert mtc.ROOT_MARKER == libmod.ROOT_MARKER
+
+    catalog_result = walk_library(root)
+    script_result = mtc.walk_library(root, mtc.EXTS)
+    assert catalog_result == script_result
+
+
+def test_nested_root_rejected(tmp_path: Path) -> None:
+    """add_root raises ValueError for descendant, ancestor, and duplicate
+    roots; a sibling root succeeds and round-trips through save/load."""
+    home = tmp_path / "home"
+    a = tmp_path / "a"
+    a.mkdir()
+    a_sub = a / "sub"
+    a_sub.mkdir()
+    b = tmp_path / "b"
+    b.mkdir()
+
+    lid = libmod.mint_library_id()
+    cfg = libmod.LibraryConfig(
+        library_id=lid, name="Test Library",
+        roots=[libmod.LibraryRoot(
+            id="a1b2c3d4", path=a, label="A")],
+        home=home,
+    )
+
+    # Descendant of existing root
+    with pytest.raises(ValueError):
+        libmod.add_root(cfg, a_sub)
+
+    # Ancestor of existing root (tmp_path contains a)
+    with pytest.raises(ValueError):
+        libmod.add_root(cfg, tmp_path)
+
+    # Exact duplicate
+    with pytest.raises(ValueError):
+        libmod.add_root(cfg, a)
+
+    # Sibling root succeeds
+    new_root = libmod.add_root(cfg, b)
+    assert re.fullmatch(r"[0-9a-f]{8}", new_root.id)
+    assert new_root.id != "a1b2c3d4"
+    assert new_root.label == "b"
+    assert len(cfg.roots) == 2
+
+    # Round-trip through save/load
+    libmod.save_library(cfg)
+    loaded = libmod.load_library(home)
+    assert loaded is not None
+    assert len(loaded.roots) == 2
+    assert loaded.roots[1].id == new_root.id
+
+
+def test_add_root_rejects_home_swallow(tmp_path: Path) -> None:
+    """add_root raises ValueError when the candidate would contain the
+    library-home; a different sibling root succeeds."""
+    h_home = tmp_path / "h" / "home"
+    a = tmp_path / "a"
+    a.mkdir()
+    (tmp_path / "h").mkdir()
+
+    lid = libmod.mint_library_id()
+    cfg = libmod.LibraryConfig(
+        library_id=lid, name="Test Library",
+        roots=[libmod.LibraryRoot(
+            id="a1b2c3d4", path=a, label="A")],
+        home=h_home,
+    )
+
+    # tmp/"h" contains home (h/home); adding it would swallow the home
+    with pytest.raises(ValueError):
+        libmod.add_root(cfg, tmp_path / "h")
+
+    # A genuinely separate root succeeds
+    c = tmp_path / "c"
+    c.mkdir()
+    new_root = libmod.add_root(cfg, c)
+    assert new_root.id != "a1b2c3d4"
+
+
+def test_add_root_on_legacy_raises(tmp_path: Path) -> None:
+    """add_root raises ValueError on a legacy config (promotion is bead .d)."""
+    d = tmp_path / "photos"
+    d.mkdir()
+    cfg = libmod.legacy_config(d)
+    assert cfg.is_legacy
+    with pytest.raises(ValueError):
+        libmod.add_root(cfg, tmp_path / "other")
+
+
+def test_save_library_on_legacy_raises(tmp_path: Path) -> None:
+    """save_library refuses a legacy config (no home; never written to disk)."""
+    d = tmp_path / "photos"
+    d.mkdir()
+    with pytest.raises(ValueError):
+        libmod.save_library(libmod.legacy_config(d))

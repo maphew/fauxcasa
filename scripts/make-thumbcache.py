@@ -98,9 +98,28 @@ POSTER_SEEK_S = 1.0
 # (PSD = the flattened composite, matching the app's Pillow fallback).
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
         ".webp", ".tga", ".psd"} | RAW_EXTS | VIDEO_EXTS
+# Mirror of apps/desktop-python/library.py LIBRARY_DIR / ROOT_MARKER — the
+# library-state dir and per-root id marker are excluded from the walk in
+# BOTH twins (multiroot .a, fauxcasa-ed5.7.1) or caches stop binding.
+LIBRARY_DIR = ".fauxcasa"
+ROOT_MARKER = ".fauxcasa-root"
 # Mirror of apps/desktop-python/thumbcache.py.RECOMMENDED_LEVELS — 512 is the
 # hi-DPI/loupe payload, 256 is the grid's primary, 128 a cheap low-DPI level.
 RECOMMENDED_LEVELS = (512, THUMB_EDGE, 128)
+
+
+def walk_library(root: Path, exts) -> list[Path]:
+    """Twin of apps/desktop-python/catalog.py walk_library: the frozen
+    path-component-sort walk rule, minus .fauxcasa/ and .fauxcasa-root.
+    Any change lands in both files in the same commit (multiroot .a,
+    fauxcasa-ed5.7.1) or caches stop binding."""
+    nroot = len(root.parts)
+    return sorted(
+        p for p in root.rglob("*")
+        if p.suffix.lower() in exts and p.is_file()
+        and LIBRARY_DIR not in p.parts[nroot:]
+        and p.name != ROOT_MARKER
+    )
 
 
 def _normalize_levels(levels) -> list[int]:
@@ -294,10 +313,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         exts -= drop
 
-    files = sorted(
-        p for p in args.library.rglob("*")
-        if p.suffix.lower() in exts and p.is_file()
-    )
+    files = walk_library(args.library, exts)
     if not files:
         print("no images found", file=sys.stderr)
         return 2
