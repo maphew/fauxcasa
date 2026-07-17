@@ -813,6 +813,8 @@ class ViewerPage(QWidget):
             parts.append(format_geotag(photo.geotag))  # §3 geotag readout
         if photo.caption:
             parts.append(f"“{photo.caption}”")
+        if photo.stashed_original is not None:
+            parts.append("Picasa-saved original kept")
         return "   ·   ".join(parts)
 
     @staticmethod

@@ -96,6 +96,7 @@ class Reference:
     pal_files: int                # albums/*.pal
     contacts_xml: int             # <contact> entries in contacts/contacts.xml
     manifest: dict[str, Any]      # generator ground truth
+    stashed_fs: int               # stash-dir media files whose same-name sibling exists
 
 
 def build_reference(corpus: Path) -> Reference:
@@ -110,6 +111,12 @@ def build_reference(corpus: Path) -> Reference:
     if cx.is_file():
         contacts_xml = len(re.findall(r"<contact\b", cx.read_text("utf-8")))
     manifest = json.loads((corpus / "manifest.json").read_text("utf-8"))
+    stashed_fs = sum(
+        1 for p in images
+        if (p.parent.name.lower() == ".picasaoriginals"
+            or p.parent.name == "Originals")
+        and (p.parent.parent / p.name).is_file()
+    )
     return Reference(
         survey=survey,
         photos_fs=len(images),
@@ -118,6 +125,7 @@ def build_reference(corpus: Path) -> Reference:
         pal_files=len(list((corpus / "albums").glob("*.pal"))),
         contacts_xml=contacts_xml,
         manifest=manifest,
+        stashed_fs=stashed_fs,
     )
 
 
@@ -290,6 +298,14 @@ CLASSES: list[ParityClass] = [
         lambda r: r.manifest["expected"]["placeholder_album_uids"],
         lambda c, r: sum(1 for a in c.albums.values() if a.placeholder),
         manifest_key="placeholder_album_uids"),
+    # ---- stash association: ingested by fauxcasa-cam.19 -------------------
+    ParityClass(
+        # .picasaoriginals / legacy Originals pairs: every stash file whose
+        # same-name sibling exists links as that sibling's saved original
+        "stashed_originals", lambda r: r.stashed_fs,
+        lambda c, r: sum(1 for p in c.photos
+                         if p.stashed_original is not None),
+        manifest_key="stashed_originals"),
     # ---- edit recipes: ingested by fauxcasa-cam.15 PR ----------------------
     ParityClass(
         # every per-file edit-recipe key line besides the long-ingested

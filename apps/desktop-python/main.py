@@ -1761,6 +1761,10 @@ class MainWindow(QMainWindow):
             parts.append(f"“{p.caption}”")
         if p.keywords:
             parts.append("#" + " #".join(p.keywords))
+        if p.stashed_original is not None:
+            # baked edit with the untouched original still in the stash
+            # (fauxcasa-cam.19); restore machinery is M3.
+            parts.append("Picasa-saved original kept")
         self.meta_label.setText("   ".join(parts) + "  ")
 
     def _build_progress(self, done: int, total: int) -> None:

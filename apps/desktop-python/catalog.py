@@ -202,6 +202,14 @@ class Photo:
     # Picasa stashes pre-edit originals in .picasaoriginals/; those files
     # are catalog entries (cache-order parity) but never shown in the grid.
     visible: bool = True
+    # M1 read-only .picasaoriginals association (fauxcasa-cam.19, spec §10
+    # item 18): the catalog INDEX of this photo's stashed pre-edit original
+    # — the same-named file in the folder's .picasaoriginals/ (or legacy
+    # Originals/) stash, where Picasa File->Save moved the untouched bytes
+    # (oracle fixtures 005/019). DERIVED from the photo list on both scan
+    # and load (like folder/name/visible/media), never persisted. None =
+    # no Picasa-saved original. Un-bake/restore is M3; this is display-only.
+    stashed_original: int | None = None
     # Identity + staleness signals, filled by the indexer (build_cache),
     # persisted in the catalog, and used by reconcile (cheap size+mtime
     # diff) and N6 identity (sha256). -1 / None until indexed.
@@ -437,6 +445,33 @@ def _is_stashed(folder_rel: str) -> bool:
     Picasa 3) and the legacy `Originals` name (Picasa 1.x/2.x)."""
     return any(part.startswith(".") or part == "Originals"
                for part in folder_rel.split("/") if part)
+
+
+def _is_stash_leaf(folder_rel: str) -> bool:
+    """True when `folder_rel` IS a Picasa stash directory (its last
+    component), vs _is_stashed's any-ancestor hiding test. Only the two
+    real stash names count — an arbitrary dot-folder is hidden by
+    _is_stashed but is never an association source. Case rule mirrors
+    _is_stashed: .picasaoriginals case-insensitive, legacy Originals exact."""
+    leaf = folder_rel.rsplit("/", 1)[-1]
+    return leaf.lower() == ".picasaoriginals" or leaf == "Originals"
+
+
+def _link_stashed_originals(photos: list[Photo]) -> None:
+    """When Picasa "saves" an edit it bakes the pixels into the visible
+    file and moves the untouched original into the folder's stash under
+    the SAME file name. Link each such sibling to its stash copy by
+    catalog index. Pure derivation over rel paths, so scan_library and
+    load_catalog both call it and agree; a stash file whose sibling is
+    gone (original moved away) links nothing — fail-soft, no report."""
+    by_rel = {p.rel: i for i, p in enumerate(photos)}
+    for i, p in enumerate(photos):
+        if not _is_stash_leaf(p.folder):
+            continue
+        parent = p.folder.rsplit("/", 1)[0] if "/" in p.folder else ""
+        j = by_rel.get(f"{parent}/{p.name}" if parent else p.name)
+        if j is not None:
+            photos[j].stashed_original = i
 
 
 def _flag(sec: picasa_db.IniSection, key: str) -> bool:
@@ -1006,6 +1041,8 @@ def scan_library(root: Path,
             photo.visible = False
         photos.append(photo)
 
+    _link_stashed_originals(photos)
+
     # Album definitions: [.album:<uid>] sections live in each member
     # folder's ini; collect once per uid, then resolve membership tokens.
     # When folders carry diverging duplicate definitions of one uid,
@@ -1367,6 +1404,8 @@ def load_catalog(path: Path, root: Path) -> Catalog | None:
             p.visible = (not p.hidden and not _is_stashed(folder)
                          and folder not in hidden_folders)
             photos.append(p)
+
+        _link_stashed_originals(photos)
 
         folder_desc = data.get("folders", {})
         if not isinstance(folder_desc, dict):
