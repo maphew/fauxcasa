@@ -371,7 +371,16 @@ precedence, to be hardened empirically against the oracle before M1 exit:
 in-file metadata wins for tier-1 data (captions, keywords, faces-in-XMP);
 ini wins for app state (stars, albums, edit recipes); db3 fills gaps only
 (the rescue classes); every conflict is surfaced in the import report, never
-silently resolved. Robustness rules per `picasa-ini-format.md` ("fail soft
+silently resolved. For album membership specifically — the one datum living
+in ini, `.pal`, *and* db3 — the rank is **ini > .pal > db3** (pinned:
+delegated, 2026-07-03, fauxcasa-79b; §10 item 16): ini is Picasa's own
+synchronous durable record (oracle fixture 003: Picasa 3.9 creates albums
+as db3 row + ini sections, writing no `.pal` at all — `.pal` is the
+Picasa-2-era/export artifact); a `.pal` fills gaps only — a `.pal`-only
+album materializes as a real album flagged pal-sourced, and a `.pal`
+diverging from ini never overrides membership, the divergence lands in the
+import report; db3, the lazy mirror, fills last. This is the rank the
+tracer already implements (`_merge_pal_albums`), now spec, not assumption. Robustness rules per `picasa-ini-format.md` ("fail soft
 per-line, never per-file"; preserve unknown keys/sections byte-faithfully).
 
 **Write: the durable layer, Picasa-acceptably.** The fixture sessions
@@ -442,9 +451,19 @@ Library & navigation
 - Flat + tree folder views (tree shows volumes; flat shows path on demand);
   per-folder sort modes (date / name / size / manual — manual is one mode
   among them, durable per N3).
-- Picasa-native auto-collections: **Starred Photos** (with scoped views per
-  footgun 17) and **Recently Updated** (plus the Exports collection under
-  In & out, and the **Rejected** collection under Organize, below).
+- Picasa-native auto-collections: **Starred Photos** and **Recently
+  Updated** (plus the Exports collection under In & out, and the
+  **Rejected** collection under Organize, below). Scoped star views
+  (footgun 17) — ⚖ argue (proposed 2026-07-03, fauxcasa-07w; §10
+  item 19): scoping reuses the browse dimensions the app already has
+  rather than inventing a new one. (a) The star predicate (threshold ≥ N,
+  §3) composes with *any* view — folder, album, search, date range — so
+  "starred in this folder / this search / this month" needs no dedicated
+  surface; (b) the Starred Photos collection itself is date-grouped with
+  the same pinned headers and jump buttons as the main grid, so decades of
+  stale stars can never bury the current triage pass; (c) bulk-unstar is
+  the ordinary select-all-in-view gesture in any of those scopes plus the
+  one-gesture star clear (§3) — no separate bulk-unstar mode to learn.
 - Selection tray: persistent cross-folder selection with Hold/Clear, live
   type-aware readout ("Folder Selected — 14 photos"), the universal input to
   every output action, with enablement keyed to selection type.
@@ -570,7 +589,15 @@ Maintenance & trust
   auto-install. Even the check is off until the user turns it on; it exists
   at all because Picasa's broken updater stranded users on vulnerable
   builds, but consent comes first.
-- i18n string externalization from day one (full localization is post-v1).
+- i18n string externalization from day one — *of the product*. Ruled
+  (delegated, 2026-07-03, fauxcasa-64z; §10 item 17): the tracer is exempt
+  while its README says "evidence, not yet the application" — taxing every
+  experiment with `tr()` buys nothing while the code is disposable — and
+  string externalization is instead a **blocking criterion of the
+  tracer-to-product promotion gate** (`docs/design/tracer-promotion.md`),
+  so "day one" binds the application from the moment the code stops being
+  disposable, which is the earliest day one it can honestly have. Full
+  localization is post-v1.
 
 ### P1 — the in-file metadata write policy (settled in direction — owner, 2026-06-11)
 
@@ -690,7 +717,9 @@ guarantee (N2) — that is a different act and is not gated here.
 - Custom buttons / external-tool API (tray-consuming, export-then-act, with
   a consent gate Picasa lacked).
 - Standalone fast viewer + OS file associations.
-- Full localization (string externalization is already day-one).
+- Full localization (string externalization is a day-one *product*
+  requirement — the tracer is exempt until the promotion gate; §5
+  Maintenance, fauxcasa-64z).
 - **Multi-machine sync, peer-to-peer** (far-range, *owner priority*):
   local-first stays the ethic — no hosted backend, ever (§1) — but
   same-owner multi-machine libraries are a real scenario (the NAS story is
@@ -736,7 +765,7 @@ to a documented failure:
 | 14 | Frozen RAW table; OS-codec dependency | Updatable decode libraries, bundled codecs |
 | 15 | MakerNote corruption on metadata write | In-file writes round-trip-verified or not made (§5 P1) |
 | 16 | UI floor of year 1903 on dates | Unbounded dates (scanned photos predate 1903) |
-| 17 | Starred Photos accretes forever (the V2 tutorial narrator wades through 84 stale stars), degrading the triage loop | Scoped star views + easy bulk-unstar |
+| 17 | Starred Photos accretes forever (the V2 tutorial narrator wades through 84 stale stars), degrading the triage loop | Scoped star views + easy bulk-unstar (semantics proposed in §5 Library & navigation, fauxcasa-07w — ⚖ argue) |
 | 18 | Positional row joins across dozens of per-column .pmp files with no cross-file integrity check — documented failures: thumbnails joined to wrong photos after corruption; a hand-edited column file bricking every category | Catalog cache is a single transactional store with explicit keys; durable state is per-file records |
 | 19 | Users hand-edit state files and brick categories | Tier-2 files human-readable and validated on load; unparseable content is quarantined and surfaced, never rewritten (preserves the §4 byte-faithful rule) |
 
@@ -752,8 +781,9 @@ disk, or SMB over gigabit with ~1 ms RTT). Budgets are per volume class where
 they differ, and each row becomes a CI gate at the milestone where its
 feature lands (§9). Picasa-era baselines appear in parentheses — they are
 *reported or derived* from the corpus (community planning guidance, tutorial
-observations), not measurements, except the catalog-size row, which is
-oracle-measured.
+observations), not measurements — the one oracle-measured figure is the
+catalog-size row's ~50 B/photo *historical baseline* (its gate number is
+re-argued, §10 item 20, not measured).
 
 | Operation | Budget |
 |---|---|
@@ -763,7 +793,7 @@ oracle-measured.
 | Star/caption → durable | UI acknowledgment < 100 ms; durable = fsync'd journal/sidecar append: < 100 ms local, < 1 s NAS. In-file metadata mirroring, when enabled, is async and queued (§5 P1) |
 | Initial index (no faces), including content hashing | library browsable immediately; ≥ 30 photos/s sustained on the local volume, ≥ 10/s on the slow volume (Picasa planning lore: ~3/s *including* face recognition — not like-for-like; the honest bar is "browsable immediately" plus the absolute rates) |
 | Full cache rebuild | background, lossless (N3), UI responsive throughout, ≥ initial-index rate — never an event users plan around |
-| Catalog size | ~50 bytes/photo core catalog (oracle-measured); cache total ≤ 2% of library |
+| Catalog size | ≤ 100 bytes/photo on disk, fully indexed, content hash included (re-argued 2026-07-03, fauxcasa-1jb, §10 item 20: the §3 identity hash is an irreducible 32 raw bytes — most of the old budget by itself — so Picasa's oracle-measured ~50 B/photo stays as the historical baseline, not the gate; meeting 100 honestly requires compact hash encoding or the binary catalog, fauxcasa-ed5.5). Adopt-mode/no-hash figures are never quoted as green. Cache total ≤ 2% of library |
 | External change → visible in UI | < 5 s on local volumes (FS events); ≤ 10 min on NAS at the 5-min default poll interval |
 
 Resource austerity is part of the identity, honestly restated for 2026:
@@ -823,7 +853,8 @@ only check. The build order mirrors the tutorial corpus's own pedagogy:
 organize → edit → faces.
 
 **M0 — Ground truth.** *Done:* format research, validated parsers
-(`picasa_db.py`), Wine oracle + fixtures 001–013, this spec; the **100k
+(`picasa_db.py`), Wine oracle + fixtures 001–033 (a growing corpus — the
+directory is the truth), this spec; the **100k
 synthetic library generator** (`make-synthetic-library.py --benchmark`:
 defined composition — file-size and EXIF-date distributions, folder shapes,
 duplicate files, mixed formats — so §7 numbers are reproducible); and the
@@ -835,8 +866,11 @@ unproven for the host language is the §7 index rate including content hashing
 (fauxcasa-hw0). *Remaining:* none — M0 complete.
 
 **M1 — See your library again.** Read-only browser over an existing Picasa
-library: full ingest (ini, .pal, contacts.xml, db3 rescue, XMP) under the §4
-precedence (pinned by M1 exit), instant grid, folders/albums/stars/captions/
+library: full ingest (ini, .pal, contacts.xml, db3 rescue, XMP, and the
+`.picasaoriginals` *association* — which photos carry a Picasa-saved
+original, detected and displayed read-only; pinned: delegated, 2026-07-03,
+fauxcasa-o66, §10 item 18 — the un-bake/restore machinery itself is M3's)
+under the §4 precedence (pinned by M1 exit), instant grid, folders/albums/stars/captions/
 faces displayed, search, selection tray, slideshow, stills + RAW rendering,
 video indexing/playback, decode isolation per the §5 threat-model
 requirement. *Gate:* N4 budgets green on the 100k synthetic library;
@@ -964,6 +998,39 @@ items. Argue here, then edit the spec.
 15. ~~Reverse star priority~~ — **decided (delegated, 2026-06-11):** v1/M2,
     riding the star machinery end-to-end at near-zero marginal cost; it
     completes the triage loop (§5 Organize).
+16. ~~.pal rank in the §4 precedence~~ — **decided (delegated, 2026-07-03,
+    fauxcasa-79b):** album membership merges **ini > .pal > db3**. Fixture
+    003 shows Picasa 3.9 itself writes no `.pal`; ini is the synchronous
+    durable record, `.pal` fills gaps only (pal-sourced albums,
+    divergences surfaced), db3 last. Matches the shipped tracer merge
+    (§4).
+17. ~~i18n day one vs the tracer~~ — **decided (delegated, 2026-07-03,
+    fauxcasa-64z):** the tracer is exempt while labeled evidence; string
+    externalization is a blocking criterion of the tracer-to-product
+    promotion gate instead (§5 Maintenance,
+    `docs/design/tracer-promotion.md`).
+18. ~~.picasaoriginals milestone~~ — **decided (delegated, 2026-07-03,
+    fauxcasa-o66):** M1 owns the read-only *association* (detect stash
+    dirs, link original to photo, display it, count it in the ingest
+    cross-check); M3 owns the un-bake/restore semantics. §4's "read
+    everything" and §9's M1 parenthetical now agree (§9).
+19. **Scoped star views (footgun 17)** — ⚖ argue (proposed 2026-07-03,
+    fauxcasa-07w, awaiting owner ratification): scope = compose the star
+    threshold predicate with the existing browse dimensions (folder,
+    album, search, date), date-group the Starred collection itself, and
+    make bulk-unstar the ordinary select-all-in-scope + one-gesture clear
+    — no new mechanism (§5 Library & navigation).
+20. ~~Catalog-size budget vs per-row sha256~~ — **re-argued (2026-07-03,
+    fauxcasa-1jb):** new number: ≤ 100 B/photo on disk, fully indexed,
+    hash included. The identity hash (N6) is irreducible 32 raw bytes;
+    hex-in-JSON's 64 B was encoding waste, not essential cost. ~50 B
+    stays the historical baseline; fauxcasa-ed5.5 implements the compact
+    encoding (§7).
+21. **Tracer-to-product promotion gate** — defined (2026-07-03,
+    fauxcasa-mqi): promotion happens at M1 exit, **before any M2
+    write-path work begins** — code labeled "evidence" never writes a
+    user's library. Criteria and mechanics:
+    `docs/design/tracer-promotion.md`.
 
 ---
 
@@ -971,6 +1038,11 @@ items. Argue here, then edit the spec.
 by owner-set procedure (cache, measured at M1), 6 delegated to the spec
 (items 5, 8, 10, 13, 14, 15). Delegated decisions remain overturnable by
 argument; new arguments get new numbers.
+
+**Agenda additions, 2026-07-03** (from the 2026-07-02 M1 gap audit): items
+16–21. Four decided delegated (16, 17, 18, 20), one defined with its own
+doc (21), one proposed and explicitly awaiting owner ratification (19 —
+scoped star views). Same rule as ever: overturnable by argument.
 
 ---
 
@@ -981,7 +1053,8 @@ argument; new arguments get new numbers.
   generator. Setup, launch, and recipes: `docs/research/wine-oracle.md`.
 - **Fixture / differential fixture** — a committed before/after snapshot pair
   of the oracle's on-disk state around exactly one UI action, with a decoded
-  diff (`fixtures/oracle/NNN-*/`). Thirteen exist as of this writing.
+  diff (`fixtures/oracle/NNN-*/`). Thirty-three exist as of this writing;
+  the directory is the authoritative count.
 - **Differential acceptance** — the M2 gate: Fauxcasa writes a library, real
   Picasa reads it in the oracle, and the resulting diffs are machine-checked
   against expected classes (no rebuild, no rejection, state visible).
