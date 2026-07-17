@@ -536,6 +536,15 @@ _EXTRAS_VIDEOS: list[tuple[str, str, int]] = [
     ("2010-12-25 Winter Holiday", "clip00.mp4", 41),
 ]
 
+# Picasa-saved-original stash pairs (fauxcasa-cam.19): (folder, stash dir,
+# file name). The stash copy shares the sibling's NAME (what the tracer
+# associates on), not its bytes — association is name-based, per oracle
+# fixtures 005/019. One Picasa-3 dot-stash, one legacy Originals stash.
+_EXTRAS_STASHED: list[tuple[str, str, str]] = [
+    ("2015-03-15 Garden Project", ".picasaoriginals", "photo00.jpg"),
+    ("Unsorted Box", "Originals", "photo00.jpg"),
+]
+
 _EXTRAS_CONTACTS_XML = (
     "<contacts>\n"
     f' <contact id="{CONTACT_ALICE}" name="Alice Example"'
@@ -610,13 +619,14 @@ def _pal_xml(uid: str, name: str, members: list[str]) -> str:
 # the counts below are derived by hand from the plan above and asserted
 # against the survey reader in the harness, so drift fails loudly.
 _EXTRAS_EXPECTED = {
-    "photos": 22,            # every walked media file: 20 stills + 2 videos
+    "photos": 24,            # every walked media file: 20 stills + 2 videos + 2 stashed originals
     "videos": 2,             # the walked VIDEO_EXTS subset (fauxcasa-v46.2)
     "video_starred": 1,      # clip00.avi star=yes
     "video_captioned": 1,    # clip00.mp4 caption=
     "video_album_memberships": 1,  # clip00.avi albums= token
-    "folders": 5,
+    "folders": 7,            # 5 plan folders + 2 stash dirs
     "ini_files": 4,
+    "stashed_originals": 2,  # stash files whose same-name sibling exists
     "starred": 6,            # 5 stills + the starred clip
     "captioned": 4,          # 3 stills + the captioned clip (empty
                              # caption= still does not count)
@@ -674,6 +684,13 @@ def make_extras_library(root: Path | None = None) -> Path:
         f = library / folder / name
         if not f.exists():
             make_clip_fast(f, hue_idx)
+    dates = {folder: date for folder, date, _c, _i in _EXTRAS_FOLDERS}
+    for folder, stash, name in _EXTRAS_STASHED:
+        f = library / folder / stash / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if not f.exists():
+            make_photo_fast(f, folder, idx, dates[folder])
+        idx += 1
     contacts = root / "contacts"
     contacts.mkdir(parents=True, exist_ok=True)
     (contacts / "contacts.xml").write_text(_EXTRAS_CONTACTS_XML, encoding="utf-8")

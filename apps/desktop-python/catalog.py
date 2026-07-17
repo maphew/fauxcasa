@@ -45,7 +45,22 @@ contacts.xml (see load_contacts_xml / default_contacts_xml) wins over
 [Contacts2] on name conflicts per §4. A face whose contact id is
 UNKNOWN_CONTACT (unconfirmed suggestion) or that no source names stays
 unnamed (name None) — the suggested-vs-confirmed distinction this
-read-only slice carries.
+read-only slice carries — unless a machine-local db3's person albums name
+it: the §4 rescue importer (db3rescue.rescue_people, fauxcasa-cam.6/.7)
+gap-fills ONLY those still-unnamed ids, source-flagged on
+Catalog.db3_contacts, with every conflict/residue on the ImportReport.
+
+Edit recipes (§4 "ini wins for edit recipes"; fauxcasa-cam.15):
+scan_library resolves the CURRENT crop from `crop=rect64(..)` (falling
+back to the filters= chain's crop64 op — crop= wins when both parse, a
+disagreement is an import-report entry) into Photo.crop, and preserves
+the raw recipe key/values (filters/crop/redo/text… — EDIT_RECIPE_KEYS)
+on Photo.edits for N3 losslessness. Display paths bake the crop — thumbs
+at index time (thumbcache._index_one), the viewer at decode — composing
+crop -> EXIF orientation -> rotate= (see apps/desktop-python/cropmap.py
+for why that order). Full recipe rendering (tilt, color ops, …) is M3
+and deliberately NOT displayed; Photo.has_edits drives the honest M1
+"edited" cue instead.
 
 Remaining tracer-scope gaps (see apps/desktop-python/README.md): EXIF orientation is
 applied at decode (Qt/PIL auto-transform, composed with the rotate= user
@@ -72,6 +87,7 @@ import json
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +96,7 @@ _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "scripts"))
 
 import picasa_db  # noqa: E402
+from db3rescue import rescue_people  # noqa: E402
 from library import (  # noqa: E402
     LEGACY_ROOT_ID,
     LIBRARY_DIR,
@@ -119,6 +136,16 @@ BACKFILL_COMPLETE = "complete"
 # NOT transform them and EXIF orientation is the consumer's job
 # (picasa-ini-format.md "faces="); name None = suggested/unnamed.
 FaceTag = tuple[tuple[float, float, float, float], str, str | None]
+
+# Per-file ini keys that carry Picasa edit-recipe state (fauxcasa-cam.15),
+# PRESERVED raw on Photo.edits. rotate= is deliberately excluded — it has a
+# parsed field of its own and composes live in paint (never a pending
+# recipe). This is the survey's edit-key vocabulary (picasa_db
+# _INI_EDIT_KEYS) minus rotate, plus text= (the text-tool record that
+# travels with textactive=; kept for N3 losslessness even though the survey
+# does not count it).
+EDIT_RECIPE_KEYS = frozenset(
+    "filters crop crop64 flipped redo textactive text".split())
 
 
 @dataclass(frozen=True)
@@ -183,15 +210,56 @@ class Photo:
     # for video files, the tracer's only pre-decode dim source there;
     # harmless extra signal on stills that carry them). None = unknown.
     dims: tuple[int, int] | None = None
+    # Edit recipe (fauxcasa-cam.15). `crop`: the CURRENT crop as (left,
+    # top, right, bottom) fractions of the STORED pixels (rect64 grammar —
+    # the same frame as faces=: rotate= does not transform it and EXIF
+    # orientation is the consumer's job), or None. Resolved at scan:
+    # crop= wins over the filters= chain's crop64 op (_resolve_crop).
+    # Display paths BAKE it: thumbs at index time, the viewer at decode,
+    # composing crop -> EXIF orientation -> rotate= (cropmap.py).
+    crop: tuple[float, float, float, float] | None = None
+    # The RAW edit-recipe key/value pairs, in ini order, duplicates kept —
+    # preserved byte-faithfully for N3 losslessness (full recipe rendering
+    # is M3; only the crop is displayed in M1). Keys: EDIT_RECIPE_KEYS.
+    edits: tuple[tuple[str, str], ...] = ()
     # Picasa stashes pre-edit originals in .picasaoriginals/; those files
     # are catalog entries (cache-order parity) but never shown in the grid.
     visible: bool = True
+    # M1 read-only .picasaoriginals association (fauxcasa-cam.19, spec §10
+    # item 18): the catalog INDEX of this photo's stashed pre-edit original
+    # — the same-named file in the folder's .picasaoriginals/ (or legacy
+    # Originals/) stash, where Picasa File->Save moved the untouched bytes
+    # (oracle fixtures 005/019). DERIVED from the photo list on both scan
+    # and load (like folder/name/visible/media), never persisted. None =
+    # no Picasa-saved original. Un-bake/restore is M3; this is display-only.
+    stashed_original: int | None = None
     # Identity + staleness signals, filled by the indexer (build_cache),
     # persisted in the catalog, and used by reconcile (cheap size+mtime
     # diff) and N6 identity (sha256). -1 / None until indexed.
     size: int = -1
     mtime: int = -1
     sha256: str | None = None
+
+    @property
+    def has_edits(self) -> bool:
+        """The photo carries pending Picasa edit-recipe state — the M1
+        honest 'edited' cue (viewer info bar). DERIVED from crop/edits so
+        it can never drift from what was persisted. True for a resolved
+        crop or any non-empty recipe value, with two carve-outs:
+        `textactive=0` alone is NOT an edit (Picasa records the
+        overlay-off state — fixture 005 writes it into the post-bake
+        stash ini), and rotate= never counts (it is displayed live, not a
+        pending recipe; it isn't in EDIT_RECIPE_KEYS at all). The
+        unsaved-vs-baked state cue is M3 — this is presence only."""
+        if self.crop is not None:
+            return True
+        for k, v in self.edits:
+            if k.lower() == "textactive":
+                if v.strip() == "1":
+                    return True
+            elif v.strip():
+                return True
+        return False
 
 
 @dataclass
@@ -294,6 +362,12 @@ class Catalog:
     # folder inheritance chain instead, so they stay right even where
     # folders disagree; this registry is the flat, persistable union.
     contacts: dict[str, str] = field(default_factory=dict)
+    # Contact ids whose display name came from the db3 rescue import
+    # (fauxcasa-cam.6/.7): people albums exist only in db3, so a name no
+    # ini [Contacts2] or contacts.xml provided is gap-filled from there
+    # (§4) and source-flagged here — the People sidebar surfaces the
+    # provenance, and the flag persists so warm starts keep it.
+    db3_contacts: set[str] = field(default_factory=set)
     # Import diagnostics collected while this catalog was built (§4; empty
     # on a warm load until main() re-attaches the persisted report).
     report: ImportReport = field(default_factory=ImportReport)
@@ -478,6 +552,33 @@ def _is_stashed(folder_rel: str) -> bool:
                for part in folder_rel.split("/") if part)
 
 
+def _is_stash_leaf(folder_rel: str) -> bool:
+    """True when `folder_rel` IS a Picasa stash directory (its last
+    component), vs _is_stashed's any-ancestor hiding test. Only the two
+    real stash names count — an arbitrary dot-folder is hidden by
+    _is_stashed but is never an association source. Case rule mirrors
+    _is_stashed: .picasaoriginals case-insensitive, legacy Originals exact."""
+    leaf = folder_rel.rsplit("/", 1)[-1]
+    return leaf.lower() == ".picasaoriginals" or leaf == "Originals"
+
+
+def _link_stashed_originals(photos: list[Photo]) -> None:
+    """When Picasa "saves" an edit it bakes the pixels into the visible
+    file and moves the untouched original into the folder's stash under
+    the SAME file name. Link each such sibling to its stash copy by
+    catalog index. Pure derivation over rel paths, so scan_library and
+    load_catalog both call it and agree; a stash file whose sibling is
+    gone (original moved away) links nothing — fail-soft, no report."""
+    by_rel = {p.rel: i for i, p in enumerate(photos)}
+    for i, p in enumerate(photos):
+        if not _is_stash_leaf(p.folder):
+            continue
+        parent = p.folder.rsplit("/", 1)[0] if "/" in p.folder else ""
+        j = by_rel.get(f"{parent}/{p.name}" if parent else p.name)
+        if j is not None:
+            photos[j].stashed_original = i
+
+
 def _flag(sec: picasa_db.IniSection, key: str) -> bool:
     return (sec.get(key) or "").strip().lower() == "yes"
 
@@ -510,6 +611,88 @@ def format_date_taken(date_taken: str) -> str:
     """Human form of the canonical capture date: the ISO 'T' becomes a
     space; no other reinterpretation (footgun 16: never a year floor)."""
     return date_taken.replace("T", " ")
+
+
+# ---- edit recipes (fauxcasa-cam.15) ---------------------------------------
+#
+# §4: ini wins for edit recipes, and M1 "see your library again" means a
+# cropped photo shows CROPPED — Picasa itself rendered unsaved recipes
+# applied (oracle fixture 004: the crop lives in the ini ALONE, JPEG
+# untouched, no db3 change). This slice ingests the recipe keys (crop
+# parsed for display, everything preserved raw); rendering the rest of the
+# chain (tilt, color ops, …) is M3.
+
+
+def _usable_rect(rect: tuple[float, float, float, float] | None) -> bool:
+    """A crop rect the display can act on: parsed AND non-degenerate
+    (right > left, bottom > top). rect64 values are already in [0, 1]."""
+    return rect is not None and rect[0] < rect[2] and rect[1] < rect[3]
+
+
+def _crop_from_filters(value: str) -> tuple[float, float, float, float] | None:
+    """The crop64 op inside a filters= chain -> its rect, or None.
+    Grammar: ``crop64=1,<bare rect64 hex>;`` (picasa-ini-format.md). The
+    chain is ordered edit history and ops can repeat, so the LAST crop64
+    wins — a re-crop appends. Fail-soft per op: an unparseable crop64
+    param is skipped, never an exception (§4 robustness)."""
+    rect = None
+    for name, params in picasa_db.parse_filters(value):
+        if name.strip().lower() == "crop64" and len(params) >= 2:
+            try:
+                got = picasa_db.parse_rect64(params[1].strip())
+            except ValueError:
+                continue
+            if _usable_rect(got):
+                rect = got
+    return rect
+
+
+def _resolve_crop(sec: picasa_db.IniSection, rel: str,
+                  report: ImportReport) -> tuple[float, float, float, float] | None:
+    """The photo's CURRENT crop rect, or None. Source precedence:
+
+    1. ``crop=rect64(..)`` — authoritative per the format doc ("current
+       crop; history lives in filters= as crop64 op");
+    2. the filters= chain's crop64 op, filling in when crop= is absent or
+       unparseable (Picasa normally writes BOTH — fixture 004);
+    3. a standalone ``crop64=`` key (gist-era shape, ``1,<hex>`` or a
+       bare hex) as the last resort.
+
+    When crop= and the chain both parse and DISAGREE, crop= wins and the
+    conflict is surfaced on the import report (§4: never silently
+    resolved); the normal agreeing pair stays silent. Degenerate or
+    malformed values fail soft per line to the next source."""
+    crop = None
+    raw = sec.get("crop")
+    if raw:
+        try:
+            crop = picasa_db.parse_rect64(raw.strip())
+        except ValueError:
+            crop = None
+        if not _usable_rect(crop):
+            crop = None
+    chain = None
+    fraw = sec.get("filters")
+    if fraw:
+        chain = _crop_from_filters(fraw)
+    if crop is not None:
+        if chain is not None and chain != crop:
+            report.add("ini", "crop_conflict", rel,
+                       f"crop= says {crop} but the filters= chain's crop64 "
+                       f"says {chain} — crop= wins (the format doc's "
+                       f"'current crop'; the chain is history)")
+        return crop
+    if chain is not None:
+        return chain
+    craw = sec.get("crop64")
+    if craw:
+        try:
+            rect = picasa_db.parse_rect64(craw.split(",")[-1].strip())
+        except ValueError:
+            return None
+        if _usable_rect(rect):
+            return rect
+    return None
 
 
 # Picasa hides a WHOLE folder by putting it in the built-in "Hidden Folders"
@@ -612,7 +795,7 @@ def _harvest_contacts2(secmap: dict, out: dict[str, str]) -> None:
 # (~lines 234-267): dbid, albumid, property elements (uid string, category
 # num, date real64 = OLE automation days, token, name) with a <files> member
 # list of `[C]\path\to\file` volume-token paths nested in the name property.
-# §4 merge rank (assumed ini > .pal > db3 pending spec pin, fauxcasa-79b):
+# §4 merge rank (pinned ini > .pal > db3 — spec §10 item 16, fauxcasa-79b):
 # ini wins membership; .pal fills gaps ONLY — a .pal-only album materializes
 # like a real album flagged pal-sourced, and a divergent .pal's extra members
 # become import-report entries, never membership.
@@ -711,7 +894,7 @@ def default_pal_dir() -> Path | None:
 def _merge_pal_albums(pal_dir: Path, photos: list[Photo],
                       albums: dict[str, Album],
                       report: ImportReport) -> None:
-    """§4 merge, rank assumed ini > .pal > db3 (spec pin: fauxcasa-79b):
+    """§4 merge, rank ini > .pal > db3 (pinned: spec §10 item 16, fauxcasa-79b):
 
     - a uid the ini knows nothing of (no [.album:] definition, no albums=
       token) materializes from its .pal like a real album, flagged
@@ -809,15 +992,20 @@ def scan_library(root: Path,
                  scan_filter: ScanFilter | None = None,
                  contacts: dict[str, str] | None = None,
                  pal_dir: Path | None = None,
-                 exts: frozenset[str] | set[str] | None = None) -> Catalog:
+                 exts: frozenset[str] | set[str] | None = None,
+                 db3_dir: Path | None = None) -> Catalog:
     """Walk `root` and build the catalog. `contacts` is the machine-local
     contacts.xml id->name map (load_contacts_xml); per §4 it wins over the
     ini [Contacts2] tables when both name a contact. `pal_dir` is a
     Picasa2Albums directory of .pal album files, merged per §4 (ini wins
-    membership; .pal fills gaps only — see _merge_pal_albums). Conflicts
-    and unknown-uid placeholders land on the catalog's ImportReport, never
-    resolved silently (fauxcasa-cam.13/.8). `exts` is the effective
-    extension set from the File Types panel (walk_library docstring)."""
+    membership; .pal fills gaps only — see _merge_pal_albums). `exts` is
+    the effective extension set from the File Types panel (walk_library
+    docstring). `db3_dir` is a machine-local Picasa db3 directory: its
+    person albums gap-fill contact names the ini/contacts.xml never
+    provided, source-flagged on Catalog.db3_contacts
+    (db3rescue.rescue_people, fauxcasa-cam.6/.7). Conflicts and
+    unknown-uid placeholders land on the catalog's ImportReport, never
+    resolved silently (fauxcasa-cam.13/.8)."""
     root = root.resolve()
     files = walk_library(root, scan_filter, exts)
     contacts = contacts or {}
@@ -940,12 +1128,25 @@ def scan_library(root: Path,
                          else contacts.get(cid) or local.get(cid))
                         for rect, cid in parsed
                     )
+            # Edit recipes (fauxcasa-cam.15): every recipe key/value is
+            # preserved RAW, in ini order with duplicates kept (N3
+            # losslessness — Photo.edits); the current crop is resolved
+            # for display (crop= wins over the filters= chain's crop64;
+            # a disagreement lands on the import report). rotate= stays
+            # its own parsed field above.
+            recipe = tuple((k, v) for k, v in sec.items
+                           if k.lower() in EDIT_RECIPE_KEYS)
+            if recipe:
+                photo.edits = recipe
+                photo.crop = _resolve_crop(sec, rel, report)
 
         # A whole folder in the "Hidden Folders" collection hides every
         # photo under it, exactly like per-photo hidden=yes or a stash dir.
         if photo.hidden or folders[folder_rel].folder_hidden:
             photo.visible = False
         photos.append(photo)
+
+    _link_stashed_originals(photos)
 
     # Album definitions: [.album:<uid>] sections live in each member
     # folder's ini; collect once per uid, then resolve membership tokens.
@@ -1018,8 +1219,17 @@ def scan_library(root: Path,
                        f"wins (§4)")
     registry.update(contacts)
 
+    # db3 rescue (fauxcasa-cam.6/.7), LAST so every other source had its
+    # say: person-album names fill only the ids still unnamed (§4 rank
+    # ini/contacts.xml > db3), and db3 face rows are checked against the
+    # ini-parsed faces for residue surfacing — never membership.
+    db3_contacts: set[str] = set()
+    if db3_dir is not None:
+        db3_contacts = rescue_people(db3_dir, root, photos, registry, report)
+
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
-                   contacts=registry, report=report,
+                   contacts=registry, db3_contacts=db3_contacts,
+                   report=report,
                    roots=[LibraryRoot(id=LEGACY_ROOT_ID, path=root)])
 
 
@@ -1079,23 +1289,40 @@ def scan_library(root: Path,
 # — a v8 catalog was walked without them, so a warm start would silently
 # hide every TGA/PSD in the library until some unrelated drift; reject
 # and cold-rebuild (the same shape as the v7 video bump).
-# v10: multiroot catalog plumbing (fauxcasa-ed5.7.2, design §5/§14 bead
+# v10: Picasa edit-recipe keys (fauxcasa-cam.15) are ingested — the crop=
+# rect (or the filters= chain's crop64) drives crop-applied display, the
+# raw recipe strings are preserved (per-photo `cp`/`e` rows) — and the
+# indexer now BAKES the crop into the thumbnail like EXIF orientation. A
+# v9 catalog has neither the fields nor crop-baked thumbs, and nothing in
+# the cheap size/mtime drift check would notice (the recipe lives in the
+# ini sidecar, not the photo file); reject and cold-rebuild, which also
+# rebuilds the machine-local fcache with crops baked. The fcache MAGIC
+# version is untouched (the packed layout is unchanged, and the shipped
+# benchmark cache stays adoptable — its synthetic photos carry no recipe
+# keys, so the bake is a no-op there; same posture as the v2 EXIF bake).
+# v11: the db3 rescue import (fauxcasa-cam.6/.7) gap-fills contact names
+# from db3 person albums at scan and persists the rescued ids as a
+# top-level `db3_contacts` list (the People-sidebar source flag). A v10
+# catalog scanned before the rescue carries neither the rescued names nor
+# the flag, so a warm start would silently un-name rescued people; reject
+# and cold-rebuild.
+# v12: multiroot catalog plumbing (fauxcasa-ed5.7.2, design §5/§14 bead
 # .b) — ADDITIVE, not a walk-rule change: a per-photo row may carry an
 # optional "R" (root_id, ABSENT MEANS roots[0] — see _expand_root_id),
 # folder/hidden_folder keys may carry a "<root_id>/<rel>" prefix for
 # non-first roots (see _folder_json_key), and the header carries either
 # "library_id"+"roots" (explicit libraries) or "library" (implicit
-# legacy, unchanged). COMPAT: a v9 file is still accepted when the
+# legacy, unchanged). COMPAT: a v11 file is still accepted when the
 # library passed to load_catalog has exactly one root (rows/keys are then
-# all implicitly roots[0] — see load_catalog's compat path); a v9 file
-# is rejected outright for a multi-root library (cold walk), since a v9
+# all implicitly roots[0] — see load_catalog's compat path); a v11 file
+# is rejected outright for a multi-root library (cold walk), since a v11
 # file predates root disambiguation entirely and cannot express it.
-CATALOG_VERSION = 10
+CATALOG_VERSION = 12
 # The last pre-multiroot format (fauxcasa-ed5.7.2, bead .b): load_catalog's
 # ONLY version-compat carve-out, and only when the library has exactly one
 # root (see load_catalog). A fixed number, not "CATALOG_VERSION - 1" — see
 # load_catalog's comment for why that distinction matters going forward.
-PRE_MULTIROOT_VERSION = 9
+PRE_MULTIROOT_VERSION = 11
 
 # The import report's file name, written beside catalog.json (same cache
 # dir) by save_report and re-attached on warm starts via load_report.
@@ -1179,6 +1406,12 @@ def _photo_to_row(p: Photo, first_root_id: str) -> dict:
         # rect fractions are n/65536 — exact binary fractions, so they
         # round-trip through JSON floats byte-identically.
         row["f"] = [[list(rect), cid, name] for rect, cid, name in p.faces]
+    if p.crop is not None:
+        row["cp"] = list(p.crop)  # n/65536 fractions: exact JSON round-trip
+    if p.edits:
+        # raw edit-recipe strings, verbatim (N3; has_edits derives from
+        # these on load, so no flag is persisted — it could only drift)
+        row["e"] = [[k, v] for k, v in p.edits]
     if p.date_taken:
         row["d"] = p.date_taken
     if p.geotag is not None:
@@ -1233,6 +1466,9 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
         # contact id -> display name registry (already contacts.xml-merged
         # at scan time; the warm path never re-reads inis or contacts.xml)
         "contacts": catalog.contacts,
+        # v11: which registry ids the db3 rescue named (sorted for a
+        # deterministic file; the warm path never re-reads db3)
+        "db3_contacts": sorted(catalog.db3_contacts),
         "albums": [
             {"uid": a.uid, "name": a.name, "date": a.date,
              "description": a.description, "members": a.members,
@@ -1253,6 +1489,31 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
     tmp = path.with_suffix(".catalog.tmp")
     tmp.write_text(json.dumps(data))
     tmp.replace(path)
+
+
+def save_catalog_retrying(catalog: Catalog, path: Path,
+                          attempts: int = 5,
+                          backoff: float = 0.1) -> None:
+    """save_catalog with linear-backoff retry on transient OSError.
+
+    On Windows, os.replace onto catalog.json briefly held open by a reader
+    (antivirus, search indexer, any tool peeking at the file) raises
+    PermissionError (WinError 5 / WinError 32).  Retries up to `attempts`
+    times, sleeping `backoff * attempt` seconds between each pair; raises
+    the final OSError if all attempts fail.
+    """
+    # Linear schedule: 0.1 s, 0.2 s, … up to (attempts-1) * backoff.
+    total = max(1, attempts)  # attempts <= 0 would fall through to raise None
+    err: OSError | None = None
+    for attempt in range(total):
+        try:
+            save_catalog(catalog, path)
+            return
+        except OSError as e:
+            err = e
+            if attempt < total - 1:
+                time.sleep(backoff * (attempt + 1))
+    raise err  # type: ignore[misc]
 
 
 def load_catalog(path: Path, cfg: Path | LibraryConfig) -> Catalog | None:
@@ -1292,14 +1553,14 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig) -> Catalog | None:
     if version == CATALOG_VERSION:
         current = True
     elif version == PRE_MULTIROOT_VERSION and len(cfg.roots) == 1:
-        # Compat path (design §5): a v9 file predates root
+        # Compat path (design §5): a v11 file predates root
         # disambiguation entirely (no "R", no "roots" header) and is
         # only unambiguous when the library has exactly one root — every
         # row is then implicitly roots[0]. A HARD-CODED version number,
         # not "CATALOG_VERSION - 1": this carve-out is specific to the
-        # v9->v10 multiroot transition and must not silently reopen for
+        # v11->v12 multiroot transition and must not silently reopen for
         # some future unrelated bump the same way every prior bump (v1
-        # through v9) rejected its immediate predecessor outright.
+        # through v11) rejected its immediate predecessor outright.
         current = False
     else:
         return None
@@ -1330,6 +1591,7 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig) -> Catalog | None:
             folder, _, name = rel.rpartition("/")
             g = row.get("g")
             wh = row.get("wh")
+            cp = row.get("cp")
             row_root_id = (_expand_root_id(row.get("R"), cfg.roots)
                            if current else first_root_id)
             folder_key = _folder_json_key(folder, row_root_id, first_root_id)
@@ -1346,12 +1608,17 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig) -> Catalog | None:
                 date_taken=row.get("d"),
                 geotag=(float(g[0]), float(g[1])) if g else None,
                 dims=(int(wh[0]), int(wh[1])) if wh else None,
+                crop=(float(cp[0]), float(cp[1]),
+                      float(cp[2]), float(cp[3])) if cp else None,
+                edits=tuple((str(k), str(v)) for k, v in row.get("e", ())),
                 size=row.get("z", -1), mtime=row.get("m", -1),
                 sha256=row.get("x"),
             )
             p.visible = (not p.hidden and not _is_stashed(folder)
                          and folder_key not in hidden_folders)
             photos.append(p)
+
+        _link_stashed_originals(photos)
 
         folder_desc = data.get("folders", {})
         if not isinstance(folder_desc, dict):
@@ -1388,6 +1655,11 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig) -> Catalog | None:
         if not isinstance(contacts, dict):
             contacts = {}
 
+        db3_contacts = data.get("db3_contacts", [])
+        if not isinstance(db3_contacts, list):
+            db3_contacts = []
+        db3_contacts = {str(c) for c in db3_contacts}
+
         # Backfill progress (cam.12): an absent key means complete (the
         # indexer-built shape — save_catalog omits it then). A non-dict
         # value raises here (AttributeError -> the defensive net); an
@@ -1411,7 +1683,8 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig) -> Catalog | None:
         return None
 
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
-                   contacts=contacts, backfill_state=backfill_state,
+                   contacts=contacts, db3_contacts=db3_contacts,
+                   backfill_state=backfill_state,
                    backfill_cursor=backfill_cursor,
                    roots=list(cfg.roots), library_id=cfg.library_id)
 
