@@ -869,6 +869,12 @@ class MainWindow(QMainWindow):
         # Non-blocking cold-walk thread (fauxcasa-q6l.13): set on the plain
         # cold path (non-adopt); None on warm starts and the adopt path.
         self._scan_thread: threading.Thread | None = None
+        # Positive busy flag for the non-blocking cold path: between the
+        # scan thread dying and the queued scan_done slot running, thread
+        # liveness alone reads idle — --finish-build could quit before the
+        # build ever starts. Set in _start_cold_scan, cleared (on the GUI
+        # thread) in _on_scan_done.
+        self._cold_scan_pending = False
         # The build_dir deferred from _start_cold_scan to _on_scan_done.
         self._scan_build_dir: Path | None = None
         self._scan_t0: float = 0.0  # perf_counter at scan start (q6l.13)
@@ -1050,6 +1056,7 @@ class MainWindow(QMainWindow):
         opens."""
         self._scan_build_dir = build_dir
         self._scan_t0 = time.perf_counter()
+        self._cold_scan_pending = True
         self._on_status(f"Scanning {self.catalog.root.name}…")
         bridge = self._bridge
 
@@ -1071,6 +1078,10 @@ class MainWindow(QMainWindow):
     def _on_scan_done(self, catalog) -> None:
         """Walk landed (fauxcasa-q6l.13): swap in the real catalog via the
         same atomic-swap path as reconcile, then start the thumbnail build."""
+        # Cleared here, not when the thread dies: everything below runs
+        # synchronously in this GUI-thread slot, so by the time index_busy
+        # can be polled again the build thread (if any) is already alive.
+        self._cold_scan_pending = False
         self._on_status("")          # clear 'Scanning…'
         if catalog is None:
             self.statusBar().showMessage("scan failed — see log", 10000)
@@ -1155,9 +1166,10 @@ class MainWindow(QMainWindow):
         self.meta_label.setText("")
 
     def index_busy(self) -> bool:
-        return any(t is not None and t.is_alive()
-                   for t in (self._build_thread, self._reconcile_thread,
-                              self._scan_thread))
+        return self._cold_scan_pending or any(
+            t is not None and t.is_alive()
+            for t in (self._build_thread, self._reconcile_thread,
+                      self._scan_thread))
 
     def shutdown(self) -> None:
         """Stop and reap the index threads so none is mid-write (or

@@ -1402,6 +1402,18 @@ def reconcile_walk(catalog: Catalog, root: Path,
         if not found_ini:
             drift.ini_changed = True  # ini present at scan, now gone
 
+    # The inverse case: an ini APPEARED in a folder that had none at scan
+    # (Picasa alternation can create one anywhere) — ini_sigs only lists
+    # folders that had an ini, so walk the catalog's other folders too.
+    if not drift.ini_changed:
+        for folder_rel in {p.folder for p in catalog.photos}:
+            if folder_rel in catalog.ini_sigs:
+                continue
+            folder_path = root / folder_rel if folder_rel else root
+            if any((folder_path / name).is_file() for name in INI_NAMES):
+                drift.ini_changed = True  # new ini in a previously bare folder
+                break
+
     # Contacts.xml freshness (fauxcasa-cam.14 rider).
     effective_contacts = contacts_path or default_contacts_xml()
     if catalog.contacts_sig is not None:

@@ -39,6 +39,7 @@ the decode-service §3c sandbox-valve ruling — not this module's scope.
 from __future__ import annotations
 
 import io
+from datetime import datetime
 
 # Picasa 3's documented video list ("For playback in Picasa",
 # files-supported-by-picasa3.md): mpg, mod, mmv, tod, wmv, asf, avi,
@@ -186,10 +187,20 @@ def _parse_creation_time(value: str | None) -> str | None:
     dot = s.find(".")
     if dot >= 19:
         s = s[:dot]
-    # Validate the canonical 19-char shape 'YYYY-MM-DDTHH:MM:SS'.
+    # Validate shape AND field ranges: containers commonly carry an
+    # all-zeros placeholder creation_time, and month-13-style garbage
+    # exists in the wild — either would poison date sorts via the video
+    # gap-fill (videos have no ini date source to correct it). datetime
+    # rejects both; §6 footgun 16's unbounded-dates concern is the
+    # pre-1903 end of the range, which datetime accepts down to year 1.
     if (len(s) == 19 and s[4] == "-" and s[7] == "-"
             and s[10].upper() == "T" and s[13] == ":" and s[16] == ":"):
-        return s[:10] + "T" + s[11:19]
+        canon = s[:10] + "T" + s[11:19]
+        try:
+            datetime.strptime(canon, "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return None
+        return canon
     return None
 
 

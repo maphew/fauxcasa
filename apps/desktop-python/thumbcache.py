@@ -346,7 +346,10 @@ def apply_photo_meta(photo, size: int, mtime: int, sha: str,
                        f'caption: ini "{photo.caption}" -> in-file "{meta.caption}"')
         photo.caption = meta.caption
     if meta.keywords:
-        if report is not None and photo.keywords and photo.keywords != meta.keywords:
+        # Set-compare for the report only: ini vs in-file ordering can
+        # differ for an identical keyword set — that is not a conflict.
+        if (report is not None and photo.keywords
+                and set(photo.keywords) != set(meta.keywords)):
             ini_kw = ", ".join(photo.keywords)
             new_kw = ", ".join(meta.keywords)
             report.add("file", "infile_override", photo.rel,
@@ -358,7 +361,13 @@ def apply_photo_meta(photo, size: int, mtime: int, sha: str,
         # takes precedence; gap-fill only, never a conflict.
         photo.date_taken = fmeta.date_taken
     if fmeta.gps is not None:
-        if report is not None and photo.geotag is not None and photo.geotag != fmeta.gps:
+        # Report only real disagreement: ini geotag= is low precision,
+        # EXIF GPS parses to full float — exact compare would flag nearly
+        # every photo carrying both. 5 decimals (~1 m) matches
+        # format_geotag's display precision.
+        if (report is not None and photo.geotag is not None
+                and tuple(round(c, 5) for c in photo.geotag)
+                != tuple(round(c, 5) for c in fmeta.gps)):
             report.add("file", "infile_override", photo.rel,
                        f"geotag: ini {photo.geotag} -> in-file {fmeta.gps}")
         photo.geotag = fmeta.gps
