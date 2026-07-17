@@ -46,6 +46,17 @@ whatever _shown_rect says (fit / panned 1:1), tracking zoom and pan.
 See map_face_fraction / face_widget_rect and the metareader.
 read_orientation seam. Viewer-only by policy: the peek and slideshow
 subclasses are glance surfaces and set face_overlay_allowed False.
+
+Crop-applied display (fauxcasa-cam.15): a photo with an unsaved Picasa
+crop recipe (Photo.crop) shows CROPPED — the M1 "see your library again"
+bar, since Picasa itself rendered unsaved recipes applied. The crop is
+applied to the decoded original in load_original_oriented, composing
+crop -> EXIF orientation -> rotate= (crop coords are STORED-frame; see
+cropmap.py for the order's evidence); the cached preview stand-in is
+already crop-baked by the indexer, so the hand-off stays a sharpen in
+place. Face rects on a cropped photo rebase through the crop first
+(_face_rects), and the info bar carries an honest "edited" chip
+(has_edits) — the unsaved-vs-baked state cue is M3.
 """
 
 from __future__ import annotations
@@ -60,6 +71,11 @@ from PySide6.QtWidgets import QWidget
 
 import keymap
 from catalog import Catalog, format_date_taken, format_geotag
+from cropmap import (
+    crop_qimage_upright,
+    map_fraction_rect,
+    rebase_fraction_rect,
+)
 from locate import reveal_in_file_manager
 from thumbcache import THUMB_EDGE, ThumbCache
 
@@ -86,7 +102,9 @@ def _pan_delta(event) -> tuple[int, int] | None:
     return None
 
 
-def load_original_oriented(path: str, rotate: int) -> tuple[QImage, int]:
+def load_original_oriented(path: str, rotate: int,
+                           crop: tuple[float, float, float, float] | None
+                           = None) -> tuple[QImage, int]:
     """Decode a full original AND report the stored file's EXIF Orientation
     value (1..8; 1 on anything unusable). The image comes back EXIF-upright
     (auto-orientation on read, so it matches the EXIF-baked grid thumbnails)
@@ -96,6 +114,16 @@ def load_original_oriented(path: str, rotate: int) -> tuple[QImage, int]:
     prefetch (slideshow.py), so every consumer orients identically. Returns
     (null QImage, 1) on failure. Thread-safe: QImage (unlike QPixmap) may be
     built off the GUI thread, and callers do call this from worker threads.
+
+    `crop` is the photo's unsaved Picasa crop recipe (Photo.crop,
+    fauxcasa-cam.15), fractions of the STORED pixels. It is applied to
+    the decoded pixels here so every original consumer shows the crop,
+    composing crop -> EXIF orientation -> rotate= — the crop selects
+    stored pixels first (rect64 grammar; rotate= does not transform crop
+    coords), and since the decode below hands back EXIF-upright pixels
+    the rect maps through the reported orientation instead of
+    re-orienting (cropmap.crop_qimage_upright, where the order's
+    evidence lives). Fail-soft: a degenerate rect leaves the image whole.
 
     The file's bytes are read ONCE and shared by the decode and the
     orientation read (metareader.read_orientation, the exiv2 seam) — the
@@ -142,20 +170,33 @@ def load_original_oriented(path: str, rotate: int) -> tuple[QImage, int]:
         if is_raw_suffix(path):
             img = load_raw_qimage(data)
         else:
-            buf = QBuffer()
-            buf.setData(data)  # setData copies; see thumbcache._index_one
-            buf.open(QIODevice.OpenModeFlag.ReadOnly)
-            reader = QImageReader(buf)
-            reader.setAutoTransform(True)
-            img = reader.read()
-            if img.isNull():
-                # Qt has no decoder for this still (PSD — Pillow reads
-                # the flattened composite, fauxcasa-v46.4): same bytes,
-                # one Pillow attempt, orientation applied exactly once
-                # by exif_transpose there (pillowload module doc).
-                from pillowload import pillow_qimage
+            from pillowload import pillow_qimage, tiff_is_16bit
 
+            # Pre-route 16-bit TIFFs to Pillow on ALL platforms: Qt's
+            # tiff plugin silently clips 16-bit grayscale to white on
+            # Linux (fauxcasa-v46.7). Header sniff only — no pixel decode.
+            _is_tiff = path.lower().endswith((".tif", ".tiff"))
+            if _is_tiff and tiff_is_16bit(data):
                 img = pillow_qimage(data)
+            else:
+                buf = QBuffer()
+                buf.setData(data)  # setData copies; see thumbcache._index_one
+                buf.open(QIODevice.OpenModeFlag.ReadOnly)
+                reader = QImageReader(buf)
+                reader.setAutoTransform(True)
+                img = reader.read()
+                if img.isNull():
+                    # Qt has no decoder for this still (PSD — Pillow reads
+                    # the flattened composite, fauxcasa-v46.4): same bytes,
+                    # one Pillow attempt, orientation applied exactly once
+                    # by exif_transpose there (pillowload module doc).
+                    img = pillow_qimage(data)
+    if not img.isNull() and crop is not None:
+        # crop FIRST (stored-frame rect mapped through the orientation the
+        # upright decode already applied — incl. the Pillow fallback's
+        # exif_transpose), THEN the rotate= turns below — the composition
+        # order cropmap.py documents.
+        img = crop_qimage_upright(img, crop, orientation)
     if not img.isNull() and rotate:
         from PySide6.QtGui import QTransform
 
@@ -163,10 +204,12 @@ def load_original_oriented(path: str, rotate: int) -> tuple[QImage, int]:
     return img, orientation
 
 
-def load_original(path: str, rotate: int) -> QImage:
+def load_original(path: str, rotate: int,
+                  crop: tuple[float, float, float, float] | None
+                  = None) -> QImage:
     """load_original_oriented for callers that need only the pixels (the
     slideshow prefetch — its surface never shows the face overlay)."""
-    return load_original_oriented(path, rotate)[0]
+    return load_original_oriented(path, rotate, crop)[0]
 
 
 # ---- face-overlay coordinate math (fauxcasa-cam.4) -------------------------
@@ -176,24 +219,9 @@ def load_original(path: str, rotate: int) -> QImage:
 # (picasa-ini-format.md "faces="). This app displays stored pixels through
 # EXIF orientation (autoTransform at decode) THEN rotate= quarter-turns
 # (load_original_oriented / _load_preview / the grid bake), so the overlay
-# must push the stored-frame rect through the SAME composed transform.
-
-# Stored-frame fractional point (x right, y down, both 0..1) -> upright-frame
-# point, one entry per EXIF Orientation value. Each is the display transform
-# autoTransform applies: 2 mirror-H, 3 rotate 180, 4 mirror-V, 5 transpose
-# (main diagonal), 6 rotate 90 CW, 7 transverse (anti-diagonal), 8 rotate
-# 90 CCW. Derivation check for 6: rotating an image 90 CW sends stored
-# top-left (0,0) to upright top-right (1,0) = (1-y, x).
-_ORIENT_MAP = {
-    1: lambda x, y: (x, y),
-    2: lambda x, y: (1.0 - x, y),
-    3: lambda x, y: (1.0 - x, 1.0 - y),
-    4: lambda x, y: (x, 1.0 - y),
-    5: lambda x, y: (y, x),
-    6: lambda x, y: (1.0 - y, x),
-    7: lambda x, y: (1.0 - y, 1.0 - x),
-    8: lambda x, y: (y, 1.0 - x),
-}
+# must push the stored-frame rect through the SAME composed transform. The
+# fraction-rect algebra (incl. the 8-entry orientation map) now lives in
+# cropmap.py, single-sourced with the crop bake (fauxcasa-cam.15).
 
 
 def map_face_fraction(rect: tuple[float, float, float, float],
@@ -203,16 +231,9 @@ def map_face_fraction(rect: tuple[float, float, float, float],
     catalog FaceTag shape) -> the SAME face's fractional rect in the
     DISPLAYED frame: EXIF orientation first (all 8 cases incl. mirrors),
     then rotate= quarter-turns clockwise, i.e. exactly the transform the
-    pixels get. Pure and fail-soft: an out-of-range orientation reads as
-    1 (matching metareader.read_orientation), rotate is taken mod 4, and
-    the result is corner-normalized so mirrored cases stay (l,t,r,b)."""
-    left, top, right, bottom = rect
-    f = _ORIENT_MAP.get(orientation, _ORIENT_MAP[1])
-    (x0, y0), (x1, y1) = f(left, top), f(right, bottom)
-    for _ in range(rotate % 4):
-        # one clockwise quarter-turn of the frame: (x, y) -> (1 - y, x)
-        (x0, y0), (x1, y1) = (1.0 - y0, x0), (1.0 - y1, x1)
-    return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+    pixels get. Pure and fail-soft (see cropmap.map_fraction_rect, which
+    this delegates to — kept as the overlay's named seam)."""
+    return map_fraction_rect(rect, orientation, rotate)
 
 
 def face_widget_rect(rect: tuple[float, float, float, float],
@@ -386,6 +407,12 @@ class ViewerPage(QWidget):
         self.loading = True
         path = str(self.catalog.root / self.catalog.photos[idx].rel)
         rotate = self.catalog.photos[idx].rotate
+        # Unsaved Picasa crop recipe (fauxcasa-cam.15): applied to the
+        # decoded original (crop -> EXIF -> rotate). The cached preview
+        # below is already crop-baked by the v10 indexer, so both stand-in
+        # and original show the same sub-rect (a prebuilt adopt-mode cache
+        # may predate the bake — accepted: its corpus carries no recipes).
+        crop = self.catalog.photos[idx].crop
         # Show a cached stand-in NOW — synchronous, but cheap (a <= 512 px
         # JPEG decodes in a couple of ms) — so the viewport is never blank
         # while the worker below decodes the full original. This is the
@@ -402,7 +429,7 @@ class ViewerPage(QWidget):
             # decode, and the emit is guarded against Qt teardown.
             if serial != self._serial:
                 return
-            img, orientation = load_original_oriented(path, rotate)
+            img, orientation = load_original_oriented(path, rotate, crop)
             if serial != self._serial:
                 return
             try:
@@ -618,9 +645,21 @@ class ViewerPage(QWidget):
         if not photo.faces:
             return []
         shown = self._shown_rect(self.width(), self.height(), self.image)
-        return [(face_widget_rect(rect, self._orientation, photo.rotate,
-                                  shown), name)
-                for rect, _cid, name in photo.faces]
+        out: list[tuple[QRectF, str | None]] = []
+        for rect, _cid, name in photo.faces:
+            if photo.crop is not None:
+                # Faces on a cropped photo still reference STORED pixels
+                # (fauxcasa-cam.15): rebase into the crop sub-rect FIRST
+                # (the displayed image IS that sub-rect), then the same
+                # EXIF x rotate mapping as the pixels. A face the crop
+                # cut out entirely has no on-screen pixels — skipped; one
+                # straddling the edge shows its visible part (clamped).
+                rect = rebase_fraction_rect(rect, photo.crop)
+                if rect is None:
+                    continue
+            out.append((face_widget_rect(rect, self._orientation,
+                                         photo.rotate, shown), name))
+        return out
 
     def _paint_faces(self, painter: QPainter) -> None:
         """Rounded outline + name chip per face: solid for a named face,
@@ -761,6 +800,11 @@ class ViewerPage(QWidget):
             # chip above): subtle discoverability, no extra chrome.
             n = len(photo.faces)
             parts.append(f"{n} face{'s' if n != 1 else ''} (F)")
+        if photo.has_edits:
+            # Honest M1 marker (fauxcasa-cam.15): this photo carries a
+            # Picasa edit recipe (only its crop is rendered; the rest of
+            # the chain — and the unsaved-vs-baked state cue — is M3).
+            parts.append("edited")
         if photo.star:
             parts.append("★" * min(photo.star, 5))  # 0-5 count (cam.11)
         if photo.date_taken:
@@ -769,6 +813,8 @@ class ViewerPage(QWidget):
             parts.append(format_geotag(photo.geotag))  # §3 geotag readout
         if photo.caption:
             parts.append(f"“{photo.caption}”")
+        if photo.stashed_original is not None:
+            parts.append("Picasa-saved original kept")
         return "   ·   ".join(parts)
 
     @staticmethod

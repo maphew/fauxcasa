@@ -1095,6 +1095,20 @@ class GridView(QAbstractScrollArea):
                        else cur)
                 self._set_selection(set(self.display), cur, anc)
             return
+        if keymap.matches(event, "grid.deselect"):
+            # Ctrl+D: Picasa "Deselect photos" — clears the selection set;
+            # the current item stays as keyboard focus but is deselected.
+            self._set_selection(set(), self.current, self.current)
+            return
+        if keymap.matches(event, "grid.invert"):
+            # Ctrl+I: Picasa "Invert selection" — flip membership for every
+            # photo in the current view; current item stays as keyboard focus.
+            if self.display:
+                new_sel = set(self.display) - self.selection
+                cur = (self.current if self.current in self.display_pos
+                       else -1)
+                self._set_selection(new_sel, cur, cur)
+            return
         if keymap.matches(event, "grid.locate"):
             # Ctrl+Enter: Picasa's Locate on Disk — reveal the CURRENT item
             # in the OS file manager (q6l.8). Checked BEFORE grid.open's
@@ -1126,6 +1140,12 @@ class GridView(QAbstractScrollArea):
             target = self._row_step(keymap.matches(event, "grid.row_down"))
             if target < 0:
                 return
+        elif keymap.matches(event, "grid.first"):
+            # Home: jump to the first photo in the current view (ed5.12).
+            target = self.display[0]
+        elif keymap.matches(event, "grid.last"):
+            # End: jump to the last photo in the current view (ed5.12).
+            target = self.display[-1]
         else:
             super().keyPressEvent(event)
             return
