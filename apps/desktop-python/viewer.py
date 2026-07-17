@@ -408,9 +408,10 @@ class ViewerPage(QWidget):
         self.loading = True
         # Catalog.abs() is the single choke point for absolute-path
         # composition (multiroot .b, design §6). An offline/unresolvable
-        # root (None) degrades to the existing unreadable-file fail-soft
-        # path below (empty path -> OSError -> null image, error tile) —
-        # the actual offline placeholder/badge is bead .e's job.
+        # root (None, bead .e's offline-tolerance semantics, design §8)
+        # degrades to the existing unreadable-file fail-soft path below
+        # (empty path -> OSError -> null image, error tile) — a working
+        # "volume offline" stand-in without a dedicated overlay for M1.
         abs_path = self.catalog.abs(self.catalog.photos[idx])
         path = str(abs_path) if abs_path is not None else ""
         rotate = self.catalog.photos[idx].rotate

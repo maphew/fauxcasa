@@ -104,6 +104,7 @@ from library import (  # noqa: E402
     LibraryConfig,
     LibraryRoot,
     legacy_config,
+    root_is_online,
 )
 from rawload import RAW_EXTS, is_raw_suffix  # noqa: E402
 from videoload import VIDEO_EXTS, is_video_suffix  # noqa: E402
@@ -390,22 +391,60 @@ class Catalog:
     # "" for the implicit legacy library; a full uuid4 for an explicit one
     # (mirrors LibraryConfig.library_id — see load_catalog's validation).
     library_id: str = ""
+    # Offline-root tolerance (fauxcasa-ed5.7.5, bead .e, design §8). Root
+    # ids from `roots` currently judged offline (library.root_is_online()
+    # returned False the last time this was checked) — NOT recomputed
+    # automatically on every read, so it reflects the state as of the last
+    # refresh_offline_ids() call (load_catalog calls it on open; the
+    # per-root reconcile loop calls it again on reconcile — "populated
+    # when the catalog is opened/reconciled", design §8). Empty by default:
+    # a freshly scan_library()-built catalog just walked every one of its
+    # roots successfully, so nothing in it can be offline yet.
+    offline_ids: set[str] = field(default_factory=set)
 
     @property
     def visible_count(self) -> int:
         return sum(1 for p in self.photos if p.visible)
 
+    def refresh_offline_ids(self) -> None:
+        """Recompute `offline_ids` from `roots` (design §8, bead .e): a
+        root is offline when library.root_is_online() says its resolved
+        path is not a directory — unplugged drive, remapped network share,
+        etc. Simple path check only; volume-UUID-based remount recognition
+        is bead .f. Call this whenever the catalog is opened (load_catalog)
+        or reconciled (the per-root reconcile loop) so abs() and the
+        online_roots()/offline_roots() split reflect current reality
+        before the next UI read."""
+        self.offline_ids = {r.id for r in self.roots if not root_is_online(r)}
+
+    def online_roots(self) -> list[LibraryRoot]:
+        """`roots` minus `offline_ids`, in library.json order (design §8/
+        §9: the per-root reconcile loop — and any other per-root operation
+        — iterates over exactly this set, never an offline root)."""
+        return [r for r in self.roots if r.id not in self.offline_ids]
+
+    def offline_roots(self) -> list[LibraryRoot]:
+        """The complement of online_roots(): roots currently in
+        `offline_ids`, in library.json order — what a status message or
+        sidebar badge lists as unreachable this session."""
+        return [r for r in self.roots if r.id in self.offline_ids]
+
     def abs(self, photo: Photo) -> Path | None:
         """The single choke point for absolute-path composition (design
-        §6): look up `photo.root_id` among self.roots and join `photo.rel`.
-        Returns None when the root is unknown/offline to this catalog —
-        every consumer of an absolute photo path MUST go through this
-        method and handle None (bead .b's grep-audit requirement; the
-        actual offline-volume placeholder/badge is bead .e — for now, an
-        unresolvable root_id is the only reason this returns None)."""
+        §6, extended by bead .e's offline semantics, design §8): look up
+        `photo.root_id` among self.roots and join `photo.rel`. Returns
+        None when the root is unknown to this catalog OR is currently
+        offline (`photo.root_id in self.offline_ids`) — every consumer of
+        an absolute photo path MUST go through this method and handle
+        None (bead .b's grep-audit requirement, reconfirmed by bead .e's
+        own audit). Offline roots' photos deliberately STAY in `photos`
+        (design §8's "unplugging a drive does not lose data" rule) with a
+        perfectly resolvable root_id; abs() still returns None for them on
+        purpose so every consumer shows the offline placeholder instead of
+        racing an unplugged drive with an OSError."""
         for r in self.roots:
             if r.id == photo.root_id:
-                return r.path / photo.rel
+                return None if r.id in self.offline_ids else r.path / photo.rel
         return None
 
     def photos_for_root(self, root_id: str) -> list[Photo]:
@@ -1682,11 +1721,18 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig) -> Catalog | None:
     except (KeyError, IndexError, TypeError, AttributeError, ValueError):
         return None
 
-    return Catalog(root=root, photos=photos, folders=folders, albums=albums,
-                   contacts=contacts, db3_contacts=db3_contacts,
-                   backfill_state=backfill_state,
-                   backfill_cursor=backfill_cursor,
-                   roots=list(cfg.roots), library_id=cfg.library_id)
+    catalog = Catalog(root=root, photos=photos, folders=folders,
+                      albums=albums, contacts=contacts,
+                      db3_contacts=db3_contacts,
+                      backfill_state=backfill_state,
+                      backfill_cursor=backfill_cursor,
+                      roots=list(cfg.roots), library_id=cfg.library_id)
+    # "populated when the catalog is opened" (design §8, bead .e) — a warm
+    # load is exactly an open, so check every root's reachability now
+    # rather than leaving offline_ids at its all-online default until the
+    # first reconcile.
+    catalog.refresh_offline_ids()
+    return catalog
 
 
 @dataclass

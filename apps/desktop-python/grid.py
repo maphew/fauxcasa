@@ -1116,8 +1116,8 @@ class GridView(QAbstractScrollArea):
             if self.current >= 0 and self.catalog is not None:
                 # Catalog.abs() is the single choke point for absolute-path
                 # composition (multiroot .b, design §6); None means the
-                # photo's root is missing/offline — nothing to reveal (the
-                # offline placeholder/badge is bead .e's job).
+                # photo's root is missing/offline (bead .e, design §8) —
+                # nothing to reveal, a silent no-op.
                 target = self.catalog.abs(self.catalog.photos[self.current])
                 if target is not None:
                     reveal_in_file_manager(target)

@@ -105,6 +105,27 @@ def library_json_path(home: Path) -> Path:
     return home / LIBRARY_DIR / LIBRARY_FILE
 
 
+def root_is_online(root: LibraryRoot) -> bool:
+    """Offline detection (design §8, bead .e): a root is offline when its
+    resolved path is not a directory. A simple existence/is_dir check
+    only — volume-UUID-based remount recognition (a root that comes back
+    at a different drive letter) is bead .f, deferred past M1 (design §13
+    item 3: until then a removable-drive letter change reads as offline,
+    not data loss, since offline roots' catalog entries are never touched
+    — see reconcile's per-online-root loop).
+
+    `LibraryRoot.path` is stored UNVERBATIM/unresolved (last-known-path
+    semantics, load_library's docstring) — resolve() here before the
+    is_dir() check so a relative or symlinked last-known path is judged
+    by what it actually points at, not its raw stored form. Any OSError
+    during resolution (e.g. a broken junction) reads as offline, fail-soft
+    like every other offline-detection path in this module."""
+    try:
+        return Path(root.path).resolve().is_dir()
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Load / save
 # ---------------------------------------------------------------------------

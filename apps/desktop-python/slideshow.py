@@ -182,9 +182,9 @@ class SlideshowPage(ViewerPage):
         photo = self.catalog.photos[nxt]
         # Catalog.abs() is the single choke point for absolute-path
         # composition (multiroot .b, design §6). An offline/unresolvable
-        # root (None) degrades to the same fail-soft path as an unreadable
-        # file (empty path -> OSError -> null image) — the actual offline
-        # placeholder/badge is bead .e's job.
+        # root (None, bead .e's offline-tolerance semantics, design §8)
+        # degrades to the same fail-soft path as an unreadable file (empty
+        # path -> OSError -> null image).
         abs_path = self.catalog.abs(photo)
         path = str(abs_path) if abs_path is not None else ""
         rotate = photo.rotate
