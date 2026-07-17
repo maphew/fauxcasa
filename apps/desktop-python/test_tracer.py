@@ -9324,10 +9324,14 @@ def test_viewer_info_bar_edited_chip(tmp_path: Path) -> None:
 
 
 def test_ingest_parity_gate_passes() -> None:
-    """The M1 ingest-parity gate (spec §9 clause 2) end-to-end: with
-    edit-recipe ingest landed (fauxcasa-cam.15) the expectation table has
-    ZERO expected-missing classes, so the gate must PASS fully ingested —
-    zero loss across every class it tracks. Runs the real script in its
+    """The M1 ingest-parity gate (spec §9 clause 2) end-to-end: zero
+    ingest LOSS across every ingested class, always (the gate FAILS on
+    loss/excess/ratchet regardless of expected-missing count — see
+    check-ingest-parity.py's run_gate). fauxcasa-cam.15 took the table to
+    zero expected-missing; fauxcasa-ed5.11 added db3_caption_precedence
+    back (owner fauxcasa-cam.20, db3 caption gap-fill not yet wired), so
+    this asserts PASS with exactly that one expected-missing class rather
+    than the old "fully ingested" wording. Runs the real script in its
     own uv env (exactly CI's tests.yml job); skips when uv is absent."""
     import shutil
     import subprocess
@@ -9340,7 +9344,8 @@ def test_ingest_parity_gate_passes() -> None:
         capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=600)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert "fully ingested (0 expected-missing)" in proc.stdout
+    assert "PASS: zero ingest loss across" in proc.stdout
+    assert "1 expected-missing classes are owned and probed" in proc.stdout
 
 
 # ===========================================================================

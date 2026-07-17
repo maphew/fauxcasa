@@ -23,9 +23,10 @@ synthetic picasa-extras corpus (scripts/make-synthetic-library.py
 
 -- and diffs feature counts per ingest class. Designed to land GREEN and
 RATCHET: classes the tracer does not yet ingest are marked
-expected-missing with the owning bead id (as of fauxcasa-cam.15 the
-table is FULLY ingested -- zero expected-missing classes), and the
-harness FAILS on
+expected-missing with the owning bead id (fauxcasa-cam.15 took the table
+to zero expected-missing; fauxcasa-ed5.11 adds one back --
+db3_caption_precedence, owner fauxcasa-cam.20 -- see the CLASSES table),
+and the harness FAILS on
 
 (a) LOSS/mismatch in a class marked ingested,
 (b) a class the tracer now ingests but the table still marks
@@ -64,6 +65,10 @@ sys.path.insert(0, str(REPO / "apps" / "desktop-python"))
 
 import picasa_db  # noqa: E402
 from catalog import Catalog, load_contacts_xml, scan_library  # noqa: E402
+# db3 rescue plumbing (fauxcasa-cam.6): the same machine-path translator
+# scan_library's own rescue_people uses, reused here so the gate's
+# reference-side db3 join follows the exact same rule as the tracer.
+from db3rescue import translate_db3_path  # noqa: E402
 
 # Media extensions the tracer walks (catalog.EXTS is the tracer's rule;
 # imported, not copied, so the photo count follows the tracer's walk) and
@@ -97,6 +102,98 @@ class Reference:
     contacts_xml: int             # <contact> entries in contacts/contacts.xml
     manifest: dict[str, Any]      # generator ground truth
     stashed_fs: int               # stash-dir media files whose same-name sibling exists
+    # db3 (fauxcasa-ed5.11, deps cam.6/cam.7) — read straight off the
+    # corpus's synthetic db3/ dir via picasa_db's validated readers, joined
+    # onto library-relative rel paths through db3rescue.translate_db3_path
+    # (the exact join the rescue import itself uses). Never touches the
+    # tracer's Catalog — see _db3_reference.
+    db3_video_dims: dict[str, tuple[int, int]]     # rel -> (width, height), db3-indexed video clips only
+    db3_video_filetype: dict[str, int]             # rel -> imagedata.filetype code, same rows
+    # rel -> (db3 caption, ini caption) for every db3-indexed row whose
+    # db3 caption differs from the independently-reread ini caption= value
+    db3_caption_diverge: dict[str, tuple[str, str]]
+
+
+# imagedata.filetype codes for a db3-indexed video clip, derived from
+# picasa_db.THUMBINDEX_FILE_TYPES (0x08 avi, 0x09 mpeg4?) rather than an
+# ad-hoc literal set — thumbindex ftype mirrors imagedata.filetype exactly
+# on real (non-face-crop) rows per picasa-db3-validated.md, so the same
+# codes apply to both tables. Compared by CODE only (0x09's name carries a
+# documented "?" in that table — this gate doesn't depend on the name).
+_DB3_VIDEO_FILETYPE_CODES = frozenset(
+    code for code, name in picasa_db.THUMBINDEX_FILE_TYPES.items()
+    if name in ("avi", "mpeg4?")
+)
+
+
+def _db3_reference(
+    db3_dir: Path, library: Path
+) -> tuple[dict[str, tuple[int, int]], dict[str, int],
+           dict[str, tuple[str, str]]]:
+    """Independently rebuild the db3-indexed rel-path ground truth
+    straight from db3_dir's .pmp columns + thumbindex.db (picasa_db's
+    validated readers — read_table/read_thumbindex, never a hand-rolled
+    parse), joined via db3rescue.translate_db3_path exactly like the
+    rescue importer joins. Returns (video dims by rel, video filetype by
+    rel, caption-divergence by rel) — the three db3 ParityClasses' ground
+    truth. Fail-soft: an absent db3_dir yields all-empty (a corpus profile
+    that never ships one, or the default single-root gate run, still
+    passes trivially — no class is asserted at reference-count 0 unless
+    the caller's corpus is expected to exercise it)."""
+    dims: dict[str, tuple[int, int]] = {}
+    filetypes: dict[str, int] = {}
+    diverge: dict[str, tuple[str, str]] = {}
+    ti_path = db3_dir / "thumbindex.db"
+    if not ti_path.is_file():
+        return dims, filetypes, diverge
+    # scan_library resolves its root before db3rescue.translate_db3_path
+    # ever sees it (catalog.py: "root = root.resolve()") — resolve here
+    # too so this independent reference-side join can't silently drift
+    # from the tracer's on a platform where the corpus path needs it.
+    library = library.resolve()
+
+    entries = picasa_db.read_thumbindex(ti_path, strict=False)
+    full_paths = picasa_db.thumbindex_full_paths(entries)
+    table = picasa_db.read_table(db3_dir, "imagedata", strict=False)
+    width_col = table.columns.get("width")
+    height_col = table.columns.get("height")
+    filetype_col = table.columns.get("filetype")
+    caption_col = table.columns.get("caption")
+    ini_cache: dict[Path, picasa_db.PicasaIni] = {}
+
+    for entry, abs_path in zip(entries, full_paths):
+        if not entry.name or entry.is_folder:
+            continue  # folders, face-crop rows, and deleted slots carry no file
+        rel = translate_db3_path(abs_path, library)
+        if rel is None:
+            continue  # outside this library — not this gate's concern
+        ftype = filetype_col.get(entry.index) if filetype_col else None
+        if ftype in _DB3_VIDEO_FILETYPE_CODES:
+            filetypes[rel] = ftype
+            w = width_col.get(entry.index) if width_col else None
+            h = height_col.get(entry.index) if height_col else None
+            if w is not None and h is not None:
+                dims[rel] = (w, h)
+        db3_caption = caption_col.get(entry.index) if caption_col else None
+        if not db3_caption:
+            continue
+        folder_rel, _, name = rel.rpartition("/")
+        ini_path = (library / folder_rel if folder_rel else library) \
+            / ".picasa.ini"
+        if ini_path not in ini_cache:
+            ini_cache[ini_path] = (
+                picasa_db.read_picasa_ini(ini_path)
+                if ini_path.is_file() else None
+            )
+        ini = ini_cache[ini_path]
+        ini_caption = ""
+        if ini is not None:
+            sec = ini.section(name)
+            if sec is not None:
+                ini_caption = sec.get("caption") or ""
+        if db3_caption != ini_caption:
+            diverge[rel] = (db3_caption, ini_caption)
+    return dims, filetypes, diverge
 
 
 def build_reference(corpus: Path) -> Reference:
@@ -117,6 +214,9 @@ def build_reference(corpus: Path) -> Reference:
             or p.parent.name == "Originals")
         and (p.parent.parent / p.name).is_file()
     )
+    db3_video_dims, db3_video_filetype, db3_caption_diverge = (
+        _db3_reference(corpus / "db3", library)
+    )
     return Reference(
         survey=survey,
         photos_fs=len(images),
@@ -126,6 +226,9 @@ def build_reference(corpus: Path) -> Reference:
         contacts_xml=contacts_xml,
         manifest=manifest,
         stashed_fs=stashed_fs,
+        db3_video_dims=db3_video_dims,
+        db3_video_filetype=db3_video_filetype,
+        db3_caption_diverge=db3_caption_diverge,
     )
 
 
@@ -137,10 +240,16 @@ def build_reference(corpus: Path) -> Reference:
 # a representation (dataclass fields by candidate names, behavioral
 # evidence) and an int after, so the gate flipped to "ratchet forward" the
 # moment fauxcasa-cam.* ingest work landed, even in a parallel branch. As
-# of fauxcasa-cam.15 (edit_keys_other, the last class) the table is FULLY
-# ingested and the probe machinery is retired; if a future class lands
-# expected-missing, revive the pattern from git history (_photo_field /
-# _count_photo_values / probe_*).
+# of fauxcasa-cam.15 (edit_keys_other) the table went fully ingested and
+# the probe machinery was retired; fauxcasa-ed5.11 revives it for
+# db3_caption_precedence below (owner fauxcasa-cam.20) -- see
+# _probe_db3_caption_precedence.
+
+
+def _photos_by_rel(c: Catalog) -> dict[str, Any]:
+    return {p.rel: p for p in c.photos}
+
+
 # --------------------------------------------------------------------------
 
 # The survey's per-file edit-key vocabulary (picasa_db._INI_EDIT_KEYS)
@@ -318,7 +427,84 @@ CLASSES: list[ParityClass] = [
         lambda c, r: sum(1 for p in c.photos for k, _v in p.edits
                          if k.lower() in _EDIT_KEYS_OTHER),
         manifest_key="edit_keys_other"),
+    # ---- db3 rescue plumbing: ingested by fauxcasa-cam.6/cam.7 -------------
+    # scan_library's db3_dir param (rescue_people) is real db3 -> catalog
+    # ingest already; these two classes corroborate ALREADY-ingested
+    # ini-sourced fields (Photo.dims seeded from video width=/height=,
+    # Photo.media from the walk's extension routing) against db3's
+    # independently-written imagedata rows for the db3-indexed clips —
+    # an ingest-loss check in the cross-store-agreement sense, not a new
+    # db3->catalog data path.
+    ParityClass(
+        # imagedata width/height for db3-indexed video clips vs the
+        # catalog's ini-seeded Photo.dims (Picasa records movie dims in
+        # BOTH the ini width=/height= keys and db3 imagedata) — the two
+        # independent sources must agree for every db3-indexed clip.
+        "db3_video_dims", lambda r: len(r.db3_video_dims),
+        lambda c, r: _tracer_db3_video_dims(c, r),
+        manifest_key="db3_video_dims"),
+    ParityClass(
+        # imagedata.filetype (0x08 avi / 0x09 mpeg4?, THUMBINDEX_FILE_TYPES
+        # in picasa_db.py) corroborating the catalog's extension-derived
+        # media=='video' for the same db3-indexed clips — an independent
+        # cross-check that the walk's extension routing agrees with
+        # Picasa's own filetype classification.
+        "db3_video_filetype", lambda r: len(r.db3_video_filetype),
+        lambda c, r: _tracer_db3_video_filetype(c, r),
+        manifest_key="db3_video_filetype"),
+    # ---- expected-missing: owned, probed, ratchets forward ------------------
+    ParityClass(
+        # db3 caption gap-fill (§4 precedence: product-spec.md says
+        # in-file/ini captions win tier-1 data and "db3 fills gaps only",
+        # so a diverging db3 caption should never override an existing
+        # ini one) is not wired anywhere yet — db3rescue.py implements
+        # only the class-4 person-album rescue (cam.6/cam.7); no code
+        # reads imagedata_caption.pmp. The synthetic-library-extras db3/
+        # dir carries one photo (Beach Day/photo01.jpg) whose db3 caption
+        # diverges from its ini caption= "Sunset over the bay" so the
+        # fixture is ready the moment cam.20 lands.
+        "db3_caption_precedence", lambda r: len(r.db3_caption_diverge),
+        lambda c, r: _probe_db3_caption_precedence(c, r),
+        owner="fauxcasa-cam.20", manifest_key="db3_caption_precedence"),
 ]
+
+
+def _tracer_db3_video_dims(c: Catalog, r: Reference) -> int:
+    by_rel = _photos_by_rel(c)
+    return sum(
+        1 for rel, dims in r.db3_video_dims.items()
+        if (p := by_rel.get(rel)) is not None and p.dims == dims
+    )
+
+
+def _tracer_db3_video_filetype(c: Catalog, r: Reference) -> int:
+    by_rel = _photos_by_rel(c)
+    return sum(
+        1 for rel, ftype in r.db3_video_filetype.items()
+        if (p := by_rel.get(rel)) is not None and p.media == "video"
+        and ftype in _DB3_VIDEO_FILETYPE_CODES
+    )
+
+
+def _probe_db3_caption_precedence(c: Catalog, r: Reference) -> int | None:
+    """Probe for fauxcasa-cam.20 (db3 caption gap-fill; not yet
+    implemented anywhere -- db3rescue.py only reads albumdata/imagedata
+    columns for the class-4 person rescue). Fires -- returns a real count,
+    tripping the ratchet -- the moment ANY future merge code changes
+    Photo.caption away from the plain ini value on a row this fixture
+    marks db3-divergent, regardless of which way the merge resolves it:
+    product-spec.md §4 says db3 fills gaps only, so the un-changed case
+    (this photo already has an ini caption) may legitimately persist even
+    after cam.20 lands correctly -- that bead owns the final call on
+    exact precedence and on rewriting this probe/fixture if the gap-fill
+    semantics need a photo with NO ini caption instead."""
+    by_rel = _photos_by_rel(c)
+    n = 0
+    for rel, (_db3_caption, ini_caption) in r.db3_caption_diverge.items():
+        p = by_rel.get(rel)
+        if p is not None and p.caption != ini_caption:
+            n += 1
+    return n or None
 
 
 # --------------------------------------------------------------------------
@@ -330,12 +516,17 @@ def run_gate(corpus: Path) -> int:
     ref = build_reference(corpus)
     # The gate scans the way the app does: contacts.xml threaded in when the
     # corpus ships one (fauxcasa-cam.2's --contacts discovery, made explicit),
-    # and the Picasa2Albums .pal dir likewise (fauxcasa-cam.8's --pal-dir).
+    # the Picasa2Albums .pal dir likewise (fauxcasa-cam.8's --pal-dir), and
+    # the synthetic db3 dir likewise (fauxcasa-cam.6's --db3 discovery) —
+    # this is scan_library's own db3-rescue path (class-4 person albums),
+    # exercised here on real (if minimal) db3 bytes rather than mocked.
     cx = corpus / "contacts" / "contacts.xml"
     contacts = load_contacts_xml(cx) if cx.is_file() else {}
     pal_dir = corpus / "albums"
+    db3_dir = corpus / "db3"
     cat = scan_library(corpus / "library", contacts=contacts,
-                       pal_dir=pal_dir if pal_dir.is_dir() else None)
+                       pal_dir=pal_dir if pal_dir.is_dir() else None,
+                       db3_dir=db3_dir if db3_dir.is_dir() else None)
     expected = ref.manifest.get("expected", {})
 
     failures: list[str] = []

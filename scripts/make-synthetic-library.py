@@ -42,14 +42,22 @@ rotate, album defs/memberships, folder descriptions, Hidden Folders),
 plus two tiny deterministic video clips (PyAV, solid-color frames, ~1 s,
 a few KB each — fauxcasa-v46.2/ed5.11) whose ini sections exercise
 star/caption/album-membership attachment and width=/height= dim seeds
-for video files. The corpus ships a manifest.json of ground-truth
-expected counts.
+for video files, plus a synthetic ``db3/`` directory (fauxcasa-ed5.11,
+cam.6/cam.7 rescue plumbing) — a handful of .pmp columns + thumbindex.db
+in the byte format documented in docs/research/picasa-db3-validated.md,
+mirroring only a SUBSET of the corpus the way Picasa's own lazy (2-6 min
+flush) db3 mirror would: both video clips (imagedata filetype 0x08/0x09,
+THUMBINDEX_FILE_TYPES in picasa_db.py), three stills with dims, and one
+photo whose db3 caption diverges from its ini caption (the §4 precedence
+case check-ingest-parity.py's db3_caption_precedence class exercises).
+The corpus ships a manifest.json of ground-truth expected counts.
 The default / --scale / --benchmark outputs are byte-for-byte unchanged
 by this profile (existing benchmark caches bind to library digests).
 """
 
 import argparse
 import random
+import struct
 from pathlib import Path
 
 import piexif
@@ -613,6 +621,140 @@ def _pal_xml(uid: str, name: str, members: list[str]) -> str:
     )
 
 
+# --------------------------------------------------------------------------
+# db3 corpus (fauxcasa-ed5.11, deps cam.6/cam.7): a SYNTHETIC Picasa db3
+# directory (.pmp columns + thumbindex.db) for the ingest-parity gate's db3
+# classes. This writer is self-contained and independent of both product
+# code (scripts/picasa_db.py) and the test-only writers (scripts/
+# test_picasa_db.py make_pmp/write_pmp, apps/desktop-python/test_tracer.py
+# _write_pmp/_write_thumbindex) — every format constant below is written
+# LITERALLY from docs/research/picasa-db3-validated.md, not imported, so
+# check-ingest-parity.py's own reference reader (picasa_db.read_pmp/
+# read_thumbindex, the validated parsers) proves the bytes independently.
+#
+# Real Picasa's db3 is a LAZY mirror (product-spec.md §4: "2-6 min flush,
+# no shutdown flush"), so this deliberately indexes a SUBSET of the extras
+# corpus, not everything: two of the five plan folders, both video clips
+# (imagedata filetype 0x08/0x09 — THUMBINDEX_FILE_TYPES in picasa_db.py),
+# three stills carrying dims, and one photo (photo01.jpg, Beach Day) whose
+# db3 caption DIVERGES from its ini caption= "Sunset over the bay" — the
+# case check-ingest-parity.py's db3_caption_precedence class exercises
+# (db3 caption ingestion itself is not yet wired, fauxcasa-cam.20; the
+# class documents the fixture as expected-missing until it lands).
+# --------------------------------------------------------------------------
+
+_DB3_PMP_MAGIC = 0x3FCCCCCD
+_DB3_PMP_CONST1 = 0x1332
+_DB3_PMP_CONST2 = 0x00000002
+_DB3_THUMBINDEX_MAGIC = 0x40466666
+
+_DB3_FIELD_STRING = 0x0
+_DB3_FIELD_UINT32 = 0x1
+
+_DB3_FOLDER_1 = "2009-07-04 Beach Day"
+_DB3_FOLDER_2 = "2010-12-25 Winter Holiday"
+# The ini caption this diverges from (see _EXTRAS_FOLDERS, Beach Day
+# photo01.jpg: "caption=Sunset over the bay").
+_DB3_DIVERGENT_CAPTION = "Sunset light over the bay (db3)"
+
+
+def _db3_abs_path(folder: Path, drive: str = "Q:") -> str:
+    """The synthetic db3 "machine" spelling of `folder`: absolute,
+    backslash-separated components, trailing separator, under a drive
+    letter DIFFERENT from wherever this corpus actually lives (§8: drive
+    letters are translated, never stored — db3rescue.translate_db3_path
+    strips each side's own drive before comparing components, so the
+    swap is exactly what proves the translation rather than a same-drive
+    coincidence). This produces Windows-shaped bytes even when the
+    generator runs on Linux CI, since only the path COMPONENTS matter to
+    the translator, not the host OS's own path syntax."""
+    parts = [c for c in str(folder).replace("\\", "/").split("/") if c]
+    if parts and len(parts[0]) == 2 and parts[0][1] == ":":
+        parts = parts[1:]
+    return drive + "\\" + "\\".join(parts) + "\\"
+
+
+def _write_db3_pmp(path: Path, field_type: int, values: list) -> None:
+    """One .pmp column file, header + payload written from LITERAL format
+    constants (picasa-db3-validated.md), matching the independent-bytes
+    doctrine of the test-only writers this deliberately does not import:
+    u32 magic 0x3fcccccd | u16 type | u16 0x1332 | u32 2 | u16 type |
+    u16 0x1332 | u32 count | payload (NUL-terminated strings, or packed
+    little-endian uint32 values)."""
+    header = struct.pack(
+        "<IHHIHHI", _DB3_PMP_MAGIC, field_type, _DB3_PMP_CONST1,
+        _DB3_PMP_CONST2, field_type, _DB3_PMP_CONST1, len(values),
+    )
+    if field_type == _DB3_FIELD_STRING:
+        payload = b"".join(v.encode("utf-8") + b"\x00" for v in values)
+    else:
+        payload = b"".join(struct.pack("<I", v) for v in values)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(header + payload)
+
+
+def _write_db3_thumbindex(
+    path: Path, entries: list[tuple[str, int, int | None]]
+) -> None:
+    """thumbindex.db from literal format constants (picasa-db3-validated.md):
+    u32 magic 0x40466666 | u32 count | per entry NUL-terminated name +
+    <u64 taken, u64 mtime, u32 size, u8 ftype, u32 flags, u8 valid,
+    u32 parent>. `entries` is (name, ftype, parent-row-or-None); this
+    corpus needs no face-crop rows so timestamps/size/flags stay 0 and
+    valid is always 1, matching the oracle's real (non-face-crop) rows."""
+    out = bytearray(struct.pack("<II", _DB3_THUMBINDEX_MAGIC, len(entries)))
+    for name, ftype, parent in entries:
+        out += name.encode("utf-8") + b"\x00"
+        out += struct.pack(
+            "<QQIBIBI", 0, 0, 0, ftype, 0, 1,
+            0xFFFFFFFF if parent is None else parent,
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(out))
+
+
+def _write_extras_db3(root: Path, library: Path) -> None:
+    """Write root/db3/: thumbindex.db + imagedata_{filetype,width,height,
+    caption}.pmp. Row numbers below double as thumbindex record numbers
+    AND imagedata row numbers (the join model picasa-db3-validated.md
+    validates 29/29): 0/4 are the two mirrored folders, the rest their
+    file children (parent = the folder's row).
+
+    The machine paths are built from `library.resolve()`, not the raw
+    `library` Path: scan_library resolves its `root` before calling the
+    db3 rescue's translate_db3_path (catalog.py: "root = root.resolve()"),
+    so an unresolved generator-side path could silently mismatch it on a
+    platform where the corpus's temp dir needs resolving (e.g. a Windows
+    runner's short/relocated TEMP) — resolving on both sides keeps the
+    join exact everywhere."""
+    library = library.resolve()
+    db3 = root / "db3"
+    f1 = _db3_abs_path(library / _DB3_FOLDER_1)
+    f2 = _db3_abs_path(library / _DB3_FOLDER_2)
+    entries = [
+        (f1, 0x01, None),           # row 0: folder (Beach Day)
+        ("photo00.jpg", 0x02, 0),   # row 1: still, dims only
+        ("photo01.jpg", 0x02, 0),   # row 2: still, DIVERGENT db3 caption
+        ("clip00.avi", 0x08, 0),    # row 3: video (avi)
+        (f2, 0x01, None),           # row 4: folder (Winter Holiday)
+        ("photo00.jpg", 0x02, 4),   # row 5: still, dims only
+        ("clip00.mp4", 0x09, 4),    # row 6: video (mp4)
+    ]
+    _write_db3_thumbindex(db3 / "thumbindex.db", entries)
+    _write_db3_pmp(db3 / "imagedata_filetype.pmp", _DB3_FIELD_UINT32,
+                   [1, 2, 2, 8, 1, 2, 9])
+    _write_db3_pmp(db3 / "imagedata_width.pmp", _DB3_FIELD_UINT32,
+                   [0, 1600, 1200, 64, 0, 2048, 64])
+    _write_db3_pmp(db3 / "imagedata_height.pmp", _DB3_FIELD_UINT32,
+                   [0, 1200, 1600, 48, 0, 1536, 48])
+    # SHORT column on purpose (3 of the 7 rows): exercises PmpColumn.get's
+    # documented past-end default (picasa_db.py — "columns of one table
+    # legitimately have different lengths"); rows 3-6 carry no db3 caption
+    # at all, only the folder (row 0, empty) and the two Beach Day stills.
+    _write_db3_pmp(db3 / "imagedata_caption.pmp", _DB3_FIELD_STRING,
+                   ["", "", _DB3_DIVERGENT_CAPTION])
+
+
 # Ground truth the generator promises (checked three ways by
 # check-ingest-parity.py: manifest == survey rollup == tracer catalog for
 # ingested classes). Keep in sync with _EXTRAS_FOLDERS by construction —
@@ -651,6 +793,10 @@ _EXTRAS_EXPECTED = {
     "placeholder_album_uids": 1,   # distinct unknown-UID albums (ALBUM_UNKNOWN)
     "placeholder_album_refs": 2,   # albums= tokens naming them
     "edit_keys_other": 1,    # filters=/crop besides the ingested rotate=
+    # ---- db3 (fauxcasa-ed5.11, deps cam.6/cam.7) — see _write_extras_db3 ---
+    "db3_video_dims": 2,      # both video clips indexed with matching dims
+    "db3_video_filetype": 2,  # both video clips, imagedata filetype 0x08/0x09
+    "db3_caption_precedence": 1,  # photo01.jpg: db3 caption diverges from ini
 }
 
 
@@ -700,6 +846,7 @@ def make_extras_library(root: Path | None = None) -> Path:
         (albums / f"{uid}.pal").write_text(
             _pal_xml(uid, name, members), encoding="utf-8"
         )
+    _write_extras_db3(root, library)
     manifest = {
         "profile": "picasa-extras",
         "expected": _EXTRAS_EXPECTED,
@@ -721,7 +868,8 @@ def make_extras_library(root: Path | None = None) -> Path:
         f"{_EXTRAS_EXPECTED['videos']} videos) in "
         f"{_EXTRAS_EXPECTED['folders']} "
         f"folders, {_EXTRAS_EXPECTED['ini_files']} inis, "
-        f"{_EXTRAS_EXPECTED['pal_albums']} .pal, contacts.xml at {root}"
+        f"{_EXTRAS_EXPECTED['pal_albums']} .pal, contacts.xml, a synthetic "
+        f"db3/ at {root}"
     )
     return root
 
