@@ -27,7 +27,6 @@ from PySide6.QtGui import (
     QColor,
     QCursor,
     QImage,
-    QKeySequence,
     QPainter,
     QPen,
     QPolygonF,
@@ -41,7 +40,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import keymap
 from catalog import Catalog
+from keymap import PEEK_MODS  # noqa: F401 -- re-export (see _MOD_OF note)
+from locate import reveal_in_file_manager
 from thumbcache import THUMB_EDGE, ThumbCache
 
 HEADER_H = 26
@@ -132,11 +134,9 @@ HIDDEN_VEIL = QColor(0, 0, 0, 110)  # reveal mode: dim hidden/stash tiles
 PEN_SELECTED = QPen(SELECT, 1)
 PEN_CURRENT = QPen(SELECT, 3)
 PEN_FOCUS = QPen(SELECT, 1, Qt.PenStyle.DashLine)
-# The hover-peek trigger chord (fauxcasa-q6l.5): Picasa's "Hover over a
-# photo and use Ctrl-Alt" (the shortcut corpus). Qt's standard modifiers
-# keep it platform-correct (Cmd reports as ControlModifier on macOS).
-PEEK_MODS = (Qt.KeyboardModifier.ControlModifier
-             | Qt.KeyboardModifier.AltModifier)
+# The hover-peek trigger chord (fauxcasa-q6l.5) lives in the keymap —
+# the single source of truth for bindings (fauxcasa-q6l.8); re-exported
+# here because tests and callers know it as grid.PEEK_MODS.
 _MOD_OF = {Qt.Key.Key_Control: Qt.KeyboardModifier.ControlModifier,
            Qt.Key.Key_Alt: Qt.KeyboardModifier.AltModifier}
 
@@ -1065,8 +1065,11 @@ class GridView(QAbstractScrollArea):
             self._activate(idx)
 
     def keyPressEvent(self, event) -> None:
+        # Every binding is a keymap lookup (fauxcasa-q6l.8): the default-
+        # scheme table is the single source of truth; this handler only
+        # sequences the context layering (peek overlay first, then grid).
         key = event.key()
-        if key == Qt.Key.Key_Escape and self._peek_idx >= 0:
+        if keymap.matches(event, "peek.dismiss") and self._peek_idx >= 0:
             # Esc dismisses the peek — and ONLY the peek this press (the
             # selection-collapse Esc below is untouched for the next one) —
             # suppressed until the chord drops, so a twitch can't re-fire.
@@ -1078,13 +1081,12 @@ class GridView(QAbstractScrollArea):
             # — Picasa's actual gesture. OR the pressed key's own bit in
             # (see keyReleaseEvent for why we normalize explicitly).
             self._peek_update(event.modifiers() | _MOD_OF[key])
-        if (key == Qt.Key.Key_H
-                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+        if keymap.matches(event, "grid.hold"):
             # Ctrl+H: hold the current selection in the tray (q6l.2).
             self.hold_requested.emit()
             return
-        if event.matches(QKeySequence.StandardKey.SelectAll):
-            # Ctrl+A (Cmd+A on macOS via QKeySequence): the whole current
+        if keymap.matches(event, "grid.select_all"):
+            # Ctrl+A (Cmd+A on macOS via the StandardKey): the whole current
             # display set. Current/anchor keep their place if shown.
             if self.display:
                 cur = (self.current if self.current in self.display_pos
@@ -1093,25 +1095,35 @@ class GridView(QAbstractScrollArea):
                        else cur)
                 self._set_selection(set(self.display), cur, anc)
             return
-        if key == Qt.Key.Key_Escape:
+        if keymap.matches(event, "grid.locate"):
+            # Ctrl+Enter: Picasa's Locate on Disk — reveal the CURRENT item
+            # in the OS file manager (q6l.8). Checked BEFORE grid.open's
+            # key_only Return so the chord reveals instead of activating.
+            if self.current >= 0 and self.catalog is not None:
+                reveal_in_file_manager(
+                    self.catalog.root / self.catalog.photos[self.current].rel)
+            return
+        if keymap.matches(event, "grid.clear"):
             # Esc: collapse the set to the current item only (clears all
             # when there is no current item).
             self._select(self.current)
             return
-        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.current >= 0:
+        if keymap.matches(event, "grid.open") and self.current >= 0:
             self._activate(self.current)
             return
         if not self.display:
             super().keyPressEvent(event)
             return
-        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
-            step = -1 if key == Qt.Key.Key_Left else 1
+        fwd = keymap.matches(event, "grid.next")   # Right / J (q6l.8)
+        if fwd or keymap.matches(event, "grid.prev"):
+            step = 1 if fwd else -1
             pos = self.display_pos.get(self.current, -1)
             pos = max(0, min(len(self.display) - 1,
                              pos + step if pos >= 0 else 0))
             target = self.display[pos]
-        elif key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
-            target = self._row_step(key == Qt.Key.Key_Down)
+        elif keymap.matches(event, "grid.row_up") \
+                or keymap.matches(event, "grid.row_down"):
+            target = self._row_step(keymap.matches(event, "grid.row_down"))
             if target < 0:
                 return
         else:

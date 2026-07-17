@@ -25,7 +25,9 @@ a 2x blowup). Bindings: `1` — Picasa Photo Viewer's own "Toggle 100%
 zoom" (docs/research/sources/picasaresources/keyboard-shortcuts.md) —
 plus Ctrl+Alt+0 as the conflict-free spelling (the M2 triage loop will
 claim bare digits 0–5 for star-set keys, at which point `1` cedes and
-Ctrl+Alt+0 remains), plus a plain click, anchored so the clicked image
+Ctrl+Alt+0 remains — that arbitration is now ENCODED in keymap.py, the
+default-scheme table all key handling here looks bindings up from,
+fauxcasa-q6l.8), plus a plain click, anchored so the clicked image
 point stays put under the cursor. While at 1:1, drag pans (and
 Ctrl+arrows pan a quarter-viewport) — PLAIN arrows keep meaning
 next/prev, the triage loop's key priority. Zoom state resets to fit on
@@ -67,12 +69,14 @@ from PySide6.QtCore import QObject, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QWidget
 
+import keymap
 from catalog import Catalog, format_date_taken, format_geotag
 from cropmap import (
     crop_qimage_upright,
     map_fraction_rect,
     rebase_fraction_rect,
 )
+from locate import reveal_in_file_manager
 from thumbcache import THUMB_EDGE, ThumbCache
 
 BACKGROUND = QColor(12, 12, 12)
@@ -83,6 +87,19 @@ CLICK_SLOP = 6
 # Face-overlay chrome (fauxcasa-cam.4): subtle, non-blocking outlines.
 FACE_PEN = QColor(255, 255, 255, 215)
 FACE_RADIUS = 6  # rounded-rect corner, logical px (chrome, so zoom-invariant)
+
+
+def _pan_delta(event) -> tuple[int, int] | None:
+    """(dx, dy) unit for a viewer.pan_* chord, None when the event is no
+    pan key. Positive means the image moves right/down — the historical
+    sign convention of _pan_by (pan Left reveals what lies to the left)."""
+    for action, delta in (("viewer.pan_left", (1, 0)),
+                          ("viewer.pan_right", (-1, 0)),
+                          ("viewer.pan_up", (0, 1)),
+                          ("viewer.pan_down", (0, -1))):
+        if keymap.matches(event, action):
+            return delta
+    return None
 
 
 def load_original_oriented(path: str, rotate: int,
@@ -678,43 +695,40 @@ class ViewerPage(QWidget):
         self._load_current()
 
     def keyPressEvent(self, event) -> None:
-        key = event.key()
-        mods = event.modifiers()
-        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
-        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
-        arrows = (Qt.Key.Key_Left, Qt.Key.Key_Right,
-                  Qt.Key.Key_Up, Qt.Key.Key_Down)
-        if key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace):
+        # Every binding is a keymap lookup (fauxcasa-q6l.8); ordering is
+        # the contract: pan is checked before prev/next so Ctrl+arrows pan
+        # while zoomed, and PLAIN arrows always mean next/prev (the triage
+        # loop owns them, module docstring).
+        if keymap.matches(event, "viewer.close"):
             self.closed.emit(self.current_index())
-        elif (ctrl and alt and key == Qt.Key.Key_0) or (
-                key == Qt.Key.Key_1
-                and mods in (Qt.KeyboardModifier.NoModifier,
-                             Qt.KeyboardModifier.KeypadModifier)):
+        elif keymap.matches(event, "viewer.zoom_toggle"):
             # `1` = Picasa Photo Viewer's "Toggle 100% zoom"; Ctrl+Alt+0 is
             # the conflict-free spelling that survives the M2 star-set keys
-            # claiming bare digits (module docstring).
+            # claiming bare digits (keymap arbitration + module docstring).
             self.toggle_zoom()
-        elif ctrl and key == Qt.Key.Key_H:
+        elif keymap.matches(event, "viewer.hold"):
             # Ctrl+H holds the shown photo in the tray (fauxcasa-q6l.2).
             idx = self.current_index()
             if idx >= 0:
                 self.hold_requested.emit(idx)
-        elif key == Qt.Key.Key_F \
-                and mods == Qt.KeyboardModifier.NoModifier:
+        elif keymap.matches(event, "viewer.locate"):
+            # Ctrl+Enter: Picasa's Locate on Disk, from the viewer too
+            # (q6l.8) — reveal the shown photo in the OS file manager.
+            idx = self.current_index()
+            if idx >= 0:
+                reveal_in_file_manager(
+                    self.catalog.root / self.catalog.photos[idx].rel)
+        elif keymap.matches(event, "viewer.faces"):
             # F = face overlay (toggle_faces docstring: our own binding —
             # Picasa documents no view-mode key for face boxes).
             self.toggle_faces()
-        elif self.zoomed and ctrl and key in arrows:
-            # Ctrl+arrows pan a quarter-viewport at 1:1; PLAIN arrows keep
-            # meaning next/prev below (the triage loop owns them).
-            self._pan_by(
-                (self.width() // 4) * {Qt.Key.Key_Left: 1,
-                                       Qt.Key.Key_Right: -1}.get(key, 0),
-                (self.height() // 4) * {Qt.Key.Key_Up: 1,
-                                        Qt.Key.Key_Down: -1}.get(key, 0))
-        elif key in (Qt.Key.Key_Left, Qt.Key.Key_K):
+        elif self.zoomed and (pan := _pan_delta(event)) is not None:
+            # Ctrl+arrows pan a quarter-viewport at 1:1.
+            self._pan_by((self.width() // 4) * pan[0],
+                         (self.height() // 4) * pan[1])
+        elif keymap.matches(event, "viewer.prev"):
             self._step(-1)
-        elif key in (Qt.Key.Key_Right, Qt.Key.Key_J, Qt.Key.Key_Space):
+        elif keymap.matches(event, "viewer.next"):
             self._step(1)
         else:
             super().keyPressEvent(event)
