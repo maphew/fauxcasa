@@ -9078,6 +9078,42 @@ def test_thumb_bakes_crop_before_downscale(tmp_path: Path) -> None:
     assert tl.red() > 150 and tl.green() < 90          # TL still red
 
 
+def test_thumb_tiny_crop_of_large_source_decodes_correctly(
+        tmp_path: Path) -> None:
+    """fauxcasa-7aj.1 (PR #58 decode-cost nit): when the crop's kept region
+    ALREADY fits the top-level box (no downscale needed), _index_one bounds
+    the decode with QImageReader.setClipRect (an ROI decode) instead of
+    reading the whole source at full resolution and cropping after —
+    exercised here on a 1024px source cropped down to a 128x128 corner (well
+    under THUMB_EDGE=256). This pins CORRECTNESS of that ROI path: the wrong
+    quadrant, an off-by-one clip rect, or a double-crop (clip_applied not
+    suppressing the later crop_qimage_upright call) would all fail the
+    pixel/dimension assertions below."""
+    _offscreen_app()
+    root = tmp_path / "lib"
+    _quadrant_jpeg(root / "f" / "cropped.jpg", edge=1024)
+    # fraction rect (0.5, 0.0, 0.625, 0.125) -> pixel box (512, 0, 128, 128)
+    # on the 1024px source: a 128x128 corner entirely inside the TR (green)
+    # quadrant (x in [512,1024), y in [0,512)), and already <= THUMB_EDGE.
+    (root / "f" / ".picasa.ini").write_text(
+        "[cropped.jpg]\r\ncrop=rect64(80000000a0002000)\r\n")
+    cat, cache = _bound_cache(tmp_path, root)
+    ci = next(i for i, p in enumerate(cat.photos) if p.name == "cropped.jpg")
+    assert cat.photos[ci].crop == (0.5, 0.0, 0.625, 0.125)
+    offset, length, w, h = cache.entries[ci]
+    assert length > 0
+    with open(cache.path, "rb") as f:
+        f.seek(offset)
+        from PySide6.QtGui import QImage
+        img = QImage.fromData(f.read(length), "JPEG")
+    assert not img.isNull()
+    # Never upscaled: the crop box was already 128x128, under THUMB_EDGE.
+    assert (img.width(), img.height()) == (128, 128) == (w, h)
+    for fx, fy in ((0.1, 0.1), (0.5, 0.5), (0.9, 0.9)):
+        c = img.pixelColor(int(fx * img.width()), int(fy * img.height()))
+        assert c.green() > 150 and c.red() < 90 and c.blue() < 90, (fx, fy)
+
+
 def test_thumb_crop_composes_with_exif_orientation(tmp_path: Path) -> None:
     """crop= coordinates are STORED-frame while the baked thumb is
     EXIF-upright, so the bake must map the rect through the orientation

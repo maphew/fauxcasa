@@ -452,7 +452,7 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
     source for video in M1. sha256/size/mtime identity is as usual: the
     bytes are read whole for the N6 content hash and the same in-memory
     bytes feed the poster decode (seekable, so moov-at-end MP4s work)."""
-    from PySide6.QtCore import QBuffer, QIODevice, QSize, Qt
+    from PySide6.QtCore import QBuffer, QIODevice, QRect, QSize, Qt
     from PySide6.QtGui import QImageReader
 
     top = levels[0]  # largest edge (levels are descending)
@@ -460,6 +460,12 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
 
     data, size, mtime, sha, meta, fmeta = read_photo_meta(src, photo)
     is_video = is_video_suffix(photo.rel)
+    # Set below when the QImageReader branch decode-time-crops via
+    # setClipRect (fauxcasa-7aj.1): the explicit crop_qimage_upright call
+    # near the end of this function must then be SKIPPED for this image —
+    # the crop is already baked into `img`, and re-applying the fraction
+    # rect to the now-smaller image would double-crop it.
+    clip_applied = False
     # The ini crop= recipe to bake (docstring above). getattr keeps the
     # builder tolerant of pre-v10 Photo objects handed in by tests.
     crop = getattr(photo, "crop", None)
@@ -561,6 +567,7 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
                 # ~top px first and cropping after would throw away exactly
                 # the resolution the crop zooms into.
                 kw, kh = sz.width(), sz.height()
+                box = None
                 if crop is not None:
                     box = crop_pixel_box(crop, kw, kh)
                     if box is not None:
@@ -569,7 +576,36 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
                     s = min(top / kw, top / kh)
                     reader.setScaledSize(QSize(max(1, round(sz.width() * s)),
                                                max(1, round(sz.height() * s))))
+                elif box is not None:
+                    # fauxcasa-7aj.1 (PR #58 decode-cost nit): the crop's
+                    # kept region ALREADY fits the top-level box, so the
+                    # branch above never fires and — before this fix — the
+                    # reader was left completely unscaled/unclipped, decoding
+                    # the ENTIRE source at full resolution just to throw
+                    # nearly all of it away in the crop below (an 8000x8000
+                    # photo cropped to 100x100 decoded all 8000x8000 px).
+                    # Bound the decode itself with QImageReader's clip rect
+                    # (a real ROI decode, not a post-decode crop): clipRect's
+                    # coordinates are the SAME pre-transform/stored frame
+                    # `box` and setScaledSize above both use (verified
+                    # empirically against a real orientation-6 JPEG — Qt
+                    # swaps w/h for the 90/270 orientations AFTER either
+                    # clip or scale, not before), so `box` is a correct clip
+                    # rect as-is. Clip-then-autoTransform is exactly the
+                    # "crop stored pixels, then orient" form the cropmap.py
+                    # module doc proves is mathematically identical to
+                    # crop_qimage_upright's "orient, then crop the mapped
+                    # rect" form — so the explicit crop_qimage_upright call
+                    # near the end of this function is skipped for this
+                    # image (`clip_applied`), not doubled.
+                    reader.setClipRect(QRect(*box))
+                    clip_applied = True
             img = reader.read()
+            if img.isNull():
+                # Fail-soft (as elsewhere): a clip that somehow yields
+                # nothing must not suppress the ordinary crop step below if
+                # a fallback decode below produces a (full, uncropped) image.
+                clip_applied = False
             if img.isNull() and data:
                 # Qt yielded null for a still (no PSD plugin ships with Qt;
                 # exotic TIFF/JPEG variants): one Pillow attempt on the same
@@ -580,12 +616,15 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
     if img.isNull():
         return (idx, [(b"", 0, 0) for _ in levels], size, mtime, sha,
                 meta, fmeta, None)
-    if crop is not None:
+    if crop is not None and not clip_applied:
         # Bake the crop (docstring): the decoded image is EXIF-upright on
         # every path (autoTransform / LibRaw / a poster frame's implicit
         # 1), so map the stored-frame rect through the orientation tag
         # read from the SAME bytes the decode consumed. Fail-soft by
         # construction (a degenerate rect leaves the image whole).
+        # (`clip_applied` means the QImageReader branch above already baked
+        # this crop via setClipRect — fauxcasa-7aj.1 — so re-cropping here
+        # would double-crop an already-cropped image.)
         orientation = 1
         if data and not is_video:
             orientation = metareader.read_orientation(data)
