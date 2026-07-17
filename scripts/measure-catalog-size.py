@@ -10,8 +10,13 @@ then SYNTHESIZES the fully-indexed row shape (identity substrate z/m/x
 plus indexer-filled d) on the same 100k rel paths and prototypes every
 candidate encoding on those rows. All synthesized numbers are labelled.
 
-Output: JSON blob of results to stdout (consumed by the report author).
+The benchmark catalog itself is a machine-local, untracked artifact (it
+lives under <repo-root>/cache/, gitignored) — pass --catalog to point at a
+different one. Output goes to stdout as a JSON blob; pass --out to also
+write it to a file (fauxcasa-7aj.5: writing results.json unconditionally
+was a footgun for a repo-tooling script with no fixture of its own).
 """
+import argparse
 import base64
 import gzip
 import hashlib
@@ -25,8 +30,22 @@ from pathlib import Path
 
 import zstandard
 
-CATALOG = Path(r"A:\dev\fauxcasa\cache\benchmark-thumbs.fcache.catalog.json")
-OUT = Path(__file__).parent / "results.json"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CATALOG = REPO_ROOT / "cache" / "benchmark-thumbs.fcache.catalog.json"
+
+parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+parser.add_argument(
+    "--catalog", type=Path, default=DEFAULT_CATALOG,
+    help=f"Path to the benchmark catalog.json to measure "
+         f"(default: {DEFAULT_CATALOG})")
+parser.add_argument(
+    "--out", type=Path, default=None,
+    help="Also write the results JSON to this path (default: stdout only, "
+         "nothing written to disk)")
+args = parser.parse_args()
+
+CATALOG = args.catalog
+OUT = args.out
 
 random.seed(0xED55)
 
@@ -203,7 +222,8 @@ options["g2_grouped_folders_hex_default_sep"] = {
 #   header: magic 4 + ver 2 + counts/offsets 24            (O(1), ignored /photo)
 #   folder table: per folder u16 len + utf8 path
 #   per row:
-#     folder_id  varint (100k photos / ~5k folders -> 2 B)
+#     folder_id  varint (100k photos / 1,548 real benchmark folders,
+#                measured below as len(folders) -> 2 B)
 #     name       u8 len + utf8 bytes (avg measured)
 #     flags      u8  (hidden/visible/star-count/has-geotag/has-dims/R-rider...)
 #     mtime      u32 (4)   [epoch seconds; 2106 horizon]
@@ -277,5 +297,6 @@ results["collisions"] = {
 results["R_rider_bytes_when_present"] = len(', "R": 1')
 
 results["options"] = options
-OUT.write_text(json.dumps(results, indent=1))
+if OUT is not None:
+    OUT.write_text(json.dumps(results, indent=1))
 print(json.dumps(results, indent=1))

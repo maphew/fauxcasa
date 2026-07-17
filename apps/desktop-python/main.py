@@ -1296,14 +1296,19 @@ class MainWindow(QMainWindow):
         # explicit "Unnamed faces" affordance for photos carrying
         # suggested/unresolved face regions (N7: the gap is never silent).
         # Counts are live: rebuilt with the sidebar on reveal/reconcile.
-        people, unnamed = self._people_counts()
+        people, unnamed, name_cids = self._people_counts()
         if people or unnamed:
             # db3-rescued people are source-flagged (fauxcasa-cam.7): the
             # name exists only because the §4 rescue importer read it from
             # a machine-local db3 person album — provenance in the tooltip,
-            # like a .pal-sourced album's.
-            db3_names = {cat.contacts[c] for c in cat.db3_contacts
-                         if c in cat.contacts}
+            # like a .pal-sourced album's. Rekeyed honestly by contact id,
+            # not display name (fauxcasa-7aj.2): two DIFFERENT contacts can
+            # share a display name (one ini-named, one db3-rescued), so a
+            # name is flagged only when EVERY contact id that resolves to
+            # it is db3-rescued — a name also known via a non-db3 contact
+            # id must not be tarred with the rescue flag.
+            db3_names = {name for name, cids in name_cids.items()
+                         if cids and cids <= cat.db3_contacts}
             people_root = QTreeWidgetItem(t, ["People"])
             people_root.setFlags(
                 people_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
@@ -1350,13 +1355,18 @@ class MainWindow(QMainWindow):
                 return
             it += 1
 
-    def _people_counts(self) -> tuple[dict[str, int], int]:
+    def _people_counts(self) -> tuple[dict[str, int], int, dict[str, set]]:
         """Per-person photo tallies for the current reveal state: {name:
         photo count} over named faces, plus how many photos carry at least
         one unnamed (suggested/unresolved) face. Photo counts, not face
-        counts — a photo with the same person tagged twice counts once."""
+        counts — a photo with the same person tagged twice counts once.
+        Also returns {name: {contact ids that resolved to it}} — the
+        db3-rescued sidebar flag (fauxcasa-7aj.2) needs this to rekey by
+        contact id rather than display name, since two DIFFERENT contacts
+        can share a display name."""
         reveal = self.grid.reveal
         people: dict[str, int] = {}
+        name_cids: dict[str, set] = {}
         unnamed = 0
         for p in self.catalog.photos:
             if not (p.visible or reveal) or not p.faces:
@@ -1364,9 +1374,12 @@ class MainWindow(QMainWindow):
             names = {n for _rect, _cid, n in p.faces if n}
             for n in names:
                 people[n] = people.get(n, 0) + 1
+            for _rect, cid, n in p.faces:
+                if n:
+                    name_cids.setdefault(n, set()).add(cid)
             if any(n is None for _rect, _cid, n in p.faces):
                 unnamed += 1
-        return people, unnamed
+        return people, unnamed, name_cids
 
     def _sidebar_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
         data = item.data(0, Qt.ItemDataRole.UserRole)
