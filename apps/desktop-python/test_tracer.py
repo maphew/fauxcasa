@@ -10277,3 +10277,216 @@ def test_make_thumbcache_library_home_default_out_dir_formula(
     lib_id = libmod.mint_library_id()
     expected = thumbcache.cache_dir_for(lib_id, tmp_path / "cache")
     assert mtc._default_out_dir(lib_id) == expected
+
+
+# ---- multiroot offline tolerance (fauxcasa-ed5.7.5, bead .e) --------------
+
+
+def test_root_is_online_resolved_path_check(tmp_path: Path) -> None:
+    """library.root_is_online (design §8, bead .e): a resolved existing
+    directory is online; a missing path (unplugged drive) is offline; a
+    path that resolves to a FILE, not a directory, is offline too — the
+    check is is_dir(), not merely exists(). LibraryRoot.path is stored
+    UNRESOLVED (last-known-path semantics), so a relative path pointed at
+    a real directory must also read as online once resolved."""
+    online_dir = tmp_path / "a"
+    online_dir.mkdir()
+    missing_dir = tmp_path / "gone"
+    a_file = tmp_path / "not-a-dir.txt"
+    a_file.write_text("x")
+
+    assert libmod.root_is_online(libmod.LibraryRoot(id="x", path=online_dir))
+    assert not libmod.root_is_online(
+        libmod.LibraryRoot(id="x", path=missing_dir))
+    assert not libmod.root_is_online(libmod.LibraryRoot(id="x", path=a_file))
+
+
+def test_catalog_offline_ids_refresh_and_abs_none_for_offline(
+        tmp_path: Path) -> None:
+    """Catalog.refresh_offline_ids/online_roots/offline_roots/abs (design
+    §8, bead .e): both roots online -> abs() resolves both photos
+    normally; root B's directory removed -> refresh_offline_ids() puts
+    its id in offline_ids, online_roots()/offline_roots() split
+    accordingly, and abs() now returns None for root B's photo (extending
+    bead .b's unknown-root None case to the offline case) while root A's
+    photo still resolves — and the photo ROW itself stays in
+    `catalog.photos` untouched (design §8: unplugging a drive does not
+    lose data)."""
+    import shutil
+
+    from catalog import Catalog, Photo
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    photo_a = Photo(rel="1.jpg", folder="", name="1.jpg", root_id=id_a)
+    photo_b = Photo(rel="2.jpg", folder="", name="2.jpg", root_id=id_b)
+    cat = Catalog(root=root_a, photos=[photo_a, photo_b], folders={},
+                 albums={},
+                 roots=[libmod.LibraryRoot(id=id_a, path=root_a, label="A"),
+                        libmod.LibraryRoot(id=id_b, path=root_b, label="B")])
+
+    cat.refresh_offline_ids()
+    assert cat.offline_ids == set()
+    assert [r.id for r in cat.online_roots()] == [id_a, id_b]
+    assert cat.offline_roots() == []
+    assert cat.abs(photo_a) == root_a / "1.jpg"
+    assert cat.abs(photo_b) == root_b / "2.jpg"
+
+    shutil.rmtree(root_b)
+    cat.refresh_offline_ids()
+    assert cat.offline_ids == {id_b}
+    assert [r.id for r in cat.online_roots()] == [id_a]
+    assert [r.id for r in cat.offline_roots()] == [id_b]
+    assert cat.abs(photo_a) == root_a / "1.jpg"      # online root: unaffected
+    assert cat.abs(photo_b) is None                   # offline: placeholder
+    assert photo_b in cat.photos                      # row never dropped
+
+
+def test_reconcile_never_removes_offline_root_entries(tmp_path: Path) -> None:
+    """THE regression test the bead names (design §8's load-bearing rule,
+    §13 item 3): unplug root B — delete its directory outright, a whole
+    drive vanishing, not a single file — run the per-root reconcile loop
+    (main._reconcile_online_roots), and assert ZERO catalog entries are
+    ever counted as removed for root B, root B is reported offline, and
+    drift on the still-online root A is detected normally and is
+    unaffected by root B's absence."""
+    import shutil
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+    from catalog import Catalog, Photo
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    make_jpeg(root_a / "1.jpg")
+    make_jpeg(root_a / "2.jpg")
+    make_jpeg(root_b / "3.jpg")
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+
+    def sig(p: Path) -> tuple[int, int]:
+        st = p.stat()
+        return st.st_size, int(st.st_mtime)
+
+    s1, s2, s3 = (sig(root_a / "1.jpg"), sig(root_a / "2.jpg"),
+                 sig(root_b / "3.jpg"))
+    photos = [
+        Photo(rel="1.jpg", folder="", name="1.jpg", root_id=id_a,
+             size=s1[0], mtime=s1[1]),
+        Photo(rel="2.jpg", folder="", name="2.jpg", root_id=id_a,
+             size=s2[0], mtime=s2[1]),
+        Photo(rel="3.jpg", folder="", name="3.jpg", root_id=id_b,
+             size=s3[0], mtime=s3[1]),
+    ]
+    cat = Catalog(root=root_a, photos=photos, folders={}, albums={},
+                 roots=[libmod.LibraryRoot(id=id_a, path=root_a, label="A"),
+                        libmod.LibraryRoot(id=id_b, path=root_b, label="B")])
+
+    # Baseline: nothing changed yet, both roots online.
+    drift, offline = main._reconcile_online_roots(cat, None, None, None)
+    assert drift is not None and not drift.changed
+    assert offline == []
+
+    # Unplug root B outright, and produce REAL drift on root A so the
+    # still-online root's reconcile is proven unaffected by root B's
+    # absence, not just silent because nothing else happened either.
+    shutil.rmtree(root_b)
+    make_jpeg(root_a / "4.jpg")
+
+    drift2, offline2 = main._reconcile_online_roots(cat, None, None, None)
+    assert drift2 is not None
+    # THE assertion: root B's now-missing "3.jpg" is NEVER counted as
+    # removed — its root is offline, so reconcile_walk is never even
+    # invoked for it.
+    assert drift2.removed == 0
+    assert drift2.added == 1           # root A's "4.jpg", detected normally
+    assert drift2.modified == 0
+    assert offline2 == ["B"]
+
+    # The catalog itself still carries root B's photo row untouched.
+    assert any(p.rel == "3.jpg" and p.root_id == id_b for p in cat.photos)
+
+
+def test_offline_root_labels_empty_for_single_root_library(
+        tmp_path: Path) -> None:
+    """_offline_root_labels (design §12, bead .e) is a no-op for a
+    single-root (today's real, legacy) library even if offline_ids
+    happens to be non-empty by construction — a single-root library going
+    offline has no in-app badge target (main.py never opens an explicit
+    multi-root library yet, bead .d/.g). A genuine >1-root library with an
+    offline root DOES produce a label, falling back path.name when no
+    explicit `label` was set."""
+    import main
+    from catalog import Catalog, Photo
+
+    root = tmp_path / "solo"
+    root.mkdir()
+    single = Catalog(
+        root=root, photos=[Photo(rel="1.jpg", folder="", name="1.jpg")],
+        folders={}, albums={},
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=root)])
+    single.offline_ids = {"aaaaaaaa"}      # contrived — still len(roots) == 1
+    assert main._offline_root_labels(single) == []
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    root_a.mkdir()
+    cat = Catalog(root=root_a, photos=[], folders={}, albums={},
+                 roots=[libmod.LibraryRoot(id="aaaaaaaa", path=root_a),
+                        libmod.LibraryRoot(id="bbbbbbbb", path=root_b)])
+    cat.refresh_offline_ids()   # root_b was never created -> offline
+    assert main._offline_root_labels(cat) == ["b"]     # falls back to path.name
+
+
+def test_sidebar_shows_offline_root_badge(tmp_path: Path) -> None:
+    """_build_sidebar (design §12, bead .e): a >1-root library with an
+    offline root gets a greyed, disabled 'B (offline)' leaf at the TOP of
+    Folders — no per-root tree restructuring (bead .g, out of scope). The
+    badge is neither selectable nor enabled (never reaches
+    _sidebar_clicked), and an online-only library shows no badge at all."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+    from catalog import Catalog, Photo
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    def badge_texts(win) -> list[str]:
+        out = []
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            item = it.value()
+            if item.text(0).endswith("(offline)"):
+                out.append(item.text(0))
+            it += 1
+        return out
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    root_a.mkdir()   # root_b deliberately never created -> offline
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    cat = Catalog(root=root_a, photos=[], folders={}, albums={},
+                 roots=[libmod.LibraryRoot(id=id_a, path=root_a, label="A"),
+                        libmod.LibraryRoot(id=id_b, path=root_b, label="B")])
+    cat.refresh_offline_ids()
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    texts = badge_texts(win)
+    assert texts == ["B (offline)"]
+    it = QTreeWidgetItemIterator(win.tree)
+    badge = None
+    while it.value():
+        if it.value().text(0) == "B (offline)":
+            badge = it.value()
+            break
+        it += 1
+    assert badge is not None
+    assert not bool(badge.flags() & Qt.ItemFlag.ItemIsSelectable)
+    assert not bool(badge.flags() & Qt.ItemFlag.ItemIsEnabled)
+    assert badge.font(0).italic()
+
+    # An online-only (single-root) library shows no offline badge.
+    solo = Catalog(root=root_a, photos=[], folders={}, albums={},
+                   roots=[libmod.LibraryRoot(id=id_a, path=root_a)])
+    win2 = MainWindow(solo, None, cache_dir=None, build_dir=None)
+    assert badge_texts(win2) == []

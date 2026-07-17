@@ -71,8 +71,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from catalog import (  # noqa: E402
     BACKFILL_COMPLETE,
     BACKFILL_NOT_STARTED,
+    LEGACY_ROOT_ID,
     REPORT_NAME,
     Catalog,
+    Drift,
+    LibraryRoot,
     Photo,
     ScanFilter,
     default_contacts_xml,
@@ -561,6 +564,73 @@ def _emit(signal, *args) -> None:
         pass
 
 
+def _reconcile_online_roots(
+        catalog: Catalog, scan_filter: ScanFilter | None, cancel,
+        exts: frozenset[str] | set[str] | None,
+        ) -> tuple[Drift | None, list[str]]:
+    """Per-online-root reconcile (fauxcasa-ed5.7.5, bead .e, design §8/§9).
+
+    `reconcile_walk` is a single-root primitive by design (its own
+    docstring: "looping over all online roots is bead .e's job, out of
+    this function's scope") — this is that job. Loop over
+    `catalog.online_roots()` only, run `reconcile_walk` per root keyed on
+    that root's id, and aggregate the results into one Drift. THE RULE
+    (design §8, the load-bearing offline-tolerance invariant): an offline
+    root is never passed to `reconcile_walk` at all, so nothing in its
+    catalog slice can ever be diffed against a missing directory — an
+    unplugged drive's photos are never counted as removed.
+
+    `catalog.roots` is normally non-empty (scan_library/load_catalog both
+    populate it, even for the single implicit legacy root, id ""); the
+    `or` fallback below only matters for a hand-built Catalog fixture that
+    never set `roots` — treated as that one implicit root at `catalog.root`
+    so legacy single-root behavior is untouched either way.
+
+    Returns `(None, [])` if a cancel fires mid-walk on any root (same
+    None-means-cancelled contract as reconcile_walk itself — the caller's
+    existing `drift is None` check keeps working unmodified). Otherwise
+    returns `(aggregated Drift, offline root labels)` — the labels are for
+    the caller's status-bar text; whether to act on `Drift.changed` is
+    still the caller's call, same as before this bead."""
+    catalog.refresh_offline_ids()
+    roots = catalog.roots or [LibraryRoot(id=LEGACY_ROOT_ID, path=catalog.root)]
+    online = [r for r in roots if r.id not in catalog.offline_ids]
+    offline = [r for r in roots if r.id in catalog.offline_ids]
+
+    total = Drift()
+    for r in online:
+        d = reconcile_walk(catalog, r.path, scan_filter, cancel=cancel,
+                           exts=exts, root_id=r.id)
+        if d is None:
+            return None, []  # cancelled mid-walk
+        total.added += d.added
+        total.removed += d.removed
+        total.modified += d.modified
+
+    labels = [r.label or r.path.name or str(r.path) for r in offline]
+    return total, labels
+
+
+def _offline_root_labels(catalog: Catalog) -> list[str]:
+    """Sidebar/status-bar badge labels for offline roots (design §12, bead
+    .e). Only meaningful once a library actually HAS more than one root —
+    a single-root library going offline has no sensible in-app badge (the
+    grid/viewer would show nothing at all, and today's main.py never even
+    opens a multi-root library — bead .d/.g), so this returns [] whenever
+    `len(catalog.roots) <= 1` even if `offline_ids` happens to be
+    populated. Kept as a pure function (no Qt types) so the offline-badge
+    LOGIC is unit-testable without a QApplication or pixel-level check —
+    per bead .e's brief, "test the logic (offline set) rather than
+    pixels." Does NOT call refresh_offline_ids() itself: callers
+    (load_catalog on open, _reconcile_online_roots on reconcile) already
+    keep `offline_ids` current, and re-stat-ing on every sidebar rebuild
+    would be surprising I/O in a UI-paint path."""
+    if len(catalog.roots) <= 1:
+        return []
+    return [r.label or r.path.name or str(r.path)
+            for r in catalog.offline_roots()]
+
+
 @dataclass(frozen=True)
 class SelectionContext:
     """What an output action would act on RIGHT NOW — the M2 attachment
@@ -773,6 +843,15 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.meta_label)
         self._show_counts("All photos", self._shown_count())
         self._update_import_notes()
+        # Offline-root status-bar mention (fauxcasa-ed5.7.5, bead .e,
+        # design §12): a fresh open surfaces any already-offline root here
+        # too, not just the sidebar badge (_build_sidebar/
+        # _offline_root_labels) — a transient notice like the backfill
+        # banner, not a permanent widget.
+        offline_at_open = _offline_root_labels(self.catalog)
+        if offline_at_open:
+            self.statusBar().showMessage(
+                f"offline: {', '.join(offline_at_open)}", 8000)
 
         # --- wiring ---
         # The grid's set-valued signal drives the status label (single
@@ -872,28 +951,59 @@ class MainWindow(QMainWindow):
         """Warm start: confirm the persisted catalog still matches disk.
         No live feed — the grid shows the loaded catalog, and a fresh
         index uses new indices that would misalign with it, so any
-        rebuilt catalog is swapped in atomically when complete."""
+        rebuilt catalog is swapped in atomically when complete.
+
+        Reconcile runs per ONLINE root only (fauxcasa-ed5.7.5, bead .e,
+        design §8/§9 — see _reconcile_online_roots): an offline root's
+        catalog entries are never diffed against a missing directory, so
+        they can never be counted as removed. main.py doesn't open
+        explicit multi-root libraries yet (bead .d/.g), so today's real
+        catalogs always carry exactly one (online) root and this is a
+        legacy no-op path — it exists so a >1-root catalog reconciles
+        safely from the day that lands, without a second migration here."""
         bridge, old, cache_dir = self._bridge, self.catalog, self.cache_dir
 
         def work() -> None:
             try:
-                drift = reconcile_walk(old, old.root, self.scan_filter,
-                                       cancel=self.build_cancel,
-                                       exts=self.exts)
+                drift, offline_labels = _reconcile_online_roots(
+                    old, self.scan_filter, self.build_cancel, self.exts)
             except Exception as e:
                 log.error("reconcile walk failed: %s", e)
                 return
-            if drift is None or self.build_cancel.is_set() or not drift.changed:
-                return  # cancelled, or library unchanged
-            if self.adopt:
+            if drift is None or self.build_cancel.is_set():
+                return  # cancelled mid-walk
+            offline_note = ""
+            if offline_labels:
+                offline_note = (
+                    f" — offline, skipped: {', '.join(offline_labels)}")
+            if not drift.changed:
+                if offline_note:
+                    # Nothing changed on the online roots, but the offline
+                    # ones are still worth a mention — the user may not
+                    # know a drive is unreachable this session.
+                    _emit(bridge.status, f"library unchanged{offline_note}")
+                return  # nothing else to do
+            multiroot = len(old.roots) > 1
+            if self.adopt or multiroot:
                 # The thumbs are an external (--thumbs) cache we can't
-                # rebuild; surface the drift and leave the view as-is.
+                # rebuild (adopt-mode) — OR this is an explicit multi-root
+                # library, where a full scan_library(old.root) rebuild
+                # below is the WRONG shape (single-root signature) and
+                # would silently drop every non-first root's photos
+                # (design §7 risk 7 / §13 item 7). Bead .e's drift-rebuild
+                # choice: surface the drift and keep showing the indexed
+                # snapshot (option (b), conservative) rather than a
+                # per-root rescan-and-merge (option (a)) — safe index
+                # contiguity under a merge needs the per-root
+                # reindex/backfill wiring bead .d lands, not present here.
                 _emit(bridge.status,
                       f"library changed since this cache was built "
-                      f"({drift.summary()}) — showing the indexed snapshot")
+                      f"({drift.summary()}){offline_note} — showing the "
+                      f"indexed snapshot")
                 return
             _emit(bridge.status,
-                  f"library changed ({drift.summary()}) — reindexing…")
+                  f"library changed ({drift.summary()}){offline_note} — "
+                  f"reindexing…")
             fresh = None
             try:
                 fresh = scan_library(old.root, self.scan_filter,
@@ -1242,6 +1352,18 @@ class MainWindow(QMainWindow):
         folders_root = QTreeWidgetItem(t, ["Folders"])
         folders_root.setFlags(
             folders_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        # Offline-root badges (fauxcasa-ed5.7.5, bead .e, design §12):
+        # minimal — a greyed, disabled leaf per offline root at the TOP of
+        # Folders, no per-root tree restructuring (that's bead .g, out of
+        # scope here). _offline_root_labels is the pure/testable logic
+        # half; this is just the Qt painting of it.
+        for label in _offline_root_labels(cat):
+            badge = QTreeWidgetItem(folders_root, [f"{label} (offline)"])
+            badge.setFlags(badge.flags() & ~Qt.ItemFlag.ItemIsSelectable
+                           & ~Qt.ItemFlag.ItemIsEnabled)
+            bf = badge.font(0)
+            bf.setItalic(True)
+            badge.setFont(0, bf)
         nodes: dict[str, QTreeWidgetItem] = {"": folders_root}
 
         def node_for(rel: str) -> QTreeWidgetItem:
