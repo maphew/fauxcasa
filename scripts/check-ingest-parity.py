@@ -23,7 +23,9 @@ synthetic picasa-extras corpus (scripts/make-synthetic-library.py
 
 -- and diffs feature counts per ingest class. Designed to land GREEN and
 RATCHET: classes the tracer does not yet ingest are marked
-expected-missing with the owning bead id, and the harness FAILS on
+expected-missing with the owning bead id (as of fauxcasa-cam.15 the
+table is FULLY ingested -- zero expected-missing classes), and the
+harness FAILS on
 
 (a) LOSS/mismatch in a class marked ingested,
 (b) a class the tracer now ingests but the table still marks
@@ -61,7 +63,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 sys.path.insert(0, str(REPO / "apps" / "desktop-python"))
 
 import picasa_db  # noqa: E402
-from catalog import Catalog, Photo, load_contacts_xml, scan_library  # noqa: E402
+from catalog import Catalog, load_contacts_xml, scan_library  # noqa: E402
 
 # Media extensions the tracer walks (catalog.EXTS is the tracer's rule;
 # imported, not copied, so the photo count follows the tracer's walk) and
@@ -128,44 +130,25 @@ def build_reference(corpus: Path) -> Reference:
 
 
 # --------------------------------------------------------------------------
-# Tracer side: counts from the public Catalog, with RATCHET PROBES.
+# Tracer side: counts from the public Catalog.
 #
-# A probe returns None while the tracer has no representation for the
-# class ("expected-missing" holds) and an int once it does. Probes look
-# for dataclass fields by candidate names and for behavioral evidence
-# (e.g. a .pal-only album uid appearing in catalog.albums), so the gate
-# flips to "ratchet forward" the moment fauxcasa-cam.* ingest work lands
-# -- even in a parallel branch -- rather than silently staying green.
+# HISTORY (the ratchet design): while classes were still expected-missing,
+# each carried a PROBE -- a tracer fn returning None until the tracer grew
+# a representation (dataclass fields by candidate names, behavioral
+# evidence) and an int after, so the gate flipped to "ratchet forward" the
+# moment fauxcasa-cam.* ingest work landed, even in a parallel branch. As
+# of fauxcasa-cam.15 (edit_keys_other, the last class) the table is FULLY
+# ingested and the probe machinery is retired; if a future class lands
+# expected-missing, revive the pattern from git history (_photo_field /
+# _count_photo_values / probe_*).
 # --------------------------------------------------------------------------
 
-
-def _photo_field(name_candidates: tuple[str, ...]) -> str | None:
-    for n in name_candidates:
-        if n in Photo.__dataclass_fields__:
-            return n
-    return None
-
-
-def _catalog_field(name_candidates: tuple[str, ...]) -> str | None:
-    for n in name_candidates:
-        if n in Catalog.__dataclass_fields__:
-            return n
-    return None
-
-
-def _count_photo_values(cat: Catalog, field: str) -> int:
-    n = 0
-    for p in cat.photos:
-        v = getattr(p, field, None)
-        if v is None or v == () or v == "" or v == 0 or v is False:
-            continue
-        n += len(v) if isinstance(v, (tuple, list)) else 1
-    return n
-
-
-def probe_edit_keys(cat: Catalog, ref: Reference) -> int | None:
-    f = _photo_field(("filters", "edits", "edit_stack", "crop"))
-    return _count_photo_values(cat, f) if f else None
+# The survey's per-file edit-key vocabulary (picasa_db._INI_EDIT_KEYS)
+# minus rotate=, which is ingested/counted as its own class. Photo.edits
+# also preserves text= (N3 losslessness), excluded here because the survey
+# does not count it.
+_EDIT_KEYS_OTHER = frozenset(
+    "filters crop crop64 flipped redo textactive".split())
 
 
 # --------------------------------------------------------------------------
@@ -323,14 +306,18 @@ CLASSES: list[ParityClass] = [
         lambda c, r: sum(1 for p in c.photos
                          if p.stashed_original is not None),
         manifest_key="stashed_originals"),
-    # ---- expected-missing: owned, probed, ratchets forward -----------------
+    # ---- edit recipes: ingested by fauxcasa-cam.15 PR ----------------------
     ParityClass(
+        # every per-file edit-recipe key line besides the long-ingested
+        # rotate= (the survey's edit_keys folds rotate in; subtract it).
+        # The tracer preserves each key/value RAW on Photo.edits (dupes
+        # kept, ini order), so the line counts match one-for-one.
         "edit_keys_other",
-        # survey's edit_keys folds in rotate=, which IS ingested; subtract it
         lambda r: (r.survey["features"].get("edit_keys", 0)
                    - r.survey["keys"].get("rotate", 0)),
-        probe_edit_keys,
-        owner="fauxcasa-cam.15", manifest_key="edit_keys_other"),
+        lambda c, r: sum(1 for p in c.photos for k, _v in p.edits
+                         if k.lower() in _EDIT_KEYS_OTHER),
+        manifest_key="edit_keys_other"),
 ]
 
 
@@ -415,9 +402,14 @@ def run_gate(corpus: Path) -> int:
             print(f"  - {f}")
         return 1
     n_ing = sum(1 for c in CLASSES if c.ingested)
-    print(f"\nPASS: zero ingest loss across {n_ing} ingested classes; "
-          f"{len(CLASSES) - n_ing} expected-missing classes are owned and "
-          f"probed for ratchet")
+    missing = len(CLASSES) - n_ing
+    if missing:
+        print(f"\nPASS: zero ingest loss across {n_ing} ingested classes; "
+              f"{missing} expected-missing classes are owned and "
+              f"probed for ratchet")
+    else:
+        print(f"\nPASS: zero ingest loss across all {n_ing} classes — "
+              f"the table is fully ingested (0 expected-missing)")
     return 0
 
 

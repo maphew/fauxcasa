@@ -25,14 +25,14 @@ Library (grid) surface:
     Picasa binding        Picasa action              Fauxcasa (this table)
     --------------------  -------------------------  --------------------------
     Ctrl+A / Cmd+A        Select all in folder       grid.select_all (StandardKey.SelectAll — shipped)
-    Ctrl+D                Deselect photos            future v1-IN (not yet bound)
-    Ctrl+I                Invert selection           future v1-IN (not yet bound)
-    Home / End            First / last photo         future v1-IN (not yet bound)
+    Ctrl+D                Deselect photos            grid.deselect (ed5.12)
+    Ctrl+I                Invert selection           grid.invert (ed5.12)
+    Home / End            First / last photo         grid.first / grid.last (ed5.12)
     Ctrl+H                Hold selection in tray     grid.hold (shipped, fauxcasa-q6l.2)
     Ctrl+Enter            Locate on Disk             grid.locate / viewer.locate (NEW here)
     Ctrl+Alt (hover)      Full-screen photo preview  PEEK_MODS chord (shipped, fauxcasa-q6l.5)
     Ctrl+1 / Ctrl+2       Small / large thumbnails   superseded by the thumbnail zoom slider
-    Ctrl+4                Start a slideshow          covered by app.play (F11); Ctrl+4 unbound
+    Ctrl+4                Start a slideshow          app.play Ctrl+4 alias (ed5.12)
     F11                   Full-screen mode           REPURPOSED: app.play = slideshow of the
                                                      current view (fauxcasa-q6l.3's call)
     Ctrl+3                Edit mode                  M3 (edit room)
@@ -125,9 +125,9 @@ class Binding:
 DEFAULT_SCHEME: dict[str, Binding] = {
     # ---- app: main-window QAction shortcuts ----
     "app.play": Binding(
-        ("F11",),
+        ("F11", "Ctrl+4"),
         note="Slideshow of the current view (q6l.3). Repurposes Picasa's "
-             "F11 full-screen; Picasa's own Ctrl+4 stays unbound for now."),
+             "F11 full-screen; Ctrl+4 is Picasa's own slideshow chord (ed5.12)."),
 
     # ---- grid (library) ----
     "grid.select_all": Binding(
@@ -136,6 +136,15 @@ DEFAULT_SCHEME: dict[str, Binding] = {
     "grid.hold": Binding(
         ("Ctrl+H",),
         note="Picasa: Hold selected photos in Photo Tray (q6l.2)."),
+    "grid.deselect": Binding(
+        ("Ctrl+D",),
+        note="Picasa: Deselect photos (ed5.12). Clears the selection set; "
+             "the current item keeps keyboard focus but is deselected."),
+    "grid.invert": Binding(
+        ("Ctrl+I",),
+        note="Picasa: Invert selection (ed5.12). Flips membership for every "
+             "photo in the current view — selected become unselected and vice "
+             "versa; the current item stays as keyboard focus."),
     "grid.locate": Binding(
         ("Ctrl+Return", "Ctrl+Enter"),
         note="Picasa: Locate on Disk (Ctrl+Enter). Both Return and keypad "
@@ -161,6 +170,14 @@ DEFAULT_SCHEME: dict[str, Binding] = {
     "grid.row_up": Binding(
         ("Up",), key_only=True,
         note="One visual row up; Shift extends (handler logic)."),
+    "grid.first": Binding(
+        ("Home",), key_only=True,
+        note="Jump to the first photo in the current view (ed5.12). "
+             "key_only so Shift+Home extends the selection from the anchor."),
+    "grid.last": Binding(
+        ("End",), key_only=True,
+        note="Jump to the last photo in the current view (ed5.12). "
+             "key_only so Shift+End extends the selection from the anchor."),
 
     # ---- peek overlay (handled by the grid while a peek is up) ----
     "peek.dismiss": Binding(

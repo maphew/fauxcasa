@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -21,12 +22,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import inmeta
+import library as libmod  # alias avoids shadowing the `library` Path fixture (:173)
 import thumbcache
 from catalog import (
     ScanFilter,
     load_catalog,
     reconcile_walk,
     save_catalog,
+    save_catalog_retrying,
     scan_library,
     walk_library,
 )
@@ -226,17 +229,10 @@ def test_walk_rule_parity_with_make_thumbcache(library: Path) -> None:
     """catalog order must equal make-thumbcache entry order or caches
     stop binding — compare against the script's own walk."""
     import catalog
-    import importlib.util
 
-    spec = importlib.util.spec_from_file_location(
-        "mtc", REPO / "scripts" / "make-thumbcache.py")
-    mtc = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mtc)
+    mtc = _load_mtc()
     assert mtc.EXTS == catalog.EXTS  # the usual drift vector
-    script_walk = sorted(
-        p for p in library.rglob("*")
-        if p.suffix.lower() in mtc.EXTS and p.is_file()
-    )
+    script_walk = mtc.walk_library(library, mtc.EXTS)
     assert walk_library(library) == script_walk
 
 
@@ -479,6 +475,49 @@ def test_load_catalog_rejects_foreign_format(tmp_path: Path) -> None:
     p.write_text("{ not json")
     assert load_catalog(p, tmp_path) is None
     assert load_catalog(tmp_path / "missing.json", tmp_path) is None
+
+
+def test_save_catalog_retrying_succeeds_after_transient_errors(
+        library: Path, tmp_path: Path) -> None:
+    """save_catalog_retrying retries on OSError and returns on first success."""
+    import unittest.mock as mock
+
+    cat = scan_library(library)
+    path = tmp_path / "catalog.json"
+    call_count = 0
+
+    original = __import__("catalog").save_catalog
+
+    def flaky_save(catalog, p):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:  # fail twice, succeed on third
+            raise OSError("transient sharing violation")
+        original(catalog, p)
+
+    with mock.patch("catalog.save_catalog", side_effect=flaky_save):
+        # backoff=0 avoids real sleeps in tests
+        save_catalog_retrying(cat, path, attempts=5, backoff=0)
+
+    assert call_count == 3
+    assert path.exists()
+    assert load_catalog(path, library) is not None
+
+
+def test_save_catalog_retrying_raises_after_all_attempts_exhausted(
+        library: Path, tmp_path: Path) -> None:
+    """save_catalog_retrying raises OSError when every attempt fails."""
+    import unittest.mock as mock
+
+    cat = scan_library(library)
+    path = tmp_path / "catalog.json"
+    sentinel = OSError("always broken")
+
+    with mock.patch("catalog.save_catalog", side_effect=sentinel):
+        with pytest.raises(OSError, match="always broken"):
+            save_catalog_retrying(cat, path, attempts=3, backoff=0)
+
+    assert not path.exists()  # nothing written on total failure
 
 
 def test_reconcile_detects_drift(library: Path, tmp_path: Path) -> None:
@@ -2072,6 +2111,163 @@ def test_restart_command_source_vs_frozen(monkeypatch, tmp_path: Path) -> None:
     )
 
 
+def test_restart_command_scan_filter_flags(monkeypatch, tmp_path: Path) -> None:
+    """--min-image-size and --max-image-size are forwarded when set, absent
+    when the filter is inactive — fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    library = tmp_path / "lib"
+    cache_root = tmp_path / "cr"
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(main.sys, "executable", "/usr/bin/fauxcasa")
+
+    # No filter — neither flag appears.
+    _prog, args = main._restart_command(library, cache_root, scan_filter=None)
+    assert "--min-image-size" not in args
+    assert "--max-image-size" not in args
+
+    # Inactive filter (all zeros) — same: no flags.
+    _prog, args = main._restart_command(
+        library, cache_root, scan_filter=ScanFilter())
+    assert "--min-image-size" not in args
+    assert "--max-image-size" not in args
+
+    # Active min filter only.
+    sf = ScanFilter(min_width=100, min_height=75)
+    _prog, args = main._restart_command(library, cache_root, scan_filter=sf)
+    idx = args.index("--min-image-size")
+    assert args[idx + 1] == "100x75"
+    assert "--max-image-size" not in args
+
+    # Active max filter only.
+    sf = ScanFilter(max_width=8000, max_height=6000)
+    _prog, args = main._restart_command(library, cache_root, scan_filter=sf)
+    assert "--min-image-size" not in args
+    idx = args.index("--max-image-size")
+    assert args[idx + 1] == "8000x6000"
+
+    # Both min and max set.
+    sf = ScanFilter(min_width=100, min_height=75,
+                    max_width=8000, max_height=6000)
+    _prog, args = main._restart_command(library, cache_root, scan_filter=sf)
+    assert args[args.index("--min-image-size") + 1] == "100x75"
+    assert args[args.index("--max-image-size") + 1] == "8000x6000"
+
+
+def test_restart_command_thumbs_flag(monkeypatch, tmp_path: Path) -> None:
+    """--thumbs is forwarded only when supplied — fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    library = tmp_path / "lib"
+    cache_root = tmp_path / "cr"
+    thumbs_path = tmp_path / "bench.fcache"
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(main.sys, "executable", "/usr/bin/fauxcasa")
+
+    # thumbs=None — flag absent.
+    _prog, args = main._restart_command(library, cache_root, thumbs=None)
+    assert "--thumbs" not in args
+
+    # thumbs supplied — flag present with the correct path.
+    _prog, args = main._restart_command(library, cache_root, thumbs=thumbs_path)
+    idx = args.index("--thumbs")
+    assert args[idx + 1] == str(thumbs_path)
+
+
+def test_restart_command_open_drops_thumbs(monkeypatch, tmp_path: Path) -> None:
+    """_change_library (Open...) does NOT carry --thumbs to a different
+    library — the adopted cache is specific to the original library.
+    fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication, QFileDialog
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    current = tmp_path / "Current"
+    chosen = tmp_path / "Chosen"
+    make_jpeg(current / "a.jpg")
+    make_jpeg(chosen / "b.jpg")
+    cache_root = tmp_path / "cr"
+    thumbs_path = tmp_path / "bench.fcache"
+
+    cat = scan_library(current)
+    sf = ScanFilter(min_width=50, min_height=50)
+    win = main.MainWindow(cat, None, cache_root / "cache", None,
+                          scan_filter=sf, cache_root=cache_root,
+                          thumbs_path=thumbs_path)
+
+    captured: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(chosen)))
+    monkeypatch.setattr(QProcess, "startDetached",
+                        staticmethod(lambda prog, argv:
+                                     captured.append((prog, argv)) or True))
+
+    win._change_library()
+
+    assert captured, "expected startDetached to be called"
+    _prog, argv = captured[0]
+    # Scan-size constraint preserved.
+    assert "--min-image-size" in argv
+    # --thumbs must NOT appear for a different-library relaunch.
+    assert "--thumbs" not in argv
+
+
+def test_restart_command_file_types_drops_thumbs(
+        monkeypatch, tmp_path: Path) -> None:
+    """_show_file_types must NOT carry --thumbs: a File-Types change alters
+    the effective walk (exts), so an adopted cache no longer matches the new
+    file set — bind() would raise CacheError and the relaunched process exits
+    2 with no UI.  The relaunch must cold-rebuild instead.
+    fauxcasa-q6l.19."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication
+    from filetypes import FileTypesDialog, save_excluded_exts
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    lib = tmp_path / "lib"
+    make_jpeg(lib / "a.jpg")
+    cache_root = tmp_path / "cr"
+    thumbs_path = tmp_path / "bench.fcache"
+
+    cat = scan_library(lib)
+    sf = ScanFilter(min_width=50, min_height=50)
+    win = main.MainWindow(cat, None, cache_root / "cache", None,
+                          scan_filter=sf, cache_root=cache_root,
+                          thumbs_path=thumbs_path)
+
+    captured: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(QProcess, "startDetached",
+                        staticmethod(lambda prog, argv:
+                                     captured.append((prog, argv)) or True))
+    # Simulate user toggling a file type (different from current exclusions).
+    monkeypatch.setattr(FileTypesDialog, "exec_", lambda self: True)
+    monkeypatch.setattr(FileTypesDialog, "excluded", lambda self: {".tga"})
+
+    win._show_file_types()
+
+    assert captured, "expected startDetached to be called"
+    _prog, argv = captured[0]
+    # Scan-size constraint preserved.
+    assert "--min-image-size" in argv
+    # --thumbs must NOT appear: the extension change alters the file set,
+    # so an adopted cache would fail bind() — the relaunch cold-rebuilds.
+    assert "--thumbs" not in argv
+
+
 def test_resolve_library_frozen_first_run(monkeypatch, tmp_path: Path) -> None:
     """Frozen, no library and nothing remembered: a chosen folder is used;
     a cancelled/headless picker yields None (graceful), not a crash."""
@@ -2293,7 +2489,7 @@ def test_mainwindow_open_action_relaunches_with_selected_library(
                      or True),
     )
     monkeypatch.setattr(main, "_restart_command",
-                        lambda root, cr: ("prog", [str(root), str(cr)]))
+                        lambda root, cr, **_kw: ("prog", [str(root), str(cr)]))
 
     win._change_library()
 
@@ -2330,7 +2526,7 @@ def test_mainwindow_open_action_warns_when_relaunch_fails(
         staticmethod(lambda _program, _args: (False, 0)),
     )
     monkeypatch.setattr(main, "_restart_command",
-                        lambda root, cr: ("prog", [str(root), str(cr)]))
+                        lambda root, cr, **_kw: ("prog", [str(root), str(cr)]))
     monkeypatch.setattr(
         QMessageBox,
         "warning",
@@ -2444,6 +2640,45 @@ def test_pcts_nearest_rank() -> None:
     assert r["min"] == 1.0             # s[0]
     assert r["p50"] == 50.0            # nearest-rank lower index
     assert r["p99"] < 100.0            # the trap: must NOT collapse onto max
+
+
+# ---------- bench_scroll: occlusion_clean platform gate (fauxcasa-ed5.10) ---
+
+def test_occlusion_clean_timeout_frames_ignored_on_windows() -> None:
+    """On Windows a paint-bound run produces ~100 ms intervals that alias with
+    the Wayland frame-callback-timeout signature.  timeout_frames must NOT
+    disqualify occlusion_clean on win32."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import bench_scroll as bs
+
+    # Simulate: visible, no fill stalls, but 25 timeout-band intervals.
+    assert bs._occlusion_clean(0, 0, 25, platform="win32") is True
+    assert bs._occlusion_clean(0, 0, 25, platform="cygwin") is True
+
+
+def test_occlusion_clean_timeout_frames_disqualify_on_linux() -> None:
+    """On Linux the ~100 ms cluster is the Wayland compositor occlusion
+    signature; timeout_frames > 0 must disqualify occlusion_clean."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import bench_scroll as bs
+
+    assert bs._occlusion_clean(0, 0, 1, platform="linux") is False
+    assert bs._occlusion_clean(0, 0, 25, platform="linux2") is False
+
+
+def test_occlusion_clean_other_tells_still_apply_on_all_platforms() -> None:
+    """not_visible_ticks and fill_timeouts disqualify occlusion_clean
+    regardless of platform."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import bench_scroll as bs
+
+    for plat in ("win32", "linux", "darwin"):
+        assert bs._occlusion_clean(1, 0, 0, platform=plat) is False  # not_visible
+        assert bs._occlusion_clean(0, 1, 0, platform=plat) is False  # fill_timeout
+        assert bs._occlusion_clean(0, 0, 0, platform=plat) is True   # all clean
 
 
 # ---------- diagnostics: log file survives console=False (fauxcasa-pqw) ----
@@ -3316,6 +3551,70 @@ def test_grid_select_all_and_escape(tmp_path: Path) -> None:
     g._select(-1)
     _key(g, Qt.Key.Key_Escape)    # no current: clears to empty, no crash
     assert g.selection == set() and g.current == -1
+
+
+def test_grid_deselect_ctrl_d(tmp_path: Path) -> None:
+    """Ctrl+D (grid.deselect) clears the entire selection set while keeping
+    the current item as keyboard focus (deselected but still current).
+    Distinct from Esc (grid.clear) which collapses to {current}."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[1])
+    _click(g, d[4], SHIFT)
+    assert len(g.selection) > 1   # range selection assembled
+    _key(g, Qt.Key.Key_D, CTRL)
+    assert g.selection == set()   # all deselected
+    assert g.current == d[4]      # keyboard focus preserved
+    # Ctrl+D with no current item is a clean no-op (no crash)
+    g._select(-1)
+    _key(g, Qt.Key.Key_D, CTRL)
+    assert g.selection == set() and g.current == -1
+
+
+def test_grid_invert_selection_ctrl_i(tmp_path: Path) -> None:
+    """Ctrl+I (grid.invert) flips selection membership over the current
+    view: unselected photos become selected and vice versa. The current
+    item stays as keyboard focus regardless of its new membership state."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[0])
+    _click(g, d[2], SHIFT)         # d[0], d[1], d[2] selected
+    assert g.selection == set(d[:3])
+    _key(g, Qt.Key.Key_I, CTRL)
+    assert g.selection == set(d[3:])    # the other 6 photos are now selected
+    assert g.current == d[2]            # current preserved
+    # Invert of the full set yields empty
+    _key(g, Qt.Key.Key_A, CTRL)        # select all first
+    _key(g, Qt.Key.Key_I, CTRL)
+    assert g.selection == set()
+
+
+def test_grid_home_end_navigation(tmp_path: Path) -> None:
+    """Home (grid.first) jumps to the first photo; End (grid.last) to the
+    last. Both are key_only so they ride the same Shift-extension path as
+    arrows: Shift+Home selects anchor..first, Shift+End anchor..last."""
+    from PySide6.QtCore import Qt
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+    _click(g, d[4])                    # somewhere in the middle
+    _key(g, Qt.Key.Key_Home)
+    assert g.current == d[0] and g.selection == {d[0]}
+    _key(g, Qt.Key.Key_End)
+    assert g.current == d[-1] and g.selection == {d[-1]}
+    # Shift+Home from d[-1] extends the selection to anchor..d[0]
+    _key(g, Qt.Key.Key_Home, SHIFT)
+    assert g.current == d[0] and g.anchor == d[-1]
+    assert g.selection == set(d)
 
 
 def test_grid_selection_signal_payloads(tmp_path: Path) -> None:
@@ -5527,6 +5826,434 @@ def test_catalog_v6_roundtrips_album_flags(
 
 
 # ---------------------------------------------------------------------------
+# db3 rescue import (fauxcasa-cam.6/.7): the §4 plumbing (locate db3,
+# translate machine paths, thumbindex/pmp joins) + the class-4 rescue
+# (person albums -> contacts-only face names). Synthetic fixtures only
+# (privacy rule): the MINIMAL writer below emits the byte formats documented
+# in docs/research/picasa-db3-validated.md — TESTS ONLY, never product code
+# — and the validated picasa_db readers are the arbiter (round-trip test).
+# Rescue classes 1-3 (ignored faces, manual sort, video overrides) have no
+# pinned byte format yet (fauxcasa-ed5.9) and stay out of scope here.
+# ---------------------------------------------------------------------------
+
+CID_DB3 = "ca5c88ca60f42c0b"           # oracle-014's contact-id shape
+PERSON_DB3 = "Synthetic Person 1200"
+
+_PMP_TYPE_CODES = {"string": 0x0, "uint32": 0x1, "uint8": 0x3, "uint64": 0x4}
+_PMP_PACK = {0x1: "<I", 0x3: "<B", 0x4: "<Q"}
+
+
+def _write_pmp(path: Path, type_name: str, values: list) -> Path:
+    """One .pmp column file to the documented layout (constants written
+    literally from picasa-db3-validated.md, NOT taken from the reader, so
+    the round-trip test proves the parser against independent bytes):
+    u32 magic 0x3fcccccd | u16 type | u16 0x1332 | u32 2 | u16 type |
+    u16 0x1332 | u32 count | payload (NUL-terminated strings or packed
+    little-endian fixed-width values)."""
+    code = _PMP_TYPE_CODES[type_name]
+    out = bytearray(struct.pack("<IHHIHHI", 0x3FCCCCCD, code, 0x1332, 2,
+                                code, 0x1332, len(values)))
+    for v in values:
+        if code == 0x0:
+            out += v.encode("utf-8") + b"\x00"
+        else:
+            out += struct.pack(_PMP_PACK[code], v)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(out))
+    return path
+
+
+def _write_thumbindex(path: Path, entries: list) -> Path:
+    """thumbindex.db to the documented layout: u32 magic 0x40466666 |
+    u32 count | per entry NUL-terminated name + <u64 taken, u64 mtime,
+    u32 size, u8 ftype, u32 flags, u8 valid, u32 parent>. `entries` is
+    (name, ftype, parent-index-or-None); timestamps/sizes stay 0 (the
+    oracle's face-crop records carry 0 there too) and valid is 1."""
+    out = bytearray(struct.pack("<II", 0x40466666, len(entries)))
+    for name, ftype, parent in entries:
+        out += name.encode("utf-8") + b"\x00"
+        out += struct.pack("<QQIBIBI", 0, 0, 0, ftype, 0, 1,
+                           0xFFFFFFFF if parent is None else parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(out))
+    return path
+
+
+def _db3_machine_path(folder: Path, drive: str = "Q:") -> str:
+    """The db3 spelling of `folder`: absolute, backslashes, trailing
+    separator (folder thumbindex entries carry one), and a DIFFERENT
+    drive letter than the live one — §8 says drive letters are
+    translated, so every join in these tests must survive the swap."""
+    parts = [c for c in str(folder).replace("\\", "/").split("/") if c]
+    if len(parts[0]) == 2 and parts[0][1] == ":":
+        parts = parts[1:]
+    return drive + "\\" + "\\".join(parts) + "\\"
+
+
+def _make_person_db3(db3: Path, folder_abs: str, photos: list[str],
+                     contact_id: str = CID_DB3,
+                     person_name: str = PERSON_DB3,
+                     face_parent: int | None = None) -> Path:
+    """A minimal synthetic db3 in the oracle-014 shape: thumbindex row 0
+    is the folder (absolute machine path), rows 1..n the photos, plus —
+    when face_parent (a photo's thumbindex row) is given — a virtual
+    face-crop record whose imagedata row is filetype 1001 joined via
+    personalbumid to a category-8 person album. albumdata carries the
+    stock no-contact-id people bucket too, which the rescue must skip."""
+    if not folder_abs.endswith(("\\", "/")):
+        folder_abs += "\\"
+    ti = [(folder_abs, 0x01, None)]
+    for name in photos:
+        ti.append((name, 0x02, 0))
+    filetype = [1] + [2] * len(photos)
+    personalbumid = [0] * (1 + len(photos))
+    if face_parent is not None:
+        ti.append(("", 0xE9, face_parent))    # ftype = low byte of 0x3e9
+        filetype.append(1001)                 # the virtual face-crop row
+        personalbumid.append(2)               # -> the person-album row
+    _write_thumbindex(db3 / "thumbindex.db", ti)
+    # albumdata rows: [0] the watched folder (category 2), [1] the stock
+    # people bucket (category 8, NO contact id — skipped by the rescue),
+    # [2] the person album (category 8, name + albumcontactids).
+    _write_pmp(db3 / "albumdata_category.pmp", "uint32", [2, 8, 8])
+    _write_pmp(db3 / "albumdata_name.pmp", "string",
+               [folder_abs, "Unnamed people", person_name])
+    _write_pmp(db3 / "albumdata_albumcontactids.pmp", "uint64",
+               [0, 0, int(contact_id, 16)])
+    _write_pmp(db3 / "albumdata_token.pmp", "string",
+               ["", "]unknownface", "]facealbum:2"])
+    _write_pmp(db3 / "imagedata_filetype.pmp", "uint32", filetype)
+    _write_pmp(db3 / "imagedata_personalbumid.pmp", "uint32", personalbumid)
+    return db3
+
+
+@pytest.fixture()
+def db3_library(tmp_path: Path) -> Path:
+    """One folder, two photos: a.jpg carries an ini faces= region whose
+    contact id NO ini/contacts.xml source names — the exact gap the db3
+    person-album rescue exists to fill; b.jpg carries no faces= at all."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "a.jpg")
+    make_jpeg(root / "Trip" / "b.jpg")
+    (root / "Trip" / ".picasa.ini").write_text(
+        "[a.jpg]\r\n"
+        f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n")
+    return root
+
+
+def test_db3_writer_roundtrip_via_validated_parsers(tmp_path: Path) -> None:
+    """The synthetic writer's bytes read back through the VALIDATED
+    parsers under strict mode: pmp string/uint32/uint64 columns (values,
+    filename-derived table/column, exact-fit payload) and thumbindex
+    (folder/file/face-crop discrimination, parent linkage, full-path
+    join) — so every db3 test below runs on oracle-shaped bytes."""
+    import picasa_db
+
+    db3 = tmp_path / "db3"
+    col = picasa_db.read_pmp(
+        _write_pmp(db3 / "albumdata_name.pmp", "string", ["a", "", "sí"]))
+    assert (col.table, col.column) == ("albumdata", "name")
+    assert col.values == ["a", "", "sí"] and col.count == 3
+
+    col = picasa_db.read_pmp(
+        _write_pmp(db3 / "imagedata_filetype.pmp", "uint32", [1, 2, 1001]))
+    assert col.values == [1, 2, 1001] and col.type_name == "uint32"
+
+    col = picasa_db.read_pmp(
+        _write_pmp(db3 / "albumdata_albumcontactids.pmp", "uint64",
+                   [0, int(CID_DB3, 16)]))
+    assert col.values == [0, 0xCA5C88CA60F42C0B]
+
+    entries = picasa_db.read_thumbindex(_write_thumbindex(
+        db3 / "thumbindex.db", [
+            ("C:\\lib\\Trip\\", 0x01, None),
+            ("a.jpg", 0x02, 0),
+            ("", 0xE9, 1),
+        ]))
+    assert [e.is_folder for e in entries] == [True, False, False]
+    assert entries[1].parent == 0 and entries[1].ftype_name == "jpeg"
+    assert entries[2].is_facecrop and entries[2].parent == 1
+    assert picasa_db.thumbindex_full_paths(entries) == [
+        "C:\\lib\\Trip\\", "C:\\lib\\Trip\\a.jpg", ""]
+
+
+def test_translate_db3_path_drives_case_and_misses(tmp_path: Path) -> None:
+    """§8 path translation: drive letters compare stripped (a library
+    moved from C: to Q: still joins), separators normalize, components
+    match case-insensitively while the returned key keeps the db3
+    spelling, the root itself is "", and a path outside the library —
+    or shorter than it — is None (import-report material, never an
+    error)."""
+    from db3rescue import translate_db3_path
+
+    root = tmp_path / "lib"
+    trip = _db3_machine_path(root / "Trip")        # Q:-drive spelling
+    assert translate_db3_path(trip + "a.jpg", root) == "Trip/a.jpg"
+    assert translate_db3_path(trip, root) == "Trip"
+    assert translate_db3_path(_db3_machine_path(root), root) == ""
+    assert translate_db3_path(trip.upper() + "A.JPG", root) == "TRIP/A.JPG"
+    assert translate_db3_path("Q:\\elsewhere\\Trip\\a.jpg", root) is None
+    assert translate_db3_path("Q:\\", root) is None
+
+
+def test_default_db3_dir_discovery(monkeypatch, tmp_path: Path) -> None:
+    """default_db3_dir finds %LocalAppData%\\Google\\Picasa2\\db3 when it
+    exists and returns None (not a phantom path) when the env var or the
+    directory is absent — same fail-soft shape as contacts/.pal."""
+    from db3rescue import default_db3_dir
+
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    assert default_db3_dir() is None
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert default_db3_dir() is None               # dir absent
+    d = tmp_path / "Google" / "Picasa2" / "db3"
+    d.mkdir(parents=True)
+    assert default_db3_dir() == d
+
+
+def test_db3_person_album_rescue_end_to_end(db3_library: Path,
+                                            tmp_path: Path) -> None:
+    """The class-4 rescue end to end: a db3 person album (category 8,
+    name + albumcontactids) names a contact id the ini faces= carries
+    but nothing else names — the name fills the gap (§4), resolves the
+    face, joins the registry source-flagged, and the rescue is an
+    import-report entry; the agreeing virtual face row produces NO
+    residue note. Without the db3 the same scan leaves the gap."""
+    import picasa_db
+
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)         # the face is on a.jpg
+    cat = scan_library(db3_library, db3_dir=db3)
+
+    a = next(p for p in cat.photos if p.rel == "Trip/a.jpg")
+    assert a.faces == ((picasa_db.parse_rect64("6800600097ff9fff"),
+                        CID_DB3, PERSON_DB3),)
+    assert cat.contacts[CID_DB3] == PERSON_DB3
+    assert cat.db3_contacts == {CID_DB3}
+    kinds = [(e.kind, e.subject) for e in cat.report.entries]
+    assert ("db3_person_rescued", CID_DB3) in kinds
+    assert not any(k == "db3_face_residue" for k, _s in kinds)
+    assert not any(k == "db3_path_unresolved" for k, _s in kinds)
+    rescued = next(e for e in cat.report.entries
+                   if e.kind == "db3_person_rescued")
+    assert rescued.source == "db3" and PERSON_DB3 in rescued.detail
+
+    plain = scan_library(db3_library)              # no db3: the gap shows
+    ap = next(p for p in plain.photos if p.rel == "Trip/a.jpg")
+    assert ap.faces[0][2] is None and CID_DB3 not in plain.contacts
+
+
+def test_db3_gap_fill_only_never_renames(db3_library: Path,
+                                         tmp_path: Path) -> None:
+    """§4 rank ini/contacts.xml > db3: a name either source already
+    provides NEVER changes — a divergent db3 person album is an
+    import-report entry recording both names, not a rename — and an
+    agreeing db3 produces no notes and no source flag at all."""
+    ini = db3_library / "Trip" / ".picasa.ini"
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+
+    # [Contacts2] already names the id: kept verbatim, conflict reported
+    ini.write_text("[Contacts2]\r\n"
+                   f"{CID_DB3}=Ini Name;;\r\n"
+                   "[a.jpg]\r\n"
+                   f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n")
+    cat = scan_library(db3_library, db3_dir=db3)
+    a = next(p for p in cat.photos if p.rel == "Trip/a.jpg")
+    assert a.faces[0][2] == "Ini Name"
+    assert cat.contacts[CID_DB3] == "Ini Name"
+    assert cat.db3_contacts == set()
+    conf = [e for e in cat.report.entries if e.kind == "db3_name_conflict"]
+    assert len(conf) == 1 and conf[0].subject == CID_DB3
+    assert "Ini Name" in conf[0].detail and PERSON_DB3 in conf[0].detail
+    assert not any(e.kind == "db3_person_rescued"
+                   for e in cat.report.entries)
+
+    # contacts.xml names it: same rule (xml outranks db3 too)
+    ini.write_text("[a.jpg]\r\n"
+                   f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n")
+    cat = scan_library(db3_library, contacts={CID_DB3: "Xml Name"},
+                       db3_dir=db3)
+    a = next(p for p in cat.photos if p.rel == "Trip/a.jpg")
+    assert a.faces[0][2] == "Xml Name"
+    assert cat.db3_contacts == set()
+    assert any(e.kind == "db3_name_conflict" for e in cat.report.entries)
+
+    # agreement is not a conflict: same name everywhere -> no db3 notes
+    ini.write_text("[Contacts2]\r\n"
+                   f"{CID_DB3}={PERSON_DB3};;\r\n"
+                   "[a.jpg]\r\n"
+                   f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n")
+    cat = scan_library(db3_library, db3_dir=db3)
+    assert cat.db3_contacts == set()
+    assert not any(e.kind.startswith("db3_") for e in cat.report.entries)
+
+
+def test_db3_untag_not_resurrected_fixture_026(tmp_path: Path) -> None:
+    """The fixture-026 shape, exactly: Reset Faces removed the ini
+    faces= line but left the [Contacts2] line, the db3 person album, and
+    the virtual face row behind. An absent ini faces= is an
+    AUTHORITATIVE UNTAG — the db3 residue must not resurrect the face
+    (it becomes an import-report entry instead). The pure-db3 variant
+    (no [Contacts2] residue either) still rescues the NAME — people
+    albums exist only in db3 — but the person ends with zero tagged
+    photos: no resurrect through the back door."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "b.jpg")
+    ini = root / "Trip" / ".picasa.ini"
+    ini.write_text("[Contacts2]\r\n"
+                   f"{CID_DB3}={PERSON_DB3};;\r\n"   # 026: line REMAINS
+                   "[b.jpg]\r\n"
+                   "backuphash=22344\r\n")           # rewritten, no faces=
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(root / "Trip"),
+        ["b.jpg"], face_parent=1)
+
+    cat = scan_library(root, db3_dir=db3)
+    b = next(p for p in cat.photos if p.rel == "Trip/b.jpg")
+    assert b.faces == ()                             # NOT resurrected
+    assert cat.contacts[CID_DB3] == PERSON_DB3       # named by the ini...
+    assert cat.db3_contacts == set()                 # ...not by the rescue
+    res = [e for e in cat.report.entries if e.kind == "db3_face_residue"]
+    assert len(res) == 1 and res[0].subject == "Trip/b.jpg"
+    assert "026" in res[0].detail and "not resurrected" in res[0].detail
+
+    ini.write_text("[b.jpg]\r\nbackuphash=1\r\n")    # pure-db3 residue
+    cat = scan_library(root, db3_dir=db3)
+    b = next(p for p in cat.photos if p.rel == "Trip/b.jpg")
+    assert b.faces == ()
+    assert cat.contacts[CID_DB3] == PERSON_DB3       # name rescued...
+    assert cat.db3_contacts == {CID_DB3}             # ...and source-flagged
+    assert not any(p.faces for p in cat.photos)      # zero tagged photos
+    assert any(e.kind == "db3_face_residue" for e in cat.report.entries)
+
+
+def test_db3_unresolvable_paths_reported_not_fatal(db3_library: Path,
+                                                   tmp_path: Path) -> None:
+    """A db3 whose face row sits on a photo OUTSIDE this library (a
+    watched folder we don't browse, or a moved tree): the path fails to
+    translate and becomes an import-report entry — never an error — and
+    the name rescue itself still lands (it needs no path)."""
+    db3 = _make_person_db3(tmp_path / "db3", "Q:\\somewhere\\else",
+                           ["a.jpg", "b.jpg"], face_parent=1)
+    cat = scan_library(db3_library, db3_dir=db3)
+
+    a = next(p for p in cat.photos if p.rel == "Trip/a.jpg")
+    assert a.faces[0][2] == PERSON_DB3               # rescue still lands
+    assert cat.db3_contacts == {CID_DB3}
+    bad = [e for e in cat.report.entries if e.kind == "db3_path_unresolved"]
+    assert len(bad) == 1
+    assert bad[0].subject == "Q:\\somewhere\\else\\a.jpg"
+    assert "cannot join" in bad[0].detail and bad[0].source == "db3"
+
+
+def test_db3_fail_soft_absent_and_corrupt(db3_library: Path,
+                                          tmp_path: Path) -> None:
+    """Fail-soft plumbing: an empty db3 dir (a fresh install has no
+    albumdata) rescues nothing silently; corrupt pmp columns degrade to
+    no rescue without sinking the scan; a corrupt thumbindex still lets
+    the NAME rescue land and surfaces the degraded face join as an
+    import note instead of an exception."""
+    empty = tmp_path / "empty-db3"
+    empty.mkdir()
+    cat = scan_library(db3_library, db3_dir=empty)
+    assert cat.db3_contacts == set() and not cat.report.entries
+
+    broken = tmp_path / "broken-db3"
+    broken.mkdir()
+    (broken / "albumdata_category.pmp").write_bytes(b"\x00\x01 garbage")
+    (broken / "albumdata_name.pmp").write_bytes(b"junk")
+    (broken / "albumdata_albumcontactids.pmp").write_bytes(b"junk")
+    cat = scan_library(db3_library, db3_dir=broken)
+    assert cat.db3_contacts == set() and not cat.report.entries
+
+    half = _make_person_db3(
+        tmp_path / "half-db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+    (half / "thumbindex.db").write_bytes(b"\xde\xad\xbe\xef corrupt")
+    cat = scan_library(db3_library, db3_dir=half)
+    assert cat.contacts[CID_DB3] == PERSON_DB3       # names still rescued
+    assert cat.db3_contacts == {CID_DB3}
+    assert any(e.kind == "db3_unreadable" for e in cat.report.entries)
+
+
+def test_db3_catalog_roundtrip_v11(db3_library: Path,
+                                   tmp_path: Path) -> None:
+    """From CATALOG_VERSION 11 on: rescued names on faces/registry and the
+    db3_contacts source flag survive the persisted catalog, and a v10
+    catalog (scanned before the rescue existed) is rejected so a warm
+    start cold-rebuilds instead of silently un-naming rescued people.
+    (== 11: the newest version-gate test pins the exact value.)"""
+    import catalog as catmod
+
+    assert catmod.CATALOG_VERSION == 11
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+    cat = scan_library(db3_library, db3_dir=db3)
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, db3_library)
+    assert loaded is not None
+    assert loaded.db3_contacts == {CID_DB3}
+    assert [p.faces for p in loaded.photos] == [p.faces for p in cat.photos]
+    assert loaded.contacts == cat.contacts
+
+    data = json.loads(path.read_text())
+    data["version"] = 10                   # pre-db3-rescue format
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, db3_library) is None
+
+
+def test_db3_people_sidebar_source_flag(db3_library: Path,
+                                        tmp_path: Path) -> None:
+    """db3-rescued people join the People sidebar like any named person
+    — live counts, click-to-filter — with their provenance flagged in
+    the tooltip; an ini-named person alongside shows the flag is
+    per-person, not global."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    (db3_library / "Trip" / ".picasa.ini").write_text(
+        "[Contacts2]\r\n"
+        "bbbbbbbbbbbbbbb2=Ini Bob;;\r\n"
+        "[a.jpg]\r\n"
+        f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n"
+        "[b.jpg]\r\n"
+        "faces=rect64(1234),bbbbbbbbbbbbbbb2\r\n")
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+    cat = scan_library(db3_library, db3_dir=db3)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    def item_for(kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    rescued = item_for("person", PERSON_DB3)
+    assert rescued is not None and rescued.text(0).endswith("(1)")
+    assert "db3" in rescued.toolTip(0)
+    named = item_for("person", "Ini Bob")
+    assert named is not None and named.toolTip(0) == ""
+
+    win._sidebar_clicked(rescued, 0)     # counts/filters live like any person
+    assert [cat.photos[i].rel for i in win.grid.display] == ["Trip/a.jpg"]
+
+
+# ---------------------------------------------------------------------------
 # Selection tray (fauxcasa-q6l.2): persistent CROSS-FOLDER Hold/Clear +
 # typed readout (spec §5). Decisions under test (tray.py module doc):
 # identity by REL PATH (survives reconcile index remaps), HOLD ORDER
@@ -5738,6 +6465,73 @@ def test_tray_click_navigates_grid_with_view_fallback(
     win.search.setText("d")
     win._tray_navigate("f1/d.jpg")               # shown -> search survives
     assert win.search.text() == "d" and g.current == d[3]
+
+
+def test_tray_navigate_hidden_photo_auto_reveals(library: Path) -> None:
+    """Navigating to a held photo that is hidden auto-reveals rather than
+    silently falling back to All photos (q6l.18, N7 compliance).
+    reveal_box is set so UI state stays consistent; the photo is selected;
+    a status message names the action."""
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    g = win.grid
+
+    # library fixture: "2020-01-01 Trip/b.jpg" carries hidden=yes
+    hidden_rel = "2020-01-01 Trip/b.jpg"
+    idx = next(i for i, p in enumerate(cat.photos) if p.rel == hidden_rel)
+    assert not cat.photos[idx].visible            # confirm fixture
+    assert not win.grid.reveal                    # reveal starts off
+    assert idx not in g.display_pos              # absent without reveal
+
+    win.tray.hold([hidden_rel])                   # hold the hidden photo
+    win._tray_navigate(hidden_rel)
+
+    assert win.grid.reveal                        # auto-revealed via reveal_box
+    assert win.reveal_box.isChecked()             # checkbox UI in sync
+    assert idx in g.display_pos                  # photo now in grid
+    assert g.current == idx                       # photo selected
+    assert "revealed" in win.statusBar().currentMessage().lower()
+
+
+def test_tray_navigate_hidden_reveals_but_still_missing(
+        monkeypatch, library: Path) -> None:
+    """When reveal is toggled ON during tray navigation but the photo is
+    still absent after the fallback, the status message names BOTH facts:
+    reveal was toggled AND the photo was not found — reveal is never a
+    silent side effect (q6l.18, N7).
+
+    The edge case is simulated by patching set_filter to a no-op so
+    display_pos is never updated, keeping the photo absent throughout."""
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    g = win.grid
+
+    hidden_rel = "2020-01-01 Trip/b.jpg"
+    idx = next(i for i, p in enumerate(cat.photos) if p.rel == hidden_rel)
+    assert not cat.photos[idx].visible   # confirm fixture
+    assert not win.grid.reveal           # reveal starts off
+    assert idx not in g.display_pos      # absent without reveal
+
+    win.tray.hold([hidden_rel])
+
+    # Patch set_filter so display_pos is never updated — simulates the
+    # edge case where reveal toggled but the photo is still not shown.
+    monkeypatch.setattr(g, "set_filter", lambda *a, **k: None)
+
+    win._tray_navigate(hidden_rel)
+
+    # reveal flag was set as a side effect of the navigation attempt
+    assert win.grid.reveal
+    msg = win.statusBar().currentMessage()
+    # message must name the reveal action AND acknowledge the failure
+    assert "revealed" in msg.lower()
+    assert "not visible" in msg.lower()
 
 
 def test_tray_clear_and_per_item_remove(tmp_path: Path) -> None:
@@ -6335,12 +7129,19 @@ def test_backfill_interrupt_resume_and_periodic_persist(
 
     saves: list[int] = []
     real_save = thumbcache.save_catalog
+    real_save_retrying = thumbcache.save_catalog_retrying
 
     def counting_save(c, p):
         saves.append(c.backfill_cursor)
         real_save(c, p)
 
+    def counting_save_retrying(c, p, attempts=5, backoff=0.1):
+        # terminal (must=True) saves now go through save_catalog_retrying
+        saves.append(c.backfill_cursor)
+        real_save_retrying(c, p, attempts=attempts, backoff=backoff)
+
     monkeypatch.setattr(thumbcache, "save_catalog", counting_save)
+    monkeypatch.setattr(thumbcache, "save_catalog_retrying", counting_save_retrying)
 
     stop = threading.Event()
     assert thumbcache.backfill_catalog(
@@ -6545,9 +7346,10 @@ def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
     path.write_text(json.dumps(data))
     assert load_catalog(path, root) is None
 
-    # v9 = TGA/PSD stills joined the walk (fauxcasa-v46.4); bump this pin
-    # with every CATALOG_VERSION change so the rejection below stays real.
-    assert catmod.CATALOG_VERSION == 9
+    # v9 (TGA/PSD stills, fauxcasa-v46.4) through v10 (edit recipes,
+    # fauxcasa-cam.15): the exact current value is pinned by the newest
+    # version-gate test (test_db3_catalog_roundtrip_v11).
+    assert catmod.CATALOG_VERSION >= 9
     cat.backfill_state = BACKFILL_COMPLETE
     save_catalog(cat, path)
     data = json.loads(path.read_text())
@@ -7508,6 +8310,34 @@ def test_make_thumbcache_exclude_exts(tmp_path: Path) -> None:
                      "--exclude-exts", ".bogus"]) == 2
 
 
+def test_tiff_is_16bit_header_sniff(tmp_path: Path) -> None:
+    """tiff_is_16bit: pure TIFF header sniff, four boundary cases
+    (fauxcasa-v46.7):
+      16-bit grayscale TIFF  -> True
+      8-bit grayscale TIFF   -> False
+      non-TIFF bytes         -> False
+      truncated bytes        -> False, never raises
+    """
+    from PIL import Image
+    from pillowload import tiff_is_16bit
+
+    g16 = tmp_path / "g16.tif"
+    Image.new("I;16", (4, 4), 40000).save(g16, "TIFF")
+    assert tiff_is_16bit(g16.read_bytes()) is True
+
+    g8 = tmp_path / "g8.tif"
+    Image.new("L", (4, 4), 128).save(g8, "TIFF")
+    assert tiff_is_16bit(g8.read_bytes()) is False
+
+    assert tiff_is_16bit(b"not a tiff") is False  # non-TIFF magic
+    assert tiff_is_16bit(b"II") is False           # truncated before magic
+    assert tiff_is_16bit(b"") is False             # empty
+
+    # Truncated: valid II header but cut before IFD content
+    full = g16.read_bytes()
+    assert tiff_is_16bit(full[:8]) is False        # header only, no IFD
+
+
 def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
     """The §5 stills-matrix regression sweep (fauxcasa-v46.4): before
     this, 5 of the 6 claimed formats were 'done' only by construction —
@@ -7525,9 +8355,10 @@ def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
       good.psd    PSD with composite     -> decodes (Pillow fallback)
       nocomp.psd  PSD, unusable composite-> error tile, by design
 
-    (Verified against the pinned PySide6 build: Qt itself decodes the
-    first five; PSD is the Pillow fallback's. If a Qt upgrade ever drops
-    one, the fallback rescues it and this matrix still pins the pixels.)"""
+    (Verified against the pinned PySide6 build: Qt decodes most of these;
+    16-bit TIFF and PSD go through the Pillow route. If a Qt upgrade ever
+    drops one of the Qt-decoded formats, the fallback rescues it and this
+    matrix still pins the pixels.)"""
     from PIL import Image
 
     lib = tmp_path / "lib"
@@ -7563,14 +8394,7 @@ def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
     px = color_at("prog.jpg")
     assert px.blue() > 170 and px.red() < 80
     px = color_at("gray16.tif")                  # 40000/65535 ~ 156 gray
-    if sys.platform == "win32" or sys.platform == "darwin":
-        assert abs(px.red() - 156) < 30 and abs(px.red() - px.blue()) < 10
-    else:
-        # Linux Qt's tiff plugin CLIPS 16-bit grayscale to white — a real
-        # fidelity defect users would see (fauxcasa-v46.7), not a test
-        # artifact. Pin decode-succeeds + gray-ness here; the mid-gray
-        # value assertion returns when the Pillow routing lands.
-        assert abs(px.red() - px.blue()) < 10
+    assert abs(px.red() - 156) < 30 and abs(px.red() - px.blue()) < 10
     px = color_at("anim.gif")                    # FIRST frame green...
     assert px.green() > 150 and px.red() < 90    # ...never frame-2 magenta
     px = color_at("t.tga")
@@ -7641,14 +8465,31 @@ def test_keymap_conflict_checker_is_real() -> None:
 def test_keymap_platform_correctness_rides_qt() -> None:
     """Ctrl/Cmd correctness (spec §8) comes from Qt, not per-OS tables:
     grid.select_all defers to StandardKey.SelectAll (Cmd+A on macOS from
-    Qt's own binding list), and app.play resolves to the F11 heritage
-    binding for QAction.setShortcuts."""
+    Qt's own binding list), and app.play resolves F11 + Ctrl+4 (the
+    Picasa slideshow chord added in ed5.12) for QAction.setShortcuts."""
     import keymap
     from PySide6.QtGui import QKeySequence
 
     assert (keymap.DEFAULT_SCHEME["grid.select_all"].standard
             == QKeySequence.StandardKey.SelectAll)
-    assert [s.toString() for s in keymap.shortcuts("app.play")] == ["F11"]
+    play_strs = [s.toString() for s in keymap.shortcuts("app.play")]
+    assert "F11" in play_strs
+    assert "Ctrl+4" in play_strs
+
+
+def test_play_tooltip_derives_from_keymap(library: Path) -> None:
+    """The ▶ Play tooltip is built from keymap.shortcuts, not a hard-coded
+    string — every chord in the scheme appears in the tooltip text, so
+    adding or removing a chord keeps the UI self-consistent (ed5.12)."""
+    import keymap
+    _offscreen_app()
+    from main import MainWindow
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    tip = win.play_action.toolTip()
+    for seq in keymap.shortcuts("app.play"):
+        assert seq.toString() in tip, (
+            f"{seq.toString()!r} missing from play tooltip: {tip!r}")
 
 
 def test_grid_jk_navigate_next_prev(tmp_path: Path) -> None:
@@ -7793,3 +8634,780 @@ def test_reveal_in_file_manager_per_platform(tmp_path: Path,
 
     monkeypatch.setattr(locate.subprocess, "Popen", _boom)
     assert not locate.reveal_in_file_manager(target, platform="win32")
+
+
+# ---------------------------------------------------------------------------
+# Edit-recipe ingest + crop-applied display (fauxcasa-cam.15): §4 "ini wins
+# for edit recipes", and M1 "see your library again" means a cropped photo
+# shows CROPPED — Picasa itself rendered unsaved recipes applied (oracle
+# fixture 004: the crop lives in the ini ALONE — crop=rect64(..) plus its
+# filters= crop64 twin — JPEG untouched, no db3 change). Ingest: the crop
+# rect is resolved for display (crop= wins over the chain; conflicts land on
+# the import report) and every recipe key/value is preserved RAW on
+# Photo.edits (N3 losslessness; full recipe rendering is M3). Display: the
+# crop bakes into thumbnails at index time — like the EXIF bake, and UNLIKE
+# rotate=, because a crop changes WHICH pixels are shown — and applies to
+# the viewer's decoded original, composing crop -> EXIF orientation ->
+# rotate= (rect64 fractions are STORED-frame: the format doc pins that
+# rotate= does not transform crop coords; cropmap.py holds the derivation).
+# Faces on a cropped photo rebase through the crop first — they still
+# reference stored pixels. Fixtures are synthetic (privacy rule).
+# ---------------------------------------------------------------------------
+
+# Oracle fixture 004's exact value: rect64(dc3369dc570a51e), zero-stripped
+# 15-hex — the padded split is 0dc3 369d c570 a51e.
+_FIXTURE_004_CROP = "rect64(dc3369dc570a51e)"
+_FIXTURE_004_RECT = (0x0DC3 / 65536, 0x369D / 65536,
+                     0xC570 / 65536, 0xA51E / 65536)
+
+
+def test_crop_ingest_fixture_004_shape(tmp_path: Path) -> None:
+    """The observed unsaved-crop ini shape (oracle fixture 004): crop= and
+    the agreeing filters= crop64 twin parse to the exact rect64 fractions,
+    both raw lines are preserved in ini order on Photo.edits (backuphash=
+    is NOT a recipe key), has_edits is on, and the agreeing pair raises NO
+    crop_conflict import note — Picasa always writes both."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "photo03.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[photo03.jpg]\r\n"
+        "backuphash=64082\r\n"
+        f"crop={_FIXTURE_004_CROP}\r\n"
+        "filters=crop64=1,dc3369dc570a51e;\r\n")
+    cat = scan_library(root)
+    p = cat.photos[0]
+    assert p.crop == _FIXTURE_004_RECT
+    assert p.edits == (("crop", _FIXTURE_004_CROP),
+                       ("filters", "crop64=1,dc3369dc570a51e;"))
+    assert p.has_edits
+    assert not [e for e in cat.report.entries if e.kind == "crop_conflict"]
+
+
+def test_crop_source_precedence(tmp_path: Path) -> None:
+    """_resolve_crop's source ladder: a filters=-only chain fills in (its
+    LAST crop64 wins — the chain is ordered history and a re-crop
+    appends); a disagreeing crop= WINS and surfaces a crop_conflict import
+    note (§4: never silently resolved); a malformed crop= falls through to
+    the chain; a standalone gist-era crop64= key is the last resort; a
+    degenerate rect is no crop at all — but the raw junk is still
+    preserved and still reads as edited (honest marker)."""
+    root = tmp_path / "lib"
+    for name in "abcde":
+        make_jpeg(root / "f" / f"{name}.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        # chain only; two crop64 ops -> the LAST one wins
+        "[a.jpg]\r\n"
+        "filters=crop64=1,10001000;crop64=1,400080008000c000;\r\n"
+        # crop= disagrees with the chain -> crop= wins + import note
+        "[b.jpg]\r\n"
+        "crop=rect64(40004000c000c000)\r\n"
+        "filters=crop64=1,10001000;\r\n"
+        # malformed crop= -> the chain fills the gap, no conflict
+        "[c.jpg]\r\n"
+        "crop=rect64(not-hex)\r\n"
+        "filters=crop64=1,40004000c000c000;\r\n"
+        # standalone crop64= key (gist-era), op-param shape
+        "[d.jpg]\r\n"
+        "crop64=1,40004000c000c000\r\n"
+        # degenerate rect (right < left, bottom < top): unusable
+        "[e.jpg]\r\n"
+        "crop=rect64(c000c00040004000)\r\n")
+    cat = scan_library(root)
+    by = {p.name: p for p in cat.photos}
+    assert by["a.jpg"].crop == (0.25, 0.5, 0.5, 0.75)          # last crop64
+    assert by["b.jpg"].crop == (0.25, 0.25, 0.75, 0.75)        # crop= wins
+    assert by["c.jpg"].crop == (0.25, 0.25, 0.75, 0.75)        # chain fills
+    assert by["d.jpg"].crop == (0.25, 0.25, 0.75, 0.75)        # bare crop64=
+    assert by["e.jpg"].crop is None
+    assert by["e.jpg"].edits and by["e.jpg"].has_edits         # raw survives
+    conflicts = [e for e in cat.report.entries if e.kind == "crop_conflict"]
+    assert len(conflicts) == 1 and conflicts[0].subject == "f/b.jpg"
+
+
+def test_edit_recipe_raw_preservation_and_marker(tmp_path: Path) -> None:
+    """N3 losslessness: every recipe key/value survives verbatim, in ini
+    order, DUPLICATES kept (crashed-mid-write files have them) — and
+    rotate= is excluded (parsed field of its own, composes live). The
+    has_edits marker: redo= alone counts (recipe state present even if
+    every op is undone), text=/textactive=1 count, but textactive=0 alone
+    does NOT (Picasa's overlay-off record — fixture 005 writes it into the
+    post-bake stash ini), nor does rotate= alone."""
+    root = tmp_path / "lib"
+    for name in ("a", "b", "c", "d"):
+        make_jpeg(root / "f" / f"{name}.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\n"
+        "rotate=rotate(1)\r\n"
+        "redo=unsharp=1,0.5;\r\n"
+        "textactive=1\r\n"
+        "text=1;10;20;hello;Arial;0.1;0.2;0.3;0.4;v1,ffffffff;;\r\n"
+        "flipped=1\r\n"
+        "redo=unsharp=1,0.7;\r\n"          # duplicate key, kept in order
+        "[b.jpg]\r\n"
+        "textactive=0\r\n"                  # overlay-off alone: NOT edited
+        "[c.jpg]\r\n"
+        "rotate=rotate(2)\r\n"              # rotate alone: NOT a recipe
+        "[d.jpg]\r\n"
+        "redo=unsharp=1,0.5;\r\n")          # undone ops still carry state
+    cat = scan_library(root)
+    by = {p.name: p for p in cat.photos}
+    assert by["a.jpg"].edits == (
+        ("redo", "unsharp=1,0.5;"),
+        ("textactive", "1"),
+        ("text", "1;10;20;hello;Arial;0.1;0.2;0.3;0.4;v1,ffffffff;;"),
+        ("flipped", "1"),
+        ("redo", "unsharp=1,0.7;"),
+    )
+    assert by["a.jpg"].rotate == 1 and by["a.jpg"].has_edits
+    assert by["b.jpg"].edits == (("textactive", "0"),)
+    assert not by["b.jpg"].has_edits
+    assert by["c.jpg"].edits == () and not by["c.jpg"].has_edits
+    assert by["d.jpg"].has_edits
+
+
+def test_catalog_v10_crop_roundtrip_and_version_gate(tmp_path: Path) -> None:
+    """CATALOG_VERSION is 10 (edit recipes + the crop-baked thumbs it
+    implies; v9 was TGA/PSD), the crop rect and raw recipe strings
+    round-trip exactly through the persisted catalog (n/65536 fractions
+    are exact in JSON; has_edits re-derives), and a pre-v10 file is
+    rejected -> the caller cold-rebuilds (nothing in the size/mtime drift
+    check could notice an ini-only interpretation change)."""
+    from catalog import CATALOG_VERSION
+
+    assert CATALOG_VERSION >= 10  # exact value pinned by the v11 test
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\n"
+        f"crop={_FIXTURE_004_CROP}\r\n"
+        "filters=crop64=1,dc3369dc570a51e;\r\n"
+        "redo=unsharp=1,0.5;\r\n")
+    cat = scan_library(root)
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+    loaded = load_catalog(path, root)
+    assert loaded is not None
+    a, b = loaded.photos[0], loaded.photos[1]
+    assert a.crop == _FIXTURE_004_RECT
+    assert a.edits == cat.photos[0].edits
+    assert a.has_edits and not b.has_edits
+    assert b.crop is None and b.edits == ()
+    data = json.loads(path.read_text())
+    data["version"] = 9                          # pre-edit-recipe format
+    path.write_text(json.dumps(data))
+    assert load_catalog(path, root) is None
+
+
+def _quadrant_jpeg(path: Path, edge: int = 1024) -> None:
+    """A 4-quadrant marker image: TL red, TR green, BL blue, BR white."""
+    from PySide6.QtGui import QColor, QImage, QPainter
+
+    img = QImage(edge, edge, QImage.Format.Format_RGB32)
+    half = edge // 2
+    p = QPainter(img)
+    p.fillRect(0, 0, half, half, QColor(255, 0, 0))
+    p.fillRect(half, 0, half, half, QColor(0, 200, 0))
+    p.fillRect(0, half, half, half, QColor(0, 0, 255))
+    p.fillRect(half, half, half, half, QColor(255, 255, 255))
+    p.end()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    assert img.save(str(path), "JPEG", 95)
+
+
+def test_thumb_bakes_crop_before_downscale(tmp_path: Path) -> None:
+    """The indexer bakes the crop into the cached thumbnail, and it crops
+    BEFORE the downscale in resolution terms: cropping a 1024px source to
+    its 512px top-right quadrant must yield a 256px thumb (the scaled-
+    decode target is computed for the SUB-RECT) — the naive decode-to-256-
+    then-crop order would yield 128px, so the dimension assertion pins the
+    order. Pixel probes confirm WHICH quadrant survived. The uncropped
+    sibling behaves exactly as before."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+
+    root = tmp_path / "lib"
+    _quadrant_jpeg(root / "f" / "cropped.jpg")
+    _quadrant_jpeg(root / "f" / "plain.jpg")
+    # top-right quadrant: (0.5, 0.0, ~1.0, 0.5) — 1.0 is not encodable in
+    # a u16 fraction, so Picasa writes 0xffff (0.999985), as here
+    (root / "f" / ".picasa.ini").write_text(
+        "[cropped.jpg]\r\ncrop=rect64(80000000ffff8000)\r\n")
+    cat, cache = _bound_cache(tmp_path, root)
+    by = {p.name: i for i, p in enumerate(cat.photos)}
+
+    def thumb(idx: int) -> QImage:
+        offset, length, _w, _h = cache.entries[idx]
+        assert length > 0
+        with open(cache.path, "rb") as f:
+            f.seek(offset)
+            img = QImage.fromData(f.read(length), "JPEG")
+        assert not img.isNull()
+        return img
+
+    ci = by["cropped.jpg"]
+    img = thumb(ci)
+    assert (img.width(), img.height()) == (256, 256)   # NOT 128: see doc
+    assert cache.entries[ci][2:] == (256, 256)
+    for fx, fy in ((0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)):
+        c = img.pixelColor(int(fx * img.width()), int(fy * img.height()))
+        assert c.green() > 150 and c.red() < 90 and c.blue() < 90, (fx, fy)
+    plain = thumb(by["plain.jpg"])
+    assert (plain.width(), plain.height()) == (256, 256)
+    tl = plain.pixelColor(64, 64)
+    assert tl.red() > 150 and tl.green() < 90          # TL still red
+
+
+def test_thumb_crop_composes_with_exif_orientation(tmp_path: Path) -> None:
+    """crop= coordinates are STORED-frame while the baked thumb is
+    EXIF-upright, so the bake must map the rect through the orientation
+    tag: on a 90-CW-stored (orientation 6) photo, cropping exactly the
+    marked stored rect yields a thumb of the region's SWAPPED dims that is
+    all marker — an unmapped rect would crop gray. Uses _index_one
+    directly (the bake seam)."""
+    _offscreen_app()
+    from PySide6.QtCore import QBuffer, QIODevice
+
+    import metareader
+
+    root = tmp_path / "lib"
+    img = _marked_stored_image()          # 96x64, red at (.25,.5,.5,.75)
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert img.save(buf, "JPEG", 95)
+    (root / "f").mkdir(parents=True)
+    (root / "f" / "a.jpg").write_bytes(
+        metareader.embed_test_metadata(bytes(buf.data()), orientation=6))
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\ncrop=rect64(400080008000c000)\r\n")  # == the red patch
+    cat = scan_library(root)
+    assert cat.photos[0].crop == (0.25, 0.5, 0.5, 0.75)
+    _idx, blobs, *_rest, primary = thumbcache._index_one(
+        root, cat.photos[0], 0, [thumbcache.THUMB_EDGE])
+    # stored region 24x16 -> orientation 6 swaps -> 16x24 upright, < 256
+    # so never upscaled
+    assert (primary.width(), primary.height()) == (16, 24)
+    assert blobs[0][1:] == (16, 24)
+    c = primary.pixelColor(8, 12)
+    assert c.red() > 150 and c.green() < 100 and c.blue() < 100
+
+
+def test_viewer_crop_exif_rotate_composition_order(tmp_path: Path) -> None:
+    """The viewer's decode composes crop -> EXIF orientation -> rotate=,
+    against REAL EXIF bytes: with orientation 6 and a stored-frame crop
+    whose top-left quadrant is the red patch, the patch must land top-
+    RIGHT at rotate=0 (one 90 CW) and bottom-right at rotate=1 (180
+    total), with the dims transformed to match. Wrong order — cropping
+    the upright pixels with the UNMAPPED stored rect, or cropping after
+    rotate= — moves the patch and fails the probes."""
+    _offscreen_app()
+    from PySide6.QtCore import QBuffer, QIODevice
+
+    import metareader
+    from viewer import load_original_oriented
+
+    img = _marked_stored_image()          # 96x64, red at (.25,.5,.5,.75)
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert img.save(buf, "JPEG", 95)
+    p = tmp_path / "a.jpg"
+    p.write_bytes(
+        metareader.embed_test_metadata(bytes(buf.data()), orientation=6))
+    # stored-frame crop (0.25, 0.5, 0.75, 1.0): a 48x32 region whose
+    # LEFT-TOP quadrant is exactly the red patch
+    crop = (0.25, 0.5, 0.75, 1.0)
+
+    def red(shown, fx: float, fy: float) -> bool:
+        c = shown.pixelColor(int(fx * shown.width()),
+                             int(fy * shown.height()))
+        return c.red() > 150 and c.green() < 100 and c.blue() < 100
+
+    shown, got = load_original_oriented(str(p), 0, crop)
+    assert got == 6 and not shown.isNull()
+    assert (shown.width(), shown.height()) == (32, 48)  # 90 CW swaps
+    assert red(shown, 0.75, 0.25) and not red(shown, 0.25, 0.75)
+
+    shown, got = load_original_oriented(str(p), 1, crop)
+    assert got == 6
+    assert (shown.width(), shown.height()) == (48, 32)  # 180 total
+    assert red(shown, 0.75, 0.75) and not red(shown, 0.25, 0.25)
+
+
+def test_face_rect_rebase_through_crop() -> None:
+    """Faces on a cropped photo still reference STORED pixels, so the
+    overlay rebases each rect into the crop sub-rect FIRST, then applies
+    the same EXIF x rotate mapping as the pixels. Pure-math contract:
+    identity (face == crop fills the frame), clamping (a straddling face
+    shows its visible part), rejection (a cropped-out face has no
+    on-screen pixels), degenerate crops, and the composition with the
+    orientation map afterwards."""
+    from cropmap import map_fraction_rect, rebase_fraction_rect
+
+    crop = (0.25, 0.25, 0.75, 0.75)
+    assert rebase_fraction_rect(crop, crop) == (0.0, 0.0, 1.0, 1.0)
+    got = rebase_fraction_rect((0.4, 0.4, 0.6, 0.6), (0.5, 0.25, 1.0, 0.75))
+    assert got == pytest.approx((0.0, 0.3, 0.2, 0.7))
+    assert rebase_fraction_rect((0.0, 0.0, 0.1, 0.1), (0.5, 0.5, 1.0, 1.0)) \
+        is None
+    assert rebase_fraction_rect((0.4, 0.4, 0.6, 0.6), (0.5, 0.5, 0.5, 1.0)) \
+        is None                                        # degenerate crop
+    # composed: a face filling the crop fills the displayed frame under
+    # ANY orientation x rotate (the mapping of (0,0,1,1) is (0,0,1,1))
+    for orientation in range(1, 9):
+        for rotate in range(4):
+            assert map_fraction_rect(
+                rebase_fraction_rect(crop, crop), orientation, rotate
+            ) == (0.0, 0.0, 1.0, 1.0)
+
+
+def test_viewer_face_rects_on_cropped_photo(tmp_path: Path) -> None:
+    """End-to-end overlay-on-crop: a face tag coinciding with the crop
+    fills the shown rect exactly, and a face the crop cut out produces NO
+    box (its pixels are not on screen) — the mapping goes rebase -> EXIF x
+    rotate -> _shown_rect, all through the real viewer plumbing."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+
+    from viewer import ViewerPage, face_widget_rect
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[Contacts2]\r\nabcdef0123456789=Pat Named;;\r\n"
+        "[a.jpg]\r\n"
+        "crop=rect64(40004000c000c000)\r\n"
+        "faces=rect64(40004000c000c000),abcdef0123456789;"
+        "rect64(10001000),ffffffffffffffff\r\n")
+    cat = scan_library(root)
+    p = cat.photos[0]
+    assert p.crop == (0.25, 0.25, 0.75, 0.75) and len(p.faces) == 2
+    v = ViewerPage(cat, None)
+    v.resize(1280, 800)
+    v.show_photo([0], 0)
+    v._serial += 1                        # stale the async decode job
+    orig = QImage(640, 480, QImage.Format.Format_RGB32)  # cropped decode
+    orig.fill(0x336699)
+    v._on_loaded(v._serial, orig, 1)
+    v.faces_visible = True
+    rects = v._face_rects()
+    # the (0,0,.0625,.0625) face lies wholly outside the crop: dropped
+    assert len(rects) == 1 and rects[0][1] == "Pat Named"
+    shown = v._shown_rect(1280, 800, orig)
+    assert rects[0][0] == face_widget_rect((0.0, 0.0, 1.0, 1.0), 1, 0, shown)
+
+
+def test_viewer_info_bar_edited_chip(tmp_path: Path) -> None:
+    """The honest M1 'edited' cue: a photo carrying a recipe shows the
+    chip in the viewer info bar; a plain photo (and a textactive=0-only
+    one) does not. The unsaved-vs-baked state cue is M3 — presence only."""
+    _offscreen_app()
+    from viewer import ViewerPage
+
+    root = tmp_path / "lib"
+    for name in ("a", "b", "c"):
+        make_jpeg(root / "f" / f"{name}.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\nfilters=tilt=1,0.280632,0.000000;\r\n"
+        "[c.jpg]\r\ntextactive=0\r\n")
+    cat = scan_library(root)
+    by = {p.name: p for p in cat.photos}
+    v = ViewerPage(cat, None)
+    v.display, v.pos = [0, 1, 2], 0
+    assert "edited" in v._info_text(by["a.jpg"])
+    assert "edited" not in v._info_text(by["b.jpg"])
+    assert "edited" not in v._info_text(by["c.jpg"])
+
+
+def test_ingest_parity_gate_passes() -> None:
+    """The M1 ingest-parity gate (spec §9 clause 2) end-to-end: with
+    edit-recipe ingest landed (fauxcasa-cam.15) the expectation table has
+    ZERO expected-missing classes, so the gate must PASS fully ingested —
+    zero loss across every class it tracks. Runs the real script in its
+    own uv env (exactly CI's tests.yml job); skips when uv is absent."""
+    import shutil
+    import subprocess
+
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv not on PATH")
+    proc = subprocess.run(
+        [uv, "run", str(REPO / "scripts" / "check-ingest-parity.py")],
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=600)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "fully ingested (0 expected-missing)" in proc.stdout
+
+
+# ===========================================================================
+# ---- multi-root library model core (fauxcasa-ed5.7.1): library.json,
+# ---- root-id minting, resolve_open_path, .fauxcasa walk exclusion
+# ===========================================================================
+
+
+def test_mint_root_id_shape_and_uniqueness() -> None:
+    """mint_root_id returns 8-char lowercase hex; 200 mints are all unique
+    and never path-derived. mint_library_id returns a parseable uuid4."""
+    import uuid
+
+    ids = [libmod.mint_root_id() for _ in range(200)]
+    for rid in ids:
+        assert re.fullmatch(r"[0-9a-f]{8}", rid), f"bad shape: {rid!r}"
+    assert len(set(ids)) == 200, "collision among 200 mints"
+
+    lid1 = libmod.mint_library_id()
+    lid2 = libmod.mint_library_id()
+    uuid.UUID(lid1)   # must parse without raising
+    uuid.UUID(lid2)
+    assert lid1 != lid2
+
+
+def test_library_json_roundtrip(tmp_path: Path) -> None:
+    """save_library + load_library is a lossless roundtrip; atomic replace
+    works on a second write; no .tmp files left behind."""
+    home = tmp_path / "home"
+    root_a = tmp_path / "photos"
+    root_b = tmp_path / "scans"
+    root_a.mkdir()
+    root_b.mkdir()
+
+    id_a = libmod.mint_root_id()
+    id_b = libmod.mint_root_id()
+    library_id = libmod.mint_library_id()
+
+    cfg = libmod.LibraryConfig(
+        library_id=library_id,
+        name="Test Library",
+        roots=[
+            libmod.LibraryRoot(id=id_a, path=root_a, label="Photos"),
+            libmod.LibraryRoot(id=id_b, path=root_b, label="Scans"),
+        ],
+        home=home,
+    )
+
+    libmod.save_library(cfg)
+
+    json_path = home / ".fauxcasa" / "library.json"
+    assert json_path.is_file()
+
+    raw = json.loads(json_path.read_text(encoding="utf-8"))
+    assert raw["format"] == 1
+    assert raw["library_id"] == library_id
+    assert raw["roots"][0]["path"] == root_a.as_posix()
+    assert raw["roots"][1]["path"] == root_b.as_posix()
+
+    loaded = libmod.load_library(home)
+    assert loaded is not None
+    assert loaded.library_id == cfg.library_id
+    assert loaded.name == cfg.name
+    assert not loaded.is_legacy
+    assert len(loaded.roots) == 2
+    assert loaded.roots[0].id == id_a
+    assert loaded.roots[0].label == "Photos"
+    assert loaded.roots[1].id == id_b
+    assert loaded.roots[1].label == "Scans"
+
+    # Second save: atomic replace over existing file still works
+    libmod.save_library(cfg)
+    loaded2 = libmod.load_library(home)
+    assert loaded2 is not None
+    assert loaded2.library_id == library_id
+
+    # No leftover .tmp files
+    tmp_files = list((home / ".fauxcasa").glob("*.tmp"))
+    assert tmp_files == [], f"leftover tmp files: {tmp_files}"
+
+
+def test_load_library_fail_soft(tmp_path: Path) -> None:
+    """load_library returns None for all invalid inputs."""
+    home = tmp_path / "home"
+    fauxcasa_dir = home / ".fauxcasa"
+    fauxcasa_dir.mkdir(parents=True)
+
+    def write_json(data) -> None:
+        (fauxcasa_dir / "library.json").write_text(
+            json.dumps(data), encoding="utf-8")
+
+    # Missing .fauxcasa/ entirely
+    assert libmod.load_library(tmp_path / "nonexistent") is None
+
+    # Garbage text
+    (fauxcasa_dir / "library.json").write_text("not json!!", encoding="utf-8")
+    assert libmod.load_library(home) is None
+
+    # Wrong format version
+    write_json({"format": 2, "library_id": "abc", "roots": []})
+    assert libmod.load_library(home) is None
+
+    # Empty roots list
+    write_json({"format": 1, "library_id": "test-id", "name": "", "roots": []})
+    assert libmod.load_library(home) is None
+
+    # Duplicate root ids
+    ra = tmp_path / "a"
+    rb = tmp_path / "b"
+    ra.mkdir(); rb.mkdir()
+    write_json({
+        "format": 1, "library_id": "test-id", "name": "",
+        "roots": [
+            {"id": "a1b2c3d4", "path": ra.as_posix(),
+             "volume_uuid": None, "vol_rel": None, "label": ""},
+            {"id": "a1b2c3d4", "path": rb.as_posix(),
+             "volume_uuid": None, "vol_rel": None, "label": ""},
+        ]
+    })
+    assert libmod.load_library(home) is None
+
+    # Root with reserved id ""
+    write_json({
+        "format": 1, "library_id": "test-id", "name": "",
+        "roots": [
+            {"id": "", "path": ra.as_posix(),
+             "volume_uuid": None, "vol_rel": None, "label": ""},
+        ]
+    })
+    assert libmod.load_library(home) is None
+
+    # Nested roots (tmp/a and tmp/a/sub)
+    ra_sub = ra / "sub"
+    ra_sub.mkdir()
+    write_json({
+        "format": 1, "library_id": "test-id", "name": "",
+        "roots": [
+            {"id": "a1b2c3d4", "path": ra.as_posix(),
+             "volume_uuid": None, "vol_rel": None, "label": ""},
+            {"id": "5e6f7a8b", "path": ra_sub.as_posix(),
+             "volume_uuid": None, "vol_rel": None, "label": ""},
+        ]
+    })
+    assert libmod.load_library(home) is None
+
+
+def test_resolve_open_path(tmp_path: Path) -> None:
+    """resolve_open_path: explicit cfg for a valid library.json, legacy
+    fallback for a bare dir or a corrupt library.json."""
+    # (a) dir with a valid library.json -> explicit config
+    home_a = tmp_path / "home_a"
+    root_a = tmp_path / "root_a"
+    root_a.mkdir()
+    lid = libmod.mint_library_id()
+    cfg = libmod.LibraryConfig(
+        library_id=lid, name="Test Library",
+        roots=[libmod.LibraryRoot(
+            id=libmod.mint_root_id(), path=root_a, label="Root A")],
+        home=home_a,
+    )
+    libmod.save_library(cfg)
+    result = libmod.resolve_open_path(home_a)
+    assert not result.is_legacy
+    assert result.library_id == lid
+
+    # (b) bare dir -> degenerate legacy
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    result_b = libmod.resolve_open_path(bare)
+    assert result_b.is_legacy
+    assert result_b.home is None
+    assert len(result_b.roots) == 1
+    assert result_b.roots[0].id == libmod.LEGACY_ROOT_ID
+    assert result_b.roots[0].path == bare.resolve()
+
+    # (c) dir with corrupt library.json -> legacy fallback
+    corrupt = tmp_path / "corrupt"
+    corrupt_fauxcasa = corrupt / ".fauxcasa"
+    corrupt_fauxcasa.mkdir(parents=True)
+    (corrupt_fauxcasa / "library.json").write_text("{ bad json", encoding="utf-8")
+    result_c = libmod.resolve_open_path(corrupt)
+    assert result_c.is_legacy
+
+
+def test_root_marker_roundtrip(tmp_path: Path) -> None:
+    """write_root_marker / read_root_marker: valid id round-trips; absent
+    and garbage content return None; nonexistent parent returns False."""
+    d = tmp_path / "root"
+    d.mkdir()
+
+    # Successful write + read
+    assert libmod.write_root_marker(d, "a1b2c3d4") is True
+    assert libmod.read_root_marker(d) == "a1b2c3d4"
+
+    # Absent marker -> None
+    d2 = tmp_path / "nomarker"
+    d2.mkdir()
+    assert libmod.read_root_marker(d2) is None
+
+    # Garbage content -> None
+    d3 = tmp_path / "bad"
+    d3.mkdir()
+    (d3 / libmod.ROOT_MARKER).write_text("not an id", encoding="utf-8")
+    assert libmod.read_root_marker(d3) is None
+
+    # Write to a nonexistent parent dir -> False, no exception
+    nodir = tmp_path / "does_not_exist" / "also_not_here"
+    result = libmod.write_root_marker(nodir, "a1b2c3d4")
+    assert result is False
+
+
+def test_walk_excludes_fauxcasa_dir_and_marker(tmp_path: Path) -> None:
+    """walk_library excludes .fauxcasa/ content and .fauxcasa-root at any
+    depth; .picasaoriginals (dot-stash) is still walked; scan_library
+    photo count agrees."""
+    root = tmp_path / "root"
+
+    # Two normal jpegs
+    make_jpeg(root / "a.jpg")
+    make_jpeg(root / "sub" / "b.jpg")
+
+    # .fauxcasa library state — extension-bearing file (proved real behavior)
+    (root / ".fauxcasa").mkdir()
+    (root / ".fauxcasa" / "library.json").write_text("{}", encoding="utf-8")
+    (root / ".fauxcasa" / "thumbs").mkdir()
+    make_jpeg(root / ".fauxcasa" / "thumbs" / "leak.jpg")
+
+    # Nested .fauxcasa at a sub-level
+    (root / "f" / ".fauxcasa").mkdir(parents=True)
+    make_jpeg(root / "f" / ".fauxcasa" / "deep.jpg")
+
+    # The root marker file
+    (root / libmod.ROOT_MARKER).write_text("a1b2c3d4", encoding="utf-8")
+
+    # .picasaoriginals dot-stash — should still be walked
+    make_jpeg(root / "f" / ".picasaoriginals" / "orig.jpg")
+
+    result = walk_library(root)
+    result_rels = [p.relative_to(root).as_posix() for p in result]
+
+    assert "a.jpg" in result_rels
+    assert "sub/b.jpg" in result_rels
+    assert "f/.picasaoriginals/orig.jpg" in result_rels
+
+    # Nothing under any .fauxcasa dir
+    for rel in result_rels:
+        assert ".fauxcasa" not in Path(rel).parts, (
+            f"found .fauxcasa path in walk: {rel!r}")
+
+    # The marker file is excluded
+    assert libmod.ROOT_MARKER not in result_rels
+
+    # Exactly the three expected files
+    assert len(result) == 3, f"expected 3 files, got {result_rels!r}"
+
+    # scan_library agrees on photo count
+    cat = scan_library(root)
+    assert len(cat.photos) == 3
+
+
+def test_fauxcasa_exclusion_parity_with_make_thumbcache(tmp_path: Path) -> None:
+    """Both walk twins exclude .fauxcasa/ and .fauxcasa-root identically;
+    constant drift between library.py and the script is caught here."""
+    root = tmp_path / "root"
+
+    make_jpeg(root / "a.jpg")
+    make_jpeg(root / "sub" / "b.jpg")
+    make_jpeg(root / "f" / ".picasaoriginals" / "orig.jpg")
+
+    (root / ".fauxcasa").mkdir()
+    make_jpeg(root / ".fauxcasa" / "leak.jpg")
+    (root / ".fauxcasa" / "sub").mkdir()
+    make_jpeg(root / ".fauxcasa" / "sub" / "deep.jpg")
+    (root / libmod.ROOT_MARKER).write_text("a1b2c3d4", encoding="utf-8")
+
+    mtc = _load_mtc()
+
+    # Constant drift guard (the twin-invariant)
+    assert mtc.LIBRARY_DIR == libmod.LIBRARY_DIR
+    assert mtc.ROOT_MARKER == libmod.ROOT_MARKER
+
+    catalog_result = walk_library(root)
+    script_result = mtc.walk_library(root, mtc.EXTS)
+    assert catalog_result == script_result
+
+
+def test_nested_root_rejected(tmp_path: Path) -> None:
+    """add_root raises ValueError for descendant, ancestor, and duplicate
+    roots; a sibling root succeeds and round-trips through save/load."""
+    home = tmp_path / "home"
+    a = tmp_path / "a"
+    a.mkdir()
+    a_sub = a / "sub"
+    a_sub.mkdir()
+    b = tmp_path / "b"
+    b.mkdir()
+
+    lid = libmod.mint_library_id()
+    cfg = libmod.LibraryConfig(
+        library_id=lid, name="Test Library",
+        roots=[libmod.LibraryRoot(
+            id="a1b2c3d4", path=a, label="A")],
+        home=home,
+    )
+
+    # Descendant of existing root
+    with pytest.raises(ValueError):
+        libmod.add_root(cfg, a_sub)
+
+    # Ancestor of existing root (tmp_path contains a)
+    with pytest.raises(ValueError):
+        libmod.add_root(cfg, tmp_path)
+
+    # Exact duplicate
+    with pytest.raises(ValueError):
+        libmod.add_root(cfg, a)
+
+    # Sibling root succeeds
+    new_root = libmod.add_root(cfg, b)
+    assert re.fullmatch(r"[0-9a-f]{8}", new_root.id)
+    assert new_root.id != "a1b2c3d4"
+    assert new_root.label == "b"
+    assert len(cfg.roots) == 2
+
+    # Round-trip through save/load
+    libmod.save_library(cfg)
+    loaded = libmod.load_library(home)
+    assert loaded is not None
+    assert len(loaded.roots) == 2
+    assert loaded.roots[1].id == new_root.id
+
+
+def test_add_root_rejects_home_swallow(tmp_path: Path) -> None:
+    """add_root raises ValueError when the candidate would contain the
+    library-home; a different sibling root succeeds."""
+    h_home = tmp_path / "h" / "home"
+    a = tmp_path / "a"
+    a.mkdir()
+    (tmp_path / "h").mkdir()
+
+    lid = libmod.mint_library_id()
+    cfg = libmod.LibraryConfig(
+        library_id=lid, name="Test Library",
+        roots=[libmod.LibraryRoot(
+            id="a1b2c3d4", path=a, label="A")],
+        home=h_home,
+    )
+
+    # tmp/"h" contains home (h/home); adding it would swallow the home
+    with pytest.raises(ValueError):
+        libmod.add_root(cfg, tmp_path / "h")
+
+    # A genuinely separate root succeeds
+    c = tmp_path / "c"
+    c.mkdir()
+    new_root = libmod.add_root(cfg, c)
+    assert new_root.id != "a1b2c3d4"
+
+
+def test_add_root_on_legacy_raises(tmp_path: Path) -> None:
+    """add_root raises ValueError on a legacy config (promotion is bead .d)."""
+    d = tmp_path / "photos"
+    d.mkdir()
+    cfg = libmod.legacy_config(d)
+    assert cfg.is_legacy
+    with pytest.raises(ValueError):
+        libmod.add_root(cfg, tmp_path / "other")
+
+
+def test_save_library_on_legacy_raises(tmp_path: Path) -> None:
+    """save_library refuses a legacy config (no home; never written to disk)."""
+    d = tmp_path / "photos"
+    d.mkdir()
+    with pytest.raises(ValueError):
+        libmod.save_library(libmod.legacy_config(d))
