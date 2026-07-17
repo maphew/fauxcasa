@@ -6255,6 +6255,52 @@ def test_db3_people_sidebar_source_flag(db3_library: Path,
     assert [cat.photos[i].rel for i in win.grid.display] == ["Trip/a.jpg"]
 
 
+def test_db3_people_sidebar_not_flagged_when_name_shared_with_ini_contact(
+        db3_library: Path, tmp_path: Path) -> None:
+    """fauxcasa-7aj.2: the db3-rescued tooltip flag is keyed by CONTACT ID,
+    not display name. b.jpg here names a SECOND, ini-only contact id that
+    happens to share PERSON_DB3's display name with the db3-rescued
+    contact on a.jpg — the display name is therefore known via a non-db3
+    source too, so it must NOT be flagged (the old name-keyed check
+    (`{cat.contacts[c] for c in db3_contacts}` matched by display name)
+    would have wrongly flagged this ini contact as db3-rescued)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    cid_ini = "cccccccccccccccc"
+    (db3_library / "Trip" / ".picasa.ini").write_text(
+        "[Contacts2]\r\n"
+        f"{cid_ini}={PERSON_DB3};;\r\n"
+        "[a.jpg]\r\n"
+        f"faces=rect64(6800600097ff9fff),{CID_DB3}\r\n"
+        "[b.jpg]\r\n"
+        f"faces=rect64(1234),{cid_ini}\r\n")
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+    cat = scan_library(db3_library, db3_dir=db3)
+    assert cat.db3_contacts == {CID_DB3}
+    assert cat.contacts[CID_DB3] == cat.contacts[cid_ini] == PERSON_DB3
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    def item_for(kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    shared = item_for("person", PERSON_DB3)
+    assert shared is not None and shared.text(0).endswith("(2)")
+    assert shared.toolTip(0) == ""      # NOT flagged: also ini-named
+
+
 # ---------------------------------------------------------------------------
 # Selection tray (fauxcasa-q6l.2): persistent CROSS-FOLDER Hold/Clear +
 # typed readout (spec §5). Decisions under test (tray.py module doc):
