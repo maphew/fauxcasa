@@ -8413,8 +8413,9 @@ def test_nonjpeg_regression_matrix(tmp_path: Path) -> None:
 # future star-set key), the NEW bindings the bead owes (J/K in the GRID,
 # Ctrl+Enter reveal-in-file-manager from grid and viewer), and the per-
 # platform launcher commands behind locate.reveal_in_file_manager (Windows
-# verified for real during development; macOS/Linux structurally). Existing
-# key tests above pin that the refactor changed only the lookup mechanism.
+# verified for real during development; macOS/Linux structurally; Linux probe
+# is async as of q6l.21). Existing key tests above pin that the refactor
+# changed only the lookup mechanism.
 # ---------------------------------------------------------------------------
 
 
@@ -8574,10 +8575,12 @@ def test_reveal_in_file_manager_per_platform(tmp_path: Path,
     explorer's comma parsing) — this exact form was verified for real on
     Windows (explorer opens with the file selected, checked via the Shell
     COM automation API). macOS: open -R argv. Linux: FileManager1
-    ShowItems over dbus-send, falling back to xdg-open of the CONTAINING
-    FOLDER when the call fails or dbus-send is missing; a launcher OSError
+    ShowItems probed ASYNCHRONOUSLY (q6l.21) via QProcess; settle path
+    drives an xdg-open folder fallback when dbus-send fails or is missing.
+    True on Linux means the async probe was started; a launcher OSError
     reports False instead of raising into a key handler."""
     import locate
+    from PySide6.QtCore import QProcess
 
     target = tmp_path / "sub dir" / "photo one.jpg"    # spaces on purpose
     target.parent.mkdir(parents=True)
@@ -8593,40 +8596,107 @@ def test_reveal_in_file_manager_per_platform(tmp_path: Path,
     assert locate.reveal_in_file_manager(target, platform="darwin")
     assert popens == [["open", "-R", str(target)]]
 
-    # Linux, happy path: ShowItems answers -> no fallback launcher at all
+    # --------------- Linux legs: fake QProcess + QTimer seam ----------------
+    # The Linux path is now an async QProcess probe — we swap in a fake so
+    # the test runs identically on Windows CI (no session bus needed) and
+    # exercises all settle-path branches synchronously by driving signals.
+
+    class _Sig:
+        def __init__(self): self.cbs = []
+        def connect(self, cb): self.cbs.append(cb)
+        def emit(self, *a):
+            for cb in list(self.cbs): cb(*a)
+
+    class _FakeProc:
+        # Expose the real enums: locate compares against QProcess.ExitStatus
+        # through the (monkeypatched) module global, so the fake must carry them.
+        ExitStatus = QProcess.ExitStatus
+        ProcessError = QProcess.ProcessError
+        instances: list["_FakeProc"] = []
+        def __init__(self):
+            self.finished = _Sig(); self.errorOccurred = _Sig()
+            self.cmd = None; self.killed = False; self.deleted = False
+            _FakeProc.instances.append(self)
+        def start(self, program, args): self.cmd = [program, *args]
+        def kill(self): self.killed = True
+        def deleteLater(self): self.deleted = True
+
+    shots: list[tuple[int, object]] = []
+
+    class _FakeTimer:
+        @staticmethod
+        def singleShot(ms, cb): shots.append((ms, cb))
+
+    monkeypatch.setattr(locate, "QProcess", _FakeProc)
+    monkeypatch.setattr(locate, "QTimer", _FakeTimer)
+    monkeypatch.setattr(locate, "_pending", set())
+
+    # Leg 1: happy path — ShowItems answers OK -> no fallback at all
     popens.clear()
-    runs: list[list[str]] = []
+    _FakeProc.instances.clear()
+    shots.clear()
+    assert locate.reveal_in_file_manager(target, platform="linux")  # returns IMMEDIATELY
+    (proc,) = _FakeProc.instances
+    assert proc.cmd[0] == "dbus-send"
+    assert "--dest=org.freedesktop.FileManager1" in proc.cmd
+    assert proc.cmd[-2] == f"array:string:{target.absolute().as_uri()}"
+    assert proc.cmd[-1] == "string:"                 # empty startup id
+    assert popens == []                              # no fallback yet
+    ms, _ = shots[0]
+    assert ms == 3000                                # deadline matches _DBUS_TIMEOUT
+    proc.finished.emit(0, QProcess.ExitStatus.NormalExit)
+    assert popens == []                              # success: no folder fallback
+    assert proc not in locate._pending              # reaped from set
+    assert proc.deleted                             # deleteLater called
 
-    class _Ok:
-        returncode = 0
-
-    monkeypatch.setattr(locate.subprocess, "run",
-                        lambda cmd, **k: runs.append(cmd) or _Ok())
-    assert locate.reveal_in_file_manager(target, platform="linux")
-    assert popens == []
-    (cmd,) = runs
-    assert cmd[0] == "dbus-send"
-    assert "--dest=org.freedesktop.FileManager1" in cmd
-    assert cmd[-2] == f"array:string:{target.absolute().as_uri()}"
-    assert cmd[-1] == "string:"                 # empty startup id
-
-    # Linux, no FileManager1 answer: open the containing folder instead
-    class _Fail:
-        returncode = 1
-
-    monkeypatch.setattr(locate.subprocess, "run", lambda cmd, **k: _Fail())
-    assert locate.reveal_in_file_manager(target, platform="linux")
+    # Leg 2: ShowItems answers nonzero -> xdg-open folder fallback
+    _FakeProc.instances.clear()
+    shots.clear()
+    locate.reveal_in_file_manager(target, platform="linux")
+    (proc,) = _FakeProc.instances
+    proc.finished.emit(1, QProcess.ExitStatus.NormalExit)
     assert popens == [["xdg-open", str(target.parent)]]
 
-    # Linux, dbus-send binary missing entirely: the same folder fallback
+    # Leg 3: dbus-send missing (FailedToStart) -> folder fallback; then a
+    # late finished signal must NOT trigger a second fallback (double-settle guard)
     popens.clear()
-
-    def _missing(cmd, **k):
-        raise FileNotFoundError("dbus-send")
-
-    monkeypatch.setattr(locate.subprocess, "run", _missing)
-    assert locate.reveal_in_file_manager(target, platform="linux")
+    _FakeProc.instances.clear()
+    shots.clear()
+    locate.reveal_in_file_manager(target, platform="linux")
+    (proc,) = _FakeProc.instances
+    proc.errorOccurred.emit(QProcess.ProcessError.FailedToStart)
     assert popens == [["xdg-open", str(target.parent)]]
+    proc.finished.emit(1, QProcess.ExitStatus.CrashExit)
+    assert popens == [["xdg-open", str(target.parent)]]  # still exactly one
+
+    # Leg 4: deadline fires before any signal -> kill() -> CrashExit -> fallback
+    # CrashExit with code 0 must NOT count as success (pins NormalExit term)
+    popens.clear()
+    _FakeProc.instances.clear()
+    shots.clear()
+    locate.reveal_in_file_manager(target, platform="linux")
+    (proc,) = _FakeProc.instances
+    assert shots                                     # deadline shot registered
+    deadline_ms, deadline_cb = shots[0]
+    assert deadline_ms == 3000
+    deadline_cb()                                    # simulate timer firing
+    assert proc.killed                               # kill() called on hung probe
+    proc.finished.emit(0, QProcess.ExitStatus.CrashExit)  # code=0 but CrashExit
+    assert popens == [["xdg-open", str(target.parent)]]   # fallback fired
+
+    # Leg 5: fallback Popen raising OSError is swallowed, no exception escapes
+    popens.clear()
+    _FakeProc.instances.clear()
+    shots.clear()
+    monkeypatch.setattr(locate.subprocess, "Popen",
+                        lambda cmd, *a, **k: (_ for _ in ()).throw(OSError("xdg gone")))
+    locate.reveal_in_file_manager(target, platform="linux")
+    (proc,) = _FakeProc.instances
+    proc.finished.emit(1, QProcess.ExitStatus.NormalExit)  # triggers fallback -> OSError swallowed
+
+    # restore Popen for the final OSError->False leg below
+    monkeypatch.setattr(locate.subprocess, "Popen",
+                        lambda cmd, *a, **k: popens.append(cmd))
 
     # launcher failure -> False, never an exception into the key handler
     def _boom(cmd, *a, **k):
@@ -9411,3 +9481,58 @@ def test_save_library_on_legacy_raises(tmp_path: Path) -> None:
     d.mkdir()
     with pytest.raises(ValueError):
         libmod.save_library(libmod.legacy_config(d))
+
+
+def test_linux_reveal_does_not_block_key_handler(tmp_path: Path,
+                                                 monkeypatch) -> None:
+    """q6l.21 regression pin: the Linux reveal call must return before the
+    D-Bus deadline elapses. The OLD synchronous subprocess.run path would
+    hold the key handler for up to _DBUS_TIMEOUT (3 s) if dbus-send hung.
+    This test runs a genuinely slow probe (sys.executable sleeping 30 s),
+    patches _DBUS_TIMEOUT down to 0.2 s, and asserts that:
+      1. reveal_in_file_manager returns immediately (well under 1 s).
+      2. The fallback (xdg-open folder) fires LATER via the QTimer deadline
+         kill, not inline in the key handler.
+      3. The QProcess is reaped (_pending is empty) after settling, so no
+         live QProcess leaks into subsequent tests.
+
+    Uses real QProcess/QTimer against sys.executable (not dbus-send), so
+    the test is deterministic on both Windows and ubuntu CI legs with no
+    session bus needed. Synthetic tmp_path data only."""
+    import time
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+
+    import locate
+
+    target = tmp_path / "d" / "p.jpg"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+
+    # Replace the dbus-send command with a probe that sleeps for 30 s —
+    # long enough to be "hung" relative to the 0.2 s deadline we set below.
+    monkeypatch.setattr(locate, "_dbus_show_items_cmd",
+                        lambda p: [sys.executable, "-c",
+                                   "import time; time.sleep(30)"])
+    # Shrink the deadline so the test completes in ~0.2 s, not 3 s.
+    monkeypatch.setattr(locate, "_DBUS_TIMEOUT", 0.2)
+    popens: list[object] = []
+    monkeypatch.setattr(locate.subprocess, "Popen",
+                        lambda cmd, *a, **k: popens.append(cmd))
+
+    t0 = time.monotonic()
+    assert locate.reveal_in_file_manager(target, platform="linux")
+    # Key assertion: the call returns IMMEDIATELY, not after _DBUS_TIMEOUT.
+    # The old sync path would have held the key handler for the full timeout.
+    assert time.monotonic() - t0 < 1.0
+    assert popens == []                              # fallback resolves later, not inline
+
+    # Pump the event loop until the QTimer deadline fires, kills the probe,
+    # and the settle path launches xdg-open.
+    assert _spin(app, lambda: popens)
+    assert popens == [["xdg-open", str(target.parent)]]
+
+    # Probe must be fully reaped — no live QProcess leaks into the next test.
+    assert _spin(app, lambda: not locate._pending)
