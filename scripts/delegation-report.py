@@ -42,6 +42,7 @@ Usage:
   uv run scripts/delegation-report.py
   uv run scripts/delegation-report.py --since 2026-07-01
   uv run scripts/delegation-report.py --baseline
+  uv run scripts/delegation-report.py --by-session
   uv run scripts/delegation-report.py --json
   uv run scripts/delegation-report.py --dir /path/to/project/transcripts
 """
@@ -146,6 +147,18 @@ class SessionData:
     # inherit-model step (see _tier_for_usage).
     usage_by_model_role: dict[tuple[str, str], TokenUsage] = field(
         default_factory=dict)
+    # (kind, model) → TokenUsage / api-call count / agent-file count, where
+    # kind is 'workflow' (spawned via the Workflow tool) or 'agent-tool'
+    # (spawned via the Agent tool). This per-session split is what surfaces
+    # inherit-model leaks: a session whose spawns carry no subagent_type or
+    # model override runs every subagent on the session's own model, which
+    # the global by_model rollup averages away (fauxcasa-dvv).
+    usage_by_kind_model: dict[tuple[str, str], TokenUsage] = field(
+        default_factory=dict)
+    calls_by_kind_model: dict[tuple[str, str], int] = field(
+        default_factory=dict)
+    agents_by_kind_model: dict[tuple[str, str], int] = field(
+        default_factory=dict)
     parse_errors: list[str] = field(default_factory=list)
 
 
@@ -225,6 +238,10 @@ def _accumulate_subagent_dir(
             continue
         entries, errors = _safe_read_jsonl(jsonl_file)
         session.parse_errors.extend(errors)
+        kind = ("workflow"
+                if "workflows" in jsonl_file.relative_to(subagent_dir).parts
+                else "agent-tool")
+        file_models: dict[str, int] = defaultdict(int)
         for entry in entries:
             if entry.get("type") != "assistant":
                 continue
@@ -251,6 +268,21 @@ def _accumulate_subagent_dir(
                 if key not in session.usage_by_model_role:
                     session.usage_by_model_role[key] = TokenUsage()
                 session.usage_by_model_role[key] += usage
+                km = (kind, model)
+                if km not in session.usage_by_kind_model:
+                    session.usage_by_kind_model[km] = TokenUsage()
+                session.usage_by_kind_model[km] += usage
+                session.calls_by_kind_model[km] = (
+                    session.calls_by_kind_model.get(km, 0) + 1)
+                file_models[model] += 1
+        if file_models:
+            # One transcript file = one subagent; attribute it to the model
+            # that served most of its calls (a single agent's model can vary
+            # only across resume/retry edge cases).
+            dominant = max(file_models, key=file_models.get)
+            ka = (kind, dominant)
+            session.agents_by_kind_model[ka] = (
+                session.agents_by_kind_model.get(ka, 0) + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +615,46 @@ def _cost(sessions: list[SessionData]) -> dict:
     }
 
 
+def _by_session_models(sessions: list[SessionData]) -> list[dict]:
+    """Per-session subagent model usage, split workflow vs agent-tool.
+
+    The global by_model rollup can't distinguish 'healthy tiering everywhere'
+    from 'one session ran everything on the session model' — this view can.
+    inherited_model_output_share flags sessions whose subagents mostly ran on
+    the main-session tier (fable), i.e. spawns that carried no subagent_type
+    or model override and silently inherited.
+    """
+    rows: list[dict] = []
+    for sess in sessions:
+        if not sess.usage_by_kind_model:
+            continue
+        breakdown = []
+        for (kind, model), usage in sorted(sess.usage_by_kind_model.items()):
+            breakdown.append({
+                "kind": kind,
+                "model": model,
+                "agents": sess.agents_by_kind_model.get((kind, model), 0),
+                "api_calls": sess.calls_by_kind_model.get((kind, model), 0),
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+            })
+        total_out = sum(b["output_tokens"] for b in breakdown)
+        inherited_out = sum(
+            b["output_tokens"] for b in breakdown
+            if _tier_for_model(b["model"]) == "main-session"
+        )
+        rows.append({
+            "session": sess.session_id[:8],
+            "date": sess.start_date,
+            "epoch": sess.epoch,
+            "breakdown": breakdown,
+            "inherited_model_output_share": (
+                round(inherited_out / total_out, 3) if total_out else 0.0
+            ),
+        })
+    return rows
+
+
 def _quality(sessions: list[SessionData]) -> dict:
     reviewer_count = sum(
         1 for s in sessions
@@ -689,6 +761,7 @@ def render_text(
     since: date | None,
     until: date | None,
     baseline_mode: bool,
+    by_session_mode: bool = False,
 ) -> str:
     lines: list[str] = []
     add = lines.append
@@ -771,6 +844,26 @@ def render_text(
             add(f"  [{wf['date']}] {wf['name']:<32}  "
                 f"{_fmt_int(wf['total']):>8} tok{budget_note}")
         add("")
+
+    # --- PER-SESSION SUBAGENT MODELS ---
+    if by_session_mode:
+        add("-- 2b. PER-SESSION SUBAGENT MODELS " + "-" * 37)
+        add("")
+        add("  (⚠ marks sessions where >50% of subagent output tokens ran on")
+        add("   the main-session tier — spawns that inherited the session model")
+        add("   because no subagent_type/model was set)")
+        add("")
+        for row in _by_session_models(sessions):
+            share = row["inherited_model_output_share"]
+            flag = "  ⚠ INHERITED" if share > 0.5 else ""
+            add(f"  [{row['date']}] {row['session']}  "
+                f"(epoch: {row['epoch']}, "
+                f"session-model share: {_pct(share)}){flag}")
+            for b in row["breakdown"]:
+                add(f"    {b['kind']:<10}  {b['model']:<38}  "
+                    f"{b['agents']:>3} agents  {_fmt_int(b['api_calls']):>6} calls  "
+                    f"{_fmt_int(b['output_tokens']):>10} out-tok")
+            add("")
 
     # --- QUALITY ---
     qual = _quality(sessions)
@@ -881,6 +974,7 @@ def render_json(
         },
         "compliance": _compliance(sessions),
         "cost": _cost(sessions),
+        "by_session_models": _by_session_models(sessions),
         "quality": _quality(sessions),
         "baseline": _baseline_split(sessions),
         "parse_errors": all_errors[:100],
@@ -937,6 +1031,12 @@ def main() -> None:
         help="Show full session list split by pre/post policy date",
     )
     parser.add_argument(
+        "--by-session",
+        action="store_true",
+        help="Show per-session subagent model breakdown "
+             "(workflow vs agent-tool), flagging inherit-model leaks",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output machine-readable JSON instead of text",
@@ -953,7 +1053,8 @@ def main() -> None:
     if args.json:
         print(render_json(sessions, errors, args.since, args.until))
     else:
-        print(render_text(sessions, errors, args.since, args.until, args.baseline))
+        print(render_text(sessions, errors, args.since, args.until,
+                          args.baseline, args.by_session))
 
 
 if __name__ == "__main__":
