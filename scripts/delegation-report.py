@@ -10,7 +10,7 @@ merged in PR #61 on 2026-07-03) is working by parsing Claude Code JSONL
 transcript files.
 
 Default input directory:
-  C:/Users/Matt/.claude/projects/A--dev-fauxcasa/
+  ~/.claude/projects/A--dev-fauxcasa/
 
 Schema observed (schema may drift; parser is defensive throughout):
   Top-level *.jsonl  — main-session transcripts (one per session UUID)
@@ -42,6 +42,7 @@ Usage:
   uv run scripts/delegation-report.py
   uv run scripts/delegation-report.py --since 2026-07-01
   uv run scripts/delegation-report.py --baseline
+  uv run scripts/delegation-report.py --by-session
   uv run scripts/delegation-report.py --json
   uv run scripts/delegation-report.py --dir /path/to/project/transcripts
 """
@@ -62,7 +63,8 @@ from typing import Any
 # Constants
 # ---------------------------------------------------------------------------
 
-POLICY_DATE = date(2026, 7, 3)   # PR #61 merged — tiering guidance live
+POLICY_MERGED_AT = datetime(2026, 7, 3, 16, 37, 23, tzinfo=timezone.utc)
+POLICY_DATE = POLICY_MERGED_AT.date()
 BUDGET_DEFAULT = 200_000          # default per-task token budget in CLAUDE.md
 
 NAMED_TIERS = {"scout", "builder", "reviewer"}
@@ -74,7 +76,7 @@ MODEL_TIER: dict[str, str] = {
     "claude-opus": "reviewer",
 }
 
-DEFAULT_DIR = Path("C:/Users/Matt/.claude/projects/A--dev-fauxcasa")
+DEFAULT_DIR = Path.home() / ".claude" / "projects" / "A--dev-fauxcasa"
 
 TIER_ORDER = {"scout": 0, "builder": 1, "reviewer": 2}
 
@@ -91,6 +93,8 @@ class AgentSpawn:
     subagent_type: str             # from input.subagent_type (may be '')
     model_hint: str                # from input.model (may be '')
     description: str               # from input.description (may be '')
+    tool_use_id: str = ""
+    agent_id: str = ""             # from the matching tool result, when present
 
 
 @dataclass
@@ -101,6 +105,7 @@ class WorkflowRun:
     name: str                      # parsed from JS meta block, or ''
     run_id: str                    # from tool result toolUseResult.runId, or ''
     transcript_dir: Path | None    # where the wf agent files live
+    tool_use_id: str = ""
 
 
 @dataclass
@@ -132,6 +137,7 @@ class SessionData:
     session_id: str
     start_date: str                # YYYY-MM-DD, '' if unknown
     epoch: str                     # 'pre' | 'post'
+    main_model: str = ""           # dominant orchestrator model by output tokens
     agent_spawns: list[AgentSpawn] = field(default_factory=list)
     workflow_runs: list[WorkflowRun] = field(default_factory=list)
     # token usage in the main transcript (orchestrator messages only)
@@ -145,6 +151,16 @@ class SessionData:
     # since the same model backs both a named-tier spawn and a workflow
     # inherit-model step (see _tier_for_usage).
     usage_by_model_role: dict[tuple[str, str], TokenUsage] = field(
+        default_factory=dict)
+    # (kind, model) → TokenUsage / API-call count / transcript-file count, where
+    # kind is 'workflow' (spawned via the Workflow tool) or 'agent-tool'
+    # (spawned via the Agent tool). This per-session split surfaces sessions
+    # where subagent models match the dominant main-session model.
+    usage_by_kind_model: dict[tuple[str, str], TokenUsage] = field(
+        default_factory=dict)
+    calls_by_kind_model: dict[tuple[str, str], int] = field(
+        default_factory=dict)
+    transcripts_by_kind_model: dict[tuple[str, str], int] = field(
         default_factory=dict)
     parse_errors: list[str] = field(default_factory=list)
 
@@ -164,7 +180,13 @@ def _safe_read_jsonl(path: Path) -> tuple[list[dict], list[str]]:
                 if not raw:
                     continue
                 try:
-                    entries.append(json.loads(raw))
+                    value = json.loads(raw)
+                    if not isinstance(value, dict):
+                        errors.append(
+                            f"{path.name}:{lineno} expected object, got "
+                            f"{type(value).__name__}")
+                        continue
+                    entries.append(value)
                 except json.JSONDecodeError as exc:
                     errors.append(f"{path.name}:{lineno} bad JSON: {exc}")
     except OSError as exc:
@@ -172,24 +194,78 @@ def _safe_read_jsonl(path: Path) -> tuple[list[dict], list[str]]:
     return entries, errors
 
 
-def _extract_usage(usage: dict) -> TokenUsage:
-    """Pull token counts from a usage dict, defaulting missing fields to 0."""
+def _token_count(value: Any) -> int:
+    """Return a valid transcript token count, or zero for malformed values."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _extract_usage(usage: Any) -> TokenUsage:
+    """Pull non-negative integer token counts from a usage object."""
+    if not isinstance(usage, dict):
+        return TokenUsage()
     return TokenUsage(
-        input_tokens=usage.get("input_tokens", 0) or 0,
-        output_tokens=usage.get("output_tokens", 0) or 0,
-        cache_creation_tokens=usage.get("cache_creation_input_tokens", 0) or 0,
-        cache_read_tokens=usage.get("cache_read_input_tokens", 0) or 0,
+        input_tokens=_token_count(usage.get("input_tokens", 0)),
+        output_tokens=_token_count(usage.get("output_tokens", 0)),
+        cache_creation_tokens=_token_count(usage.get("cache_creation_input_tokens", 0)),
+        cache_read_tokens=_token_count(usage.get("cache_read_input_tokens", 0)),
     )
 
 
-def _wf_name_from_script(script: str) -> str:
+def _max_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
+    """Merge progressive snapshots of one API response without double-counting."""
+    return TokenUsage(
+        input_tokens=max(left.input_tokens, right.input_tokens),
+        output_tokens=max(left.output_tokens, right.output_tokens),
+        cache_creation_tokens=max(left.cache_creation_tokens, right.cache_creation_tokens),
+        cache_read_tokens=max(left.cache_read_tokens, right.cache_read_tokens),
+    )
+
+
+def _assistant_records(entries: list[dict]) -> list[tuple[dict, dict, TokenUsage]]:
+    """Return one usage record per assistant message/API response.
+
+    Claude transcripts may repeat a message ID as thinking, text, and tool-use
+    snapshots. Keep the latest metadata and maximum observed token fields.
+    Rows without a message ID remain distinct because they have no safe key.
+    """
+    records: dict[str, tuple[dict, dict, TokenUsage]] = {}
+    order: list[str] = []
+    for index, entry in enumerate(entries):
+        if entry.get("type") != "assistant":
+            continue
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
+            continue
+        usage_raw = msg.get("usage")
+        if not isinstance(usage_raw, dict) or not usage_raw:
+            continue
+        message_id = msg.get("id")
+        key = f"id:{message_id}" if isinstance(message_id, str) and message_id else f"row:{index}"
+        usage = _extract_usage(usage_raw)
+        if key not in records:
+            order.append(key)
+            records[key] = (entry, msg, usage)
+        else:
+            _, _, previous = records[key]
+            records[key] = (entry, msg, _max_usage(previous, usage))
+    return [records[key] for key in order]
+
+
+def _as_str(value: Any) -> str:
+    """Return transcript metadata only when it is actually a string."""
+    return value if isinstance(value, str) else ""
+
+
+def _wf_name_from_script(script: Any) -> str:
     """Try to extract the workflow name from a JS meta block."""
+    if not isinstance(script, str):
+        return ""
     m = re.search(r"name\s*:\s*['\"]([^'\"]+)['\"]", script)
     return m.group(1) if m else ""
 
 
 def _entry_timestamp(entry: dict) -> str:
-    return entry.get("timestamp", "") or ""
+    return _as_str(entry.get("timestamp", ""))
 
 
 def _date_str(ts: str) -> str:
@@ -199,14 +275,16 @@ def _date_str(ts: str) -> str:
     return ""
 
 
-def _epoch(start_date: str) -> str:
-    if not start_date:
+def _epoch(start_timestamp: str) -> str:
+    if not start_timestamp:
         return "unknown"
     try:
-        d = date.fromisoformat(start_date)
+        started = datetime.fromisoformat(start_timestamp.replace("Z", "+00:00"))
     except ValueError:
         return "unknown"
-    return "post" if d >= POLICY_DATE else "pre"
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return "post" if started >= POLICY_MERGED_AT else "pre"
 
 
 # ---------------------------------------------------------------------------
@@ -225,32 +303,37 @@ def _accumulate_subagent_dir(
             continue
         entries, errors = _safe_read_jsonl(jsonl_file)
         session.parse_errors.extend(errors)
-        for entry in entries:
-            if entry.get("type") != "assistant":
-                continue
-            msg = entry.get("message") or {}
-            usage_raw = msg.get("usage") or {}
-            if not usage_raw:
-                continue
-            usage = _extract_usage(usage_raw)
+        kind = ("workflow"
+                if "workflows" in jsonl_file.relative_to(subagent_dir).parts
+                else "agent-tool")
+        file_models: dict[str, int] = defaultdict(int)
+        for entry, msg, usage in _assistant_records(entries):
             session.subagent_usage += usage
-            model = msg.get("model", "") or ""
-            if model:
-                if model not in session.usage_by_model:
-                    session.usage_by_model[model] = TokenUsage()
-                session.usage_by_model[model] += usage
-                # entry.attributionAgent (top-level, not inside .message) is
-                # the harness's own declared role for this entry — 'scout'/
-                # 'builder'/'reviewer' for a named-tier spawn, but also
-                # 'general-purpose'/'workflow-subagent' for a workflow step
-                # that inherited the SESSION's own model (often opus) rather
-                # than being spawned as a genuine reviewer. Keyed alongside
-                # the model so _tier_for_usage can tell the two apart.
-                role = entry.get("attributionAgent", "") or ""
-                key = (model, role)
-                if key not in session.usage_by_model_role:
-                    session.usage_by_model_role[key] = TokenUsage()
-                session.usage_by_model_role[key] += usage
+            raw_model = msg.get("model", "")
+            model = raw_model if isinstance(raw_model, str) and raw_model else "(unknown)"
+            if model not in session.usage_by_model:
+                session.usage_by_model[model] = TokenUsage()
+            session.usage_by_model[model] += usage
+            raw_role = entry.get("attributionAgent", "")
+            role = raw_role if isinstance(raw_role, str) else ""
+            key = (model, role)
+            if key not in session.usage_by_model_role:
+                session.usage_by_model_role[key] = TokenUsage()
+            session.usage_by_model_role[key] += usage
+            km = (kind, model)
+            if km not in session.usage_by_kind_model:
+                session.usage_by_kind_model[km] = TokenUsage()
+            session.usage_by_kind_model[km] += usage
+            session.calls_by_kind_model[km] = (
+                session.calls_by_kind_model.get(km, 0) + 1)
+            file_models[model] += 1
+        if file_models:
+            # This is a transcript count, not a claim that every file maps to
+            # one top-level Agent spawn.
+            dominant = max(file_models, key=file_models.get)
+            ka = (kind, dominant)
+            session.transcripts_by_kind_model[ka] = (
+                session.transcripts_by_kind_model.get(ka, 0) + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -269,14 +352,23 @@ def _parse_main_transcript(
     spawn_list: list[AgentSpawn] = []
     workflow_list: list[WorkflowRun] = []
     orch_usage = TokenUsage()
+    orch_model_usage: dict[str, TokenUsage] = defaultdict(TokenUsage)
 
     # We also need to pick up Workflow tool results for run_id/transcript_dir.
     # Build a map tool_use_id → WorkflowRun to patch from subsequent user entries.
     pending_wf: dict[str, WorkflowRun] = {}
+    pending_agents: dict[str, AgentSpawn] = {}
+    seen_tool_uses: set[str] = set()
+
+    for _, msg, usage in _assistant_records(entries):
+        orch_usage += usage
+        raw_model = msg.get("model", "")
+        if isinstance(raw_model, str) and raw_model:
+            orch_model_usage[raw_model] += usage
 
     for entry in entries:
         etype = entry.get("type", "")
-        sid = entry.get("sessionId", "") or ""
+        sid = _as_str(entry.get("sessionId", ""))
         if sid and not session_id:
             session_id = sid
         ts = _entry_timestamp(entry)
@@ -285,9 +377,8 @@ def _parse_main_transcript(
 
         if etype == "assistant":
             msg = entry.get("message") or {}
-            usage_raw = msg.get("usage") or {}
-            if usage_raw:
-                orch_usage += _extract_usage(usage_raw)
+            if not isinstance(msg, dict):
+                continue
             content = msg.get("content") or []
             if not isinstance(content, list):
                 continue
@@ -296,26 +387,38 @@ def _parse_main_transcript(
                     continue
                 if item.get("type") != "tool_use":
                     continue
-                tool_name = item.get("name", "")
+                raw_tool_use_id = item.get("id", "")
+                tool_use_id = raw_tool_use_id if isinstance(raw_tool_use_id, str) else ""
+                if tool_use_id:
+                    if tool_use_id in seen_tool_uses:
+                        continue
+                    seen_tool_uses.add(tool_use_id)
+                tool_name = _as_str(item.get("name", ""))
                 inp = item.get("input") or {}
+                if not isinstance(inp, dict):
+                    continue
                 if tool_name == "Agent":
-                    spawn_list.append(AgentSpawn(
+                    spawn = AgentSpawn(
                         session_id=session_id,
                         timestamp=ts,
-                        subagent_type=inp.get("subagent_type", "") or "",
-                        model_hint=inp.get("model", "") or "",
-                        description=inp.get("description", "") or "",
-                    ))
+                        subagent_type=_as_str(inp.get("subagent_type", "")),
+                        model_hint=_as_str(inp.get("model", "")),
+                        description=_as_str(inp.get("description", "")),
+                        tool_use_id=tool_use_id,
+                    )
+                    spawn_list.append(spawn)
+                    if tool_use_id:
+                        pending_agents[tool_use_id] = spawn
                 elif tool_name == "Workflow":
-                    script = inp.get("script", "") or ""
+                    script = _as_str(inp.get("script", ""))
                     wfr = WorkflowRun(
                         session_id=session_id,
                         timestamp=ts,
                         name=_wf_name_from_script(script),
                         run_id="",
                         transcript_dir=None,
+                        tool_use_id=tool_use_id,
                     )
-                    tool_use_id = item.get("id", "")
                     workflow_list.append(wfr)
                     if tool_use_id:
                         pending_wf[tool_use_id] = wfr
@@ -323,6 +426,8 @@ def _parse_main_transcript(
         elif etype == "user":
             # Patch workflow runs from their tool results
             msg = entry.get("message") or {}
+            if not isinstance(msg, dict):
+                continue
             content = msg.get("content") or []
             if not isinstance(content, list):
                 continue
@@ -331,14 +436,20 @@ def _parse_main_transcript(
                     continue
                 if item.get("type") != "tool_result":
                     continue
-                tool_use_id = item.get("tool_use_id", "")
+                tool_use_id = _as_str(item.get("tool_use_id", ""))
+                tur = entry.get("toolUseResult") or {}
+                if not isinstance(tur, dict):
+                    tur = {}
+                if tool_use_id in pending_agents:
+                    agent_id = _as_str(tur.get("agentId", ""))
+                    pending_agents.pop(tool_use_id).agent_id = agent_id
+                    continue
                 if tool_use_id not in pending_wf:
                     continue
                 wfr = pending_wf.pop(tool_use_id)
                 # Try toolUseResult field first
-                tur = entry.get("toolUseResult") or {}
-                run_id = tur.get("runId", "") or ""
-                tdir = tur.get("transcriptDir", "") or ""
+                run_id = _as_str(tur.get("runId", ""))
+                tdir = _as_str(tur.get("transcriptDir", ""))
                 if not run_id:
                     # Fallback: parse plain-text content
                     inner = item.get("content", [])
@@ -346,7 +457,7 @@ def _parse_main_transcript(
                     if isinstance(inner, list):
                         for c in inner:
                             if isinstance(c, dict) and c.get("type") == "text":
-                                text += c.get("text", "")
+                                text += _as_str(c.get("text", ""))
                     elif isinstance(inner, str):
                         text = inner
                     m = re.search(r"Run ID:\s*(\S+)", text)
@@ -360,12 +471,24 @@ def _parse_main_transcript(
                     wfr.transcript_dir = Path(tdir)
 
     timestamps.sort()
-    start_date = _date_str(timestamps[0]) if timestamps else ""
+    start_timestamp = timestamps[0] if timestamps else ""
+    start_date = _date_str(start_timestamp)
+    main_model = ""
+    if orch_model_usage:
+        main_model = max(
+            orch_model_usage,
+            key=lambda model: (
+                orch_model_usage[model].output_tokens,
+                orch_model_usage[model].total,
+                model,
+            ),
+        )
 
     session = SessionData(
         session_id=session_id or jsonl_path.stem,
         start_date=start_date,
-        epoch=_epoch(start_date),
+        epoch=_epoch(start_timestamp),
+        main_model=main_model,
         agent_spawns=spawn_list,
         workflow_runs=workflow_list,
         orch_usage=orch_usage,
@@ -469,6 +592,58 @@ def _tier_for_usage(model: str, attribution_agent: str) -> str:
     return _tier_for_model(model)
 
 
+def _unique_workflow_runs(session: SessionData) -> list[WorkflowRun]:
+    """Collapse resume tool calls that refer to the same workflow run."""
+    runs = session.workflow_runs
+    parents = list(range(len(runs)))
+    identity_owner: dict[str, int] = {}
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for index, run in enumerate(session.workflow_runs):
+        identities: set[str] = set()
+        if run.run_id:
+            identities.add(f"run:{run.run_id}")
+        if run.transcript_dir:
+            identities.add(f"dir:{run.transcript_dir}")
+        if not identities:
+            fallback = run.tool_use_id or str(index)
+            identities.add(f"tool:{fallback}")
+        for identity in identities:
+            owner = identity_owner.get(identity)
+            if owner is None:
+                identity_owner[identity] = index
+            else:
+                union(owner, index)
+
+    grouped: dict[int, list[WorkflowRun]] = defaultdict(list)
+    for index, run in enumerate(runs):
+        grouped[find(index)].append(run)
+
+    unique: list[WorkflowRun] = []
+    for group in grouped.values():
+        unique.append(WorkflowRun(
+            session_id=next((r.session_id for r in group if r.session_id), ""),
+            timestamp=next((r.timestamp for r in group if r.timestamp), ""),
+            name=next((r.name for r in group if r.name), ""),
+            run_id=next((r.run_id for r in group if r.run_id), ""),
+            transcript_dir=next(
+                (r.transcript_dir for r in group if r.transcript_dir), None),
+            tool_use_id=next((r.tool_use_id for r in group if r.tool_use_id), ""),
+        ))
+    return unique
+
+
 # ---------------------------------------------------------------------------
 # Section builders
 # ---------------------------------------------------------------------------
@@ -492,7 +667,8 @@ def _compliance(sessions: list[SessionData]) -> dict:
 
     # Workflow runs per session
     wf_sessions = sum(1 for s in sessions if s.workflow_runs)
-    total_wf = sum(len(s.workflow_runs) for s in sessions)
+    total_wf_calls = sum(len(s.workflow_runs) for s in sessions)
+    total_wf_runs = sum(len(_unique_workflow_runs(s)) for s in sessions)
 
     share = named_count / total_count if total_count else 0.0
 
@@ -503,7 +679,8 @@ def _compliance(sessions: list[SessionData]) -> dict:
         "named_tier_share": round(share, 3),
         "explicit_model_hint_count": sum(by_model.values()),
         "model_hints": dict(sorted(by_model.items())),
-        "workflow_runs": total_wf,
+        "workflow_tool_calls": total_wf_calls,
+        "workflow_runs": total_wf_runs,
         "sessions_with_workflows": wf_sessions,
     }
 
@@ -533,18 +710,15 @@ def _cost(sessions: list[SessionData]) -> dict:
 
     # Workflow token totals from subagent dirs
     for sess in sessions:
-        for wfr in sess.workflow_runs:
+        for wfr in _unique_workflow_runs(sess):
             wf_usage = TokenUsage()
             if wfr.transcript_dir and wfr.transcript_dir.is_dir():
                 for jf in wfr.transcript_dir.rglob("*.jsonl"):
                     if jf.name == "journal.jsonl":
                         continue
                     entries, _ = _safe_read_jsonl(jf)
-                    for entry in entries:
-                        if entry.get("type") != "assistant":
-                            continue
-                        u = entry.get("message", {}).get("usage") or {}
-                        wf_usage += _extract_usage(u)
+                    for _, _, usage in _assistant_records(entries):
+                        wf_usage += usage
             wf_token_totals.append({
                 "session": sess.session_id[:8],
                 "date": sess.start_date,
@@ -581,6 +755,53 @@ def _cost(sessions: list[SessionData]) -> dict:
         },
         "workflow_runs": wf_token_totals,
     }
+
+
+def _by_session_models(sessions: list[SessionData]) -> list[dict]:
+    """Per-session subagent model usage, split workflow vs agent-tool.
+
+    The global by_model rollup can't distinguish 'healthy tiering everywhere'
+    from 'one session ran everything on the session model' — this view can.
+    same_model_output_share compares actual subagent model IDs with the
+    dominant model in the main transcript. It is evidence of model matching,
+    not proof that a spawn inherited rather than explicitly selected a model.
+    """
+    rows: list[dict] = []
+    for sess in sessions:
+        if not sess.usage_by_kind_model:
+            continue
+        breakdown = []
+        for (kind, model), usage in sorted(sess.usage_by_kind_model.items()):
+            breakdown.append({
+                "kind": kind,
+                "model": model,
+                "transcripts": sess.transcripts_by_kind_model.get((kind, model), 0),
+                "api_calls": sess.calls_by_kind_model.get((kind, model), 0),
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+            })
+        total_out = sum(b["output_tokens"] for b in breakdown)
+        same_model_out = sum(
+            b["output_tokens"] for b in breakdown
+            if sess.main_model and b["model"] == sess.main_model
+        )
+        known_out = sum(
+            b["output_tokens"] for b in breakdown if b["model"] != "(unknown)"
+        )
+        share = same_model_out / total_out if total_out and sess.main_model else None
+        rows.append({
+            "session": sess.session_id,
+            "date": sess.start_date,
+            "epoch": sess.epoch,
+            "main_model": sess.main_model or None,
+            "breakdown": breakdown,
+            "same_model_output_share": round(share, 3) if share is not None else None,
+            "same_model_warning": bool(
+                total_out and sess.main_model and same_model_out * 2 > total_out),
+            "model_metadata_coverage": (
+                round(known_out / total_out, 3) if total_out else None),
+        })
+    return sorted(rows, key=lambda row: (row["date"], row["session"]))
 
 
 def _quality(sessions: list[SessionData]) -> dict:
@@ -641,7 +862,7 @@ def _baseline_split(sessions: list[SessionData]) -> dict:
             for sp in s.agent_spawns
             if _classify_spawn_type(sp) in NAMED_TIERS
         )
-        wf = sum(len(s.workflow_runs) for s in group)
+        wf = sum(len(_unique_workflow_runs(s)) for s in group)
         reviewer = sum(
             1 for s in group
             for sp in s.agent_spawns
@@ -689,6 +910,7 @@ def render_text(
     since: date | None,
     until: date | None,
     baseline_mode: bool,
+    by_session_mode: bool = False,
 ) -> str:
     lines: list[str] = []
     add = lines.append
@@ -731,8 +953,11 @@ def render_text(
         for m, cnt in sorted(comp["model_hints"].items(), key=lambda kv: -kv[1]):
             add(f"  {m:<40}  {cnt}")
     add("")
-    add(f"Workflow tool calls:    {_fmt_int(comp['workflow_runs'])}  "
+    add(f"Workflow tool calls:    {_fmt_int(comp['workflow_tool_calls'])}  "
         f"(in {comp['sessions_with_workflows']} session(s))")
+    if comp["workflow_runs"] != comp["workflow_tool_calls"]:
+        add(f"Unique workflow runs:  {_fmt_int(comp['workflow_runs'])}  "
+            "(resume calls collapsed by run ID)")
     add("")
 
     # --- COST ---
@@ -771,6 +996,28 @@ def render_text(
             add(f"  [{wf['date']}] {wf['name']:<32}  "
                 f"{_fmt_int(wf['total']):>8} tok{budget_note}")
         add("")
+
+    # --- PER-SESSION SUBAGENT MODELS ---
+    if by_session_mode:
+        add("-- 2b. PER-SESSION SUBAGENT MODELS " + "-" * 37)
+        add("")
+        add("  (! marks sessions where >50% of subagent output tokens used the")
+        add("   dominant main-session model. A model match is not proof that the")
+        add("   spawn inherited rather than explicitly selected that model.)")
+        add("")
+        for row in _by_session_models(sessions):
+            share = row["same_model_output_share"]
+            flag = "  ! SAME MODEL" if row["same_model_warning"] else ""
+            add(f"  [{row['date']}] {row['session'][:8]}  "
+                f"(epoch: {row['epoch']}, "
+                f"main model: {row['main_model'] or 'unknown'}, "
+                f"same-model share: {_pct(share)}, "
+                f"model coverage: {_pct(row['model_metadata_coverage'])}){flag}")
+            for b in row["breakdown"]:
+                add(f"    {b['kind']:<10}  {b['model']:<38}  "
+                    f"{b['transcripts']:>3} files  {_fmt_int(b['api_calls']):>6} calls  "
+                    f"{_fmt_int(b['output_tokens']):>10} out-tok")
+            add("")
 
     # --- QUALITY ---
     qual = _quality(sessions)
@@ -851,8 +1098,9 @@ def render_text(
     add("    cost by PR count, not absolute tokens.")
     add("")
     add("  Data gaps: model hints are often absent from Agent calls (the")
-    add("  subagent's actual model is in attributionAgent/model in its own")
-    add("  transcript). Token counts exclude cache write/read overhead.")
+    add("  subagent's actual model is in message.model in its own transcript;")
+    add("  attributionAgent separately records its declared role. The")
+    add("  token counts exclude cache write/read overhead.")
     add("")
     add("=" * 72)
     return "\n".join(lines)
@@ -874,6 +1122,7 @@ def render_json(
 
     out = {
         "meta": {
+            "schema_version": 2,
             "sessions_analysed": len(sessions),
             "policy_date": str(POLICY_DATE),
             "since": str(since) if since else None,
@@ -881,6 +1130,7 @@ def render_json(
         },
         "compliance": _compliance(sessions),
         "cost": _cost(sessions),
+        "by_session_models": _by_session_models(sessions),
         "quality": _quality(sessions),
         "baseline": _baseline_split(sessions),
         "parse_errors": all_errors[:100],
@@ -903,9 +1153,11 @@ def main() -> None:
     # Ensure UTF-8 output on Windows (default console is cp1252)
     if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
         import io
-        sys.stdout = io.TextIOWrapper(
-            sys.stdout.buffer, encoding="utf-8", errors="replace"
-        )
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is not None:
+            sys.stdout = io.TextIOWrapper(
+                buffer, encoding="utf-8", errors="replace", newline="\n"
+            )
 
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -937,6 +1189,12 @@ def main() -> None:
         help="Show full session list split by pre/post policy date",
     )
     parser.add_argument(
+        "--by-session",
+        action="store_true",
+        help="Show per-session subagent model breakdown "
+             "(workflow vs agent-tool), flagging main-model matches",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output machine-readable JSON instead of text",
@@ -953,7 +1211,8 @@ def main() -> None:
     if args.json:
         print(render_json(sessions, errors, args.since, args.until))
     else:
-        print(render_text(sessions, errors, args.since, args.until, args.baseline))
+        print(render_text(sessions, errors, args.since, args.until,
+                          args.baseline, args.by_session))
 
 
 if __name__ == "__main__":
