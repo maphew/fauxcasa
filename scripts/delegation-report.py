@@ -251,14 +251,21 @@ def _assistant_records(entries: list[dict]) -> list[tuple[dict, dict, TokenUsage
     return [records[key] for key in order]
 
 
-def _wf_name_from_script(script: str) -> str:
+def _as_str(value: Any) -> str:
+    """Return transcript metadata only when it is actually a string."""
+    return value if isinstance(value, str) else ""
+
+
+def _wf_name_from_script(script: Any) -> str:
     """Try to extract the workflow name from a JS meta block."""
+    if not isinstance(script, str):
+        return ""
     m = re.search(r"name\s*:\s*['\"]([^'\"]+)['\"]", script)
     return m.group(1) if m else ""
 
 
 def _entry_timestamp(entry: dict) -> str:
-    return entry.get("timestamp", "") or ""
+    return _as_str(entry.get("timestamp", ""))
 
 
 def _date_str(ts: str) -> str:
@@ -361,7 +368,7 @@ def _parse_main_transcript(
 
     for entry in entries:
         etype = entry.get("type", "")
-        sid = entry.get("sessionId", "") or ""
+        sid = _as_str(entry.get("sessionId", ""))
         if sid and not session_id:
             session_id = sid
         ts = _entry_timestamp(entry)
@@ -386,7 +393,7 @@ def _parse_main_transcript(
                     if tool_use_id in seen_tool_uses:
                         continue
                     seen_tool_uses.add(tool_use_id)
-                tool_name = item.get("name", "")
+                tool_name = _as_str(item.get("name", ""))
                 inp = item.get("input") or {}
                 if not isinstance(inp, dict):
                     continue
@@ -394,16 +401,16 @@ def _parse_main_transcript(
                     spawn = AgentSpawn(
                         session_id=session_id,
                         timestamp=ts,
-                        subagent_type=inp.get("subagent_type", "") or "",
-                        model_hint=inp.get("model", "") or "",
-                        description=inp.get("description", "") or "",
+                        subagent_type=_as_str(inp.get("subagent_type", "")),
+                        model_hint=_as_str(inp.get("model", "")),
+                        description=_as_str(inp.get("description", "")),
                         tool_use_id=tool_use_id,
                     )
                     spawn_list.append(spawn)
                     if tool_use_id:
                         pending_agents[tool_use_id] = spawn
                 elif tool_name == "Workflow":
-                    script = inp.get("script", "") or ""
+                    script = _as_str(inp.get("script", ""))
                     wfr = WorkflowRun(
                         session_id=session_id,
                         timestamp=ts,
@@ -429,21 +436,20 @@ def _parse_main_transcript(
                     continue
                 if item.get("type") != "tool_result":
                     continue
-                tool_use_id = item.get("tool_use_id", "")
+                tool_use_id = _as_str(item.get("tool_use_id", ""))
                 tur = entry.get("toolUseResult") or {}
                 if not isinstance(tur, dict):
                     tur = {}
                 if tool_use_id in pending_agents:
-                    agent_id = tur.get("agentId", "") or ""
-                    if isinstance(agent_id, str):
-                        pending_agents.pop(tool_use_id).agent_id = agent_id
+                    agent_id = _as_str(tur.get("agentId", ""))
+                    pending_agents.pop(tool_use_id).agent_id = agent_id
                     continue
                 if tool_use_id not in pending_wf:
                     continue
                 wfr = pending_wf.pop(tool_use_id)
                 # Try toolUseResult field first
-                run_id = tur.get("runId", "") or ""
-                tdir = tur.get("transcriptDir", "") or ""
+                run_id = _as_str(tur.get("runId", ""))
+                tdir = _as_str(tur.get("transcriptDir", ""))
                 if not run_id:
                     # Fallback: parse plain-text content
                     inner = item.get("content", [])
@@ -451,7 +457,7 @@ def _parse_main_transcript(
                     if isinstance(inner, list):
                         for c in inner:
                             if isinstance(c, dict) and c.get("type") == "text":
-                                text += c.get("text", "")
+                                text += _as_str(c.get("text", ""))
                     elif isinstance(inner, str):
                         text = inner
                     m = re.search(r"Run ID:\s*(\S+)", text)
@@ -588,25 +594,35 @@ def _tier_for_usage(model: str, attribution_agent: str) -> str:
 
 def _unique_workflow_runs(session: SessionData) -> list[WorkflowRun]:
     """Collapse resume tool calls that refer to the same workflow run."""
-    unique: dict[str, WorkflowRun] = {}
+    unique: list[tuple[WorkflowRun, set[str]]] = []
     for index, run in enumerate(session.workflow_runs):
+        identities: set[str] = set()
         if run.run_id:
-            key = f"run:{run.run_id}"
-        elif run.transcript_dir:
-            key = f"dir:{run.transcript_dir}"
-        elif run.tool_use_id:
-            key = f"tool:{run.tool_use_id}"
-        else:
-            key = f"row:{index}"
-        existing = unique.get(key)
-        if existing is None:
-            unique[key] = run
-        else:
-            if not existing.name and run.name:
-                existing.name = run.name
-            if not existing.transcript_dir and run.transcript_dir:
-                existing.transcript_dir = run.transcript_dir
-    return list(unique.values())
+            identities.add(f"run:{run.run_id}")
+        if run.transcript_dir:
+            identities.add(f"dir:{run.transcript_dir}")
+        if not identities:
+            fallback = run.tool_use_id or str(index)
+            identities.add(f"tool:{fallback}")
+
+        match = next(
+            ((existing, known) for existing, known in unique
+             if identities & known),
+            None,
+        )
+        if match is None:
+            unique.append((run, identities))
+            continue
+
+        existing, known = match
+        known.update(identities)
+        if not existing.name and run.name:
+            existing.name = run.name
+        if not existing.run_id and run.run_id:
+            existing.run_id = run.run_id
+        if not existing.transcript_dir and run.transcript_dir:
+            existing.transcript_dir = run.transcript_dir
+    return [run for run, _ in unique]
 
 
 # ---------------------------------------------------------------------------

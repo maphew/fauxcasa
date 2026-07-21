@@ -139,6 +139,20 @@ def test_workflow_resumes_count_as_one_run() -> None:
     assert report._compliance([session])["workflow_runs"] == 1
 
 
+def test_partial_workflow_resume_matches_by_transcript_dir() -> None:
+    transcript_dir = Path("same")
+    session = report.SessionData(session_id="s", start_date="", epoch="unknown")
+    session.workflow_runs = [
+        report.WorkflowRun("s", "", "first", "", transcript_dir, "tool-1"),
+        report.WorkflowRun("s", "", "", "wf-1", transcript_dir, "tool-2"),
+    ]
+
+    runs = report._unique_workflow_runs(session)
+
+    assert len(runs) == 1
+    assert runs[0].run_id == "wf-1"
+
+
 @pytest.mark.parametrize(
     ("timestamp", "expected"),
     [
@@ -166,6 +180,30 @@ def test_malformed_records_do_not_discard_session(tmp_path: Path) -> None:
     assert len(sessions) == 1
     assert sessions[0].orch_usage.total == 0
     assert any("expected object" in warning for warning in sessions[0].parse_errors)
+
+
+def test_scalar_metadata_does_not_discard_session(tmp_path: Path) -> None:
+    malformed = _assistant(
+        "main",
+        "claude-fable-5",
+        5,
+        content=[
+            {"type": "tool_use", "id": "agent", "name": "Agent", "input": {
+                "subagent_type": 7, "description": 8}},
+            {"type": "tool_use", "id": "workflow", "name": "Workflow", "input": {
+                "script": 9}},
+        ],
+    )
+    malformed["timestamp"] = 7
+    _write_jsonl(tmp_path / "session.jsonl", [malformed])
+
+    sessions, errors = report.collect_sessions(tmp_path)
+
+    assert not errors
+    assert len(sessions) == 1
+    assert sessions[0].start_date == ""
+    assert sessions[0].agent_spawns[0].subagent_type == ""
+    assert sessions[0].workflow_runs[0].name == ""
 
 
 if __name__ == "__main__":
