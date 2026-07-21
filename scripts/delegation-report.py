@@ -594,7 +594,22 @@ def _tier_for_usage(model: str, attribution_agent: str) -> str:
 
 def _unique_workflow_runs(session: SessionData) -> list[WorkflowRun]:
     """Collapse resume tool calls that refer to the same workflow run."""
-    unique: list[tuple[WorkflowRun, set[str]]] = []
+    runs = session.workflow_runs
+    parents = list(range(len(runs)))
+    identity_owner: dict[str, int] = {}
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
     for index, run in enumerate(session.workflow_runs):
         identities: set[str] = set()
         if run.run_id:
@@ -604,25 +619,29 @@ def _unique_workflow_runs(session: SessionData) -> list[WorkflowRun]:
         if not identities:
             fallback = run.tool_use_id or str(index)
             identities.add(f"tool:{fallback}")
+        for identity in identities:
+            owner = identity_owner.get(identity)
+            if owner is None:
+                identity_owner[identity] = index
+            else:
+                union(owner, index)
 
-        match = next(
-            ((existing, known) for existing, known in unique
-             if identities & known),
-            None,
-        )
-        if match is None:
-            unique.append((run, identities))
-            continue
+    grouped: dict[int, list[WorkflowRun]] = defaultdict(list)
+    for index, run in enumerate(runs):
+        grouped[find(index)].append(run)
 
-        existing, known = match
-        known.update(identities)
-        if not existing.name and run.name:
-            existing.name = run.name
-        if not existing.run_id and run.run_id:
-            existing.run_id = run.run_id
-        if not existing.transcript_dir and run.transcript_dir:
-            existing.transcript_dir = run.transcript_dir
-    return [run for run, _ in unique]
+    unique: list[WorkflowRun] = []
+    for group in grouped.values():
+        unique.append(WorkflowRun(
+            session_id=next((r.session_id for r in group if r.session_id), ""),
+            timestamp=next((r.timestamp for r in group if r.timestamp), ""),
+            name=next((r.name for r in group if r.name), ""),
+            run_id=next((r.run_id for r in group if r.run_id), ""),
+            transcript_dir=next(
+                (r.transcript_dir for r in group if r.transcript_dir), None),
+            tool_use_id=next((r.tool_use_id for r in group if r.tool_use_id), ""),
+        ))
+    return unique
 
 
 # ---------------------------------------------------------------------------

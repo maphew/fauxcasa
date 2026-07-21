@@ -153,6 +153,24 @@ def test_partial_workflow_resume_matches_by_transcript_dir() -> None:
     assert runs[0].run_id == "wf-1"
 
 
+def test_workflow_identity_bridge_is_transitive_and_non_mutating() -> None:
+    transcript_dir = Path("same")
+    session = report.SessionData(session_id="s", start_date="", epoch="unknown")
+    session.workflow_runs = [
+        report.WorkflowRun("s", "", "first", "wf-1", None, "tool-1"),
+        report.WorkflowRun("s", "", "", "", transcript_dir, "tool-2"),
+        report.WorkflowRun("s", "", "", "wf-1", transcript_dir, "tool-3"),
+    ]
+
+    first = report._unique_workflow_runs(session)
+    second = report._unique_workflow_runs(session)
+
+    assert len(first) == len(second) == 1
+    assert first[0].run_id == "wf-1"
+    assert first[0].transcript_dir == transcript_dir
+    assert session.workflow_runs[0].transcript_dir is None
+
+
 @pytest.mark.parametrize(
     ("timestamp", "expected"),
     [
