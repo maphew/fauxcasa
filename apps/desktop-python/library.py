@@ -24,6 +24,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+import volumes
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -50,6 +52,7 @@ class LibraryRoot:
     path: Path
     volume_uuid: str | None = None   # populated by bead .f, carried now
     vol_rel: str | None = None
+    home_rel: str | None = None      # root relative to library-home, if any
     label: str = ""                  # default label: path.name
 
 
@@ -106,13 +109,12 @@ def library_json_path(home: Path) -> Path:
 
 
 def root_is_online(root: LibraryRoot) -> bool:
-    """Offline detection (design §8, bead .e): a root is offline when its
-    resolved path is not a directory. A simple existence/is_dir check
-    only — volume-UUID-based remount recognition (a root that comes back
-    at a different drive letter) is bead .f, deferred past M1 (design §13
-    item 3: until then a removable-drive letter change reads as offline,
-    not data loss, since offline roots' catalog entries are never touched
-    — see reconcile's per-online-root loop).
+    """Return whether the resolved path is a trustworthy online root.
+
+    A root with no durable UUID degrades to the ordinary directory check.
+    When a UUID is stored, a missing or mismatched platform probe is treated
+    conservatively as offline so a reused drive letter cannot bind unrelated
+    files into the library.
 
     `LibraryRoot.path` is stored UNVERBATIM/unresolved (last-known-path
     semantics, load_library's docstring) — resolve() here before the
@@ -121,9 +123,145 @@ def root_is_online(root: LibraryRoot) -> bool:
     during resolution (e.g. a broken junction) reads as offline, fail-soft
     like every other offline-detection path in this module."""
     try:
-        return Path(root.path).resolve().is_dir()
-    except OSError:
+        path = Path(root.path).resolve()
+        if not path.is_dir():
+            return False
+        if root.volume_uuid is None:
+            return True
+        observed = volumes.volume_uuid_for(path)
+        return observed is not None and _uuid_equal(observed, root.volume_uuid)
+    except (OSError, RuntimeError):
         return False
+
+
+def _existing_dir(path: Path) -> Path | None:
+    """Resolve *path* to an existing directory, fail-soft."""
+    try:
+        resolved = Path(path).resolve(strict=True)
+        return resolved if resolved.is_dir() else None
+    except (OSError, RuntimeError):
+        return None
+
+
+def _uuid_equal(left: str, right: str) -> bool:
+    # Windows volume GUIDs are case-insensitive and callers may retain or
+    # omit their trailing slash. Linux/macOS UUID spellings are safe under
+    # the same normalization.
+    return left.rstrip("\\/").casefold() == right.rstrip("\\/").casefold()
+
+
+def _safe_relative(value: str | None) -> Path | None:
+    """Return a confined relative path, rejecting absolute/escaping input."""
+    if value is None:
+        return None
+    candidate = Path(value)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    return candidate
+
+
+def _home_relative(path: Path, home: Path | None) -> str | None:
+    if home is None:
+        return None
+    try:
+        return path.resolve().relative_to(home.resolve()).as_posix() or "."
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _capture_volume_binding(path: Path) -> tuple[str | None, str | None]:
+    """Capture UUID plus volume-relative path without making either required."""
+    volume_uuid = volumes.volume_uuid_for(path)
+    if volume_uuid is None:
+        return None, None
+    mount = volumes.mount_for_uuid(volume_uuid)
+    if mount is None:
+        return volume_uuid, None
+    try:
+        rel = path.resolve().relative_to(mount.resolve()).as_posix() or "."
+    except (OSError, RuntimeError, ValueError):
+        return volume_uuid, None
+    return volume_uuid, rel
+
+
+def _roots_overlap(roots: list[LibraryRoot]) -> bool:
+    try:
+        resolved = [root.path.resolve() for root in roots]
+    except (OSError, RuntimeError):
+        return True
+    for i, left in enumerate(resolved):
+        for right in resolved[i + 1:]:
+            if (left == right or left.is_relative_to(right)
+                    or right.is_relative_to(left)):
+                return True
+    return False
+
+
+def bind_root_location(root: LibraryRoot, home: Path) -> Path | None:
+    """Resolve one root by last-known path, home-relative path, then UUID.
+
+    The returned path is also assigned to ``root.path`` when a fallback
+    succeeds.  The caller owns persistence so several roots can self-heal in
+    one atomic ``library.json`` write.
+    """
+    current = _existing_dir(root.path)
+    if current is not None:
+        if root.volume_uuid is None:
+            return current
+        observed = volumes.volume_uuid_for(current)
+        if observed is not None and _uuid_equal(observed, root.volume_uuid):
+            return current
+
+    home_rel = _safe_relative(root.home_rel)
+    if home_rel is not None:
+        candidate = _existing_dir(home / home_rel)
+        if candidate is not None:
+            root.path = candidate
+            # home_rel intentionally outranks UUID: a whole-library copy is a
+            # valid move even when it lands on a different volume/platform.
+            root.volume_uuid, root.vol_rel = _capture_volume_binding(candidate)
+            return candidate
+
+    vol_rel = _safe_relative(root.vol_rel)
+    if root.volume_uuid is not None and vol_rel is not None:
+        mount = volumes.mount_for_uuid(root.volume_uuid)
+        if mount is not None:
+            candidate = _existing_dir(mount / vol_rel)
+            if candidate is not None:
+                root.path = candidate
+                return candidate
+    return None
+
+
+def resolve_root_locations(cfg: LibraryConfig, *, persist: bool = True) -> bool:
+    """Resolve all explicit roots and self-heal changed last-known paths.
+
+    Returns ``True`` when one or more paths changed.  Probe and persistence
+    failures are intentionally non-fatal: unresolved roots remain offline,
+    while a read-only library-home can still be opened for browsing.
+    """
+    if cfg.is_legacy:
+        return False
+    before = [(root.path, root.volume_uuid, root.vol_rel)
+              for root in cfg.roots]
+    assert cfg.home is not None
+    for root in cfg.roots:
+        bind_root_location(root, cfg.home)
+    # A stale/corrupt pair of UUID bindings must never resolve two roots onto
+    # overlapping trees. Revert every fallback so those roots remain offline.
+    if _roots_overlap(cfg.roots):
+        for root, old in zip(cfg.roots, before):
+            root.path, root.volume_uuid, root.vol_rel = old
+        return False
+    changed = any(
+        (root.path, root.volume_uuid, root.vol_rel) != old
+        for root, old in zip(cfg.roots, before))
+    if changed and persist:
+        try:
+            save_library(cfg)
+        except OSError:
+            pass
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +277,7 @@ def load_library(home: Path) -> LibraryConfig | None:
     of another — are rejected here because they would double-count files and
     break the walk parity invariant (design §4). Stored paths are kept
     verbatim (Path(s), NO resolve) — last-known-path semantics; resolution
-    chain is bead .f."""
+    chain resolves those signals immediately after structural validation."""
     p = library_json_path(home)
     try:
         text = p.read_text(encoding="utf-8")
@@ -177,6 +315,15 @@ def load_library(home: Path) -> LibraryConfig | None:
         rpath_raw = r.get("path")
         if not rpath_raw or not isinstance(rpath_raw, str):
             return None
+        for optional in ("volume_uuid", "vol_rel", "home_rel", "label"):
+            value = r.get(optional)
+            if value is not None and not isinstance(value, str):
+                return None
+        if _safe_relative(r.get("vol_rel")) is None and r.get("vol_rel") is not None:
+            return None
+        if (_safe_relative(r.get("home_rel")) is None
+                and r.get("home_rel") is not None):
+            return None
         if rid in seen_ids:
             return None  # duplicate ids
         seen_ids.add(rid)
@@ -185,26 +332,24 @@ def load_library(home: Path) -> LibraryConfig | None:
             path=Path(rpath_raw),          # verbatim, no resolve
             volume_uuid=r.get("volume_uuid"),
             vol_rel=r.get("vol_rel"),
+            home_rel=r.get("home_rel"),
             label=r.get("label") or "",
         ))
 
     # Nested-root check: resolve before comparing so symlinks and relative
     # paths don't fool the test. Reject if any two roots are equal or
     # one contains the other.
-    resolved = [r.path.resolve() for r in roots]
-    for i, ri in enumerate(resolved):
-        for j, rj in enumerate(resolved):
-            if i == j:
-                continue
-            if ri == rj or ri.is_relative_to(rj) or rj.is_relative_to(ri):
-                return None  # nested or duplicate roots
+    if _roots_overlap(roots):
+        return None
 
-    return LibraryConfig(
+    cfg = LibraryConfig(
         library_id=library_id,
         name=data.get("name") or "",
         roots=roots,
         home=Path(home),
     )
+    resolve_root_locations(cfg)
+    return cfg
 
 
 def save_library(cfg: LibraryConfig) -> None:
@@ -224,6 +369,8 @@ def save_library(cfg: LibraryConfig) -> None:
                 "path": r.path.as_posix(),
                 "volume_uuid": r.volume_uuid,
                 "vol_rel": r.vol_rel,
+                "home_rel": (r.home_rel if r.home_rel is not None
+                             else _home_relative(r.path, cfg.home)),
                 "label": r.label,
             }
             for r in cfg.roots
@@ -307,9 +454,13 @@ def add_root(cfg: LibraryConfig,
     while rid in existing_ids:
         rid = mint_root_id()
 
+    volume_uuid, vol_rel = _capture_volume_binding(new)
     new_root = LibraryRoot(
         id=rid,
-        path=Path(path),
+        path=new,
+        volume_uuid=volume_uuid,
+        vol_rel=vol_rel,
+        home_rel=_home_relative(new, cfg.home),
         label=label or Path(path).name,
     )
     cfg.roots.append(new_root)
@@ -511,9 +662,8 @@ def promote_library(root: Path, *, cache_root: Path,
     `home` defaults to INSIDE `root` (<root>/.fauxcasa/library.json,
     design §2's default location rule); pass an explicit `home` OUTSIDE
     `root` when `root` itself is read-only (the first-class
-    read-only-NAS-root case). `volume_uuid` is left None — capturing it is
-    bead .f (volumes.py does not exist yet); the resolution chain (design
-    §8) tolerates a null UUID by design, so this is a safe deferral.
+    read-only-NAS-root case). Volume identity is captured when the platform
+    can supply it and otherwise remains null by design.
 
     On ANY failure, rolls back everything attempted so far (see
     _promote_rollback) and RE-RAISES the original exception — the caller
@@ -548,7 +698,10 @@ def promote_library(root: Path, *, cache_root: Path,
     cache_dir_renamed = False
 
     try:
-        new_root = LibraryRoot(id=root_id, path=root, label=label)
+        volume_uuid, vol_rel = _capture_volume_binding(root)
+        new_root = LibraryRoot(
+            id=root_id, path=root, volume_uuid=volume_uuid, vol_rel=vol_rel,
+            home_rel=_home_relative(root, home), label=label)
         cfg = LibraryConfig(library_id=library_id, name=label,
                             roots=[new_root], home=home)
         save_library(cfg)
