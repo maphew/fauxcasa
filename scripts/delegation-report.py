@@ -568,7 +568,7 @@ def _tier_for_model(model: str) -> str:
     return "other"
 
 
-def _tier_for_usage(model: str, attribution_agent: str) -> str:
+def _tier_for_usage(model: str, attribution_agent: str | None) -> str:
     """Classify one (model, attributionAgent) usage bucket for the cost-
     by-tier rollup (fauxcasa-7aj.3 nit): prefer the harness's DECLARED role
     over guessing from the model name. The same model backs both a genuine
@@ -579,14 +579,12 @@ def _tier_for_usage(model: str, attribution_agent: str) -> str:
     design/judge/verify stages — opus because the ORCHESTRATING session is
     on a smart model, not because the step is doing reviewer work).
     _tier_for_model alone conflated these: every opus usage record landed
-    in 'reviewer' regardless of role. Here, a NAMED_TIERS attributionAgent
-    wins outright; anything else keeps its own role label (so
-    'general-purpose'/'workflow-subagent' surface honestly instead of
-    being folded into 'reviewer'); only a genuinely absent attributionAgent
-    falls back to the model-prefix guess."""
+    in 'reviewer' regardless of role. Here, any nonempty attributionAgent
+    wins outright, including the named tiers; arbitrary roles such as
+    'general-purpose'/'workflow-subagent' surface honestly instead of being
+    folded into 'reviewer'. Only a genuinely absent attributionAgent falls
+    back to the model-prefix guess."""
     aa = (attribution_agent or "").lower().strip()
-    if aa in NAMED_TIERS:
-        return aa
     if aa:
         return aa
     return _tier_for_model(model)
@@ -967,7 +965,7 @@ def render_text(
     ot = cost["orchestrator_tokens"]
     st = cost["subagent_tokens"]
     grand = ot["total"] + st["total"]
-    add(f"Token totals (input + output, no cache):")
+    add("Token totals (input + output, no cache):")
     add(f"  Orchestrator (main session):  {_fmt_int(ot['total']):>12}  "
         f"({_fmt_int(ot['input'])} in, {_fmt_int(ot['output'])} out)")
     add(f"  Subagents (all):              {_fmt_int(st['total']):>12}  "
