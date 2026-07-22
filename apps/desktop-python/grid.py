@@ -55,6 +55,63 @@ WORKERS = 4
 # way out they outlive the widget as immortal daemons that accumulate across
 # a process and race the main thread on Qt state during teardown.
 _STOP = object()
+
+
+def folder_key(catalog: Catalog, root_id: str, rel: str) -> str:
+    """Root-qualified folder identity, with exact one-root passthrough.
+
+    Catalog persistence uses the same absent-means-first-root convention:
+    roots[0] keeps the historical bare rel, later roots use
+    ``<root_id>/<rel>``.  Keeping this helper on the UI side prevents two
+    roots' same-named folders from sharing a grid group, sort mode, or
+    sidebar target while leaving every legacy/single-root key unchanged.
+    """
+    roots = catalog.roots
+    if len(roots) <= 1 or (roots and root_id == roots[0].id):
+        return rel
+    return f"{root_id}/{rel}" if rel else root_id
+
+
+class CompositeThumbCache:
+    """Catalog-index facade over N independent per-root fcaches.
+
+    Existing consumers intentionally keep the small ``ThumbCache`` duck type
+    (``count``, ``best_level()``, ``entry()``, ``path``). ``entry`` maps a
+    global catalog index to the owning root's local cache index and records
+    that cache path thread-locally; the immediately following read therefore
+    opens the matching per-root file even in the grid's worker pool.
+    """
+
+    def __init__(self, catalog: Catalog, caches: dict[str, ThumbCache]):
+        self._caches = dict(caches)
+        next_local = {root_id: 0 for root_id in caches}
+        self._entries: list[tuple[ThumbCache, int]] = []
+        for photo in catalog.photos:
+            cache = self._caches[photo.root_id]
+            local = next_local[photo.root_id]
+            next_local[photo.root_id] = local + 1
+            self._entries.append((cache, local))
+        self.count = len(self._entries)
+        self.files = [p.rel for p in catalog.photos]
+        self._thread = threading.local()
+
+    def best_level(self, edge: int) -> int:
+        # All per-root files are produced with the same configured levels.
+        # Choosing from the first keeps the legacy ThumbCache contract; entry
+        # still lets an older root cache fall back through its own API.
+        return next(iter(self._caches.values())).best_level(edge)
+
+    def entry(self, idx: int, level: int | None = None):
+        cache, local = self._entries[idx]
+        self._thread.path = cache.path
+        return cache.entry(local, level)
+
+    @property
+    def path(self):
+        path = getattr(self._thread, "path", None)
+        if path is not None:
+            return path
+        return next(iter(self._caches.values())).path
 # Decoded-tile RAM bound. The real cost is BYTES, not entries. Tiles are
 # kept at native cache resolution (~256 px, TILE_NATIVE) and SCALED IN
 # PAINT to the current zoom, so ONE decode serves every zoom level — zoom
@@ -455,7 +512,8 @@ class GridView(QAbstractScrollArea):
         self.filter_label = label
         by_folder: dict[str, _Group] = {}
         for i in indices:
-            f = cat.photos[i].folder
+            photo = cat.photos[i]
+            f = folder_key(cat, photo.root_id, photo.folder)
             g = by_folder.get(f)
             if g is None:
                 title = cat.folders[f].title if f in cat.folders else f
@@ -604,6 +662,7 @@ class GridView(QAbstractScrollArea):
         silently evaporates."""
         fd = -1
         fd_thumbs = None  # the ThumbCache OBJECT the fd was opened for
+        fd_path = None    # composite caches select a per-root path per entry
         while True:
             job = self.jobs.get()
             if job is _STOP:
@@ -618,27 +677,30 @@ class GridView(QAbstractScrollArea):
                 continue  # scrolled away; re-requested if it comes back
             img = None
             try:  # noqa: the worker must outlive ANY per-job failure
-                # Reopen when the cache OBJECT changes, not just its path:
+                native = self._tile_native
+                offset, length, _w, _h = thumbs.entry(
+                    idx, thumbs.best_level(native))
+                source_path = thumbs.path
+                # Reopen when the cache OBJECT or selected root path changes:
                 # a reconcile rebuild replaces the fcache at the same path
                 # (new inode), so a path compare would keep reading the old
                 # unlinked file with the new file's offsets.
-                if thumbs is not fd_thumbs:
+                if thumbs is not fd_thumbs or source_path != fd_path:
                     if fd >= 0:
                         os.close(fd)
-                    fd, fd_thumbs = -1, None
+                    fd, fd_thumbs, fd_path = -1, None, None
                     # O_BINARY (Windows) keeps text-mode translation from
                     # corrupting JPEG bytes; it is 0/absent on POSIX, so the
                     # getattr keeps this portable (fauxcasa-uix).
                     fd = os.open(
-                        thumbs.path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                        source_path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
                     )
                     fd_thumbs = thumbs
+                    fd_path = source_path
                 # fcache v2 hi-DPI consumer (fauxcasa-q7m): read the cheapest
                 # level that covers the DPR-scaled native edge. v1 / d==1 ->
                 # the 256 level the grid always read (no-op); a hi-DPI display
                 # reads the 512 v2 level, or the largest level a v1 cache has.
-                native = self._tile_native
-                offset, length, _w, _h = thumbs.entry(idx, thumbs.best_level(native))
                 if length > 0:
                     # os.pread is Unix-only (it raises AttributeError on
                     # Windows, which the broad except below would turn into an

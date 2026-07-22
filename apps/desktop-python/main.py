@@ -98,7 +98,13 @@ from filetypes import (  # noqa: E402
     load_excluded_exts,
     save_excluded_exts,
 )
-from grid import DEFAULT_SORT_MODE, SORT_MODES, GridView  # noqa: E402
+from grid import (  # noqa: E402
+    DEFAULT_SORT_MODE,
+    SORT_MODES,
+    CompositeThumbCache,
+    GridView,
+    folder_key,
+)
 import keymap  # noqa: E402
 import library  # noqa: E402
 from thumbcache import (  # noqa: E402
@@ -108,6 +114,7 @@ from thumbcache import (  # noqa: E402
     bind,
     build_cache,
     cache_dir_for,
+    fcache_name,
     load_cache,
 )
 from peek import PeekPage  # noqa: E402
@@ -745,6 +752,75 @@ def _offline_root_labels(catalog: Catalog) -> list[str]:
             for r in catalog.offline_roots()]
 
 
+def _scan_library_config(
+        cfg, scan_filter: ScanFilter | None,
+        contacts: dict[str, str], pal_dir: Path | None,
+        exts, db3_dir: Path | None) -> Catalog:
+    """Compose the frozen single-root ingest over manifest-ordered roots.
+
+    Every root's photos stay a contiguous slice. Folder keys use the same
+    absent-means-first convention as catalog persistence, while album member
+    indices are shifted by that slice's global offset. Duplicate album
+    definitions retain the established first-wins rule; memberships from all
+    roots are additive, and a later real definition may fill an earlier
+    placeholder because a placeholder is explicitly not a definition.
+    """
+    if cfg.is_legacy:
+        return scan_library(cfg.roots[0].path, scan_filter, contacts, pal_dir,
+                            exts=exts, db3_dir=db3_dir)
+
+    photos = []
+    folders = {}
+    albums = {}
+    merged_contacts = {}
+    db3_contacts = set()
+    reports = []
+    identity_catalog = Catalog(
+        root=cfg.roots[0].path, photos=[], folders={}, albums={},
+        roots=list(cfg.roots), library_id=cfg.library_id)
+    for root in cfg.roots:
+        one = scan_library(root.path, scan_filter, contacts, pal_dir,
+                           exts=exts, db3_dir=db3_dir)
+        offset = len(photos)
+        for photo in one.photos:
+            photo.root_id = root.id
+        photos.extend(one.photos)
+        for folder in one.folders.values():
+            folder.root_id = root.id
+            folders[folder_key(identity_catalog, root.id, folder.rel)] = folder
+        for uid, album in one.albums.items():
+            shifted = [offset + i for i in album.members]
+            existing = albums.get(uid)
+            if existing is None:
+                album.members = shifted
+                albums[uid] = album
+            else:
+                existing.members.extend(shifted)
+                if existing.placeholder and not album.placeholder:
+                    existing.name = album.name
+                    existing.date = album.date
+                    existing.description = album.description
+                    existing.placeholder = False
+                    existing.pal_sourced = album.pal_sourced
+        for cid, name in one.contacts.items():
+            merged_contacts.setdefault(cid, name)
+        db3_contacts.update(one.db3_contacts)
+        reports.extend(one.report.entries)
+
+    from catalog import ImportReport
+    return Catalog(
+        root=cfg.roots[0].path,
+        photos=photos,
+        folders=folders,
+        albums=albums,
+        contacts=merged_contacts,
+        db3_contacts=db3_contacts,
+        report=ImportReport(reports),
+        roots=list(cfg.roots),
+        library_id=cfg.library_id,
+    )
+
+
 @dataclass(frozen=True)
 class SelectionContext:
     """What an output action would act on RIGHT NOW — the M2 attachment
@@ -766,7 +842,20 @@ class SelectionContext:
     """
     kind: str
     indices: tuple[int, ...]
-    held: tuple[str, ...]
+    held: tuple[object, ...]
+
+
+@dataclass
+class _MultiRootIndexResult:
+    """Aggregate result for one independently-built cache per root."""
+    roots: list[tuple[str, object]]
+    photos: int
+    elapsed_s: float
+    workers: int
+
+    @property
+    def rate(self) -> float:
+        return self.photos / self.elapsed_s if self.elapsed_s else 0.0
 
 
 class _BuildBridge(QObject):
@@ -1035,22 +1124,55 @@ class MainWindow(QMainWindow):
     def _start_cold_build(self, build_dir: Path) -> None:
         bridge, catalog = self._bridge, self.catalog
         done = [0]  # results arrive out of order; count completions, not idx
+        total_photos = len(catalog.photos)
 
-        def cb(i: int, total: int, img) -> None:
+        def cb(global_i: int, img) -> None:
             if img is not None:
-                self.grid.feed_tile(i, img)
+                self.grid.feed_tile(global_i, img)
             else:
-                self.grid.feed_error(i)
+                self.grid.feed_error(global_i)
             done[0] += 1
-            if done[0] % 5 == 0 or done[0] == total:
-                _emit(bridge.progress, done[0], total)
+            if done[0] % 5 == 0 or done[0] == total_photos:
+                _emit(bridge.progress, done[0], total_photos)
 
         def work() -> None:
             try:
-                result = build_cache(catalog, build_dir, cb,
-                                     cancel=self.build_cancel)
-                if result is None:
-                    return  # cancelled
+                if catalog.library_id:
+                    # Explicit libraries own one cache per manifest root.
+                    # Catalog slices are contiguous/in manifest order; map
+                    # each builder's local progress index back to the global
+                    # catalog index before feeding the live grid.
+                    built: list[tuple[str, object]] = []
+                    starts: dict[str, int] = {}
+                    for i, photo in enumerate(catalog.photos):
+                        starts.setdefault(photo.root_id, i)
+                    t0 = time.perf_counter()
+                    for root in catalog.roots:
+                        start = starts.get(root.id, 0)
+
+                        def root_cb(i, _total, img, start=start):
+                            cb(start + i, img)
+
+                        one = build_cache(
+                            catalog, build_dir, root_cb,
+                            cancel=self.build_cancel, root_id=root.id)
+                        if one is None:
+                            return
+                        built.append((root.id, one))
+                    result = _MultiRootIndexResult(
+                        roots=built,
+                        photos=sum(one.photos for _rid, one in built),
+                        elapsed_s=time.perf_counter() - t0,
+                        workers=max((one.workers for _rid, one in built),
+                                    default=0),
+                    )
+                else:
+                    result = build_cache(
+                        catalog, build_dir,
+                        lambda i, _total, img: cb(i, img),
+                        cancel=self.build_cancel)
+                    if result is None:
+                        return  # cancelled
                 save_catalog_retrying(catalog, build_dir / "catalog.json")
                 save_report(catalog.report, build_dir / REPORT_NAME)
                 _emit(bridge.finished, result, catalog, False)
@@ -1217,8 +1339,17 @@ class MainWindow(QMainWindow):
             "rate_per_s": round(result.rate, 1), "workers": result.workers,
         }), flush=True)
         try:
-            cache = load_cache(result.path)
-            bind(cache, catalog)
+            if isinstance(result, _MultiRootIndexResult):
+                caches = {}
+                for root_id, one in result.roots:
+                    cache = load_cache(one.path)
+                    bind(cache, catalog, root_id=root_id)
+                    caches[root_id] = cache
+                cache = (next(iter(caches.values())) if len(caches) == 1
+                         else CompositeThumbCache(catalog, caches))
+            else:
+                cache = load_cache(result.path)
+                bind(cache, catalog)
         except CacheError as e:
             log.error("built cache failed to bind: %s", e)
             return
@@ -1466,35 +1597,86 @@ class MainWindow(QMainWindow):
         folders_root = QTreeWidgetItem(t, ["Folders"])
         folders_root.setFlags(
             folders_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-        # Offline-root badges (fauxcasa-ed5.7.5, bead .e, design §12):
-        # minimal — a greyed, disabled leaf per offline root at the TOP of
-        # Folders, no per-root tree restructuring (that's bead .g, out of
-        # scope here). _offline_root_labels is the pure/testable logic
-        # half; this is just the Qt painting of it.
-        for label in _offline_root_labels(cat):
-            badge = QTreeWidgetItem(folders_root, [f"{label} (offline)"])
-            badge.setFlags(badge.flags() & ~Qt.ItemFlag.ItemIsSelectable
-                           & ~Qt.ItemFlag.ItemIsEnabled)
-            bf = badge.font(0)
-            bf.setItalic(True)
-            badge.setFont(0, bf)
-        nodes: dict[str, QTreeWidgetItem] = {"": folders_root}
+        if len(cat.roots) <= 1:
+            # Exact one-root passthrough: keep the historical tree shape,
+            # labels, item data, and offline badge behavior unchanged.
+            for label in _offline_root_labels(cat):
+                badge = QTreeWidgetItem(folders_root, [f"{label} (offline)"])
+                badge.setFlags(badge.flags() & ~Qt.ItemFlag.ItemIsSelectable
+                               & ~Qt.ItemFlag.ItemIsEnabled)
+                bf = badge.font(0)
+                bf.setItalic(True)
+                badge.setFont(0, bf)
+            nodes: dict[str, QTreeWidgetItem] = {"": folders_root}
 
-        def node_for(rel: str) -> QTreeWidgetItem:
-            if rel in nodes:
-                return nodes[rel]
-            parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
-            parent = node_for(parent_rel)
-            item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
-            item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
-            nodes[rel] = item
-            return item
+            def node_for(rel: str) -> QTreeWidgetItem:
+                if rel in nodes:
+                    return nodes[rel]
+                parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
+                parent = node_for(parent_rel)
+                item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
+                item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
+                nodes[rel] = item
+                return item
 
-        for rel, folder in cat.folders.items():
-            if fcount(folder) == 0:
-                continue  # empty (off-reveal: stash/hidden-only) folders out
-            item = node_for(rel)
-            item.setText(0, f"{folder.title}  ({fcount(folder)})")
+            for rel, folder in cat.folders.items():
+                if fcount(folder) == 0:
+                    continue
+                item = node_for(rel)
+                item.setText(0, f"{folder.title}  ({fcount(folder)})")
+        else:
+            # Genuine multiroot: durable manifest order is display order.
+            # Root labels are the top-level folder nodes; child identities
+            # use the catalog's root-qualified convention so duplicate rels
+            # never merge. Offline roots remain browseable from cached thumbs.
+            root_nodes: dict[str, QTreeWidgetItem] = {}
+            nodes2: dict[tuple[str, str], QTreeWidgetItem] = {}
+            for root in cat.roots:
+                label = root.label or root.path.name or str(root.path)
+                if root.id in cat.offline_ids:
+                    label += " (offline)"
+                item = QTreeWidgetItem(folders_root, [label])
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                if root.id in cat.offline_ids:
+                    font = item.font(0)
+                    font.setItalic(True)
+                    item.setFont(0, font)
+                    item.setForeground(0, t.palette().brush(
+                        QPalette.ColorGroup.Disabled,
+                        QPalette.ColorRole.Text))
+                root_nodes[root.id] = item
+                nodes2[(root.id, "")] = item
+
+            def node_for_root(root_id: str, rel: str) -> QTreeWidgetItem:
+                ident = (root_id, rel)
+                if ident in nodes2:
+                    return nodes2[ident]
+                parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
+                parent = node_for_root(root_id, parent_rel)
+                item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
+                key = folder_key(cat, root_id, rel)
+                item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
+                nodes2[ident] = item
+                return item
+
+            for key, folder in cat.folders.items():
+                if fcount(folder) == 0 or folder.root_id not in root_nodes:
+                    continue
+                item = node_for_root(folder.root_id, folder.rel)
+                if folder.rel:
+                    item.setText(0, f"{folder.title}  ({fcount(folder)})")
+                else:
+                    label = (next(r for r in cat.roots
+                                  if r.id == folder.root_id).label
+                             or next(r for r in cat.roots
+                                     if r.id == folder.root_id).path.name)
+                    if folder.root_id in cat.offline_ids:
+                        label += " (offline)"
+                    item.setText(0, f"{label}  ({fcount(folder)})")
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsSelectable)
+                    item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
+            for item in root_nodes.values():
+                item.setExpanded(True)
         folders_root.setExpanded(True)
 
         if cat.albums:
@@ -1758,12 +1940,13 @@ class MainWindow(QMainWindow):
         pairs: list[tuple[int, str]] = []
         append = pairs.append
         for i, p in enumerate(cat.photos):
+            p_folder_key = folder_key(cat, p.root_id, p.folder)
             append((i, "\n".join((
                 p.name,
                 p.caption or "",
                 " ".join(p.keywords),
                 " ".join(n for _rect, _cid, n in p.faces if n),  # people (§5)
-                folder_hay[p.folder],
+                folder_hay.get(p_folder_key, p.folder.lower()),
             )).lower()))
         self._search_pairs = pairs
         if cat.visible_count == len(cat.photos):
@@ -1858,14 +2041,15 @@ class MainWindow(QMainWindow):
             return
         pos = self.grid.display_pos
         order = sorted(sel, key=lambda i: pos.get(i, len(pos)))
-        self.tray.hold(self.catalog.photos[i].rel for i in order)
+        self.tray.hold(self.tray.photo_key(self.catalog.photos[i])
+                       for i in order)
 
     def _hold_from_viewer(self, idx: int) -> None:
         """Ctrl+H in the viewer: hold the photo on screen."""
         if 0 <= idx < len(self.catalog.photos):
-            self.tray.hold([self.catalog.photos[idx].rel])
+            self.tray.hold([self.tray.photo_key(self.catalog.photos[idx])])
 
-    def _tray_navigate(self, rel: str) -> None:
+    def _tray_navigate(self, rel: object) -> None:
         """A held thumb was clicked: show that photo in the grid — back
         on the browser page, falling back to the All-photos view when
         the active filter doesn't show it (a held photo is cross-folder
@@ -2224,6 +2408,7 @@ def main() -> int:
     root = _resolve_library(args.library, args.cache_root)
     if root is None:
         return 2
+    cfg = library.resolve_open_path(root)
 
     min_w, min_h = args.min_image_size or (0, 0)
     max_w, max_h = args.max_image_size or (0, 0)
@@ -2287,29 +2472,45 @@ def main() -> int:
     # always derived from the library root, so even an adopted-cache run
     # persists its catalog and warm-starts next time.
     adopt = args.thumbs is not None
-    # An implicit legacy single-root open keys on the resolved path itself
-    # (multiroot .c, design §7) — reproduces every existing cache dir's
-    # digest exactly; main.py doesn't open explicit multi-root libraries
-    # yet (that's bead .d/.g), so this is always the legacy key here.
-    cache_dir = cache_dir_for(str(root.resolve()), args.cache_root,
+    # Explicit libraries key the cache directory on durable library_id;
+    # implicit legacy opens retain the exact historical path digest.
+    library_key = cfg.library_id or str(root.resolve())
+    cache_dir = cache_dir_for(library_key, args.cache_root,
                               scan_filter.cache_key()
                               + exts_cache_key(excluded_exts))
     cat_path = cache_dir / "catalog.json"
-    thumbs_path = args.thumbs if adopt else cache_dir / "thumbs.fcache"
+    if adopt and not cfg.is_legacy:
+        log.error("--thumbs is a single-cache legacy option; explicit "
+                  "libraries use one managed fcache per root")
+        return 2
+    if cfg.is_legacy:
+        cache_paths = [(LEGACY_ROOT_ID,
+                        args.thumbs if adopt
+                        else cache_dir / fcache_name(LEGACY_ROOT_ID))]
+    else:
+        cache_paths = [(r.id, cache_dir / fcache_name(r.id))
+                       for r in cfg.roots]
 
     catalog: Catalog | None = None
-    thumbs: ThumbCache | None = None
+    thumbs: object | None = None
     build_dir: Path | None = None
     warm = False
 
     t_prep = time.perf_counter()
     if not args.rebuild:
-        loaded = load_catalog(cat_path, root)
-        if loaded is not None and thumbs_path.is_file():
+        loaded = load_catalog(cat_path, cfg)
+        if loaded is not None and all(path.is_file()
+                                      for _rid, path in cache_paths):
             try:
-                cached = load_cache(thumbs_path)
-                bind(cached, loaded)
-                catalog, thumbs, warm = loaded, cached, True
+                caches = {}
+                for root_id, path in cache_paths:
+                    cached = load_cache(path)
+                    bind(cached, loaded,
+                         root_id=None if cfg.is_legacy else root_id)
+                    caches[root_id] = cached
+                thumbs = (next(iter(caches.values())) if len(caches) == 1
+                          else CompositeThumbCache(loaded, caches))
+                catalog, warm = loaded, True
                 # the report was persisted beside the catalog at scan time;
                 # re-attach it so the status-bar count survives warm starts
                 catalog.report = load_report(cache_dir / REPORT_NAME)
@@ -2317,8 +2518,8 @@ def main() -> int:
                 log.warning("persisted cache unusable (%s); rescanning", e)
 
     if catalog is None:  # cold path
-        catalog = scan_library(root, scan_filter, contacts, pal_dir,
-                               exts=exts, db3_dir=db3_dir)
+        catalog = _scan_library_config(
+            cfg, scan_filter, contacts, pal_dir, exts, db3_dir)
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
@@ -2337,7 +2538,7 @@ def main() -> int:
         else:
             build_dir = cache_dir  # the build thread persists the catalog
 
-    if adopt and thumbs is not None and thumbs.library \
+    if adopt and isinstance(thumbs, ThumbCache) and thumbs.library \
             and Path(thumbs.library).resolve() != root:
         # bind() compares the full path lists, so a library mismatch with
         # identical walks is survivable — but say so loudly.
@@ -2362,8 +2563,8 @@ def main() -> int:
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
                      contacts=contacts, pal_dir=pal_dir,
-                     excluded_exts=excluded_exts,
-                     thumbs_path=args.thumbs, db3_dir=db3_dir)
+                      excluded_exts=excluded_exts,
+                      thumbs_path=args.thumbs, db3_dir=db3_dir)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
