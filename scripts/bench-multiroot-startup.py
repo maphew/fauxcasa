@@ -206,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
         "roots": 2,
         "runs_ms": values,
         "median_ms": median_ms,
+        "prep_runs_ms": [e["prep_ms"] for e in samples],
+        "vm_rss_runs_mb": [e["vm_rss_mb"] for e in samples],
         "budget_ms_exclusive": BUDGET_MS,
         "pass": median_ms < BUDGET_MS,
         "platform": sys.platform,
