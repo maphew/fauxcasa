@@ -5928,6 +5928,25 @@ def _make_person_db3(db3: Path, folder_abs: str, photos: list[str],
     return db3
 
 
+def _make_caption_db3(db3: Path, folder_abs: str, photos: list[str],
+                      captions: list[str]) -> Path:
+    """Minimal imagedata.caption + thumbindex fixture for cam.20.
+
+    Row 0 is the containing folder and rows 1..n are photo rows, exactly the
+    validated db3 join shape. captions is parallel to photos; the folder's
+    caption cell is the leading empty string.
+    """
+    assert len(photos) == len(captions)
+    if not folder_abs.endswith(("\\", "/")):
+        folder_abs += "\\"
+    _write_thumbindex(db3 / "thumbindex.db", [
+        (folder_abs, 0x01, None),
+        *((name, 0x02, 0) for name in photos),
+    ])
+    _write_pmp(db3 / "imagedata_caption.pmp", "string", ["", *captions])
+    return db3
+
+
 @pytest.fixture()
 def db3_library(tmp_path: Path) -> Path:
     """One folder, two photos: a.jpg carries an ini faces= region whose
@@ -6010,6 +6029,78 @@ def test_default_db3_dir_discovery(monkeypatch, tmp_path: Path) -> None:
     d = tmp_path / "Google" / "Picasa2" / "db3"
     d.mkdir(parents=True)
     assert default_db3_dir() == d
+
+
+def test_db3_caption_gap_fill_precedence_and_reporting(tmp_path: Path) -> None:
+    """cam.20: db3 fills only empty captions and reports every populated
+    non-gap outcome. Ini and later in-file captions remain authoritative.
+    """
+    root = tmp_path / "lib"
+    folder = root / "Trip"
+    make_jpeg(folder / "gap.jpg")
+    make_jpeg(folder / "same.jpg")
+    make_jpeg(folder / "conflict.jpg")
+    write_jpeg_meta(folder / "infile.jpg",
+                    xmp=_xmp_app1(caption="in-file wins"))
+    (folder / ".picasa.ini").write_text(
+        "[same.jpg]\r\ncaption=same caption\r\n"
+        "[conflict.jpg]\r\ncaption=ini wins\r\n")
+    db3 = _make_caption_db3(
+        tmp_path / "db3", _db3_machine_path(folder),
+        ["gap.jpg", "same.jpg", "conflict.jpg", "infile.jpg"],
+        ["rescued caption", "same caption", "db3 loses", "db3 interim"],
+    )
+
+    cat = scan_library(root, db3_dir=db3)
+    by_name = {p.name: p for p in cat.photos}
+    assert by_name["gap.jpg"].caption == "rescued caption"
+    assert by_name["same.jpg"].caption == "same caption"
+    assert by_name["conflict.jpg"].caption == "ini wins"
+    assert by_name["infile.jpg"].caption == "db3 interim"
+
+    entries = {(e.kind, e.subject): e for e in cat.report.entries}
+    assert ("db3_caption_rescued", "Trip/gap.jpg") in entries
+    assert ("db3_caption_rescued", "Trip/infile.jpg") in entries
+    assert ("db3_caption_redundant", "Trip/same.jpg") in entries
+    assert ("db3_caption_conflict", "Trip/conflict.jpg") in entries
+    assert "higher-rank" in entries[
+        ("db3_caption_conflict", "Trip/conflict.jpg")].detail
+
+    # The indexer's established §4 merge runs after db3 rescue and replaces
+    # the interim gap-fill with non-empty in-file XMP/IPTC metadata.
+    thumbcache.build_cache(cat, tmp_path / "cache")
+    assert by_name["infile.jpg"].caption == "in-file wins"
+    assert by_name["gap.jpg"].caption == "rescued caption"
+
+
+def test_db3_caption_fail_soft_unreadable_and_unjoined(tmp_path: Path) -> None:
+    """Caption rescue never sinks a scan: broken join bytes and caption rows
+    beyond thumbindex become import-report diagnostics, not exceptions.
+    """
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "a.jpg")
+
+    broken = tmp_path / "broken-db3"
+    _write_pmp(broken / "imagedata_caption.pmp", "string", ["", "caption"])
+    (broken / "thumbindex.db").write_bytes(b"not a thumbindex")
+    cat = scan_library(root, db3_dir=broken)
+    assert cat.photos[0].caption is None
+    unreadable = [e for e in cat.report.entries
+                  if e.kind == "db3_unreadable"]
+    assert len(unreadable) == 1 and unreadable[0].subject == "thumbindex.db"
+
+    short = tmp_path / "short-db3"
+    _write_thumbindex(short / "thumbindex.db", [
+        (_db3_machine_path(root / "Trip"), 0x01, None),
+        ("a.jpg", 0x02, 0),
+    ])
+    _write_pmp(short / "imagedata_caption.pmp", "string",
+               ["", "joined", "past end"])
+    cat = scan_library(root, db3_dir=short)
+    assert cat.photos[0].caption == "joined"
+    misses = [e for e in cat.report.entries
+              if e.kind == "db3_path_unresolved"]
+    assert len(misses) == 1 and misses[0].subject == "imagedata row 2"
 
 
 def test_db3_person_album_rescue_end_to_end(db3_library: Path,
@@ -9327,12 +9418,9 @@ def test_ingest_parity_gate_passes() -> None:
     """The M1 ingest-parity gate (spec §9 clause 2) end-to-end: zero
     ingest LOSS across every ingested class, always (the gate FAILS on
     loss/excess/ratchet regardless of expected-missing count — see
-    check-ingest-parity.py's run_gate). fauxcasa-cam.15 took the table to
-    zero expected-missing; fauxcasa-ed5.11 added db3_caption_precedence
-    back (owner fauxcasa-cam.20, db3 caption gap-fill not yet wired), so
-    this asserts PASS with exactly that one expected-missing class rather
-    than the old "fully ingested" wording. Runs the real script in its
-    own uv env (exactly CI's tests.yml job); skips when uv is absent."""
+    check-ingest-parity.py's run_gate). fauxcasa-cam.20's db3 caption
+    gap-fill returns the table to fully ingested. Runs the real script in
+    its own uv env (exactly CI's tests.yml job); skips when uv is absent."""
     import shutil
     import subprocess
 
@@ -9344,8 +9432,8 @@ def test_ingest_parity_gate_passes() -> None:
         capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=600)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert "PASS: zero ingest loss across" in proc.stdout
-    assert "1 expected-missing classes are owned and probed" in proc.stdout
+    assert "PASS: zero ingest loss across all" in proc.stdout
+    assert "fully ingested (0 expected-missing)" in proc.stdout
 
 
 # ===========================================================================

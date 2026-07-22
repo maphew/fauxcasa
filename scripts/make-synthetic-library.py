@@ -47,9 +47,10 @@ cam.6/cam.7 rescue plumbing) — a handful of .pmp columns + thumbindex.db
 in the byte format documented in docs/research/picasa-db3-validated.md,
 mirroring only a SUBSET of the corpus the way Picasa's own lazy (2-6 min
 flush) db3 mirror would: both video clips (imagedata filetype 0x08/0x09,
-THUMBINDEX_FILE_TYPES in picasa_db.py), three stills with dims, and one
-photo whose db3 caption diverges from its ini caption (the §4 precedence
-case check-ingest-parity.py's db3_caption_precedence class exercises).
+THUMBINDEX_FILE_TYPES in picasa_db.py), three stills with dims, one photo
+whose db3 caption fills an ini gap, and one whose db3 caption
+diverges from its ini caption (the two §4 precedence outcomes exercised by
+check-ingest-parity.py's db3_caption_precedence class).
 The corpus ships a manifest.json of ground-truth expected counts.
 The default / --scale / --benchmark outputs are byte-for-byte unchanged
 by this profile (existing benchmark caches bind to library digests).
@@ -636,11 +637,10 @@ def _pal_xml(uid: str, name: str, members: list[str]) -> str:
 # no shutdown flush"), so this deliberately indexes a SUBSET of the extras
 # corpus, not everything: two of the five plan folders, both video clips
 # (imagedata filetype 0x08/0x09 — THUMBINDEX_FILE_TYPES in picasa_db.py),
-# three stills carrying dims, and one photo (photo01.jpg, Beach Day) whose
-# db3 caption DIVERGES from its ini caption= "Sunset over the bay" — the
-# case check-ingest-parity.py's db3_caption_precedence class exercises
-# (db3 caption ingestion itself is not yet wired, fauxcasa-cam.20; the
-# class documents the fixture as expected-missing until it lands).
+# three stills carrying dims, one photo (photo00.jpg, Beach Day) whose db3
+# caption fills an ini gap, and one (photo01.jpg) whose db3 caption DIVERGES
+# from its ini caption= "Sunset over the bay" — together they prove both
+# branches of product-spec §4's db3-fills-gaps-only rule.
 # --------------------------------------------------------------------------
 
 _DB3_PMP_MAGIC = 0x3FCCCCCD
@@ -653,6 +653,7 @@ _DB3_FIELD_UINT32 = 0x1
 
 _DB3_FOLDER_1 = "2009-07-04 Beach Day"
 _DB3_FOLDER_2 = "2010-12-25 Winter Holiday"
+_DB3_GAP_CAPTION = "Beach arrival (db3 rescue)"
 # The ini caption this diverges from (see _EXTRAS_FOLDERS, Beach Day
 # photo01.jpg: "caption=Sunset over the bay").
 _DB3_DIVERGENT_CAPTION = "Sunset light over the bay (db3)"
@@ -733,7 +734,7 @@ def _write_extras_db3(root: Path, library: Path) -> None:
     f2 = _db3_abs_path(library / _DB3_FOLDER_2)
     entries = [
         (f1, 0x01, None),           # row 0: folder (Beach Day)
-        ("photo00.jpg", 0x02, 0),   # row 1: still, dims only
+        ("photo00.jpg", 0x02, 0),   # row 1: still, db3 caption fills gap
         ("photo01.jpg", 0x02, 0),   # row 2: still, DIVERGENT db3 caption
         ("clip00.avi", 0x08, 0),    # row 3: video (avi)
         (f2, 0x01, None),           # row 4: folder (Winter Holiday)
@@ -752,7 +753,7 @@ def _write_extras_db3(root: Path, library: Path) -> None:
     # legitimately have different lengths"); rows 3-6 carry no db3 caption
     # at all, only the folder (row 0, empty) and the two Beach Day stills.
     _write_db3_pmp(db3 / "imagedata_caption.pmp", _DB3_FIELD_STRING,
-                   ["", "", _DB3_DIVERGENT_CAPTION])
+                   ["", _DB3_GAP_CAPTION, _DB3_DIVERGENT_CAPTION])
 
 
 # Ground truth the generator promises (checked three ways by
@@ -770,8 +771,8 @@ _EXTRAS_EXPECTED = {
     "ini_files": 4,
     "stashed_originals": 2,  # stash files whose same-name sibling exists
     "starred": 6,            # 5 stills + the starred clip
-    "captioned": 4,          # 3 stills + the captioned clip (empty
-                             # caption= still does not count)
+    "captioned": 5,          # 3 ini stills + the captioned clip + one db3
+                             # gap-fill (empty caption= still does not count)
     "keyworded": 3,
     "hidden_photos": 2,      # per-photo hidden=yes
     "hidden_folders": 1,     # [Picasa] P2category=Hidden Folders
@@ -796,7 +797,7 @@ _EXTRAS_EXPECTED = {
     # ---- db3 (fauxcasa-ed5.11, deps cam.6/cam.7) — see _write_extras_db3 ---
     "db3_video_dims": 2,      # both video clips indexed with matching dims
     "db3_video_filetype": 2,  # both video clips, imagedata filetype 0x08/0x09
-    "db3_caption_precedence": 1,  # photo01.jpg: db3 caption diverges from ini
+    "db3_caption_precedence": 2,  # photo00 gap-fill + photo01 ini conflict
 }
 
 
