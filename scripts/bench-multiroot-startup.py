@@ -216,7 +216,8 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(result, indent=1))
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(json.dumps(result, indent=1) + "\n")
+        with args.json_out.open("w", newline="\n") as f:
+            f.write(json.dumps(result, indent=1) + "\n")
     return 0 if result["pass"] else 1
 
 
