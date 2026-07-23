@@ -36,7 +36,9 @@ Usage::
         --pal-dir C:\\...\\Picasa2Albums --db3 C:\\...\\db3 --json out\\report.json
 
 Exit codes: 0 = every strict class matches (PASS); 1 = strict mismatch
-(FAIL); 2 = usage error.
+(FAIL); 2 = usage error; 3 = an unexpected exception was raised while
+reading the archive (the exception TYPE is reported, never its message or
+traceback -- those can embed the archive's own paths/strings).
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ import picasa_db  # noqa: E402
 from catalog import (  # noqa: E402
     Catalog,
     EXTS,
+    INI_NAMES,
     _harvest_contacts2,
     load_contacts_xml,
     read_pal_dir,
@@ -102,13 +105,27 @@ def derive_picasa_home(home: Path) -> tuple[Path | None, Path | None, Path | Non
 
 @dataclass
 class Reference:
-    survey: dict[str, Any]              # picasa_db._survey_ini_tree(library)
+    # Scoped ini tallies (fauxcasa-ed5.8 review fix): NOT picasa_db.
+    # _survey_ini_tree's tree-wide rollup -- that counts every section in
+    # every .picasa.ini under `library`, including ghost sections for
+    # deleted/moved files, description=/p2category= lines that happen to
+    # live in a non-[Picasa] section, and inis in folders with no media at
+    # all. catalog.scan_library never reads any of that: it only opens the
+    # ini catalog._read_folder_ini would pick for a MEDIA folder (folders_fs
+    # below) and only merges sections whose name matches a WALKED file in
+    # that same folder. `feats`/`keys` are this gate's OWN independent
+    # rebuild of that narrower scope (see _scoped_ini_survey) -- same
+    # feature/key vocabulary as _survey_ini_tree, same predicates
+    # (predicate-anchored against it in test_confirm_archive.py on the
+    # pristine corpus), but counted only where the tracer would ever look.
+    feats: dict[str, int]
+    keys: dict[str, int]
     photos_fs: frozenset[str]           # media file rels (tracer walk rule, EXTS)
     videos_fs: frozenset[str]           # the VIDEO_EXTS subset (fauxcasa-v46.2)
     folders_fs: frozenset[str]          # folder rels with >=1 media file
     stashed_fs: frozenset[str]          # stash-file rels whose sibling exists
-    contacts_ini_ids: frozenset[str]    # ids in any [Contacts2] section, tree-wide
-    album_def_uids: frozenset[str]      # uids carrying an [.album:<uid>] section
+    contacts_ini_ids: frozenset[str]    # [Contacts2] ids, media folders + ancestors
+    album_def_uids: frozenset[str]      # [.album:<uid>] uids, media folders only
     contacts_xml_ids: frozenset[str] | None       # None = --contacts not given
     pal_uids: frozenset[str] | None               # None = --pal-dir not given
     # db3 (None sentinels below distinguish "no --db3 given" from "given but
@@ -139,42 +156,230 @@ def _fs_media(library: Path) -> list[Path]:
     ]
 
 
-def _scan_ini_tree(library: Path) -> tuple[frozenset[str], frozenset[str]]:
-    """One independent walk of every .picasa.ini/Picasa.ini under `library`
-    (same file-discovery rule as picasa_db._survey_ini_tree), collecting:
+def _folder_ini_path(folder: Path) -> Path | None:
+    """The ini file catalog._read_folder_ini would pick for `folder`: the
+    first existing name in catalog.INI_NAMES (.picasa.ini, Picasa.ini,
+    picasa.ini), in that order. Mirrors the tracer's own precedence (not a
+    reuse of its private function) so this reads the SAME sidecar the
+    tracer would load for this folder, never a tree-wide union.
 
-    - contacts_ini_ids: every [Contacts2] id, normalized exactly like the
-      tracer's catalog._harvest_contacts2 (hex-id regex, zero-padded to 16,
-      non-empty display name required) so the SET of ids that could ever
-      enter Catalog.contacts matches on both sides. Values are allowed to
-      overwrite across files (last-walked wins) -- only key membership is
-      used, so that divergence from the tracer's true nearest-ini-wins
-      precedence never matters here.
-    - album_def_uids: the uid of every `[.album:<uid>]` section, parsed
-      exactly like catalog.scan_library's own album-definition loop
-      (`sec.name.split(":", 1)[1].strip().lower()`).
+    NOTE: comparison is by filesystem lookup (`p.is_file()`), so on a
+    case-insensitive filesystem (Windows -- Picasa's own platform) a
+    folder carrying only e.g. `PICASA.INI` still resolves via the
+    `.picasa.ini` probe; on a case-sensitive filesystem this can diverge
+    from catalog.INI_NAMES's exact-name selection, exactly like the
+    tracer's own probe would."""
+    for name in INI_NAMES:
+        p = folder / name
+        if p.is_file():
+            return p
+    return None
 
-    Fail-soft per file (OSError skips that file only), matching
-    _survey_ini_tree's own read_errors handling.
+
+def _read_ini_soft(path: Path) -> picasa_db.PicasaIni | None:
+    """Fail-soft per file: an unreadable ini degrades to absent, never an
+    exception -- matches picasa_db._survey_ini_tree's read_errors handling
+    and catalog._read_folder_ini's own per-name fallback."""
+    try:
+        return picasa_db.read_picasa_ini(path)
+    except OSError:
+        return None
+
+
+def _merge_sections(ini: picasa_db.PicasaIni) -> dict[str, picasa_db.IniSection]:
+    """name.lower() -> section, duplicate sections concatenated in order.
+    Mirrors catalog._section_map's merge rule (IniSection.get is
+    first-key-wins, and concatenating preserves that across duplicates) --
+    written independently here, not imported, since it's simple enough
+    that reusing the tracer's own private helper would blur the
+    independent-readers doctrine this whole gate rests on.
+
+    NOTE: keyed by name.lower() -- targets Windows' case-insensitive
+    filesystem (Picasa's own platform), matching catalog._section_map
+    exactly; on a case-sensitive filesystem section-name casing could in
+    principle diverge from a file lookup, same caveat as
+    _folder_ini_path above."""
+    out: dict[str, picasa_db.IniSection] = {}
+    for sec in ini.sections:
+        key = sec.name.lower()
+        prev = out.get(key)
+        if prev is None:
+            out[key] = sec
+        else:
+            merged = picasa_db.IniSection(name=prev.name, items=list(prev.items))
+            merged.items.extend(sec.items)
+            out[key] = merged
+    return out
+
+
+def _scoped_ini_survey(
+    library: Path,
+    folders_fs: frozenset[str],
+    photos_by_folder: dict[str, frozenset[str]],
+) -> tuple[dict[str, int], dict[str, int], frozenset[str], frozenset[str]]:
+    """The reference-side survey rebuild, SCOPED to exactly what
+    catalog.scan_library would ever read (fauxcasa-ed5.8 review fix for
+    the aggregate-class false-FAIL blocker) -- unlike picasa_db.
+    _survey_ini_tree, which tallies every section in every .picasa.ini
+    under `library` regardless of whether any code path ever looks at it.
+
+    Returns (feats, keys, contacts_ini_ids, album_def_uids):
+
+    - feats/keys: same vocabulary and predicates as _survey_ini_tree's
+      "starred"/"captioned"/.../"edit_keys" features and the "hidden"/
+      "rotate"/"p2category"/"description" keys this gate reads (predicate-
+      anchored against _survey_ini_tree in test_confirm_archive.py, on the
+      PRISTINE synthetic corpus where every section names a real file/
+      folder so the two scopes coincide) -- but tallied ONLY from:
+        * per-photo keys (star/caption/keywords/hidden/rotate/geotag/
+          faces/albums/edit-recipe keys): sections in a MEDIA folder's ini
+          (folders_fs) whose name.lower() matches a WALKED photo's
+          filename in that same folder -- mirrors catalog.scan_library's
+          `secmap.get(name.lower())` per-file lookup exactly. A stale
+          section for a deleted/renamed file (no walked file of that
+          name) is invisible here, same as it is to the tracer.
+        * folder-level keys (description/p2category): the folder-scope
+          `[Picasa]` section only, media folders only -- mirrors
+          `psec = secmap.get("picasa")` in scan_library. A description=
+          line that happens to live in some OTHER section (e.g. an
+          [.album:] block) is not folder_descriptions/hidden_folders
+          material to the tracer and isn't counted here either.
+      "hidden"/"rotate" bump on KEY PRESENCE regardless of value (inherited
+      from _survey_ini_tree's own presence-only semantics, e.g. a
+      `hidden=no` line would still bump `keys["hidden"]`) -- a pre-existing
+      gap this fix does not attempt to close, and the synthetic corpus's
+      hidden=yes/rotate=rotate(N)-only usage never exercises it.
+    - contacts_ini_ids: [Contacts2] ids from MEDIA folders' inis AND their
+      ANCESTOR CHAIN up to and including the library root ("") -- exactly
+      the set catalog.scan_library's folder_contacts() walks on demand
+      (nearest-definition-wins inheritance), so a [Contacts2] table in a
+      photoless SIBLING branch (never an ancestor of any media folder) is
+      correctly excluded.
+    - album_def_uids: `[.album:<uid>]` sections from MEDIA folders' inis
+      ONLY -- catalog.scan_library's own album-definition loop walks
+      `ini_by_folder`, which is populated only for folders folder_ini()
+      was called on, i.e. media folders (see scan_library's per-file walk
+      loop calling `folder_ini(folder_rel)`).
+
+    Every ini read is fail-soft per file (_read_ini_soft): unreadable or
+    absent sidecars degrade to "no ini for this folder", never an
+    exception.
     """
+    feats: dict[str, int] = {}
+    keys: dict[str, int] = {}
+
+    def bump(d: dict[str, int], k: str, n: int = 1) -> None:
+        d[k] = d.get(k, 0) + n
+
+    def _first(sec: picasa_db.IniSection, key: str) -> str | None:
+        """First value whose key strip().lower()-matches `key` -- the
+        first-wins rule the tracer's own merged-section .get() applies
+        (IniSection.get is first-key-wins too; this local variant adds the
+        strip().lower() normalization so a `Star =` line matches the way
+        the key-vocabulary comparisons in this loop expect)."""
+        for k, v in sec.items:
+            if k.strip().lower() == key:
+                return v
+        return None
+
+    ini_cache: dict[str, tuple[picasa_db.PicasaIni, dict] | None] = {}
+
+    def get_ini(folder_rel: str) -> tuple[picasa_db.PicasaIni, dict] | None:
+        if folder_rel in ini_cache:
+            return ini_cache[folder_rel]
+        folder = library / folder_rel if folder_rel else library
+        path = _folder_ini_path(folder)
+        ini = _read_ini_soft(path) if path is not None else None
+        entry = (ini, _merge_sections(ini)) if ini is not None else None
+        ini_cache[folder_rel] = entry
+        return entry
+
+    # ---- contacts_ini_ids: media folders + their ancestor chain to "" ---
     contacts_ids: dict[str, str] = {}
+    visited: set[str] = set()
+    for folder_rel in folders_fs:
+        cur = folder_rel
+        while cur not in visited:
+            visited.add(cur)
+            entry = get_ini(cur)
+            if entry is not None:
+                sec = entry[1].get("contacts2")
+                if sec is not None:
+                    _harvest_contacts2({"contacts2": sec}, contacts_ids)
+            if not cur:
+                break
+            cur = cur.rsplit("/", 1)[0] if "/" in cur else ""
+
+    # ---- album_def_uids + folder-level/per-photo feats+keys -------------
     album_uids: set[str] = set()
-    for p in sorted(library.rglob("*")):
-        if p.name.lower() not in (".picasa.ini", "picasa.ini") or not p.is_file():
+    for folder_rel, photo_names in photos_by_folder.items():
+        entry = get_ini(folder_rel)
+        if entry is None:
             continue
-        try:
-            ini = picasa_db.read_picasa_ini(p)
-        except OSError:
-            continue
-        sec = ini.section("Contacts2")
-        if sec is not None:
-            _harvest_contacts2({"contacts2": sec}, contacts_ids)
+        ini, secmap = entry
+
+        # album defs: media-folder inis only (see docstring)
         for s in ini.sections:
             if s.name.lower().startswith(".album:"):
                 uid = s.name.split(":", 1)[1].strip().lower()
                 if uid:
                     album_uids.add(uid)
-    return frozenset(contacts_ids), frozenset(album_uids)
+
+        # folder-level keys: the [Picasa] section only. FIRST-WINS lookup
+        # (_first), not per-line tallying: duplicate sections are merged by
+        # concatenation above (the tracer merges them the same way exactly
+        # because real archives grow them), so a duplicated description=
+        # line must still count this folder ONCE -- the tracer reads one
+        # value per key via its section .get(), and per-line bumping here
+        # would false-FAIL on residue the tracer handles fine.
+        psec = secmap.get("picasa")
+        if psec is not None:
+            if _first(psec, "description") is not None:
+                bump(keys, "description")
+            if _first(psec, "p2category") is not None:
+                bump(keys, "p2category")
+
+        # per-photo keys: sections matching a WALKED photo in this folder.
+        # Single-value keys use the same FIRST-WINS rule as the tracer's
+        # sec.get() (see the folder-level comment above); only the edit-
+        # recipe keys tally per LINE, because Photo.edits itself preserves
+        # every key line raw, dupes kept (fauxcasa-cam.15).
+        for photo_name in photo_names:
+            sec = secmap.get(photo_name.lower())
+            if sec is None:
+                continue
+            star = _first(sec, "star")
+            if star is not None and star.strip().lower() == "yes":
+                bump(feats, "starred")
+            caption = _first(sec, "caption")
+            if caption is not None and caption.strip():
+                bump(feats, "captioned")
+            kw = _first(sec, "keywords")
+            if kw is not None and kw.strip():
+                bump(feats, "keyworded")
+            if _first(sec, "hidden") is not None:
+                bump(keys, "hidden")
+            if _first(sec, "rotate") is not None:
+                bump(keys, "rotate")
+            if _first(sec, "geotag") is not None:
+                bump(feats, "geotagged")
+            fv = _first(sec, "faces")
+            if fv is not None:
+                try:
+                    faces = picasa_db.parse_faces(fv)
+                except ValueError:
+                    pass
+                else:
+                    bump(feats, "face_tags", len(faces))
+            al = _first(sec, "albums")
+            if al is not None and al.strip():
+                bump(feats, "album_memberships",
+                     sum(1 for t in al.split(",") if t.strip()))
+            for k, _v in sec.items:
+                if k.strip().lower() in picasa_db._INI_EDIT_KEYS:
+                    bump(feats, "edit_keys")
+
+    return feats, keys, frozenset(contacts_ids), frozenset(album_uids)
 
 
 # imagedata.filetype codes for a db3-indexed video clip (picasa_db.
@@ -239,14 +444,15 @@ def _build_db3_reference(db3_dir: Path, library: Path) -> tuple[
         if not db3_caption:
             continue
         folder_rel, _, name = rel.rpartition("/")
-        ini_path = (library / folder_rel if folder_rel else library) \
-            / ".picasa.ini"
-        if ini_path not in ini_cache:
-            ini_cache[ini_path] = (
-                picasa_db.read_picasa_ini(ini_path)
-                if ini_path.is_file() else None
-            )
-        ini = ini_cache[ini_path]
+        folder = library / folder_rel if folder_rel else library
+        # The sibling ini via the SAME name-precedence catalog._read_folder_ini
+        # uses (fauxcasa-ed5.8 review fix): a hardcoded ".picasa.ini" here
+        # read every caption in a Picasa-2-era archive (Picasa.ini) as
+        # "divergent" -- there was never an ini to compare against.
+        if folder not in ini_cache:
+            path = _folder_ini_path(folder)
+            ini_cache[folder] = _read_ini_soft(path) if path is not None else None
+        ini = ini_cache[folder]
         ini_caption = ""
         if ini is not None:
             sec = ini.section(name)
@@ -266,7 +472,6 @@ def build_reference(
     """Build the reference side purely from disk -- never touches a
     Catalog. `library` must already be resolved (main() does this once,
     shared with the tracer's own scan_library(root.resolve()))."""
-    survey = picasa_db._survey_ini_tree(library)
     images = _fs_media(library)
     photos_fs = frozenset(_rel(p, library) for p in images)
     videos_fs = frozenset(
@@ -279,7 +484,14 @@ def build_reference(
             or p.parent.name == "Originals")
         and (p.parent.parent / p.name).is_file()
     )
-    contacts_ini_ids, album_def_uids = _scan_ini_tree(library)
+    photos_by_folder: dict[str, set[str]] = {fr: set() for fr in folders_fs}
+    for p in images:
+        photos_by_folder[_folder_rel(p, library)].add(p.name)
+    photos_by_folder_frozen = {
+        fr: frozenset(names) for fr, names in photos_by_folder.items()
+    }
+    feats, keys, contacts_ini_ids, album_def_uids = _scoped_ini_survey(
+        library, folders_fs, photos_by_folder_frozen)
 
     contacts_xml_ids = (
         frozenset(load_contacts_xml(contacts_path)) if contacts_path else None
@@ -298,7 +510,8 @@ def build_reference(
          db3_rows_unjoinable) = _build_db3_reference(db3_dir, library)
 
     return Reference(
-        survey=survey,
+        feats=feats,
+        keys=keys,
         photos_fs=photos_fs,
         videos_fs=videos_fs,
         folders_fs=folders_fs,
@@ -401,8 +614,8 @@ def _strict_count_row(name: str, ref_n: int | None, tr_n: int) -> ClassResult:
 def compare(ref: Reference, cat: Catalog) -> Results:
     rows: list[ClassResult] = []
     by_rel = _photos_by_rel(cat)
-    feats = ref.survey.get("features", {})
-    keys = ref.survey.get("keys", {})
+    feats = ref.feats
+    keys = ref.keys
 
     # ---- fs-vs-catalog identity classes (examples computable) -----------
     rows.append(_strict_fs_row(
@@ -551,13 +764,29 @@ def main(argv: list[str] | None = None) -> int:
                     help="Picasa db3 directory (overrides --picasa-home)")
     ap.add_argument("--json", metavar="OUT", default=None,
                     help="also write the redacted machine-readable result; "
-                    "must NOT be inside LIBRARY or --picasa-home")
+                    "must NOT be inside LIBRARY, --picasa-home, or any "
+                    "resolved --contacts/--pal-dir/--db3 source")
     ap.add_argument("--max-detail", type=int, default=DEFAULT_MAX_DETAIL,
                     metavar="N",
                     help="cap of redacted example rels printed per "
                     f"mismatching class (default: {DEFAULT_MAX_DETAIL})")
     args = ap.parse_args(argv)
 
+    try:
+        return _run(args)
+    except Exception as e:
+        # Never print str(e) or a traceback: an exception's message
+        # commonly embeds the archive's own path (an OSError's filename,
+        # a malformed-ini parse position, ...) -- the same discipline
+        # picasa_db.cmd_survey applies to its own OS-level errors ("the
+        # exception class name only"). Exit 3 is reserved for this path
+        # (see the module docstring's exit-code list).
+        print(f"error: {type(e).__name__} "
+              "(details withheld: redaction contract)", file=sys.stderr)
+        return 3
+
+
+def _run(args: argparse.Namespace) -> int:
     library = Path(args.library)
     if not library.is_dir():
         print("error: LIBRARY is not a directory", file=sys.stderr)
@@ -595,14 +824,26 @@ def main(argv: list[str] | None = None) -> int:
             db3_dir = None
 
     # Read-only guarantee: --json must not land under anything this script
-    # reads from. Checked before any archive I/O happens.
+    # actually reads from -- library, --picasa-home, AND every resolved
+    # source that survived the explicit-override logic above (contacts.
+    # xml's PARENT dir, pal_dir, db3_dir), not just the first two. Checked
+    # before any archive I/O happens.
     if args.json is not None:
         out = Path(args.json).resolve()
-        roots = [library] + ([picasa_home] if picasa_home is not None else [])
+        roots = [library]
+        if picasa_home is not None:
+            roots.append(picasa_home)
+        if contacts_path is not None:
+            roots.append(contacts_path.parent.resolve())
+        if pal_dir is not None:
+            roots.append(pal_dir.resolve())
+        if db3_dir is not None:
+            roots.append(db3_dir.resolve())
         for root in roots:
             if out == root or root in out.parents:
-                print("error: --json OUT must not be inside LIBRARY or "
-                      "--picasa-home", file=sys.stderr)
+                print("error: --json OUT must not be inside LIBRARY, "
+                      "--picasa-home, or any resolved --contacts/"
+                      "--pal-dir/--db3 source", file=sys.stderr)
                 return 2
 
     # scan_library is a pure read (verified by skimming catalog.py/

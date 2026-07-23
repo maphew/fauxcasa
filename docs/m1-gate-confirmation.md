@@ -46,8 +46,10 @@ uv run scripts/confirm-archive.py X:\archive-copy\library --picasa-home X:\archi
 The script runs both independent readers — `picasa_db.py`'s survey side and
 the tracer's `catalog.scan_library` — over the copy and compares per-class
 counts, the manifest-free sibling of the synthetic parity gate. Output is
-**always redacted**; there is no unredacted mode. Exit 0 with a `PASS` line
-is the confirmation signal for the ingest half of the clause. Advisory lines
+**always redacted**; there is no unredacted mode — even internal errors
+report only the exception type, never a path. Exit 0 with a `PASS` line is
+the confirmation signal for the ingest half of the clause (1 = a strict
+class mismatched, 2 = usage error, 3 = internal error, redacted). Advisory lines
 (db3 caption divergence, unjoinable db3 rows, import-report histogram) are
 informational: they describe real-archive residue the spec expects, and do
 not fail the check — but read them and note anything surprising in the
