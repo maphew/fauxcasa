@@ -59,7 +59,12 @@ from catalog import (  # noqa: E402
     Catalog,
     EXTS,
     INI_NAMES,
+    LIBRARY_DIR,
+    ROOT_MARKER,
+    _flag,
     _harvest_contacts2,
+    _is_folder_hidden,
+    _parse_ini_geotag,
     load_contacts_xml,
     read_pal_dir,
     scan_library,
@@ -150,9 +155,15 @@ def _fs_media(library: Path) -> list[Path]:
     `library`, exactly the class-1 reference rule (mirrors
     check-ingest-parity.py's build_reference; this gate does NOT reuse
     catalog.walk_library so a bug shared by both walks can't hide loss)."""
+    nroot = len(library.parts)
     return [
         p for p in library.rglob("*")
         if p.suffix.lower() in EXTS and p.is_file()
+        # walk_library's own exclusions, mirrored (fauxcasa-ed5.7.1): a
+        # .fauxcasa/ library-state dir or .fauxcasa-root marker inside the
+        # copied library must be invisible to BOTH sides.
+        and LIBRARY_DIR not in p.parts[nroot:]
+        and p.name != ROOT_MARKER
     ]
 
 
@@ -225,16 +236,20 @@ def _scoped_ini_survey(
 
     Returns (feats, keys, contacts_ini_ids, album_def_uids):
 
-    - feats/keys: same vocabulary and predicates as _survey_ini_tree's
-      "starred"/"captioned"/.../"edit_keys" features and the "hidden"/
-      "rotate"/"p2category"/"description" keys this gate reads (predicate-
-      anchored against _survey_ini_tree in test_confirm_archive.py, on the
-      PRISTINE synthetic corpus where every section names a real file/
-      folder so the two scopes coincide) -- but tallied ONLY from:
-        * per-photo keys (star/caption/keywords/hidden/rotate/geotag/
-          faces/albums/edit-recipe keys): sections in a MEDIA folder's ini
-          (folders_fs) whose name.lower() matches a WALKED photo's
-          filename in that same folder -- mirrors catalog.scan_library's
+    - feats/keys: _survey_ini_tree's feature/key VOCABULARY (plus this
+      gate's own "edit_keys_other"), but each key judged by the TRACER's
+      predicate -- _flag for star/hidden, `get("caption") or None`,
+      non-empty keyword tokens, parse_rotate % 4 truthiness,
+      _parse_ini_geotag is not None, _is_folder_hidden for p2category,
+      parse_faces rect count with fail-soft [] -- imported/mirrored from
+      catalog.py so a value the tracer legitimately drops (hidden=no,
+      rotate=rotate(0), a malformed geotag=, a P2category that isn't
+      "Hidden Folders", an empty description= line) can never false-FAIL
+      a strict class (second review round, fauxcasa-ed5.8). Tallied ONLY
+      from:
+        * per-photo keys: sections in a MEDIA folder's ini (folders_fs)
+          whose name.lower() matches a WALKED photo's filename in that
+          same folder -- mirrors catalog.scan_library's
           `secmap.get(name.lower())` per-file lookup exactly. A stale
           section for a deleted/renamed file (no walked file of that
           name) is invisible here, same as it is to the tracer.
@@ -244,22 +259,19 @@ def _scoped_ini_survey(
           line that happens to live in some OTHER section (e.g. an
           [.album:] block) is not folder_descriptions/hidden_folders
           material to the tracer and isn't counted here either.
-      "hidden"/"rotate" bump on KEY PRESENCE regardless of value (inherited
-      from _survey_ini_tree's own presence-only semantics, e.g. a
-      `hidden=no` line would still bump `keys["hidden"]`) -- a pre-existing
-      gap this fix does not attempt to close, and the synthetic corpus's
-      hidden=yes/rotate=rotate(N)-only usage never exercises it.
-    - contacts_ini_ids: [Contacts2] ids from MEDIA folders' inis AND their
+      The predicate-anchoring test compares these tallies against
+      _survey_ini_tree on the PRISTINE synthetic corpus, where every
+      section names a real file and every value is well-formed, so both
+      scope and predicates coincide there by construction.
+    - contacts_ini_ids / album_def_uids: [Contacts2] ids and
+      `[.album:<uid>]` definitions from MEDIA folders' inis AND their
       ANCESTOR CHAIN up to and including the library root ("") -- exactly
-      the set catalog.scan_library's folder_contacts() walks on demand
-      (nearest-definition-wins inheritance), so a [Contacts2] table in a
-      photoless SIBLING branch (never an ancestor of any media folder) is
-      correctly excluded.
-    - album_def_uids: `[.album:<uid>]` sections from MEDIA folders' inis
-      ONLY -- catalog.scan_library's own album-definition loop walks
-      `ini_by_folder`, which is populated only for folders folder_ini()
-      was called on, i.e. media folders (see scan_library's per-file walk
-      loop calling `folder_ini(folder_rel)`).
+      the ini set catalog.scan_library ever loads (ini_by_folder: media
+      folders via folder_ini per walked file, ancestors via
+      folder_contacts' on-demand walk; both the [Contacts2] registry loop
+      and the album-definition loop iterate that same ini_by_folder). A
+      photoless SIBLING branch (never an ancestor of any media folder)
+      stays correctly excluded from both.
 
     Every ini read is fail-soft per file (_read_ini_soft): unreadable or
     absent sidecars degrade to "no ini for this folder", never an
@@ -270,17 +282,6 @@ def _scoped_ini_survey(
 
     def bump(d: dict[str, int], k: str, n: int = 1) -> None:
         d[k] = d.get(k, 0) + n
-
-    def _first(sec: picasa_db.IniSection, key: str) -> str | None:
-        """First value whose key strip().lower()-matches `key` -- the
-        first-wins rule the tracer's own merged-section .get() applies
-        (IniSection.get is first-key-wins too; this local variant adds the
-        strip().lower() normalization so a `Star =` line matches the way
-        the key-vocabulary comparisons in this loop expect)."""
-        for k, v in sec.items:
-            if k.strip().lower() == key:
-                return v
-        return None
 
     ini_cache: dict[str, tuple[picasa_db.PicasaIni, dict] | None] = {}
 
@@ -294,8 +295,16 @@ def _scoped_ini_survey(
         ini_cache[folder_rel] = entry
         return entry
 
-    # ---- contacts_ini_ids: media folders + their ancestor chain to "" ---
+    # ---- contacts_ini_ids + album_def_uids: media folders + ancestors ---
+    # Both harvested over the SAME folder set the tracer actually loads:
+    # scan_library's ini_by_folder holds media folders (folder_ini per
+    # walked file) PLUS every ancestor folder_contacts() visited on
+    # demand, and BOTH its [Contacts2] registry loop and its
+    # album-definition loop iterate that same ini_by_folder -- so an
+    # [.album:] definition in an ancestor folder's ini IS ingested and
+    # must be verified here too.
     contacts_ids: dict[str, str] = {}
+    album_uids: set[str] = set()
     visited: set[str] = set()
     for folder_rel in folders_fs:
         cur = folder_rel
@@ -303,81 +312,82 @@ def _scoped_ini_survey(
             visited.add(cur)
             entry = get_ini(cur)
             if entry is not None:
-                sec = entry[1].get("contacts2")
+                ini, secmap = entry
+                sec = secmap.get("contacts2")
                 if sec is not None:
                     _harvest_contacts2({"contacts2": sec}, contacts_ids)
+                for s in ini.sections:
+                    if s.name.lower().startswith(".album:"):
+                        uid = s.name.split(":", 1)[1].strip().lower()
+                        if uid:
+                            album_uids.add(uid)
             if not cur:
                 break
             cur = cur.rsplit("/", 1)[0] if "/" in cur else ""
 
-    # ---- album_def_uids + folder-level/per-photo feats+keys -------------
-    album_uids: set[str] = set()
+    # ---- folder-level/per-photo feats+keys ------------------------------
     for folder_rel, photo_names in photos_by_folder.items():
         entry = get_ini(folder_rel)
         if entry is None:
             continue
-        ini, secmap = entry
+        _ini, secmap = entry
 
-        # album defs: media-folder inis only (see docstring)
-        for s in ini.sections:
-            if s.name.lower().startswith(".album:"):
-                uid = s.name.split(":", 1)[1].strip().lower()
-                if uid:
-                    album_uids.add(uid)
-
-        # folder-level keys: the [Picasa] section only. FIRST-WINS lookup
-        # (_first), not per-line tallying: duplicate sections are merged by
-        # concatenation above (the tracer merges them the same way exactly
-        # because real archives grow them), so a duplicated description=
-        # line must still count this folder ONCE -- the tracer reads one
-        # value per key via its section .get(), and per-line bumping here
-        # would false-FAIL on residue the tracer handles fine.
+        # folder-level keys, via the tracer's OWN predicates so a value
+        # the tracer legitimately drops (a P2category other than "Hidden
+        # Folders", an empty description= line) can never false-FAIL here.
+        # Lookup is IniSection.get -- case-insensitive FIRST-WINS, so a
+        # duplicated key line in a merged duplicate section counts once,
+        # exactly like the tracer's read.
         psec = secmap.get("picasa")
         if psec is not None:
-            if _first(psec, "description") is not None:
-                bump(keys, "description")
-            if _first(psec, "p2category") is not None:
-                bump(keys, "p2category")
-
-        # per-photo keys: sections matching a WALKED photo in this folder.
-        # Single-value keys use the same FIRST-WINS rule as the tracer's
-        # sec.get() (see the folder-level comment above); only the edit-
-        # recipe keys tally per LINE, because Photo.edits itself preserves
-        # every key line raw, dupes kept (fauxcasa-cam.15).
+            if (psec.get("description") or None) is not None:
+                bump(keys, "description")     # mirrors Folder.description
+            if _is_folder_hidden(psec):
+                bump(keys, "p2category")      # mirrors Folder.folder_hidden
+        # per-photo keys: sections matching a WALKED photo in this folder,
+        # each key judged by the exact predicate scan_library applies when
+        # it sets the Photo field compare() later counts. Only the
+        # edit-recipe keys tally per LINE, because Photo.edits itself
+        # preserves every key line raw, dupes kept (fauxcasa-cam.15).
         for photo_name in photo_names:
             sec = secmap.get(photo_name.lower())
             if sec is None:
                 continue
-            star = _first(sec, "star")
-            if star is not None and star.strip().lower() == "yes":
+            if _flag(sec, "star"):            # p.star = 1 if _flag(...)
                 bump(feats, "starred")
-            caption = _first(sec, "caption")
-            if caption is not None and caption.strip():
+            if sec.get("caption"):            # p.caption = get(...) or None
                 bump(feats, "captioned")
-            kw = _first(sec, "keywords")
-            if kw is not None and kw.strip():
-                bump(feats, "keyworded")
-            if _first(sec, "hidden") is not None:
+            kw = sec.get("keywords")
+            if kw and any(k.strip() for k in kw.split(",")):
+                bump(feats, "keyworded")      # p.keywords = non-empty tokens
+            if _flag(sec, "hidden"):          # p.hidden = _flag(...)
                 bump(keys, "hidden")
-            if _first(sec, "rotate") is not None:
-                bump(keys, "rotate")
-            if _first(sec, "geotag") is not None:
-                bump(feats, "geotagged")
-            fv = _first(sec, "faces")
-            if fv is not None:
-                try:
-                    faces = picasa_db.parse_faces(fv)
+            rot = sec.get("rotate")
+            if rot:                           # p.rotate = parse_rotate % 4,
+                try:                          # ValueError fail-soft -> 0
+                    if picasa_db.parse_rotate(rot) % 4:
+                        bump(keys, "rotate")
                 except ValueError:
                     pass
-                else:
-                    bump(feats, "face_tags", len(faces))
-            al = _first(sec, "albums")
-            if al is not None and al.strip():
+            gt = sec.get("geotag")
+            if gt and _parse_ini_geotag(gt) is not None:
+                bump(feats, "geotagged")      # p.geotag = parse or None
+            fv = sec.get("faces")
+            if fv:
+                try:                          # fail-soft per line, like
+                    faces = picasa_db.parse_faces(fv)  # scan_library's own
+                except ValueError:                     # except -> []
+                    faces = []
+                bump(feats, "face_tags", len(faces))
+            al = sec.get("albums")
+            if al:
                 bump(feats, "album_memberships",
                      sum(1 for t in al.split(",") if t.strip()))
             for k, _v in sec.items:
-                if k.strip().lower() in picasa_db._INI_EDIT_KEYS:
-                    bump(feats, "edit_keys")
+                # k.lower(), no strip: Photo.edits filters `k.lower() in
+                # EDIT_RECIPE_KEYS` and compare() narrows the same way.
+                if k.lower() in _EDIT_KEYS_OTHER:
+                    bump(feats, "edit_keys_other")
 
     return feats, keys, frozenset(contacts_ids), frozenset(album_uids)
 
@@ -664,7 +674,7 @@ def compare(ref: Reference, cat: Catalog) -> Results:
         sum(len(p.faces) for p in cat.photos)))
     rows.append(_strict_count_row(
         "edit_keys_other",
-        feats.get("edit_keys", 0) - keys.get("rotate", 0),
+        feats.get("edit_keys_other", 0),
         sum(1 for p in cat.photos for k, _v in p.edits
             if k.lower() in _EDIT_KEYS_OTHER)))
 

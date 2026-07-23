@@ -329,8 +329,14 @@ def test_scoped_tallies_match_survey_on_pristine_corpus(corpus):
     survey_keys = survey["keys"]
 
     for name in ("starred", "captioned", "keyworded", "geotagged",
-                 "face_tags", "album_memberships", "edit_keys"):
+                 "face_tags", "album_memberships"):
         assert ref.feats.get(name, 0) == survey_feats.get(name, 0), name
+    # The gate counts edit_keys_other directly (non-rotate recipe key
+    # lines); the survey folds rotate= into "edit_keys" -- same identity
+    # the parity gate uses, valid while the pristine corpus's rotate
+    # values are all well-formed and nonzero.
+    assert ref.feats.get("edit_keys_other", 0) == (
+        survey_feats.get("edit_keys", 0) - survey_keys.get("rotate", 0))
     for name in ("hidden", "rotate", "p2category", "description"):
         assert ref.keys.get(name, 0) == survey_keys.get(name, 0), name
 
@@ -387,6 +393,41 @@ def test_duplicate_section_counts_once(corpus, tmp_path):
         "--contacts", str(dup_root / "contacts" / "contacts.xml"),
         "--pal-dir", str(dup_root / "albums"),
         "--db3", str(dup_root / "db3"),
+    ])
+    assert rc == 0
+
+
+def test_value_predicates_mirror_tracer(corpus, tmp_path):
+    """Keys whose VALUES the tracer legitimately drops -- hidden=no,
+    rotate=rotate(0), a malformed geotag=, a P2category that is not
+    "Hidden Folders", an empty description= line -- must not count on the
+    reference side either (second review round: a presence-only reference
+    predicate false-FAILed every one of these). Built as a NEW media
+    folder + copied photo so no first-wins shadowing from existing
+    sections can mask a key."""
+    val_root = tmp_path / "value-corpus"
+    shutil.copytree(corpus, val_root)
+    library = val_root / "library"
+    beach = library / "2009-07-04 Beach Day"
+    src = next(beach.glob("*.jpg"))
+    vdir = library / "Value Predicates"
+    vdir.mkdir()
+    shutil.copy2(src, vdir / "valcheck.jpg")
+    (vdir / ".picasa.ini").write_text(
+        "[Picasa]\r\n"
+        "P2category=Screensaver\r\n"
+        "description=\r\n"
+        "[valcheck.jpg]\r\n"
+        "hidden=no\r\n"
+        "rotate=rotate(0)\r\n"
+        "geotag=999.000000,999.000000\r\n",
+        encoding="utf-8",
+    )
+    rc = ca.main([
+        str(library),
+        "--contacts", str(val_root / "contacts" / "contacts.xml"),
+        "--pal-dir", str(val_root / "albums"),
+        "--db3", str(val_root / "db3"),
     ])
     assert rc == 0
 
