@@ -23,10 +23,9 @@ synthetic picasa-extras corpus (scripts/make-synthetic-library.py
 
 -- and diffs feature counts per ingest class. Designed to land GREEN and
 RATCHET: classes the tracer does not yet ingest are marked
-expected-missing with the owning bead id (fauxcasa-cam.15 took the table
-to zero expected-missing; fauxcasa-ed5.11 adds one back --
-db3_caption_precedence, owner fauxcasa-cam.20 -- see the CLASSES table),
-and the harness FAILS on
+expected-missing with the owning bead id. fauxcasa-cam.20 returns the table
+to zero expected-missing by ingesting db3_caption_precedence with both a
+real gap-fill and a divergent ini-preservation case. The harness FAILS on
 
 (a) LOSS/mismatch in a class marked ingested,
 (b) a class the tracer now ingests but the table still marks
@@ -110,8 +109,9 @@ class Reference:
     db3_video_dims: dict[str, tuple[int, int]]     # rel -> (width, height), db3-indexed video clips only
     db3_video_filetype: dict[str, int]             # rel -> imagedata.filetype code, same rows
     # rel -> (db3 caption, ini caption) for every db3-indexed row whose
-    # db3 caption differs from the independently-reread ini caption= value
-    db3_caption_diverge: dict[str, tuple[str, str]]
+    # db3 caption differs from the independently-reread ini caption= value:
+    # both empty-ini gaps and populated-ini conflicts are precedence cases.
+    db3_caption_precedence: dict[str, tuple[str, str]]
 
 
 # imagedata.filetype codes for a db3-indexed video clip, derived from
@@ -135,17 +135,17 @@ def _db3_reference(
     validated readers — read_table/read_thumbindex, never a hand-rolled
     parse), joined via db3rescue.translate_db3_path exactly like the
     rescue importer joins. Returns (video dims by rel, video filetype by
-    rel, caption-divergence by rel) — the three db3 ParityClasses' ground
-    truth. Fail-soft: an absent db3_dir yields all-empty (a corpus profile
+    rel, caption-precedence cases by rel) — the three db3 ParityClasses'
+    ground truth. Fail-soft: an absent db3_dir yields all-empty (a profile
     that never ships one, or the default single-root gate run, still
     passes trivially — no class is asserted at reference-count 0 unless
     the caller's corpus is expected to exercise it)."""
     dims: dict[str, tuple[int, int]] = {}
     filetypes: dict[str, int] = {}
-    diverge: dict[str, tuple[str, str]] = {}
+    precedence: dict[str, tuple[str, str]] = {}
     ti_path = db3_dir / "thumbindex.db"
     if not ti_path.is_file():
-        return dims, filetypes, diverge
+        return dims, filetypes, precedence
     # scan_library resolves its root before db3rescue.translate_db3_path
     # ever sees it (catalog.py: "root = root.resolve()") — resolve here
     # too so this independent reference-side join can't silently drift
@@ -192,8 +192,8 @@ def _db3_reference(
             if sec is not None:
                 ini_caption = sec.get("caption") or ""
         if db3_caption != ini_caption:
-            diverge[rel] = (db3_caption, ini_caption)
-    return dims, filetypes, diverge
+            precedence[rel] = (db3_caption, ini_caption)
+    return dims, filetypes, precedence
 
 
 def build_reference(corpus: Path) -> Reference:
@@ -214,7 +214,7 @@ def build_reference(corpus: Path) -> Reference:
             or p.parent.name == "Originals")
         and (p.parent.parent / p.name).is_file()
     )
-    db3_video_dims, db3_video_filetype, db3_caption_diverge = (
+    db3_video_dims, db3_video_filetype, db3_caption_precedence = (
         _db3_reference(corpus / "db3", library)
     )
     return Reference(
@@ -228,7 +228,7 @@ def build_reference(corpus: Path) -> Reference:
         stashed_fs=stashed_fs,
         db3_video_dims=db3_video_dims,
         db3_video_filetype=db3_video_filetype,
-        db3_caption_diverge=db3_caption_diverge,
+        db3_caption_precedence=db3_caption_precedence,
     )
 
 
@@ -240,10 +240,8 @@ def build_reference(corpus: Path) -> Reference:
 # a representation (dataclass fields by candidate names, behavioral
 # evidence) and an int after, so the gate flipped to "ratchet forward" the
 # moment fauxcasa-cam.* ingest work landed, even in a parallel branch. As
-# of fauxcasa-cam.15 (edit_keys_other) the table went fully ingested and
-# the probe machinery was retired; fauxcasa-ed5.11 revives it for
-# db3_caption_precedence below (owner fauxcasa-cam.20) -- see
-# _probe_db3_caption_precedence.
+# of fauxcasa-cam.20 (db3_caption_precedence) the table is fully ingested
+# again and the temporary probe machinery is retired.
 
 
 def _photos_by_rel(c: Catalog) -> dict[str, Any]:
@@ -290,6 +288,13 @@ def _key(key: str) -> Callable[[Reference], int]:
     return lambda ref: ref.survey["keys"].get(key, 0)
 
 
+def _captioned_reference(ref: Reference) -> int:
+    """Ini-survey captions plus db3 captions that fill an actual ini gap."""
+    gaps = sum(1 for _db3, ini in ref.db3_caption_precedence.values()
+               if not ini)
+    return ref.survey["features"].get("captioned", 0) + gaps
+
+
 CLASSES: list[ParityClass] = [
     # ---- ingested today: zero loss REQUIRED --------------------------------
     ParityClass(
@@ -312,7 +317,7 @@ CLASSES: list[ParityClass] = [
         lambda c, r: sum(1 for p in c.photos if p.star),
         manifest_key="starred"),
     ParityClass(
-        "captioned", _feat("captioned"),
+        "captioned", _captioned_reference,
         lambda c, r: sum(1 for p in c.photos if p.caption),
         manifest_key="captioned"),
     ParityClass(
@@ -452,20 +457,14 @@ CLASSES: list[ParityClass] = [
         "db3_video_filetype", lambda r: len(r.db3_video_filetype),
         lambda c, r: _tracer_db3_video_filetype(c, r),
         manifest_key="db3_video_filetype"),
-    # ---- expected-missing: owned, probed, ratchets forward ------------------
     ParityClass(
         # db3 caption gap-fill (§4 precedence: product-spec.md says
         # in-file/ini captions win tier-1 data and "db3 fills gaps only",
-        # so a diverging db3 caption should never override an existing
-        # ini one) is not wired anywhere yet — db3rescue.py implements
-        # only the class-4 person-album rescue (cam.6/cam.7); no code
-        # reads imagedata_caption.pmp. The synthetic-library-extras db3/
-        # dir carries one photo (Beach Day/photo01.jpg) whose db3 caption
-        # diverges from its ini caption= "Sunset over the bay" so the
-        # fixture is ready the moment cam.20 lands.
-        "db3_caption_precedence", lambda r: len(r.db3_caption_diverge),
-        lambda c, r: _probe_db3_caption_precedence(c, r),
-        owner="fauxcasa-cam.20", manifest_key="db3_caption_precedence"),
+        # so photo00's caption-less ini adopts db3 while photo01's
+        # divergent populated ini remains authoritative.
+        "db3_caption_precedence", lambda r: len(r.db3_caption_precedence),
+        lambda c, r: _tracer_db3_caption_precedence(c, r),
+        manifest_key="db3_caption_precedence"),
 ]
 
 
@@ -486,25 +485,15 @@ def _tracer_db3_video_filetype(c: Catalog, r: Reference) -> int:
     )
 
 
-def _probe_db3_caption_precedence(c: Catalog, r: Reference) -> int | None:
-    """Probe for fauxcasa-cam.20 (db3 caption gap-fill; not yet
-    implemented anywhere -- db3rescue.py only reads albumdata/imagedata
-    columns for the class-4 person rescue). Fires -- returns a real count,
-    tripping the ratchet -- the moment ANY future merge code changes
-    Photo.caption away from the plain ini value on a row this fixture
-    marks db3-divergent, regardless of which way the merge resolves it:
-    product-spec.md §4 says db3 fills gaps only, so the un-changed case
-    (this photo already has an ini caption) may legitimately persist even
-    after cam.20 lands correctly -- that bead owns the final call on
-    exact precedence and on rewriting this probe/fixture if the gap-fill
-    semantics need a photo with NO ini caption instead."""
+def _tracer_db3_caption_precedence(c: Catalog, r: Reference) -> int:
+    """Count db3 rows whose final caption follows §4 gap-only precedence."""
     by_rel = _photos_by_rel(c)
-    n = 0
-    for rel, (_db3_caption, ini_caption) in r.db3_caption_diverge.items():
-        p = by_rel.get(rel)
-        if p is not None and p.caption != ini_caption:
-            n += 1
-    return n or None
+    return sum(
+        1 for rel, (db3_caption, ini_caption)
+        in r.db3_caption_precedence.items()
+        if (p := by_rel.get(rel)) is not None
+        and p.caption == (ini_caption or db3_caption)
+    )
 
 
 # --------------------------------------------------------------------------

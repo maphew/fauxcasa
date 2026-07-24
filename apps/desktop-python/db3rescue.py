@@ -1,4 +1,4 @@
-"""db3 rescue import for the tracer (fauxcasa-cam.6/.7).
+"""db3 rescue import for the tracer (fauxcasa-cam.6/.7/.20).
 
 Spec §4 reads the db3 catalog as the *rescue importer*: db3 fills gaps
 ONLY — anything the ini or contacts.xml already provides never changes,
@@ -19,6 +19,12 @@ components case-insensitively with the drive prefix stripped from both
 sides, so a library that moved from `C:` to `D:` (or into a Wine `Z:`
 prefix) still joins. An unresolvable path is an import-report entry,
 never an error.
+
+Caption rescue (cam.20): imagedata.caption joins through thumbindex and
+fills only a Photo.caption gap. An ini caption already parsed by the walk
+is never replaced; equal and divergent non-gap outcomes are both surfaced
+in the ImportReport. The indexer subsequently applies in-file XMP/IPTC
+captions over the walked catalog, preserving §4's in-file > ini > db3 rank.
 
 The class-4 rescue (cam.7): albumdata category-8 rows are person albums
 — name + albumcontactids (a uint64 whose %016x form is byte-equal to the
@@ -107,6 +113,76 @@ def _col(db3_dir: Path, table: str, column: str) -> "picasa_db.PmpColumn | None"
         return None
 
 
+def _rescue_captions(db3_dir: Path, root: Path, photos: list, report) -> None:
+    """Gap-fill Photo.caption from imagedata_caption.pmp, fail-soft.
+
+    thumbindex row number is the imagedata row number. Every populated db3
+    caption therefore has one of four visible outcomes: rescued into an empty
+    Photo.caption, retained as a redundant lower-rank value, rejected as a
+    divergent lower-rank value, or reported as unjoinable. Empty db3 values
+    carry no information and are ignored.
+
+    At scan time Photo.caption already carries the ini value. The existing
+    indexer later replaces it with non-empty in-file XMP/IPTC metadata, so the
+    complete §4 rank remains in-file > ini > db3 without a second parser here.
+    """
+    caption_col = _col(db3_dir, "imagedata", "caption")
+    if caption_col is None:
+        return
+    captions = [
+        (row, value) for row, value in enumerate(caption_col.values)
+        if isinstance(value, str) and value
+    ]
+    if not captions:
+        return
+
+    ti_path = db3_dir / "thumbindex.db"
+    if not ti_path.is_file():
+        report.add("db3", "db3_unreadable", "thumbindex.db",
+                   "imagedata carries caption data but thumbindex.db is "
+                   "absent — db3 captions cannot be joined to photos this "
+                   "run (fail-soft)")
+        return
+    try:
+        entries = picasa_db.read_thumbindex(ti_path, strict=False)
+        full_paths = picasa_db.thumbindex_full_paths(entries)
+    except (picasa_db.ThumbIndexError, OSError):
+        report.add("db3", "db3_unreadable", "thumbindex.db",
+                   "thumbindex.db is unreadable — db3 captions cannot be "
+                   "joined to photos this run (fail-soft)")
+        return
+
+    by_rel = {p.rel: p for p in photos}
+    by_fold = {p.rel.casefold(): p for p in photos}
+    for row, db3_caption in captions:
+        abs_path = full_paths[row] if row < len(full_paths) else ""
+        rel = translate_db3_path(abs_path, root) if abs_path else None
+        photo = None
+        if rel is not None:
+            photo = by_rel.get(rel) or by_fold.get(rel.casefold())
+        if photo is None:
+            subject = abs_path or f"imagedata row {row}"
+            report.add("db3", "db3_path_unresolved", subject,
+                       "db3 carries a caption on a row that does not join "
+                       "to a photo in this library — skipped (fail-soft)")
+            continue
+
+        if photo.caption is None or photo.caption == "":
+            photo.caption = db3_caption
+            report.add("db3", "db3_caption_rescued", photo.rel,
+                       f"db3 caption filled the empty caption on {photo.rel} "
+                       "(§4 gap-fill)")
+        elif photo.caption == db3_caption:
+            report.add("db3", "db3_caption_redundant", photo.rel,
+                       f"db3 repeats the existing caption on {photo.rel} — "
+                       "the higher-rank ini/in-file value is kept (§4)")
+        else:
+            report.add("db3", "db3_caption_conflict", photo.rel,
+                       f"db3 caption diverges from the existing caption on "
+                       f"{photo.rel} — the higher-rank ini/in-file value is "
+                       "kept (§4; db3 fills gaps only)")
+
+
 def rescue_people(db3_dir: Path, root: Path, photos: list,
                   registry: dict[str, str], report) -> set[str]:
     """The class-4 rescue, §4 gap-fill only. Mutates `registry` (adds
@@ -129,6 +205,11 @@ def rescue_people(db3_dir: Path, root: Path, photos: list,
     be rescued (a fresh db3 legitimately has no albumdata at all)."""
     db3_dir = Path(db3_dir)
     rescued: set[str] = set()
+
+    # cam.20 shares the established db3 invocation rather than widening
+    # catalog.py's public surface: caption rescue is independent of whether
+    # this db3 also happens to carry the person-album columns below.
+    _rescue_captions(db3_dir, root, photos, report)
 
     cat_col = _col(db3_dir, "albumdata", "category")
     name_col = _col(db3_dir, "albumdata", "name")
@@ -191,10 +272,12 @@ def rescue_people(db3_dir: Path, root: Path, photos: list,
         try:
             entries = picasa_db.read_thumbindex(ti_path, strict=False)
         except (picasa_db.ThumbIndexError, OSError):
-            report.add("db3", "db3_unreadable", "thumbindex.db",
-                       "thumbindex.db is unreadable — db3 face rows cannot "
-                       "be joined to photos this run (names above still "
-                       "rescued; fail-soft)")
+            if not any(e.kind == "db3_unreadable" and e.subject == "thumbindex.db"
+                       for e in report.entries):
+                report.add("db3", "db3_unreadable", "thumbindex.db",
+                           "thumbindex.db is unreadable — db3 face rows cannot "
+                           "be joined to photos this run (names above still "
+                           "rescued; fail-soft)")
     if entries is None:
         return rescued
 
