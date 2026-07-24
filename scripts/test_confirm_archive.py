@@ -48,14 +48,54 @@ def _load(name: str, filename: str):
 ca = _load("confirm_archive", "confirm-archive.py")
 msl = _load("make_synthetic_library", "make-synthetic-library.py")
 
-import catalog  # noqa: E402
-import picasa_db  # noqa: E402
+import catalog
+import picasa_db
 
 
 @pytest.fixture(scope="session")
 def corpus(tmp_path_factory) -> Path:
     root = tmp_path_factory.mktemp("confirm-archive-corpus")
     return msl.make_extras_library(root / "corpus")
+
+
+@pytest.fixture(scope="session")
+def scanned(corpus):
+    """(catalog, reference) over the PRISTINE corpus, shared by tests that
+    only read them -- compare() mutates neither, and tests that need a
+    divergent catalog build their own via dataclasses.replace (the shared
+    Photo objects are never mutated in place)."""
+    w = _wiring(corpus)
+    contacts = catalog.load_contacts_xml(w["contacts"])
+    cat = catalog.scan_library(
+        w["library"], contacts=contacts, pal_dir=w["pal_dir"],
+        db3_dir=w["db3_dir"],
+    )
+    ref = ca.build_reference(
+        w["library"].resolve(), w["contacts"], w["pal_dir"], w["db3_dir"])
+    return cat, ref
+
+
+def _drop_photo(cat, victim: int):
+    """`cat` with photos[victim] removed. Removing a list element shifts
+    every later index, so any OTHER photo's stashed_original (an index
+    into this same list) is fixed up too -- otherwise compare()'s
+    stashed_originals class could IndexError or silently follow a stale
+    link, independent of what the caller asserts. Non-destructive:
+    builds new Photo/Catalog objects, never mutates the input."""
+    mutated_photos = []
+    for i, p in enumerate(cat.photos):
+        if i == victim:
+            continue
+        so = p.stashed_original
+        if so == victim:
+            so = None
+        elif so is not None and so > victim:
+            so -= 1
+        mutated_photos.append(
+            p if so == p.stashed_original
+            else dataclasses.replace(p, stashed_original=so)
+        )
+    return dataclasses.replace(cat, photos=mutated_photos)
 
 
 def _wiring(corpus: Path) -> dict:
@@ -105,9 +145,10 @@ def test_green_run_exits_zero_and_reports_pass(corpus, tmp_path, capsys):
 
 def _sensitive_strings(corpus: Path) -> set[str]:
     """Every real archive string the corpus is known to carry: ini
-    caption/keyword values and section names, contacts.xml contact names,
-    and folder/file names under library/. Strings shorter than 4 chars are
-    dropped by the caller (trivial-collision noise)."""
+    caption/keyword/description/album-name values, [Contacts2] person
+    names, section names, contacts.xml contact names, and folder/file
+    names under library/. Strings shorter than 4 chars are dropped by the
+    caller (trivial-collision noise)."""
     out: set[str] = set()
     library = corpus / "library"
     for p in sorted(library.rglob("*")):
@@ -117,8 +158,18 @@ def _sensitive_strings(corpus: Path) -> set[str]:
             for sec in ini.sections:
                 if sec.name:
                     out.add(sec.name)
+                is_contacts = sec.name.lower() == "contacts2"
                 for k, v in sec.items:
-                    if k.lower() in ("caption", "keywords"):
+                    if is_contacts:
+                        # <id>=Name;; lines -- the person name is the
+                        # most privacy-critical string in the archive.
+                        name = v.split(";", 1)[0].strip()
+                        if name:
+                            out.add(name)
+                    elif k.lower() in ("caption", "keywords", "name",
+                                       "description"):
+                        # name= covers [.album:] album names;
+                        # description= covers folder descriptions.
                         out.add(v)
     xml_path = corpus / "contacts" / "contacts.xml"
     if xml_path.is_file():
@@ -157,38 +208,14 @@ def test_redaction_no_sensitive_string_leaks(corpus, tmp_path, capsys):
 # --------------------------------------------------------------------------
 
 
-def test_loss_detection_flags_starred_and_photos(corpus):
-    w = _wiring(corpus)
-    contacts = catalog.load_contacts_xml(w["contacts"])
-    cat = catalog.scan_library(
-        w["library"], contacts=contacts, pal_dir=w["pal_dir"],
-        db3_dir=w["db3_dir"],
-    )
-    ref = ca.build_reference(
-        w["library"].resolve(), w["contacts"], w["pal_dir"], w["db3_dir"])
+def test_loss_detection_flags_starred_and_photos(scanned):
+    cat, ref = scanned
 
-    # A copy with one starred photo removed. `cat` here is a fresh
-    # scan_library() result private to this test (every test re-scans),
-    # so this never touches another test's fixture. Removing a list
-    # element shifts every later index, so any OTHER photo's
-    # stashed_original (an index into this same list) is fixed up too --
-    # otherwise compare()'s stashed_originals class could IndexError or
-    # silently follow a stale link, independent of what this test asserts.
+    # A copy with one starred photo removed (_drop_photo builds new
+    # objects, so the shared `scanned` fixture is never touched).
     victim = next(i for i, p in enumerate(cat.photos) if p.star)
     victim_rel = cat.photos[victim].rel
-    mutated_photos = []
-    for i, p in enumerate(cat.photos):
-        if i == victim:
-            continue
-        so = p.stashed_original
-        if so == victim:
-            so = None
-        elif so is not None and so > victim:
-            so -= 1
-        mutated_photos.append(
-            p if so == p.stashed_original else dataclasses.replace(p, stashed_original=so)
-        )
-    mutated_cat = dataclasses.replace(cat, photos=mutated_photos)
+    mutated_cat = _drop_photo(cat, victim)
 
     results = ca.compare(ref, mutated_cat)
     by_name = {r.name: r for r in results.rows}
@@ -372,8 +399,8 @@ def test_duplicate_section_counts_once(corpus, tmp_path):
     section then carries duplicate key lines; the tracer reads each
     single-value key FIRST-WINS via .get(), so the reference must too --
     per-LINE tallying would count one captioned/starred photo twice and
-    false-FAIL. Regression for the _first() first-wins rule in
-    _scoped_ini_survey (a per-line implementation fails this test)."""
+    false-FAIL. Regression for _scoped_ini_survey's IniSection.get
+    first-wins reads (a per-line implementation fails this test)."""
     dup_root = tmp_path / "dup-corpus"
     shutil.copytree(corpus, dup_root)
     library = dup_root / "library"
@@ -430,6 +457,187 @@ def test_value_predicates_mirror_tracer(corpus, tmp_path):
         "--db3", str(val_root / "db3"),
     ])
     assert rc == 0
+
+
+# --------------------------------------------------------------------------
+# 9. Strict FAIL end-to-end (exit 1) + FAIL-path redaction
+# --------------------------------------------------------------------------
+
+
+def test_strict_fail_exits_one_and_renders_redacted(
+        corpus, tmp_path, monkeypatch, capsys):
+    """The gate's primary FAIL signal, end-to-end through main(): a tracer
+    that drops one photo the filesystem walk still sees must exit 1,
+    print FAIL, and render ONLY redacted example tokens -- on stdout AND
+    in --json. (The other tests pin rc 0/2/3; without this, a regression
+    in main()'s strict-FAIL filter or `return 1 if failures else 0`
+    would leave the suite green while the exit code CI keys on is
+    broken, and the FAIL-path example rendering would go unexercised.)"""
+    w = _wiring(corpus)
+    real_scan = ca.scan_library
+    dropped: dict[str, str] = {}
+
+    def scan_and_drop(*args, **kwargs):
+        cat = real_scan(*args, **kwargs)
+        victim = next(i for i, p in enumerate(cat.photos) if p.star)
+        dropped["rel"] = cat.photos[victim].rel
+        return _drop_photo(cat, victim)
+
+    monkeypatch.setattr(ca, "scan_library", scan_and_drop)
+    json_out = tmp_path / "fail-report.json"
+    rc = ca.main([
+        str(w["library"]),
+        "--contacts", str(w["contacts"]),
+        "--pal-dir", str(w["pal_dir"]),
+        "--db3", str(w["db3_dir"]),
+        "--json", str(json_out),
+    ])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "FAIL" in out
+    assert "example: <len=" in out          # examples rendered, redacted
+    json_text = json_out.read_text("utf-8")
+    assert '"<len=' in json_text
+    victim_rel = dropped["rel"]
+    victim_name = victim_rel.rsplit("/", 1)[-1]
+    for leak in (victim_rel, victim_name):
+        assert leak not in out
+        assert leak not in json_text
+
+
+# --------------------------------------------------------------------------
+# 10. json guard: every protected root, and relative-path normalization
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("root_key", ["contacts", "pal_dir", "db3_dir"])
+def test_json_inside_any_source_is_usage_error(corpus, root_key, capsys):
+    """--json must be rejected inside EVERY read source, not just LIBRARY
+    -- the guard's contacts-parent/pal/db3 roots each get a regression
+    pin (dropping one from the roots list must fail here)."""
+    w = _wiring(corpus)
+    target_dir = w[root_key].parent if root_key == "contacts" else w[root_key]
+    rc = ca.main([
+        str(w["library"]),
+        "--contacts", str(w["contacts"]),
+        "--pal-dir", str(w["pal_dir"]),
+        "--db3", str(w["db3_dir"]),
+        "--json", str(target_dir / "out.json"),
+    ])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "error" in err.lower()
+
+
+def test_json_inside_picasa_home_is_usage_error(corpus, tmp_path, capsys):
+    w = _wiring(corpus)
+    home = tmp_path / "Google"
+    home.mkdir()
+    rc = ca.main([
+        str(w["library"]),
+        "--picasa-home", str(home),
+        "--json", str(home / "out.json"),
+    ])
+    assert rc == 2
+
+
+def test_json_relative_path_resolving_into_library_is_usage_error(
+        corpus, monkeypatch, capsys):
+    """The guard compares RESOLVED paths: a relative --json that lands
+    inside the library once resolved must be rejected too."""
+    w = _wiring(corpus)
+    monkeypatch.chdir(w["library"])
+    rc = ca.main([str(w["library"]), "--json", "out.json"])
+    assert rc == 2
+
+
+# --------------------------------------------------------------------------
+# 11. --picasa-home derivation
+# --------------------------------------------------------------------------
+
+
+def test_picasa_home_derivation_full_layout(corpus, tmp_path, capsys):
+    """--picasa-home (the runbook's recommended real-archive invocation)
+    derives all three sources from a copied app-data area in the real
+    sibling layout (Picasa2Albums next to Picasa2/ -- see
+    docs/research/picasastarter-notes.md) and the run compares every
+    class, skipping none."""
+    home = tmp_path / "Google"
+    (home / "Picasa2" / "contacts").mkdir(parents=True)
+    shutil.copy2(corpus / "contacts" / "contacts.xml",
+                 home / "Picasa2" / "contacts" / "contacts.xml")
+    shutil.copytree(corpus / "albums", home / "Picasa2Albums")
+    shutil.copytree(corpus / "db3", home / "Picasa2" / "db3")
+
+    assert ca.derive_picasa_home(home) == (
+        home / "Picasa2" / "contacts" / "contacts.xml",
+        home / "Picasa2Albums",
+        home / "Picasa2" / "db3",
+    )
+
+    rc = ca.main([str(corpus / "library"), "--picasa-home", str(home)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "PASS" in out
+    assert "skipped (source absent)" not in out
+
+
+def test_picasa_home_derivation_partial_and_nested(tmp_path):
+    """Missing pieces derive to None (a copied app-data area legitimately
+    carries a subset), and catalog.default_pal_dir's nested
+    Picasa2/Picasa2Albums layout is tolerated (fauxcasa-1t6)."""
+    home = tmp_path / "Google"
+    (home / "Picasa2" / "Picasa2Albums").mkdir(parents=True)
+    contacts, pal, db3 = ca.derive_picasa_home(home)
+    assert contacts is None and db3 is None
+    assert pal == home / "Picasa2" / "Picasa2Albums"
+
+    empty = tmp_path / "Empty"
+    empty.mkdir()
+    assert ca.derive_picasa_home(empty) == (None, None, None)
+
+
+# --------------------------------------------------------------------------
+# 12. Advisory tier: the known corpus divergence is actually detected
+# --------------------------------------------------------------------------
+
+
+def test_advisory_rows_detect_known_corpus_divergence(scanned):
+    """The synthetic corpus deliberately carries exactly ONE db3-vs-ini
+    caption divergence and zero unjoinable db3 rows. Advisory rows can
+    never change the exit code, so without this pin the whole
+    _build_db3_reference caption/unjoinable join could silently regress
+    to zero-detections with every other test green."""
+    cat, ref = scanned
+    by_name = {r.name: r for r in ca.compare(ref, cat).rows}
+    assert by_name["db3_caption_diverge"].ref_count == 1
+    assert by_name["db3_caption_diverge"].verdict == "warn"
+    assert by_name["db3_rows_unjoinable"].ref_count == 0
+    assert by_name["db3_rows_unjoinable"].verdict == "ok"
+
+
+# --------------------------------------------------------------------------
+# 13. db3 join: casefold fallback (disk-vs-db3 case mismatch)
+# --------------------------------------------------------------------------
+
+
+def test_db3_join_survives_case_mismatch(scanned):
+    """translate_db3_path returns the db3's OWN path spelling; the tracer
+    joins with a casefold fallback for the rare disk-vs-db3 case mismatch
+    (db3rescue.rescue_people's two-index lookup). compare() must mirror
+    that, or a case-renamed folder on a real Windows archive false-FAILs
+    the strict db3 classes for a video the shipping importer joins fine.
+    Regression: an exact-case-only by_rel lookup fails this test."""
+    cat, ref = scanned
+    assert ref.db3_video_dims  # corpus carries db3-indexed videos
+    target = next(iter(ref.db3_video_dims))
+    mutated = dataclasses.replace(cat, photos=[
+        dataclasses.replace(p, rel=p.rel.swapcase()) if p.rel == target else p
+        for p in cat.photos
+    ])
+    by_name = {r.name: r for r in ca.compare(ref, mutated).rows}
+    assert by_name["db3_video_dims"].verdict == "ok"
+    assert by_name["db3_video_filetype"].verdict == "ok"
 
 
 if __name__ == "__main__":

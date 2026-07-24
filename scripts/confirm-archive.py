@@ -1,12 +1,13 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = [
-#   "pillow",
-#   "piexif",
-#   "av",
-# ]
+# dependencies = []
 # ///
+# No dependencies on purpose: this script only READS an existing archive
+# (stdlib + repo modules; videoload's `import av` is lazy and unreachable
+# without a scan_filter). Keeps `uv run` on the owner's machine free of
+# binary wheels. test_confirm_archive.py declares pillow/piexif/av itself
+# because IT generates a synthetic corpus.
 """M1 gate clause 3 vehicle (fauxcasa-ed5.8): owner-runnable survey/ingest
 cross-check against a REAL Picasa family archive.
 
@@ -54,13 +55,13 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 sys.path.insert(0, str(REPO / "apps" / "desktop-python"))
 
-import picasa_db  # noqa: E402
-from catalog import (  # noqa: E402
-    Catalog,
+import picasa_db
+from catalog import (
     EXTS,
     INI_NAMES,
     LIBRARY_DIR,
     ROOT_MARKER,
+    Catalog,
     _flag,
     _harvest_contacts2,
     _is_folder_hidden,
@@ -69,11 +70,12 @@ from catalog import (  # noqa: E402
     read_pal_dir,
     scan_library,
 )
+
 # db3 rescue plumbing (fauxcasa-cam.6): the same machine-path translator
 # scan_library's own rescue_people uses, reused here so the reference-side
 # db3 join follows the exact same rule as the tracer.
-from db3rescue import translate_db3_path  # noqa: E402
-from videoload import VIDEO_EXTS  # noqa: E402
+from db3rescue import translate_db3_path
+from videoload import VIDEO_EXTS
 
 _redact = picasa_db._redact_str
 
@@ -87,18 +89,24 @@ DEFAULT_MAX_DETAIL = 10
 
 def derive_picasa_home(home: Path) -> tuple[Path | None, Path | None, Path | None]:
     """(contacts.xml, Picasa2Albums dir, db3 dir) under a copied Picasa
-    app-data area, mirroring apps/desktop-python/catalog.default_contacts_xml
-    / default_pal_dir and db3rescue.default_db3_dir -- those default to
-    %LocalAppData%\\Google\\Picasa2\\{contacts\\contacts.xml,db3} and
-    %LocalAppData%\\Google\\Picasa2Albums; `home` here plays the role of
-    %LocalAppData%\\Google. Each path is returned only if it exists on
-    disk -- a copied app-data area legitimately carries a subset."""
+    app-data area; `home` plays the role of %LocalAppData%\\Google.
+    Real Picasa lays out Picasa2\\{contacts\\contacts.xml,db3} with
+    Picasa2Albums a SIBLING of Picasa2\\ (observed empirically:
+    docs/research/picasastarter-notes.md, wine-oracle.md). The sibling
+    location is probed first; Picasa2\\Picasa2Albums second, tolerating a
+    copy shaped after catalog.default_pal_dir's (divergent, fauxcasa-1t6)
+    path. Each path is returned only if it exists on disk -- a copied
+    app-data area legitimately carries a subset."""
     contacts = home / "Picasa2" / "contacts" / "contacts.xml"
-    pal_dir = home / "Picasa2Albums"
     db3_dir = home / "Picasa2" / "db3"
+    pal_dir = None
+    for cand in (home / "Picasa2Albums", home / "Picasa2" / "Picasa2Albums"):
+        if cand.is_dir():
+            pal_dir = cand
+            break
     return (
         contacts if contacts.is_file() else None,
-        pal_dir if pal_dir.is_dir() else None,
+        pal_dir,
         db3_dir if db3_dir.is_dir() else None,
     )
 
@@ -263,15 +271,23 @@ def _scoped_ini_survey(
       _survey_ini_tree on the PRISTINE synthetic corpus, where every
       section names a real file and every value is well-formed, so both
       scope and predicates coincide there by construction.
-    - contacts_ini_ids / album_def_uids: [Contacts2] ids and
-      `[.album:<uid>]` definitions from MEDIA folders' inis AND their
-      ANCESTOR CHAIN up to and including the library root ("") -- exactly
-      the ini set catalog.scan_library ever loads (ini_by_folder: media
-      folders via folder_ini per walked file, ancestors via
-      folder_contacts' on-demand walk; both the [Contacts2] registry loop
-      and the album-definition loop iterate that same ini_by_folder). A
-      photoless SIBLING branch (never an ancestor of any media folder)
-      stays correctly excluded from both.
+    - contacts_ini_ids: [Contacts2] ids from MEDIA folders' inis AND
+      their ANCESTOR CHAIN up to and including the library root ("") --
+      exactly the ini set scan_library's contacts-registry loop iterates,
+      because that loop runs AFTER folder_contacts has loaded every
+      ancestor ini into ini_by_folder. A photoless SIBLING branch (never
+      an ancestor of any media folder) stays correctly excluded.
+    - album_def_uids: `[.album:<uid>]` definitions from MEDIA folders'
+      inis ONLY. scan_library's album-definition loop runs EARLIER than
+      the contacts loop -- over ini_by_folder as it stands right after
+      the walk, i.e. media folders plus only whatever ancestors faces=
+      harvesting happened to pull in -- so an ancestor-only [.album:]
+      block is NOT reliably ingested (whether it is flips on an unrelated
+      faces= line in the subtree). Scoping the reference to media folders
+      keeps it a subset of what the tracer always ingests: real Picasa
+      writes [.album:] blocks into member (media) folders, and a strict
+      presence row can only false-FAIL on over-inclusion, never on
+      under-inclusion.
 
     Every ini read is fail-soft per file (_read_ini_soft): unreadable or
     absent sidecars degrade to "no ini for this folder", never an
@@ -295,14 +311,14 @@ def _scoped_ini_survey(
         ini_cache[folder_rel] = entry
         return entry
 
-    # ---- contacts_ini_ids + album_def_uids: media folders + ancestors ---
-    # Both harvested over the SAME folder set the tracer actually loads:
-    # scan_library's ini_by_folder holds media folders (folder_ini per
-    # walked file) PLUS every ancestor folder_contacts() visited on
-    # demand, and BOTH its [Contacts2] registry loop and its
-    # album-definition loop iterate that same ini_by_folder -- so an
-    # [.album:] definition in an ancestor folder's ini IS ingested and
-    # must be verified here too.
+    # ---- contacts_ini_ids: media folders + ancestors ---------------------
+    # ---- album_def_uids: media folders ONLY (see docstring) --------------
+    # Contacts: scan_library's [Contacts2] registry loop runs after
+    # folder_contacts() has loaded every ancestor ini, so ancestors count.
+    # Albums: scan_library's album-definition loop runs BEFORE that, over
+    # media-folder inis (plus only faces=-triggered ancestors), so the
+    # reference stays a subset -- media folders only -- to never
+    # false-FAIL a strict presence row on an ancestor-only block.
     contacts_ids: dict[str, str] = {}
     album_uids: set[str] = set()
     visited: set[str] = set()
@@ -316,11 +332,12 @@ def _scoped_ini_survey(
                 sec = secmap.get("contacts2")
                 if sec is not None:
                     _harvest_contacts2({"contacts2": sec}, contacts_ids)
-                for s in ini.sections:
-                    if s.name.lower().startswith(".album:"):
-                        uid = s.name.split(":", 1)[1].strip().lower()
-                        if uid:
-                            album_uids.add(uid)
+                if cur in folders_fs:
+                    for s in ini.sections:
+                        if s.name.lower().startswith(".album:"):
+                            uid = s.name.split(":", 1)[1].strip().lower()
+                            if uid:
+                                album_uids.add(uid)
             if not cur:
                 break
             cur = cur.rsplit("/", 1)[0] if "/" in cur else ""
@@ -546,7 +563,7 @@ def build_reference(
 # minus rotate=, which is ingested/counted as its own class -- copied
 # verbatim from check-ingest-parity.py's _EDIT_KEYS_OTHER (fauxcasa-ed5.1).
 _EDIT_KEYS_OTHER = frozenset(
-    "filters crop crop64 flipped redo textactive".split())
+    ["filters", "crop", "crop64", "flipped", "redo", "textactive"])
 
 
 def _photos_by_rel(c: Catalog) -> dict[str, Any]:
@@ -707,15 +724,26 @@ def compare(ref: Reference, cat: Catalog) -> Results:
         rows.append(_strict_presence_row("db3_video_dims", None, frozenset()))
         rows.append(_strict_presence_row("db3_video_filetype", None, frozenset()))
     else:
+        # translate_db3_path returns the DB3's own path spelling; its
+        # contract has the caller fall back to a casefolded catalog lookup
+        # for the rare disk-vs-db3 case mismatch (a case-renamed folder on
+        # a case-insensitive volume). Mirror rescue_people's two-index
+        # join exactly, or such a video false-FAILs here while the
+        # shipping importer joins it fine.
+        by_fold = {p.rel.casefold(): p for p in cat.photos}
+
+        def _lookup(rel: str):
+            return by_rel.get(rel) or by_fold.get(rel.casefold())
+
         dims_ok = frozenset(
             rel for rel, dims in ref.db3_video_dims.items()
-            if (p := by_rel.get(rel)) is not None and p.dims == dims
+            if (p := _lookup(rel)) is not None and p.dims == dims
         )
         rows.append(_strict_presence_row(
             "db3_video_dims", frozenset(ref.db3_video_dims), dims_ok))
         ft_ok = frozenset(
             rel for rel, ftype in ref.db3_video_filetype.items()
-            if (p := by_rel.get(rel)) is not None and p.media == "video"
+            if (p := _lookup(rel)) is not None and p.media == "video"
             and ftype in _DB3_VIDEO_FILETYPE_CODES
         )
         rows.append(_strict_presence_row(
@@ -784,7 +812,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         return _run(args)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- the blanket catch IS the redaction barrier
         # Never print str(e) or a traceback: an exception's message
         # commonly embeds the archive's own path (an OSError's filename,
         # a malformed-ini parse position, ...) -- the same discipline
