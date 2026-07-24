@@ -10993,9 +10993,10 @@ def test_multiroot_tray_and_composite_cache_disambiguate_duplicate_rels(
     assert tray.held_indices() == [0, 1]
 
     class FakeCache:
-        def __init__(self, path: Path):
+        def __init__(self, path: Path, levels=(256,)):
             self.path = path
             self.calls = []
+            self.levels = list(levels)
 
         def best_level(self, _edge):
             return 256
@@ -11014,6 +11015,112 @@ def test_multiroot_tray_and_composite_cache_disambiguate_duplicate_rels(
     assert composite.entry(1, 256) == (0, 10, 64, 48)
     assert composite.path == cache_b.path
     assert cache_a.calls == [(0, 256)] and cache_b.calls == [(0, 256)]
+
+
+def test_composite_cache_rejects_mismatched_root_levels(
+        tmp_path: Path) -> None:
+    """A v1 single-level cache alongside a multi-level cache would IndexError
+    once a photo routed through the smaller root's shorter levels list —
+    __init__ rejects the mismatch up front instead, naming the offending
+    root."""
+    from grid import CompositeThumbCache
+
+    cat = _multiroot_ui_catalog(tmp_path)
+
+    class FakeCache:
+        def __init__(self, path: Path, levels):
+            self.path = path
+            self.levels = list(levels)
+
+        def best_level(self, _edge):
+            return 0
+
+        def entry(self, idx, level=None):
+            return (idx * 100, 10, 64, 48)
+
+    cache_a = FakeCache(tmp_path / "thumbs-aaaaaaaa.fcache", [256])
+    cache_b = FakeCache(tmp_path / "thumbs-bbbbbbbb.fcache", [512, 256, 128])
+    with pytest.raises(ValueError, match="bbbbbbbb"):
+        CompositeThumbCache(cat, {"aaaaaaaa": cache_a, "bbbbbbbb": cache_b})
+
+
+def test_composite_cache_local_index_increments_per_root(
+        tmp_path: Path) -> None:
+    """A root's SECOND photo must get local cache index 1, not 0 — a catalog
+    with exactly one photo per root (as in the disambiguation test above)
+    can't exercise the `next_local[root_id] = local + 1` increment, since
+    every local index there is 0."""
+    from catalog import Catalog, Folder, Photo
+    from grid import CompositeThumbCache
+
+    root_a, root_b = tmp_path / "root-a", tmp_path / "root-b"
+    root_a.mkdir(parents=True)
+    root_b.mkdir(parents=True)
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    photos = [
+        Photo(rel="2019/one.jpg", folder="2019", name="one.jpg",
+              root_id=id_a),
+        Photo(rel="2019/same.jpg", folder="2019", name="same.jpg",
+              root_id=id_b),
+        Photo(rel="2019/two.jpg", folder="2019", name="two.jpg",
+              root_id=id_a),
+    ]
+    folders = {
+        "2019": Folder(rel="2019", title="A 2019", photo_count=2,
+                       total_count=2, root_id=id_a),
+        f"{id_b}/2019": Folder(rel="2019", title="B 2019", photo_count=1,
+                               total_count=1, root_id=id_b),
+    }
+    roots = [libmod.LibraryRoot(id=id_a, path=root_a, label="Primary"),
+             libmod.LibraryRoot(id=id_b, path=root_b, label="Archive")]
+    cat = Catalog(root=root_a, photos=photos, folders=folders, albums={},
+                  roots=roots, library_id=libmod.mint_library_id())
+
+    class FakeCache:
+        def __init__(self, path: Path):
+            self.path = path
+            self.calls = []
+            self.levels = [256]
+
+        def best_level(self, _edge):
+            return 256
+
+        def entry(self, idx, level=None):
+            self.calls.append((idx, level))
+            return (idx * 100, 10, 64, 48)
+
+    cache_a = FakeCache(tmp_path / "thumbs-aaaaaaaa.fcache")
+    cache_b = FakeCache(tmp_path / "thumbs-bbbbbbbb.fcache")
+    composite = CompositeThumbCache(
+        cat, {"aaaaaaaa": cache_a, "bbbbbbbb": cache_b})
+    assert composite.count == 3
+    assert composite.entry(0, 256) == (0, 10, 64, 48)  # rootA local index 0
+    # Photo 2 (global index 2) is rootA's SECOND photo -> local index 1.
+    assert composite.entry(2, 256) == (100, 10, 64, 48)
+    assert cache_a.calls == [(0, 256), (1, 256)]
+    assert cache_b.calls == []
+
+
+def test_multiroot_search_index_uses_root_qualified_folder_key(
+        tmp_path: Path) -> None:
+    """_rebuild_search_index must route each photo's folder haystack through
+    folder_key(cat, p.root_id, p.folder) — a regression to bare p.folder
+    would silently give later roots' photos the FIRST root's folder title
+    (both rels are "2019" in the fixture, but the titles differ)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    cat = _multiroot_ui_catalog(tmp_path)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    assert len(win._search_pairs) == len(cat.photos) == 2
+    hay_a = win._search_pairs[0][1]
+    hay_b = win._search_pairs[1][1]
+    assert "a 2019" in hay_a and "b 2019" not in hay_a
+    assert "b 2019" in hay_b and "a 2019" not in hay_b
 
 
 def test_main_two_root_cold_build_then_warm_open(tmp_path: Path) -> None:

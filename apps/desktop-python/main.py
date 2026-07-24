@@ -2563,8 +2563,8 @@ def main() -> int:
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
                      contacts=contacts, pal_dir=pal_dir,
-                      excluded_exts=excluded_exts,
-                      thumbs_path=args.thumbs, db3_dir=db3_dir)
+                     excluded_exts=excluded_exts,
+                     thumbs_path=args.thumbs, db3_dir=db3_dir)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)

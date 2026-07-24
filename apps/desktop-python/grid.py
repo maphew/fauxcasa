@@ -84,6 +84,17 @@ class CompositeThumbCache:
 
     def __init__(self, catalog: Catalog, caches: dict[str, ThumbCache]):
         self._caches = dict(caches)
+        first_root, first_cache = next(iter(self._caches.items()))
+        for root_id, cache in self._caches.items():
+            if cache.levels != first_cache.levels:
+                raise ValueError(
+                    f"CompositeThumbCache: root {root_id!r} has levels "
+                    f"{cache.levels!r}, but root {first_root!r} (the first) "
+                    f"has {first_cache.levels!r} — every per-root cache must "
+                    "share an identical levels list, since best_level() "
+                    "resolves an index against only the first root's cache "
+                    "and entry() forwards that same index into whichever "
+                    "root's cache actually owns the photo")
         next_local = {root_id: 0 for root_id in caches}
         self._entries: list[tuple[ThumbCache, int]] = []
         for photo in catalog.photos:
@@ -96,9 +107,14 @@ class CompositeThumbCache:
         self._thread = threading.local()
 
     def best_level(self, edge: int) -> int:
-        # All per-root files are produced with the same configured levels.
-        # Choosing from the first keeps the legacy ThumbCache contract; entry
-        # still lets an older root cache fall back through its own API.
+        # Resolves a levels-list INDEX using the first root's cache. This is
+        # safe only because __init__ enforces that every per-root cache
+        # shares an identical `levels` list (all per-root fcaches are built
+        # together with the same configured levels) — entry() then forwards
+        # this SAME index into whichever root's cache actually owns the
+        # photo, with no per-root fallback. A cache with a different levels
+        # list (e.g. a stray v1 single-level cache) would IndexError in
+        # entry(); __init__ rejects that combination up front instead.
         return next(iter(self._caches.values())).best_level(edge)
 
     def entry(self, idx: int, level: int | None = None):
