@@ -6102,6 +6102,49 @@ def test_db3_caption_fail_soft_unreadable_and_unjoined(tmp_path: Path) -> None:
               if e.kind == "db3_path_unresolved"]
     assert len(misses) == 1 and misses[0].subject == "imagedata row 2"
 
+    # imagedata carries a caption but thumbindex.db is absent altogether
+    # (distinct fail-soft branch from the corrupt-bytes case above).
+    absent = tmp_path / "absent-db3"
+    _write_pmp(absent / "imagedata_caption.pmp", "string", ["", "caption"])
+    cat = scan_library(root, db3_dir=absent)
+    assert cat.photos[0].caption is None
+    unreadable = [e for e in cat.report.entries
+                  if e.kind == "db3_unreadable"]
+    assert len(unreadable) == 1 and unreadable[0].subject == "thumbindex.db"
+
+    # a caption row's thumbindex path joins to a real machine path, but no
+    # photo in this library — the deleted-photo case; reported subject is
+    # the untranslated abs machine path (folder_abs + name), not a row index.
+    ghost_folder = _db3_machine_path(root / "Trip")
+    ghost = tmp_path / "ghost-db3"
+    _make_caption_db3(ghost, ghost_folder, ["a.jpg", "ghost.jpg"],
+                      ["", "ghost caption"])
+    cat = scan_library(root, db3_dir=ghost)
+    assert cat.photos[0].caption is None      # a.jpg's own db3 caption was ""
+    unresolved = [e for e in cat.report.entries
+                  if e.kind == "db3_path_unresolved"]
+    assert len(unresolved) == 1
+    assert unresolved[0].subject == ghost_folder + "ghost.jpg"
+
+
+def test_db3_unreadable_thumbindex_reported_once(db3_library: Path,
+                                                 tmp_path: Path) -> None:
+    """A single corrupt thumbindex.db must produce exactly ONE
+    db3_unreadable entry even when both the caption rescue and the
+    person/face rescue independently read it — caption rescue runs first
+    and bails, the face-row section must not add a second identical note.
+    """
+    db3 = _make_person_db3(
+        tmp_path / "db3", _db3_machine_path(db3_library / "Trip"),
+        ["a.jpg", "b.jpg"], face_parent=1)
+    _write_pmp(db3 / "imagedata_caption.pmp", "string", ["", "caption"])
+    (db3 / "thumbindex.db").write_bytes(b"not a thumbindex")
+
+    cat = scan_library(db3_library, db3_dir=db3)
+    unreadable = [e for e in cat.report.entries
+                  if e.kind == "db3_unreadable"]
+    assert len(unreadable) == 1 and unreadable[0].subject == "thumbindex.db"
+
 
 def test_db3_person_album_rescue_end_to_end(db3_library: Path,
                                             tmp_path: Path) -> None:

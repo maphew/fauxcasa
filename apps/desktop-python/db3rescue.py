@@ -272,10 +272,12 @@ def rescue_people(db3_dir: Path, root: Path, photos: list,
         try:
             entries = picasa_db.read_thumbindex(ti_path, strict=False)
         except (picasa_db.ThumbIndexError, OSError):
-            report.add("db3", "db3_unreadable", "thumbindex.db",
-                       "thumbindex.db is unreadable — db3 face rows cannot "
-                       "be joined to photos this run (names above still "
-                       "rescued; fail-soft)")
+            if not any(e.kind == "db3_unreadable" and e.subject == "thumbindex.db"
+                       for e in report.entries):
+                report.add("db3", "db3_unreadable", "thumbindex.db",
+                           "thumbindex.db is unreadable — db3 face rows cannot "
+                           "be joined to photos this run (names above still "
+                           "rescued; fail-soft)")
     if entries is None:
         return rescued
 
