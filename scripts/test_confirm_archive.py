@@ -603,15 +603,16 @@ def test_picasa_home_derivation_partial_and_nested(tmp_path):
 
 
 def test_advisory_rows_detect_known_corpus_divergence(scanned):
-    """The synthetic corpus deliberately carries exactly ONE db3-vs-ini
-    caption divergence and zero unjoinable db3 rows. Advisory rows can
-    never change the exit code, so without this pin the whole
-    _build_db3_reference caption/unjoinable join could silently regress
-    to zero-detections with every other test green."""
+    """The synthetic corpus deliberately carries exactly TWO db3-vs-ini
+    caption precedence cases (fauxcasa-cam.20: photo00's gap-fill and
+    photo01's populated-ini conflict) and zero unjoinable db3 rows.
+    Advisory rows can never change the exit code, so without this pin
+    the whole _build_db3_reference caption/unjoinable join could
+    silently regress to zero-detections with every other test green."""
     cat, ref = scanned
     by_name = {r.name: r for r in ca.compare(ref, cat).rows}
-    assert by_name["db3_caption_diverge"].ref_count == 1
-    assert by_name["db3_caption_diverge"].verdict == "warn"
+    assert by_name["db3_caption_precedence"].ref_count == 2
+    assert by_name["db3_caption_precedence"].verdict == "warn"
     assert by_name["db3_rows_unjoinable"].ref_count == 0
     assert by_name["db3_rows_unjoinable"].verdict == "ok"
 

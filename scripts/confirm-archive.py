@@ -145,7 +145,7 @@ class Reference:
     # the reference reader found nothing to index" -- see build_reference)
     db3_video_dims: dict[str, tuple[int, int]] | None
     db3_video_filetype: dict[str, int] | None
-    db3_caption_diverge: dict[str, tuple[str, str]] | None
+    db3_caption_precedence: dict[str, tuple[str, str]] | None
     db3_rows_unjoinable: int | None
 
 
@@ -530,10 +530,10 @@ def build_reference(
 
     db3_video_dims: dict[str, tuple[int, int]] | None = None
     db3_video_filetype: dict[str, int] | None = None
-    db3_caption_diverge: dict[str, tuple[str, str]] | None = None
+    db3_caption_precedence: dict[str, tuple[str, str]] | None = None
     db3_rows_unjoinable: int | None = None
     if db3_dir is not None:
-        (db3_video_dims, db3_video_filetype, db3_caption_diverge,
+        (db3_video_dims, db3_video_filetype, db3_caption_precedence,
          db3_rows_unjoinable) = _build_db3_reference(db3_dir, library)
 
     return Reference(
@@ -549,7 +549,7 @@ def build_reference(
         pal_uids=pal_uids,
         db3_video_dims=db3_video_dims,
         db3_video_filetype=db3_video_filetype,
-        db3_caption_diverge=db3_caption_diverge,
+        db3_caption_precedence=db3_caption_precedence,
         db3_rows_unjoinable=db3_rows_unjoinable,
     )
 
@@ -662,8 +662,22 @@ def compare(ref: Reference, cat: Catalog) -> Results:
     rows.append(_strict_count_row(
         "starred", feats.get("starred", 0),
         sum(1 for p in cat.photos if p.star)))
+    # db3 caption gap-fill (fauxcasa-cam.20): scan_library's rescue fills
+    # EMPTY captions from db3, so the tracer legitimately exceeds the ini
+    # survey by exactly the joinable gap rows -- mirror check-ingest-
+    # parity.py's _captioned_reference. A gap row counts only when its rel
+    # names a WALKED photo (disk spelling, or the rescue's own casefold
+    # fallback); a stale db3 row for a deleted file fills nothing and must
+    # not inflate the reference.
+    db3_caption_gaps = 0
+    if ref.db3_caption_precedence:
+        photos_fold = {r.casefold() for r in ref.photos_fs}
+        db3_caption_gaps = sum(
+            1 for rel, (_db3c, ini_c) in ref.db3_caption_precedence.items()
+            if not ini_c
+            and (rel in ref.photos_fs or rel.casefold() in photos_fold))
     rows.append(_strict_count_row(
-        "captioned", feats.get("captioned", 0),
+        "captioned", feats.get("captioned", 0) + db3_caption_gaps,
         sum(1 for p in cat.photos if p.caption)))
     rows.append(_strict_count_row(
         "keyworded", feats.get("keyworded", 0),
@@ -750,14 +764,14 @@ def compare(ref: Reference, cat: Catalog) -> Results:
             "db3_video_filetype", frozenset(ref.db3_video_filetype), ft_ok))
 
     # ---- advisory tier (never affects exit code) --------------------------
-    if ref.db3_caption_diverge is None:
-        rows.append(ClassResult("db3_caption_diverge", "advisory", None, None,
+    if ref.db3_caption_precedence is None:
+        rows.append(ClassResult("db3_caption_precedence", "advisory", None, None,
                                  "skipped (source absent)"))
         rows.append(ClassResult("db3_rows_unjoinable", "advisory", None, None,
                                  "skipped (source absent)"))
     else:
-        n = len(ref.db3_caption_diverge)
-        rows.append(ClassResult("db3_caption_diverge", "advisory", n, None,
+        n = len(ref.db3_caption_precedence)
+        rows.append(ClassResult("db3_caption_precedence", "advisory", n, None,
                                  "warn" if n else "ok"))
         u = ref.db3_rows_unjoinable or 0
         rows.append(ClassResult("db3_rows_unjoinable", "advisory", u, None,
