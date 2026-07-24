@@ -13,6 +13,7 @@ import plistlib
 import subprocess
 import sys
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 
 def _unescape_mount_field(value: str) -> str:
@@ -121,8 +122,11 @@ def _diskutil_info(argument: str) -> dict | None:
             return None
         data = plistlib.loads(proc.stdout)
         return data if isinstance(data, dict) else None
-    except (OSError, subprocess.SubprocessError, ValueError,
-            plistlib.InvalidFileException):
+    except (OSError, subprocess.SubprocessError, ValueError, ExpatError):
+        # ExpatError: diskutil can exit 0 with truncated/corrupt XML;
+        # plistlib.loads then raises through its expat backend, and
+        # ExpatError is not a ValueError. (InvalidFileException IS one,
+        # so ValueError already covers the empty/non-plist case.)
         return None
 
 

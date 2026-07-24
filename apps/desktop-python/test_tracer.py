@@ -10551,6 +10551,148 @@ def test_null_uuid_and_cross_platform_resolution_degrade_offline(
     assert mount_calls == []
 
 
+def test_transient_uuid_probe_glitch_preserves_stored_binding(
+        tmp_path: Path, monkeypatch) -> None:
+    """An UNMOVED root whose UUID probe transiently returns None keeps its
+    stored binding: re-capturing (None, None) there would let the caller's
+    self-heal persist the erasure, silently discarding the UUID remount
+    net. A genuinely MOVED root still re-captures through the same probe
+    outage -- home_rel's copy-outranks-UUID semantics -- clearing the now
+    possibly-stale binding."""
+    home = tmp_path / "home"
+    photos = home / "photos"
+    photos.mkdir(parents=True)
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    monkeypatch.setattr(libmod.volumes, "mount_for_uuid", lambda _u: None)
+    root = libmod.LibraryRoot(
+        id="aaaaaaaa", path=photos, volume_uuid="VOL-1", vol_rel="photos",
+        home_rel="photos")
+    assert libmod.bind_root_location(root, home) == photos.resolve()
+    assert root.volume_uuid == "VOL-1"
+    assert root.vol_rel == "photos"
+
+    moved = home / "moved"
+    moved.mkdir()
+    root.home_rel = "moved"
+    assert libmod.bind_root_location(root, home) == moved.resolve()
+    assert root.path == moved.resolve()
+    assert root.volume_uuid is None and root.vol_rel is None
+
+
+def test_load_library_drops_unsafe_recovery_hints(
+        tmp_path: Path, monkeypatch) -> None:
+    """A tampered/escaping vol_rel or home_rel is an optional hint, not
+    load-bearing structure: the root loads with the bad hint dropped
+    instead of the whole library collapsing to the implicit legacy
+    fallback (which would hide every root id/label)."""
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    monkeypatch.setattr(libmod.volumes, "mount_for_uuid", lambda _u: None)
+    home = tmp_path / "home"
+    home.mkdir()
+    root_dir = tmp_path / "photos"
+    root_dir.mkdir()
+    payload = {
+        "format": libmod.LIBRARY_FORMAT,
+        "library_id": libmod.mint_library_id(),
+        "name": "Test",
+        "roots": [{
+            "id": "aaaaaaaa",
+            "path": root_dir.as_posix(),
+            "volume_uuid": "VOL-1",
+            "vol_rel": "../../escape",
+            "home_rel": (tmp_path / "absolute").as_posix(),
+            "label": "Photos",
+        }],
+    }
+    libmod.library_json_path(home).parent.mkdir(parents=True)
+    libmod.library_json_path(home).write_text(
+        json.dumps(payload), encoding="utf-8")
+    cfg = libmod.load_library(home)
+    assert cfg is not None and not cfg.is_legacy
+    assert cfg.roots[0].id == "aaaaaaaa"
+    assert cfg.roots[0].label == "Photos"
+    assert cfg.roots[0].vol_rel is None
+    assert cfg.roots[0].home_rel is None
+    assert cfg.roots[0].volume_uuid == "VOL-1"  # non-path hint kept
+
+
+def test_linux_uuid_lookup_prefers_longest_containing_mount(
+        tmp_path: Path, monkeypatch) -> None:
+    """Overlapping mounts resolve to the NESTED mountpoint's identity --
+    pins _linux_mounts' longest-first ordering (via its injectable
+    /proc/mounts path, octal space escapes included) and
+    _containing_mount's first-match selection, which a single-mount mock
+    satisfies trivially."""
+    nested = tmp_path / "mnt"
+    nested.mkdir()
+    parent_dev = tmp_path / "parent-dev"
+    nested_dev = tmp_path / "nested-dev"
+    parent_dev.write_bytes(b"")
+    nested_dev.write_bytes(b"")
+
+    def _mount_field(p: Path) -> str:
+        return str(p).replace(" ", "\\040")
+
+    mounts_file = tmp_path / "proc-mounts"
+    mounts_file.write_text(
+        f"{_mount_field(parent_dev)} {_mount_field(tmp_path)} ext4 rw 0 0\n"
+        f"{_mount_field(nested_dev)} {_mount_field(nested)} ext4 rw 0 0\n",
+        encoding="utf-8")
+    mounts = volmod._linux_mounts(mounts_file)
+    assert mounts[0][0] == nested  # longest mountpoint first, not file order
+
+    monkeypatch.setattr(volmod.sys, "platform", "linux")
+    monkeypatch.setattr(volmod, "_linux_mounts", lambda: mounts)
+    monkeypatch.setattr(volmod, "_linux_uuid_devices", lambda: {
+        "PARENT-UUID": parent_dev.resolve(),
+        "NESTED-UUID": nested_dev.resolve(),
+    })
+    assert volmod.volume_uuid_for(nested) == "NESTED-UUID"
+    assert volmod.volume_uuid_for(tmp_path) == "PARENT-UUID"
+
+
+def test_home_rel_persists_and_recovers_moved_root(
+        tmp_path: Path, monkeypatch) -> None:
+    """save_library writes the additive home_rel for an under-home root,
+    and a fresh load self-heals through it once the last-known path is
+    gone -- the round trip the PR's 'persists home_rel additively' claim
+    rests on."""
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    monkeypatch.setattr(libmod.volumes, "mount_for_uuid", lambda _u: None)
+    home = tmp_path / "home"
+    photos = home / "sub" / "photos"
+    photos.mkdir(parents=True)
+    cfg = libmod.LibraryConfig(
+        library_id=libmod.mint_library_id(), name="Test",
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=photos,
+                                  label="Photos")],
+        home=home)
+    libmod.save_library(cfg)
+    raw = json.loads(
+        libmod.library_json_path(home).read_text(encoding="utf-8"))
+    assert raw["roots"][0]["home_rel"] == "sub/photos"
+
+    raw["roots"][0]["path"] = (tmp_path / "gone").as_posix()
+    libmod.library_json_path(home).write_text(
+        json.dumps(raw), encoding="utf-8")
+    loaded = libmod.load_library(home)
+    assert loaded is not None
+    assert loaded.roots[0].path == photos.resolve()
+
+
+def test_diskutil_probe_survives_truncated_plist(monkeypatch) -> None:
+    """diskutil exiting 0 with truncated XML must degrade to None through
+    the fail-soft contract, not raise ExpatError (which plistlib's expat
+    backend raises and which is NOT a ValueError)."""
+    class _Proc:
+        returncode = 0
+        stdout = b"<?xml version='1.0'?><plist><dict>"
+
+    monkeypatch.setattr(
+        volmod.subprocess, "run", lambda *_a, **_k: _Proc())
+    assert volmod._diskutil_info("disk1") is None
+
+
 def test_root_is_online_resolved_path_check(
         tmp_path: Path, monkeypatch) -> None:
     """library.root_is_online (design §8, bead .e): a resolved existing

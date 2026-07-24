@@ -205,6 +205,7 @@ def bind_root_location(root: LibraryRoot, home: Path) -> Path | None:
     one atomic ``library.json`` write.
     """
     current = _existing_dir(root.path)
+    observed: str | None = None
     if current is not None:
         if root.volume_uuid is None:
             return current
@@ -216,6 +217,17 @@ def bind_root_location(root: LibraryRoot, home: Path) -> Path | None:
     if home_rel is not None:
         candidate = _existing_dir(home / home_rel)
         if candidate is not None:
+            if candidate == current and observed is None:
+                # The directory never moved -- control reached here only
+                # because the UUID probe returned nothing (a transient
+                # glitch, or a volume that stopped answering). Re-capturing
+                # would write (None, None) over the stored binding and the
+                # caller's self-heal persist would make the erasure
+                # permanent, silently discarding the UUID remount net.
+                # Keep the stored hint; a mismatched (non-None) observed
+                # UUID still falls through to the copy-outranks-UUID
+                # re-capture below.
+                return current
             root.path = candidate
             # home_rel intentionally outranks UUID: a whole-library copy is a
             # valid move even when it lands on a different volume/platform.
@@ -319,11 +331,18 @@ def load_library(home: Path) -> LibraryConfig | None:
             value = r.get(optional)
             if value is not None and not isinstance(value, str):
                 return None
-        if _safe_relative(r.get("vol_rel")) is None and r.get("vol_rel") is not None:
-            return None
-        if (_safe_relative(r.get("home_rel")) is None
-                and r.get("home_rel") is not None):
-            return None
+        # Unsafe (absolute/escaping) recovery hints are DROPPED rather than
+        # rejecting the whole library: vol_rel/home_rel are optional aids,
+        # and a single tampered value must not collapse a rich multiroot
+        # config to the implicit legacy fallback. bind_root_location
+        # re-sanitizes via _safe_relative anyway, so admitting the root
+        # with a cleared hint can never enable an escape.
+        vol_rel = r.get("vol_rel")
+        if vol_rel is not None and _safe_relative(vol_rel) is None:
+            vol_rel = None
+        home_rel = r.get("home_rel")
+        if home_rel is not None and _safe_relative(home_rel) is None:
+            home_rel = None
         if rid in seen_ids:
             return None  # duplicate ids
         seen_ids.add(rid)
@@ -331,8 +350,8 @@ def load_library(home: Path) -> LibraryConfig | None:
             id=rid,
             path=Path(rpath_raw),          # verbatim, no resolve
             volume_uuid=r.get("volume_uuid"),
-            vol_rel=r.get("vol_rel"),
-            home_rel=r.get("home_rel"),
+            vol_rel=vol_rel,
+            home_rel=home_rel,
             label=r.get("label") or "",
         ))
 
