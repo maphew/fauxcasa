@@ -572,11 +572,17 @@ def _promote_rename_fcache(cache_dir: Path, root_id: str) -> tuple[bool, bool]:
     the files[] list, never a header key). Returns (fcache_renamed,
     sidecar_renamed) so the caller can roll back precisely what ran —
     either half may be absent (e.g. a cache dir with no persisted sidecar
-    yet, mid-build)."""
+    yet, mid-build). Reuses thumbcache.fcache_name() for the new name so
+    the pattern can never drift from the one thumbcache.py itself binds
+    against (deferred import: see the circular-import note in
+    promote_library above — library.py can't import thumbcache at module
+    scope)."""
+    from thumbcache import fcache_name
+
     old_fcache = cache_dir / "thumbs.fcache"
     old_sidecar = cache_dir / "thumbs.fcache.json"
-    new_fcache = cache_dir / f"thumbs-{root_id}.fcache"
-    new_sidecar = cache_dir / f"thumbs-{root_id}.fcache.json"
+    new_fcache = cache_dir / fcache_name(root_id)
+    new_sidecar = new_fcache.with_suffix(".fcache.json")
     fcache_renamed = sidecar_renamed = False
     if old_fcache.is_file():
         old_fcache.rename(new_fcache)
@@ -636,11 +642,18 @@ def _promote_rollback(root: Path, home: Path, old_dir: Path, new_dir: Path,
     worst case some cruft (a stray .bak/.tmp, an orphaned marker) is left
     behind, but the library is always left in a state that still opens as
     implicit-legacy (design §10 point 4's reversal contract: delete
-    `.fauxcasa/` and the app falls back to the original cold walk)."""
+    `.fauxcasa/` and the app falls back to the original cold walk).
+    Reuses thumbcache.fcache_name() for the renamed-away name, same as
+    _promote_rename_fcache, so the two never drift apart (deferred
+    import — see the circular-import note in promote_library above)."""
+    from thumbcache import fcache_name
+
     if cache_dir_renamed:
         cat_path = new_dir / "catalog.json"
         bak_path = new_dir / "catalog.json.bak"
         tmp_path = new_dir / "catalog.json.tmp"
+        renamed_fcache = new_dir / fcache_name(root_id)
+        renamed_sidecar = renamed_fcache.with_suffix(".fcache.json")
         try:
             if bak_path.is_file():
                 cat_path.write_text(bak_path.read_text(encoding="utf-8"),
@@ -653,13 +666,11 @@ def _promote_rollback(root: Path, home: Path, old_dir: Path, new_dir: Path,
         except OSError:
             pass
         try:
-            (new_dir / f"thumbs-{root_id}.fcache.json").rename(
-                new_dir / "thumbs.fcache.json")
+            renamed_sidecar.rename(new_dir / "thumbs.fcache.json")
         except OSError:
             pass
         try:
-            (new_dir / f"thumbs-{root_id}.fcache").rename(
-                new_dir / "thumbs.fcache")
+            renamed_fcache.rename(new_dir / "thumbs.fcache")
         except OSError:
             pass
         try:
@@ -816,7 +827,15 @@ def _read_hotfolders_raw() -> str | None:
             value, _type = winreg.QueryValueEx(key, _HOTFOLDERS_VALUE)
     except OSError:
         return None
-    return str(value) if value else None
+    if not value:
+        return None
+    if isinstance(value, (list, tuple)):
+        # REG_MULTI_SZ arrives as a list of strings from winreg — join with
+        # the newline separator the downstream re.split([;|\n]+) already
+        # tolerates, rather than str()-coercing the list itself (which would
+        # stringify to "['a', 'b']" garbage).
+        return "\n".join(str(v) for v in value)
+    return str(value)
 
 
 def picasa_watched_from_registry() -> list[Path]:

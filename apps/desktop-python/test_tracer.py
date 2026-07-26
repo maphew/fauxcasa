@@ -9281,7 +9281,7 @@ def test_thumb_bakes_crop_before_downscale(tmp_path: Path) -> None:
 
 
 def test_thumb_tiny_crop_of_large_source_decodes_correctly(
-        tmp_path: Path) -> None:
+        tmp_path: Path, monkeypatch) -> None:
     """fauxcasa-7aj.1 (PR #58 decode-cost nit): when the crop's kept region
     ALREADY fits the top-level box (no downscale needed), _index_one bounds
     the decode with QImageReader.setClipRect (an ROI decode) instead of
@@ -9290,8 +9290,28 @@ def test_thumb_tiny_crop_of_large_source_decodes_correctly(
     under THUMB_EDGE=256). This pins CORRECTNESS of that ROI path: the wrong
     quadrant, an off-by-one clip rect, or a double-crop (clip_applied not
     suppressing the later crop_qimage_upright call) would all fail the
-    pixel/dimension assertions below."""
+    pixel/dimension assertions below.
+
+    hi2 item 8: correctness alone doesn't prove the ROI *path* actually
+    ran — a correct-looking thumb could in principle come from the
+    fallback full-decode-then-crop route if setClipRect silently became a
+    no-op. A spy on QImageReader.setClipRect (patched at the class level,
+    since thumbcache imports QImageReader locally) closes that gap by
+    asserting the clip call fires exactly once with the expected pixel
+    box, in addition to the pixel/dimension pins below."""
     _offscreen_app()
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QImageReader
+
+    clip_calls: list[QRect] = []
+    orig_set_clip_rect = QImageReader.setClipRect
+
+    def spy_set_clip_rect(self, rect, *a, **kw):
+        clip_calls.append(QRect(rect))
+        return orig_set_clip_rect(self, rect, *a, **kw)
+
+    monkeypatch.setattr(QImageReader, "setClipRect", spy_set_clip_rect)
+
     root = tmp_path / "lib"
     _quadrant_jpeg(root / "f" / "cropped.jpg", edge=1024)
     # fraction rect (0.5, 0.0, 0.625, 0.125) -> pixel box (512, 0, 128, 128)
@@ -9304,6 +9324,10 @@ def test_thumb_tiny_crop_of_large_source_decodes_correctly(
     assert cat.photos[ci].crop == (0.5, 0.0, 0.625, 0.125)
     offset, length, w, h = cache.entries[ci]
     assert length > 0
+    # THE spy assertion (hi2 item 8): the ROI decode path actually fired,
+    # with exactly the pixel box the crop maps to — not just a
+    # correct-looking output that could have come from a fallback route.
+    assert clip_calls == [QRect(512, 0, 128, 128)]
     with open(cache.path, "rb") as f:
         f.seek(offset)
         from PySide6.QtGui import QImage
@@ -11321,6 +11345,39 @@ def test_picasa_watched_from_registry_seam(monkeypatch) -> None:
         libmod.picasa_watched_from_registry()
 
 
+def test_read_hotfolders_raw_handles_reg_multi_sz_list(monkeypatch) -> None:
+    """A REG_MULTI_SZ registry value arrives from winreg as a Python list,
+    not a string — str()-coercing it would stringify to garbage like
+    "['a', 'b']". _read_hotfolders_raw must join list/tuple values with a
+    separator the downstream re.split([;|\\n]+) in
+    picasa_watched_from_registry already tolerates. This mocks the
+    registry read itself (winreg.OpenKey/QueryValueEx) rather than the
+    _read_hotfolders_raw seam, so it exercises the list-handling branch
+    directly; a fake winreg module is installed in sys.modules so the
+    test runs on non-Windows too."""
+    import contextlib
+    import types
+
+    fake_winreg = types.ModuleType("winreg")
+    fake_winreg.HKEY_CURRENT_USER = object()
+
+    @contextlib.contextmanager
+    def fake_open_key(_hive, _path):
+        yield object()
+
+    fake_winreg.OpenKey = fake_open_key
+    fake_winreg.QueryValueEx = lambda _key, _name: (
+        [r"C:\Users\a\Pictures", r"C:\Users\a\Scans"], 7)  # REG_MULTI_SZ
+
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
+    raw = libmod._read_hotfolders_raw()
+    assert raw == "C:\\Users\\a\\Pictures\nC:\\Users\\a\\Scans"
+    # And the full parse still yields the right Paths downstream.
+    folders = libmod.picasa_watched_from_registry()
+    assert folders == [Path(r"C:\Users\a\Pictures"),
+                       Path(r"C:\Users\a\Scans")]
+
+
 def test_main_promote_and_add_root_cli(tmp_path: Path) -> None:
     """End-to-end --promote then --add-root via subprocess (bead .d): a
     legacy library is promoted in place, then a second root is added to
@@ -11367,6 +11424,32 @@ def test_main_promote_and_add_root_cli(tmp_path: Path) -> None:
     assert loaded is not None
     assert len(loaded.roots) == 2
     assert loaded.roots[1].path == root2.resolve()
+
+
+def test_cmd_promote_requires_explicit_library(monkeypatch, tmp_path: Path,
+                                               capsys) -> None:
+    """--promote with NO positional library argument must error out (exit
+    2) rather than falling through to _resolve_library's built-in-default
+    fallback and promoting the SAMPLE library in place — the same explicit-
+    target rule _cmd_import_picasa_watched already enforces. Monkeypatching
+    library.promote_library to raise if called proves the fallthrough never
+    even reaches the promotion step. Asserts on capsys' stderr mirror
+    (applog's _StderrHandler) rather than caplog, matching the convention
+    used elsewhere in this file for log.error() assertions — caplog's
+    non-propagating-logger handler only attaches to loggers that already
+    exist in logging's registry as of pytest_runtest_setup, so it can't
+    reliably see "fauxcasa" (propagate=False) on a first-in-process run of
+    just this test."""
+    import main as mainmod
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("promote_library must not run without an "
+                             "explicit library argument")
+
+    monkeypatch.setattr(mainmod.library, "promote_library", _boom)
+    rc = mainmod._cmd_promote(None, tmp_path / "cache")
+    assert rc == 2
+    assert "--promote requires a library" in capsys.readouterr().err
 
 
 def test_main_import_picasa_watched_listfile_cli(tmp_path: Path) -> None:

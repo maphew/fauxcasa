@@ -505,7 +505,14 @@ def _cmd_promote(library_arg: str | None, cache_root: Path) -> int:
     `library` argument in place (design §10). Reuses _resolve_library for
     the same existence/filesystem-root validation every other invocation
     gets, so a bad path fails exactly the same way it would on a normal
-    open."""
+    open. An explicit `library` is REQUIRED (same rule
+    _cmd_import_picasa_watched enforces): without one, _resolve_library
+    would silently fall through to _default_library() and promote the
+    built-in sample library in place."""
+    if not library_arg:
+        log.error("--promote requires a library path as the positional "
+                  "argument")
+        return 2
     root = _resolve_library(library_arg, cache_root)
     if root is None:
         return 2
@@ -715,6 +722,16 @@ def _reconcile_online_roots(
     the caller's status-bar text; whether to act on `Drift.changed` is
     still the caller's call, same as before this bead."""
     catalog.refresh_offline_ids()
+    # NOTE (hi2 item 6): this stays inline rather than calling
+    # catalog.online_roots()/offline_roots() directly. Those helpers filter
+    # `self.roots` as-is, so on a hand-built Catalog fixture that never set
+    # `roots` (empty list, per the docstring above) they'd both return []
+    # and this loop would silently reconcile NOTHING instead of falling
+    # back to the one implicit legacy root — a real behavior change, not
+    # just a refactor. The `roots` local below applies that fallback
+    # FIRST, then filters it the same way online_roots()/offline_roots()
+    # do, so the two stay in lockstep whenever `catalog.roots` is actually
+    # populated (the normal case).
     roots = catalog.roots or [LibraryRoot(id=LEGACY_ROOT_ID, path=catalog.root)]
     online = [r for r in roots if r.id not in catalog.offline_ids]
     offline = [r for r in roots if r.id in catalog.offline_ids]
