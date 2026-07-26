@@ -10492,6 +10492,41 @@ def test_uuid_remount_self_heals_library_json(
     assert loaded.roots[0].path == new_root.resolve()
 
 
+def test_uuid_remount_clears_stale_home_rel(
+        tmp_path: Path, monkeypatch) -> None:
+    """A UUID recovery that moves the root off the library home must also
+    re-derive home_rel: persisting the stale hint would let an unrelated
+    directory that later appears at home/<old home_rel> outrank the UUID
+    binding on the next open (home_rel is probed before UUID)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    new_mount = tmp_path / "remounted"
+    new_root = new_mount / "Photos"
+    new_root.mkdir(parents=True)
+    root = libmod.LibraryRoot(
+        id="aaaaaaaa", path=home / "Photos", volume_uuid="VOL-1",
+        vol_rel="Photos", home_rel="Photos", label="Photos")
+    cfg = libmod.LibraryConfig(
+        library_id=libmod.mint_library_id(), name="Test", roots=[root],
+        home=home)
+
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    monkeypatch.setattr(
+        libmod.volumes, "mount_for_uuid",
+        lambda value: new_mount if value == "VOL-1" else None)
+    assert libmod.resolve_root_locations(cfg)
+    assert cfg.roots[0].path == new_root.resolve()
+    assert cfg.roots[0].home_rel is None
+    raw = json.loads(libmod.library_json_path(home).read_text(encoding="utf-8"))
+    assert raw["roots"][0]["home_rel"] is None
+
+    # An unrelated directory appearing at the old home-relative spot must
+    # not capture the root on the next resolve.
+    (home / "Photos").mkdir()
+    libmod.resolve_root_locations(cfg)
+    assert cfg.roots[0].path == new_root.resolve()
+
+
 def test_uuid_resolution_rejects_overlapping_candidates(
         tmp_path: Path, monkeypatch) -> None:
     """Corrupt/stale bindings cannot self-heal two roots onto one tree."""

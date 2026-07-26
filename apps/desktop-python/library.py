@@ -241,6 +241,11 @@ def bind_root_location(root: LibraryRoot, home: Path) -> Path | None:
             candidate = _existing_dir(mount / vol_rel)
             if candidate is not None:
                 root.path = candidate
+                # Re-derive home_rel for the new location: leaving the old
+                # hint in place would let an unrelated directory that later
+                # appears at home/<stale home_rel> outrank this UUID
+                # binding on the next open (home_rel is probed first).
+                root.home_rel = _home_relative(candidate, home)
                 return candidate
     return None
 
@@ -254,7 +259,7 @@ def resolve_root_locations(cfg: LibraryConfig, *, persist: bool = True) -> bool:
     """
     if cfg.is_legacy:
         return False
-    before = [(root.path, root.volume_uuid, root.vol_rel)
+    before = [(root.path, root.volume_uuid, root.vol_rel, root.home_rel)
               for root in cfg.roots]
     assert cfg.home is not None
     for root in cfg.roots:
@@ -263,10 +268,10 @@ def resolve_root_locations(cfg: LibraryConfig, *, persist: bool = True) -> bool:
     # overlapping trees. Revert every fallback so those roots remain offline.
     if _roots_overlap(cfg.roots):
         for root, old in zip(cfg.roots, before):
-            root.path, root.volume_uuid, root.vol_rel = old
+            root.path, root.volume_uuid, root.vol_rel, root.home_rel = old
         return False
     changed = any(
-        (root.path, root.volume_uuid, root.vol_rel) != old
+        (root.path, root.volume_uuid, root.vol_rel, root.home_rel) != old
         for root, old in zip(cfg.roots, before))
     if changed and persist:
         try:
