@@ -505,6 +505,21 @@ def test_strict_fail_exits_one_and_renders_redacted(
         assert leak not in json_text
 
 
+def test_strict_fs_row_fails_on_equal_size_different_content():
+    """PR #83 review: the identity-row verdict must compare the SETS, not
+    their sizes. A tracer that drops 'a.jpg' but reports 'b.jpg' instead
+    keeps the counts equal (2 vs 2); the row must still FAIL and carry
+    both sides of the symmetric difference as (redacted) examples."""
+    row = ca._strict_fs_row("photos", frozenset({"a.jpg", "c.jpg"}),
+                            frozenset({"b.jpg", "c.jpg"}))
+    assert row.verdict == "FAIL"
+    assert row.ref_count == 2 and row.tracer_count == 2
+    assert len(row.examples) == 2                # a.jpg + b.jpg, redacted
+    ok = ca._strict_fs_row("photos", frozenset({"a.jpg"}),
+                           frozenset({"a.jpg"}))
+    assert ok.verdict == "ok" and not ok.examples
+
+
 # --------------------------------------------------------------------------
 # 10. json guard: every protected root, and relative-path normalization
 # --------------------------------------------------------------------------

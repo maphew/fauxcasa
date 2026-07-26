@@ -601,9 +601,12 @@ def _strict_fs_row(name: str, ref_set: frozenset, tracer_set: frozenset) -> Clas
     stashed_originals). ref_count/tracer_count are the true set sizes (not
     an intersection), so both loss (ref-only) and excess (tracer-only)
     show up in the counts; mismatches carry the symmetric difference as
-    redacted examples."""
+    redacted examples. The verdict compares the SETS, not their sizes
+    (PR #83 review): equal-size-but-different-content -- one rel lost,
+    a different rel invented -- is an ingest error the counts alone
+    would mask."""
     ref_n, tr_n = len(ref_set), len(tracer_set)
-    verdict = "ok" if ref_n == tr_n else "FAIL"
+    verdict = "ok" if ref_set == tracer_set else "FAIL"
     examples: list[str] = []
     if verdict == "FAIL":
         examples = [_redact(x) for x in sorted(ref_set ^ tracer_set)]
