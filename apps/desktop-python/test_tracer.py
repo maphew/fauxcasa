@@ -6229,9 +6229,12 @@ def test_multiroot_pal_membership_is_root_qualified(tmp_path: Path) -> None:
         (r / "Trip" / ".picasa.ini").write_text(
             f"[same.jpg]\r\nalbums={uid_gone}\r\n")
     pal_dir = tmp_path / "pals"
-    a_member = "/".join(
-        [c for c in str(root_a).replace("\\", "/").split("/") if c][1:]
-        + ["Trip", "same.jpg"])
+    # The volume-stripped spelling of root_a's photo: drop only a drive
+    # token (Windows) — on POSIX every component is real path material.
+    parts = [c for c in str(root_a).replace("\\", "/").split("/") if c]
+    if re.fullmatch(r"[A-Za-z]:", parts[0]):
+        parts = parts[1:]
+    a_member = "/".join(parts + ["Trip", "same.jpg"])
     _write_pal(pal_dir, uid_full, "Root A only", [a_member])
     _write_pal(pal_dir, uid_bare, "Ambiguous", ["Trip/same.jpg"])
 
