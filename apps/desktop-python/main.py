@@ -765,6 +765,19 @@ def _scan_library_config(
     definitions retain the established first-wins rule; memberships from all
     roots are additive, and a later real definition may fill an earlier
     placeholder because a placeholder is explicitly not a definition.
+
+    db3 and .pal enrichment run ONCE against the composed, root-qualified
+    catalog (fauxcasa-cam.21) — NOT once per root: a per-root pass would
+    report every other root's db3 rows as unresolved, duplicate person
+    diagnostics per root, and let two roots carrying the same rel both
+    claim one .pal member. The per-root scans below therefore run bare
+    (pal_dir/db3_dir None); merge_pal_albums_config and
+    rescue_people_config then resolve members and db3 paths through the
+    manifest's (root_id, path) pairs. unknown_album reporting moves with
+    the .pal pass: a per-root scan can't know a .pal (or another root)
+    resolves the uid, so its premature entries are dropped and the class
+    is re-emitted once after every source has had its say — the same
+    order scan_library keeps internally.
     """
     if cfg.is_legacy:
         return scan_library(cfg.roots[0].path, scan_filter, contacts, pal_dir,
@@ -774,14 +787,13 @@ def _scan_library_config(
     folders = {}
     albums = {}
     merged_contacts = {}
-    db3_contacts = set()
     reports = []
     identity_catalog = Catalog(
         root=cfg.roots[0].path, photos=[], folders={}, albums={},
         roots=list(cfg.roots), library_id=cfg.library_id)
     for root in cfg.roots:
-        one = scan_library(root.path, scan_filter, contacts, pal_dir,
-                           exts=exts, db3_dir=db3_dir)
+        one = scan_library(root.path, scan_filter, contacts, None,
+                           exts=exts, db3_dir=None)
         offset = len(photos)
         for photo in one.photos:
             photo.root_id = root.id
@@ -805,10 +817,34 @@ def _scan_library_config(
                     existing.pal_sourced = album.pal_sourced
         for cid, name in one.contacts.items():
             merged_contacts.setdefault(cid, name)
-        db3_contacts.update(one.db3_contacts)
-        reports.extend(one.report.entries)
+        reports.extend(
+            e for e in one.report.entries
+            if not (e.source == "ini" and e.kind == "unknown_album"))
 
-    from catalog import ImportReport
+    from catalog import ImportReport, merge_pal_albums_config
+    from db3rescue import rescue_people_config
+    report = ImportReport(reports)
+    manifest_roots = [(r.id, r.path) for r in cfg.roots]
+
+    if pal_dir is not None:
+        merge_pal_albums_config(pal_dir, manifest_roots, photos, albums,
+                                report)
+    # Re-emit the class the per-root scans held back, now that the .pal
+    # pass (and cross-root definitions) had their say — same text, same
+    # position in the source order as scan_library's own emission.
+    for uid, album in albums.items():
+        if album.placeholder:
+            report.add("ini", "unknown_album", uid,
+                       f"albums= references uid {uid} but no [.album:{uid}] "
+                       f"definition (or .pal) exists — materialized as "
+                       f"placeholder “{album.name}” with "
+                       f"{len(album.members)} member(s)")
+
+    db3_contacts = set()
+    if db3_dir is not None:
+        db3_contacts = rescue_people_config(
+            db3_dir, manifest_roots, photos, merged_contacts, report)
+
     return Catalog(
         root=cfg.roots[0].path,
         photos=photos,
@@ -816,7 +852,7 @@ def _scan_library_config(
         albums=albums,
         contacts=merged_contacts,
         db3_contacts=db3_contacts,
-        report=ImportReport(reports),
+        report=report,
         roots=list(cfg.roots),
         library_id=cfg.library_id,
     )

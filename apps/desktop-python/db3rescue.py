@@ -100,6 +100,83 @@ def translate_db3_path(abs_path: str, root: Path) -> str | None:
     return "/".join(p_parts[len(r_parts):])
 
 
+def _photo_maps(photos: list) -> tuple[dict, dict]:
+    return ({p.rel: p for p in photos},
+            {p.rel.casefold(): p for p in photos})
+
+
+def _drive_of(path_str: str) -> str | None:
+    """The drive token of a Windows-style absolute path ("C:"), or None."""
+    parts = [c for c in path_str.replace("\\", "/").split("/") if c]
+    if parts and _DRIVE_RE.fullmatch(parts[0]):
+        return parts[0]
+    return None
+
+
+def _make_join(roots: list[tuple[str, Path]], photos: list):
+    """A db3-abs-path -> catalog-photo join over one or many roots
+    (fauxcasa-cam.21). Returns ``join(abs_path) -> (photo | None,
+    status)`` where status is None on success, "unresolved" when no root
+    claims the path, and "ambiguous" when the drive-insensitive
+    translation matches photos in MORE than one root and the drive token
+    cannot break the tie — attaching such a row anywhere would be a
+    guess, so the caller reports it instead.
+
+    ``roots`` is ``[(root_id, path)]``. With a single root the join is
+    exactly the historical translate + exact/casefold lookup over every
+    photo (root_id is not consulted), so legacy single-root behavior and
+    reporting are preserved byte-for-byte. With several roots each root
+    resolves only against its own (root_id-tagged) photo slice, so two
+    roots carrying the same rel can never both claim one db3 row."""
+    if len(roots) == 1:
+        root = roots[0][1]
+        by_rel, by_fold = _photo_maps(photos)
+
+        def join_single(abs_path: str) -> tuple:
+            rel = translate_db3_path(abs_path, root) if abs_path else None
+            photo = None
+            if rel is not None:
+                photo = by_rel.get(rel) or by_fold.get(rel.casefold())
+            return (photo, None) if photo is not None \
+                else (None, "unresolved")
+        return join_single
+
+    ctxs = []
+    for root_id, root_path in roots:
+        one = [p for p in photos if p.root_id == root_id]
+        by_rel, by_fold = _photo_maps(one)
+        ctxs.append((root_path, _drive_of(str(root_path)), by_rel, by_fold))
+
+    def join_multi(abs_path: str) -> tuple:
+        if not abs_path:
+            return None, "unresolved"
+        p_drive = _drive_of(abs_path)
+        hits = []
+        for root_path, r_drive, by_rel, by_fold in ctxs:
+            rel = translate_db3_path(abs_path, root_path)
+            if rel is None:
+                continue
+            photo = by_rel.get(rel) or by_fold.get(rel.casefold())
+            if photo is None:
+                continue
+            same_drive = (p_drive is not None and r_drive is not None
+                          and p_drive.casefold() == r_drive.casefold())
+            hits.append((photo, same_drive))
+        if not hits:
+            return None, "unresolved"
+        if len(hits) == 1:
+            return hits[0][0], None
+        # translate_db3_path is drive-insensitive by design (§8), so
+        # sibling roots like D:\photos and E:\photos both match a
+        # stripped path; the row's own drive token breaks the tie when
+        # exactly one root shares it.
+        drive_hits = [h for h in hits if h[1]]
+        if len(drive_hits) == 1:
+            return drive_hits[0][0], None
+        return None, "ambiguous"
+    return join_multi
+
+
 def _col(db3_dir: Path, table: str, column: str) -> "picasa_db.PmpColumn | None":
     """One pmp column, tolerantly — None when the file is absent or
     defective (fail-soft: a missing or corrupt db3 must degrade the
@@ -113,7 +190,7 @@ def _col(db3_dir: Path, table: str, column: str) -> "picasa_db.PmpColumn | None"
         return None
 
 
-def _rescue_captions(db3_dir: Path, root: Path, photos: list, report) -> None:
+def _rescue_captions(db3_dir: Path, join, report) -> None:
     """Gap-fill Photo.caption from imagedata_caption.pmp, fail-soft.
 
     thumbindex row number is the imagedata row number. Every populated db3
@@ -152,19 +229,21 @@ def _rescue_captions(db3_dir: Path, root: Path, photos: list, report) -> None:
                    "joined to photos this run (fail-soft)")
         return
 
-    by_rel = {p.rel: p for p in photos}
-    by_fold = {p.rel.casefold(): p for p in photos}
     for row, db3_caption in captions:
         abs_path = full_paths[row] if row < len(full_paths) else ""
-        rel = translate_db3_path(abs_path, root) if abs_path else None
-        photo = None
-        if rel is not None:
-            photo = by_rel.get(rel) or by_fold.get(rel.casefold())
+        photo, status = join(abs_path)
         if photo is None:
             subject = abs_path or f"imagedata row {row}"
-            report.add("db3", "db3_path_unresolved", subject,
-                       "db3 carries a caption on a row that does not join "
-                       "to a photo in this library — skipped (fail-soft)")
+            if status == "ambiguous":
+                report.add("db3", "db3_path_ambiguous", subject,
+                           "db3 carries a caption on a row whose path joins "
+                           "photos in more than one root — attaching would "
+                           "be a guess; skipped (fauxcasa-cam.21)")
+            else:
+                report.add("db3", "db3_path_unresolved", subject,
+                           "db3 carries a caption on a row that does not "
+                           "join to a photo in this library — skipped "
+                           "(fail-soft)")
             continue
 
         if photo.caption is None or photo.caption == "":
@@ -185,6 +264,29 @@ def _rescue_captions(db3_dir: Path, root: Path, photos: list, report) -> None:
 
 def rescue_people(db3_dir: Path, root: Path, photos: list,
                   registry: dict[str, str], report) -> set[str]:
+    """Single-root entry point — see _rescue_people. Kept as the frozen
+    public signature scan_library calls; the (root_id, rel)-qualified
+    variant for explicit multi-root compositions is
+    rescue_people_config (fauxcasa-cam.21)."""
+    return _rescue_people(db3_dir, [("", Path(root))], photos,
+                          registry, report)
+
+
+def rescue_people_config(db3_dir: Path, roots: list[tuple[str, Path]],
+                         photos: list, registry: dict[str, str],
+                         report) -> set[str]:
+    """Root-aware rescue for an explicit library (fauxcasa-cam.21): run
+    ONCE over the composed catalog. `roots` is [(root_id, path)] from the
+    LibraryConfig manifest and `photos` the composed root_id-tagged list,
+    so db3 rows join against per-root slices (no cross-root false
+    unresolved, no per-root duplicate person diagnostics) and rows no
+    single root can claim are reported ambiguous, never guessed."""
+    return _rescue_people(db3_dir, list(roots), photos, registry, report)
+
+
+def _rescue_people(db3_dir: Path, roots: list[tuple[str, Path]],
+                   photos: list, registry: dict[str, str],
+                   report) -> set[str]:
     """The class-4 rescue, §4 gap-fill only. Mutates `registry` (adds
     names for contact ids no ini/contacts.xml source named) and the
     Photo.faces name slots that those rescued ids resolve; returns the
@@ -205,11 +307,12 @@ def rescue_people(db3_dir: Path, root: Path, photos: list,
     be rescued (a fresh db3 legitimately has no albumdata at all)."""
     db3_dir = Path(db3_dir)
     rescued: set[str] = set()
+    join = _make_join(roots, photos)
 
     # cam.20 shares the established db3 invocation rather than widening
     # catalog.py's public surface: caption rescue is independent of whether
     # this db3 also happens to carry the person-album columns below.
-    _rescue_captions(db3_dir, root, photos, report)
+    _rescue_captions(db3_dir, join, report)
 
     cat_col = _col(db3_dir, "albumdata", "category")
     name_col = _col(db3_dir, "albumdata", "name")
@@ -281,8 +384,6 @@ def rescue_people(db3_dir: Path, root: Path, photos: list,
     if entries is None:
         return rescued
 
-    by_rel = {p.rel: p for p in photos}
-    by_fold = {p.rel.casefold(): p for p in photos}
     unresolved_seen: set[str] = set()  # one note per path, not per face
     for row, ftype in enumerate(ft_col.values):
         if ftype != FACE_FILETYPE:
@@ -309,16 +410,21 @@ def rescue_people(db3_dir: Path, root: Path, photos: list,
                        f"parent linkage — skipped (fail-soft)")
             continue
         abs_path = folder_e.name + photo_e.name  # folder keeps its sep
-        rel = translate_db3_path(abs_path, root)
-        photo = None
-        if rel is not None:
-            photo = by_rel.get(rel) or by_fold.get(rel.casefold())
+        photo, status = join(abs_path)
         if photo is None:
             if abs_path not in unresolved_seen:
                 unresolved_seen.add(abs_path)
-                report.add("db3", "db3_path_unresolved", abs_path,
-                           f"db3 face of “{shown}” sits on a photo this "
-                           f"library does not contain — cannot join; skipped")
+                if status == "ambiguous":
+                    report.add("db3", "db3_path_ambiguous", abs_path,
+                               f"db3 face of “{shown}” sits on a path that "
+                               f"joins photos in more than one root — "
+                               f"attaching would be a guess; skipped "
+                               f"(fauxcasa-cam.21)")
+                else:
+                    report.add("db3", "db3_path_unresolved", abs_path,
+                               f"db3 face of “{shown}” sits on a photo this "
+                               f"library does not contain — cannot join; "
+                               f"skipped")
             continue
         if not any(fcid == cid for _rect, fcid, _n in photo.faces):
             report.add("db3", "db3_face_residue", photo.rel,
