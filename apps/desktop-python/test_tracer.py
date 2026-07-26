@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import inmeta
 import library as libmod  # alias avoids shadowing the `library` Path fixture (:173)
 import thumbcache
+import volumes as volmod
 from catalog import (
     ScanFilter,
     load_catalog,
@@ -10500,7 +10501,366 @@ def test_make_thumbcache_library_home_default_out_dir_formula(
 # ---- multiroot offline tolerance (fauxcasa-ed5.7.5, bead .e) --------------
 
 
-def test_root_is_online_resolved_path_check(tmp_path: Path) -> None:
+# ---- multiroot volume UUID resolution (fauxcasa-ed5.7.6, bead .f) ---------
+
+
+def test_volume_probe_dispatch_and_linux_uuid_mapping(
+        tmp_path: Path, monkeypatch) -> None:
+    """Linux UUID lookup maps the longest containing mount through the
+    by-uuid identity table in both directions; unsupported hosts remain
+    fail-soft rather than guessing a filesystem identity."""
+    mount = tmp_path / "mnt"
+    mount.mkdir()
+    device = tmp_path / "device"
+    device.write_bytes(b"")
+    monkeypatch.setattr(volmod.sys, "platform", "linux")
+    monkeypatch.setattr(
+        volmod, "_linux_mounts", lambda: [(mount, str(device))])
+    monkeypatch.setattr(
+        volmod, "_linux_uuid_devices",
+        lambda: {"1111-AAAA": device.resolve()})
+
+    assert volmod.volume_uuid_for(mount) == "1111-AAAA"
+    assert volmod.mount_for_uuid("1111-aaaa") == mount
+
+    monkeypatch.setattr(volmod.sys, "platform", "unsupported-test-os")
+    assert volmod.volume_uuid_for(mount) is None
+    assert volmod.mount_for_uuid("1111-AAAA") is None
+
+
+def test_volume_probe_dispatch_windows_and_macos(
+        tmp_path: Path, monkeypatch) -> None:
+    """Platform branches are testable without touching real volumes or
+    launching diskutil; null results propagate unchanged."""
+    marker = "\\\\?\\Volume{test}\\"
+    monkeypatch.setattr(volmod.sys, "platform", "win32")
+    monkeypatch.setattr(volmod, "_windows_volume_uuid", lambda _p: marker)
+    monkeypatch.setattr(
+        volmod, "_windows_mount_for_uuid", lambda _u: tmp_path)
+    assert volmod.volume_uuid_for(tmp_path) == marker
+    assert volmod.mount_for_uuid(marker) == tmp_path
+
+    monkeypatch.setattr(volmod.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        volmod, "_diskutil_info",
+        lambda arg: ({"VolumeUUID": "MAC-UUID"} if arg == str(tmp_path)
+                     else {"MountPoint": str(tmp_path)}))
+    assert volmod.volume_uuid_for(tmp_path) == "MAC-UUID"
+    assert volmod.mount_for_uuid("MAC-UUID") == tmp_path
+
+
+def test_root_resolution_order_path_then_home_then_uuid(
+        tmp_path: Path, monkeypatch) -> None:
+    """Each earlier resolution signal prevents later probes from winning."""
+    home = tmp_path / "home"
+    home_candidate = home / "photos"
+    home_candidate.mkdir(parents=True)
+    last_known = tmp_path / "last-known"
+    last_known.mkdir()
+    uuid_mount = tmp_path / "uuid-mount"
+    (uuid_mount / "archive").mkdir(parents=True)
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        libmod.volumes, "volume_uuid_for",
+        lambda _p: calls.append("path-uuid") or "VOL-A")
+    monkeypatch.setattr(
+        libmod.volumes, "mount_for_uuid",
+        lambda _u: calls.append("uuid-mount") or uuid_mount)
+    root = libmod.LibraryRoot(
+        id="aaaaaaaa", path=last_known, volume_uuid="vol-a",
+        vol_rel="archive", home_rel="photos")
+    assert libmod.bind_root_location(root, home) == last_known.resolve()
+    assert calls == ["path-uuid"]
+
+    # A mismatched volume at the last-known path must not be trusted; the
+    # home-relative moved-library candidate wins before UUID enumeration.
+    calls.clear()
+    monkeypatch.setattr(
+        libmod.volumes, "volume_uuid_for",
+        lambda _p: calls.append("path-uuid") or "DIFFERENT")
+    root.path = last_known
+    assert libmod.bind_root_location(root, home) == home_candidate.resolve()
+    assert root.path == home_candidate.resolve()
+    assert calls == ["path-uuid", "path-uuid", "uuid-mount"]
+
+    # Without a home-relative signal, UUID + vol_rel is the final recovery.
+    calls.clear()
+    root.path = tmp_path / "missing"
+    root.home_rel = None
+    root.vol_rel = "archive"
+    assert libmod.bind_root_location(root, home) == (uuid_mount / "archive").resolve()
+    assert calls == ["uuid-mount"]
+
+
+def test_uuid_remount_self_heals_library_json(
+        tmp_path: Path, monkeypatch) -> None:
+    """A drive-letter/mountpoint change rewrites only the last-known root
+    path and survives a fresh read of library.json."""
+    home = tmp_path / "home"
+    new_mount = tmp_path / "remounted"
+    new_root = new_mount / "Photos"
+    new_root.mkdir(parents=True)
+    root = libmod.LibraryRoot(
+        id="aaaaaaaa", path=tmp_path / "old-mount" / "Photos",
+        volume_uuid="VOL-1", vol_rel="Photos", label="Photos")
+    cfg = libmod.LibraryConfig(
+        library_id=libmod.mint_library_id(), name="Test", roots=[root],
+        home=home)
+    libmod.save_library(cfg)
+
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    monkeypatch.setattr(
+        libmod.volumes, "mount_for_uuid",
+        lambda value: new_mount if value == "VOL-1" else None)
+    assert libmod.resolve_root_locations(cfg)
+    assert cfg.roots[0].path == new_root.resolve()
+    raw = json.loads(libmod.library_json_path(home).read_text(encoding="utf-8"))
+    assert raw["roots"][0]["path"] == new_root.resolve().as_posix()
+
+    loaded = libmod.load_library(home)
+    assert loaded is not None
+    assert loaded.roots[0].path == new_root.resolve()
+
+
+def test_uuid_remount_clears_stale_home_rel(
+        tmp_path: Path, monkeypatch) -> None:
+    """A UUID recovery that moves the root off the library home must also
+    re-derive home_rel: persisting the stale hint would let an unrelated
+    directory that later appears at home/<old home_rel> outrank the UUID
+    binding on the next open (home_rel is probed before UUID)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    new_mount = tmp_path / "remounted"
+    new_root = new_mount / "Photos"
+    new_root.mkdir(parents=True)
+    root = libmod.LibraryRoot(
+        id="aaaaaaaa", path=home / "Photos", volume_uuid="VOL-1",
+        vol_rel="Photos", home_rel="Photos", label="Photos")
+    cfg = libmod.LibraryConfig(
+        library_id=libmod.mint_library_id(), name="Test", roots=[root],
+        home=home)
+
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    monkeypatch.setattr(
+        libmod.volumes, "mount_for_uuid",
+        lambda value: new_mount if value == "VOL-1" else None)
+    assert libmod.resolve_root_locations(cfg)
+    assert cfg.roots[0].path == new_root.resolve()
+    assert cfg.roots[0].home_rel is None
+    raw = json.loads(libmod.library_json_path(home).read_text(encoding="utf-8"))
+    assert raw["roots"][0]["home_rel"] is None
+
+    # An unrelated directory appearing at the old home-relative spot must
+    # not capture the root on the next resolve.
+    (home / "Photos").mkdir()
+    libmod.resolve_root_locations(cfg)
+    assert cfg.roots[0].path == new_root.resolve()
+
+
+def test_uuid_resolution_rejects_overlapping_candidates(
+        tmp_path: Path, monkeypatch) -> None:
+    """Corrupt/stale bindings cannot self-heal two roots onto one tree."""
+    home = tmp_path / "home"
+    mount = tmp_path / "mount"
+    (mount / "Photos").mkdir(parents=True)
+    old_a = tmp_path / "gone-a"
+    old_b = tmp_path / "gone-b"
+    roots = [
+        libmod.LibraryRoot(id="aaaaaaaa", path=old_a,
+                           volume_uuid="VOL", vol_rel="Photos"),
+        libmod.LibraryRoot(id="bbbbbbbb", path=old_b,
+                           volume_uuid="VOL", vol_rel="Photos"),
+    ]
+    cfg = libmod.LibraryConfig(
+        library_id=libmod.mint_library_id(), name="Test", roots=roots,
+        home=home)
+    libmod.save_library(cfg)
+    monkeypatch.setattr(libmod.volumes, "mount_for_uuid", lambda _u: mount)
+
+    assert not libmod.resolve_root_locations(cfg)
+    assert [root.path for root in cfg.roots] == [old_a, old_b]
+    raw = json.loads(libmod.library_json_path(home).read_text(encoding="utf-8"))
+    assert [Path(root["path"]) for root in raw["roots"]] == [old_a, old_b]
+
+
+def test_null_uuid_and_cross_platform_resolution_degrade_offline(
+        tmp_path: Path, monkeypatch) -> None:
+    """Null UUIDs use viable earlier signals but never invent a remount;
+    a persisted UUID that cannot be probed on this host is conservatively
+    offline unless home-relative or UUID enumeration can prove a location."""
+    home = tmp_path / "home"
+    home.mkdir()
+    online = tmp_path / "online"
+    online.mkdir()
+    mount_calls: list[str] = []
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    monkeypatch.setattr(
+        libmod.volumes, "mount_for_uuid",
+        lambda value: mount_calls.append(value) or None)
+
+    null_uuid = libmod.LibraryRoot(id="aaaaaaaa", path=online)
+    assert libmod.bind_root_location(null_uuid, home) == online.resolve()
+    assert mount_calls == []
+
+    null_missing = libmod.LibraryRoot(
+        id="bbbbbbbb", path=tmp_path / "gone", volume_uuid=None,
+        vol_rel="Photos")
+    assert libmod.bind_root_location(null_missing, home) is None
+    assert null_missing.path == tmp_path / "gone"
+    assert mount_calls == []
+
+    known_but_unprobeable = libmod.LibraryRoot(
+        id="cccccccc", path=online, volume_uuid="FOREIGN-UUID",
+        vol_rel=None)
+    assert libmod.bind_root_location(known_but_unprobeable, home) is None
+    assert mount_calls == []
+
+
+def test_transient_uuid_probe_glitch_preserves_stored_binding(
+        tmp_path: Path, monkeypatch) -> None:
+    """An UNMOVED root whose UUID probe transiently returns None keeps its
+    stored binding: re-capturing (None, None) there would let the caller's
+    self-heal persist the erasure, silently discarding the UUID remount
+    net. A genuinely MOVED root still re-captures through the same probe
+    outage -- home_rel's copy-outranks-UUID semantics -- clearing the now
+    possibly-stale binding."""
+    home = tmp_path / "home"
+    photos = home / "photos"
+    photos.mkdir(parents=True)
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    monkeypatch.setattr(libmod.volumes, "mount_for_uuid", lambda _u: None)
+    root = libmod.LibraryRoot(
+        id="aaaaaaaa", path=photos, volume_uuid="VOL-1", vol_rel="photos",
+        home_rel="photos")
+    assert libmod.bind_root_location(root, home) == photos.resolve()
+    assert root.volume_uuid == "VOL-1"
+    assert root.vol_rel == "photos"
+
+    moved = home / "moved"
+    moved.mkdir()
+    root.home_rel = "moved"
+    assert libmod.bind_root_location(root, home) == moved.resolve()
+    assert root.path == moved.resolve()
+    assert root.volume_uuid is None and root.vol_rel is None
+
+
+def test_load_library_drops_unsafe_recovery_hints(
+        tmp_path: Path, monkeypatch) -> None:
+    """A tampered/escaping vol_rel or home_rel is an optional hint, not
+    load-bearing structure: the root loads with the bad hint dropped
+    instead of the whole library collapsing to the implicit legacy
+    fallback (which would hide every root id/label)."""
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    monkeypatch.setattr(libmod.volumes, "mount_for_uuid", lambda _u: None)
+    home = tmp_path / "home"
+    home.mkdir()
+    root_dir = tmp_path / "photos"
+    root_dir.mkdir()
+    payload = {
+        "format": libmod.LIBRARY_FORMAT,
+        "library_id": libmod.mint_library_id(),
+        "name": "Test",
+        "roots": [{
+            "id": "aaaaaaaa",
+            "path": root_dir.as_posix(),
+            "volume_uuid": "VOL-1",
+            "vol_rel": "../../escape",
+            "home_rel": (tmp_path / "absolute").as_posix(),
+            "label": "Photos",
+        }],
+    }
+    libmod.library_json_path(home).parent.mkdir(parents=True)
+    libmod.library_json_path(home).write_text(
+        json.dumps(payload), encoding="utf-8")
+    cfg = libmod.load_library(home)
+    assert cfg is not None and not cfg.is_legacy
+    assert cfg.roots[0].id == "aaaaaaaa"
+    assert cfg.roots[0].label == "Photos"
+    assert cfg.roots[0].vol_rel is None
+    assert cfg.roots[0].home_rel is None
+    assert cfg.roots[0].volume_uuid == "VOL-1"  # non-path hint kept
+
+
+def test_linux_uuid_lookup_prefers_longest_containing_mount(
+        tmp_path: Path, monkeypatch) -> None:
+    """Overlapping mounts resolve to the NESTED mountpoint's identity --
+    pins _linux_mounts' longest-first ordering (via its injectable
+    /proc/mounts path, octal space escapes included) and
+    _containing_mount's first-match selection, which a single-mount mock
+    satisfies trivially."""
+    nested = tmp_path / "mnt"
+    nested.mkdir()
+    parent_dev = tmp_path / "parent-dev"
+    nested_dev = tmp_path / "nested-dev"
+    parent_dev.write_bytes(b"")
+    nested_dev.write_bytes(b"")
+
+    def _mount_field(p: Path) -> str:
+        return str(p).replace(" ", "\\040")
+
+    mounts_file = tmp_path / "proc-mounts"
+    mounts_file.write_text(
+        f"{_mount_field(parent_dev)} {_mount_field(tmp_path)} ext4 rw 0 0\n"
+        f"{_mount_field(nested_dev)} {_mount_field(nested)} ext4 rw 0 0\n",
+        encoding="utf-8")
+    mounts = volmod._linux_mounts(mounts_file)
+    assert mounts[0][0] == nested  # longest mountpoint first, not file order
+
+    monkeypatch.setattr(volmod.sys, "platform", "linux")
+    monkeypatch.setattr(volmod, "_linux_mounts", lambda: mounts)
+    monkeypatch.setattr(volmod, "_linux_uuid_devices", lambda: {
+        "PARENT-UUID": parent_dev.resolve(),
+        "NESTED-UUID": nested_dev.resolve(),
+    })
+    assert volmod.volume_uuid_for(nested) == "NESTED-UUID"
+    assert volmod.volume_uuid_for(tmp_path) == "PARENT-UUID"
+
+
+def test_home_rel_persists_and_recovers_moved_root(
+        tmp_path: Path, monkeypatch) -> None:
+    """save_library writes the additive home_rel for an under-home root,
+    and a fresh load self-heals through it once the last-known path is
+    gone -- the round trip the PR's 'persists home_rel additively' claim
+    rests on."""
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    monkeypatch.setattr(libmod.volumes, "mount_for_uuid", lambda _u: None)
+    home = tmp_path / "home"
+    photos = home / "sub" / "photos"
+    photos.mkdir(parents=True)
+    cfg = libmod.LibraryConfig(
+        library_id=libmod.mint_library_id(), name="Test",
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=photos,
+                                  label="Photos")],
+        home=home)
+    libmod.save_library(cfg)
+    raw = json.loads(
+        libmod.library_json_path(home).read_text(encoding="utf-8"))
+    assert raw["roots"][0]["home_rel"] == "sub/photos"
+
+    raw["roots"][0]["path"] = (tmp_path / "gone").as_posix()
+    libmod.library_json_path(home).write_text(
+        json.dumps(raw), encoding="utf-8")
+    loaded = libmod.load_library(home)
+    assert loaded is not None
+    assert loaded.roots[0].path == photos.resolve()
+
+
+def test_diskutil_probe_survives_truncated_plist(monkeypatch) -> None:
+    """diskutil exiting 0 with truncated XML must degrade to None through
+    the fail-soft contract, not raise ExpatError (which plistlib's expat
+    backend raises and which is NOT a ValueError)."""
+    class _Proc:
+        returncode = 0
+        stdout = b"<?xml version='1.0'?><plist><dict>"
+
+    monkeypatch.setattr(
+        volmod.subprocess, "run", lambda *_a, **_k: _Proc())
+    assert volmod._diskutil_info("disk1") is None
+
+
+def test_root_is_online_resolved_path_check(
+        tmp_path: Path, monkeypatch) -> None:
     """library.root_is_online (design §8, bead .e): a resolved existing
     directory is online; a missing path (unplugged drive) is offline; a
     path that resolves to a FILE, not a directory, is offline too — the
@@ -10517,6 +10877,17 @@ def test_root_is_online_resolved_path_check(tmp_path: Path) -> None:
     assert not libmod.root_is_online(
         libmod.LibraryRoot(id="x", path=missing_dir))
     assert not libmod.root_is_online(libmod.LibraryRoot(id="x", path=a_file))
+
+    bound = libmod.LibraryRoot(
+        id="x", path=online_dir, volume_uuid="BOUND-UUID")
+    monkeypatch.setattr(
+        libmod.volumes, "volume_uuid_for", lambda _p: "bound-uuid")
+    assert libmod.root_is_online(bound)
+    monkeypatch.setattr(
+        libmod.volumes, "volume_uuid_for", lambda _p: "OTHER-UUID")
+    assert not libmod.root_is_online(bound)  # reused mount path, wrong volume
+    monkeypatch.setattr(libmod.volumes, "volume_uuid_for", lambda _p: None)
+    assert not libmod.root_is_online(bound)  # unprobeable is conservatively offline
 
 
 def test_catalog_offline_ids_refresh_and_abs_none_for_offline(
