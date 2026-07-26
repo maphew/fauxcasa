@@ -127,6 +127,26 @@ def test_zero_output_has_no_share_or_warning() -> None:
     assert row["same_model_warning"] is False
 
 
+@pytest.mark.parametrize(
+    ("model", "attribution_agent", "expected"),
+    [
+        # A declared named tier wins over the model-derived tier, after the
+        # same whitespace/case normalization used for arbitrary roles.
+        ("claude-haiku-4-5", "  ReViEwEr\t", "reviewer"),
+        # Non-tier roles remain visible instead of being folded into the
+        # model's tier.
+        ("claude-opus-4-8", " General-Purpose ", "general-purpose"),
+        # Missing or whitespace-only attribution falls back to the model.
+        ("claude-opus-4-8", "", "reviewer"),
+        ("claude-sonnet-4-5", "  \t", "builder"),
+        ("claude-haiku-4-5", None, "scout"),
+    ],
+)
+def test_tier_for_usage_prefers_normalized_attribution_then_model(
+        model: str, attribution_agent: str | None, expected: str) -> None:
+    assert report._tier_for_usage(model, attribution_agent) == expected
+
+
 def test_workflow_resumes_count_as_one_run() -> None:
     session = report.SessionData(session_id="s", start_date="", epoch="unknown")
     session.workflow_runs = [
