@@ -3854,6 +3854,8 @@ def test_default_pal_dir_discovery(monkeypatch, tmp_path: Path) -> None:
     sibling = tmp_path / "Google" / "Picasa2Albums"
     sibling.mkdir()
     assert default_pal_dir() == sibling     # real layout wins over fallback
+    legacy.rmdir()
+    assert default_pal_dir() == sibling     # real layout alone, no fallback
 
 
 def test_scan_ingests_faces_regions_and_names(faces_library: Path) -> None:
