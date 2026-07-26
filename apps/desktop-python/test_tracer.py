@@ -11165,3 +11165,70 @@ def test_main_two_root_cold_build_then_warm_open(tmp_path: Path) -> None:
     warm, proc = run()
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert warm["photos"] == 2 and warm["warm"]
+
+
+def test_main_missing_cache_keeps_offline_root_slice(tmp_path: Path) -> None:
+    """A missing per-root fcache must not discard the persisted catalog
+    (PR #81 review finding): an offline root walks as empty, so falling
+    back to a cold rescan would persist a catalog without that root's
+    photos. With root B offline and root A's cache deleted, the open must
+    keep both catalog slices, re-index only A, and leave B's on-disk
+    fcache byte-identical (never overwritten with error blobs)."""
+    import subprocess
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    make_jpeg(root_a / "one.jpg")
+    make_jpeg(root_b / "two.jpg")
+    home = tmp_path / "home"
+    home.mkdir()
+    cfg = libmod.LibraryConfig(
+        library_id=libmod.mint_library_id(), name="Two roots",
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=root_a, label="A"),
+               libmod.LibraryRoot(id="bbbbbbbb", path=root_b, label="B")],
+        home=home)
+    libmod.save_library(cfg)
+    cache_root = tmp_path / "cache"
+    main_py = Path(__file__).resolve().parent / "main.py"
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+
+    def run() -> tuple[dict, subprocess.CompletedProcess]:
+        proc = subprocess.run(
+            [sys.executable, str(main_py), str(home),
+             "--cache-root", str(cache_root), "--quit-after-ready",
+             "--finish-build", "--timeout", "60"],
+            capture_output=True, text=True, env=env, timeout=90)
+        events = [json.loads(line) for line in proc.stdout.splitlines()
+                  if line.startswith("{")]
+        ready = next((e for e in events if e.get("event") == "ready"), None)
+        assert ready is not None, (proc.returncode, proc.stdout, proc.stderr)
+        return ready, proc
+
+    cold, proc = run()
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert cold["photos"] == 2 and not cold["warm"]
+    cache_dir = thumbcache.cache_dir_for(cfg.library_id, cache_root)
+    a_cache = cache_dir / "thumbs-aaaaaaaa.fcache"
+    b_cache = cache_dir / "thumbs-bbbbbbbb.fcache"
+    b_bytes = b_cache.read_bytes()
+
+    a_cache.unlink()                      # incomplete caches ...
+    root_b.rename(tmp_path / "b-moved")   # ... while root B is offline
+
+    again, proc = run()
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert again["photos"] == 2 and not again["warm"]   # slice preserved
+    assert a_cache.is_file()                            # A re-indexed
+    assert b_cache.read_bytes() == b_bytes              # B never rewritten
+    cat = json.loads((cache_dir / "catalog.json").read_text("utf-8"))
+    assert len(cat["photos"]) == 2
+
+    # Same open with B's cache also gone: the composite serves an
+    # all-error placeholder for B — the catalog still keeps B's photos
+    # and the build must not fabricate an fcache for an offline root.
+    b_cache.unlink()
+    third, proc = run()
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert third["photos"] == 2 and not third["warm"]
+    assert not b_cache.exists()
+    cat = json.loads((cache_dir / "catalog.json").read_text("utf-8"))
+    assert len(cat["photos"]) == 2

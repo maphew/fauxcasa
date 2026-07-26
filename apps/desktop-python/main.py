@@ -108,6 +108,7 @@ from grid import (  # noqa: E402
 import keymap  # noqa: E402
 import library  # noqa: E402
 from thumbcache import (  # noqa: E402
+    THUMB_EDGE,
     CacheError,
     ThumbCache,
     backfill_catalog,
@@ -847,7 +848,12 @@ class SelectionContext:
 
 @dataclass
 class _MultiRootIndexResult:
-    """Aggregate result for one independently-built cache per root."""
+    """Aggregate result for one independently-built cache per root.
+
+    A root the build skipped because it was offline (§8 tolerance —
+    indexing an unreachable tree would clobber a good fcache with error
+    blobs) appears as ``(root_id, None)``; `_offline_root_cache` fills
+    its composite slot at bind time."""
     roots: list[tuple[str, object]]
     photos: int
     elapsed_s: float
@@ -856,6 +862,38 @@ class _MultiRootIndexResult:
     @property
     def rate(self) -> float:
         return self.photos / self.elapsed_s if self.elapsed_s else 0.0
+
+
+def _offline_root_cache(catalog, root_id: str, levels: list[int],
+                        cache_dir: Path | None) -> ThumbCache:
+    """Composite slot for an offline root the cold build skipped: reuse
+    the root's existing on-disk fcache when it still binds and shares the
+    built caches' levels, else an all-error-tile placeholder (length-0
+    entries render as error tiles everywhere; a zero length means no
+    consumer ever reads from the placeholder's path)."""
+    path = cache_dir / fcache_name(root_id) if cache_dir else None
+    if path is not None and path.is_file():
+        try:
+            cache = load_cache(path)
+            bind(cache, catalog, root_id=root_id)
+            if cache.levels == levels:
+                return cache
+        except (CacheError, OSError):
+            pass
+    photos = catalog.photos_for_root(root_id)
+    level_entries = [[(0, 0, 0, 0)] * len(photos) for _ in levels]
+    return ThumbCache(
+        path=path if path is not None else Path(fcache_name(root_id)),
+        count=len(photos),
+        entries=level_entries[0],
+        files=[p.rel for p in photos],
+        library="",
+        library_id=catalog.library_id,
+        sidecar_version=2,
+        levels=list(levels),
+        primary=0,
+        level_entries=level_entries,
+    )
 
 
 class _BuildBridge(QObject):
@@ -1147,8 +1185,21 @@ class MainWindow(QMainWindow):
                     for i, photo in enumerate(catalog.photos):
                         starts.setdefault(photo.root_id, i)
                     t0 = time.perf_counter()
+                    catalog.refresh_offline_ids()
                     for root in catalog.roots:
                         start = starts.get(root.id, 0)
+                        if root.id in catalog.offline_ids:
+                            # Never index an unreachable root (§8): every
+                            # photo would decode to an error blob, and
+                            # writing that fcache would clobber a good one
+                            # from when the drive was attached. Feed error
+                            # tiles for this session and let the composite
+                            # reuse the on-disk cache (or a placeholder).
+                            for j in range(len(
+                                    catalog.photos_for_root(root.id))):
+                                cb(start + j, None)
+                            built.append((root.id, None))
+                            continue
 
                         def root_cb(i, _total, img, start=start):
                             cb(start + i, img)
@@ -1161,10 +1212,11 @@ class MainWindow(QMainWindow):
                         built.append((root.id, one))
                     result = _MultiRootIndexResult(
                         roots=built,
-                        photos=sum(one.photos for _rid, one in built),
+                        photos=sum(one.photos for _rid, one in built
+                                   if one is not None),
                         elapsed_s=time.perf_counter() - t0,
-                        workers=max((one.workers for _rid, one in built),
-                                    default=0),
+                        workers=max((one.workers for _rid, one in built
+                                     if one is not None), default=0),
                     )
                 else:
                     result = build_cache(
@@ -1341,10 +1393,19 @@ class MainWindow(QMainWindow):
         try:
             if isinstance(result, _MultiRootIndexResult):
                 caches = {}
+                skipped: list[str] = []
                 for root_id, one in result.roots:
+                    if one is None:      # offline root: build skipped (§8)
+                        skipped.append(root_id)
+                        continue
                     cache = load_cache(one.path)
                     bind(cache, catalog, root_id=root_id)
                     caches[root_id] = cache
+                levels = (next(iter(caches.values())).levels
+                          if caches else [THUMB_EDGE])
+                for root_id in skipped:
+                    caches[root_id] = _offline_root_cache(
+                        catalog, root_id, levels, self.cache_dir)
                 cache = (next(iter(caches.values())) if len(caches) == 1
                          else CompositeThumbCache(catalog, caches))
             else:
@@ -2516,6 +2577,20 @@ def main() -> int:
                 catalog.report = load_report(cache_dir / REPORT_NAME)
             except (CacheError, OSError) as e:
                 log.warning("persisted cache unusable (%s); rescanning", e)
+        if loaded is not None and catalog is None and not cfg.is_legacy:
+            # Missing or unusable per-root caches must not discard the
+            # loaded catalog (PR #81 review): an offline root walks as
+            # EMPTY, so falling through to _scan_library_config would
+            # persist a new catalog without that root's photos — the §8
+            # offline-tolerance invariant says those entries survive.
+            # Keep the catalog and let the cold build re-index caches;
+            # _start_cold_build skips offline roots so a good fcache is
+            # never overwritten with error blobs.
+            log.warning("per-root caches missing or unusable; re-indexing "
+                        "from the persisted catalog (no rescan)")
+            catalog = loaded
+            catalog.report = load_report(cache_dir / REPORT_NAME)
+            build_dir = cache_dir
 
     if catalog is None:  # cold path
         catalog = _scan_library_config(
