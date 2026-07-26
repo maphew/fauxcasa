@@ -945,6 +945,75 @@ def default_pal_dir() -> Path | None:
 def _merge_pal_albums(pal_dir: Path, photos: list[Photo],
                       albums: dict[str, Album],
                       report: ImportReport) -> None:
+    """Single-root §4 .pal merge — the frozen legacy member resolution:
+    a volume-token-stripped member string IS the library rel, matched
+    exactly. See _merge_pal_albums_core for the §4 rank rules and
+    merge_pal_albums_config for the (root_id, rel)-qualified explicit-
+    library variant (fauxcasa-cam.21)."""
+    index_by_rel = {p.rel: i for i, p in enumerate(photos)}
+
+    def resolve(member: str) -> tuple[int | None, str | None]:
+        i = index_by_rel.get(member)
+        return (i, None) if i is not None else (None, "missing")
+
+    _merge_pal_albums_core(pal_dir, photos, albums, report, resolve)
+
+
+def merge_pal_albums_config(pal_dir: Path, roots: list[tuple[str, Path]],
+                            photos: list[Photo], albums: dict[str, Album],
+                            report: ImportReport) -> None:
+    """Root-aware §4 .pal merge for an explicit multi-root composition
+    (fauxcasa-cam.21), run ONCE over the composed catalog. `roots` is
+    [(root_id, path)] from the LibraryConfig manifest; `photos` is the
+    composed root_id-tagged list with global indices.
+
+    Member resolution is root-qualified: each volume-token-stripped
+    member path first translates against every root's path
+    (db3rescue.translate_db3_path — the §8 drive-insensitive suffix
+    match, casefold-tolerant), then falls back to the legacy direct-rel
+    reading per root, so a member can only attach to the (root_id, rel)
+    it actually names. A member matching photos in more than one root is
+    reported ambiguous and attached NOWHERE — the .pal's volume token is
+    a serial read_pal already strips, so no tie-break exists and a guess
+    would silently corrupt membership.
+
+    Deliberate divergence from the legacy path (PR #86 review, P3-a): an
+    explicit single-root library resolves full volume-stripped members
+    via translation, where the frozen legacy exact-only reading could
+    not; legacy single-root behavior stays untouched by design."""
+    from db3rescue import translate_db3_path
+    idx_by_root: dict[str, dict[str, int]] = {}
+    fold_by_root: dict[str, dict[str, int]] = {}
+    for i, p in enumerate(photos):
+        idx_by_root.setdefault(p.root_id, {})[p.rel] = i
+        fold_by_root.setdefault(p.root_id, {})[p.rel.casefold()] = i
+
+    def resolve(member: str) -> tuple[int | None, str | None]:
+        hits: list[int] = []
+        for root_id, root_path in roots:
+            idx = idx_by_root.get(root_id, {})
+            rel = translate_db3_path(member, root_path)
+            j = None
+            if rel is not None:
+                j = idx.get(rel)
+                if j is None:
+                    j = fold_by_root.get(root_id, {}).get(rel.casefold())
+            if j is None:
+                j = idx.get(member)  # legacy direct-rel reading
+            if j is not None:
+                hits.append(j)
+        if not hits:
+            return None, "missing"
+        if len(hits) > 1:
+            return None, "ambiguous"
+        return hits[0], None
+
+    _merge_pal_albums_core(pal_dir, photos, albums, report, resolve)
+
+
+def _merge_pal_albums_core(pal_dir: Path, photos: list[Photo],
+                           albums: dict[str, Album],
+                           report: ImportReport, resolve) -> None:
     """§4 merge, rank ini > .pal > db3 (pinned: spec §10 item 16, fauxcasa-79b):
 
     - a uid the ini knows nothing of (no [.album:] definition, no albums=
@@ -957,23 +1026,34 @@ def _merge_pal_albums(pal_dir: Path, photos: list[Photo],
       the choice, never a membership change; only a missing date is a gap
       the .pal may fill;
     - .pal members that resolve to no catalog photo are reported, and an
-      unparseable .pal file is reported and skipped (fail-soft per file)."""
+      unparseable .pal file is reported and skipped (fail-soft per file).
+
+    `resolve(member) -> (photo index | None, status)` supplies the member
+    lookup: status None on a match, "missing" when nothing claims the
+    member, "ambiguous" when several roots do (multiroot only — reported
+    separately, never attached)."""
     pals, bad = read_pal_dir(pal_dir)
     for fname in bad:
         report.add("pal", "pal_unreadable", fname,
                    "unparseable .pal file skipped (fail-soft per file)")
     if not pals:
         return
-    index_by_rel = {p.rel: i for i, p in enumerate(photos)}
     for pal in pals:
         resolved: list[int] = []
         missing: list[str] = []
+        ambiguous: list[str] = []
         for rel in pal.members:
-            i = index_by_rel.get(rel)
+            i, status = resolve(rel)
             if i is None:
-                missing.append(rel)
+                (ambiguous if status == "ambiguous" else missing).append(rel)
             elif photos[i].visible:  # same rule as ini membership
                 resolved.append(i)
+        if ambiguous:
+            report.add("pal", "pal_member_ambiguous", pal.uid,
+                       f".pal album “{pal.name}” member(s) match photos in "
+                       f"more than one root — attached nowhere "
+                       f"(root-qualified identity, fauxcasa-cam.21): "
+                       + ", ".join(ambiguous))
         album = albums.get(pal.uid)
         if album is None:
             # .pal-only album: nothing to conflict with — the whole album

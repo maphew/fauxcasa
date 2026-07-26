@@ -6168,6 +6168,126 @@ def test_db3_unreadable_thumbindex_reported_once(db3_library: Path,
     assert len(unreadable) == 1 and unreadable[0].subject == "thumbindex.db"
 
 
+# ---- root-aware db3/.pal enrichment (fauxcasa-cam.21) --------------------
+
+
+def _two_root_library_cfg(tmp_path: Path):
+    """Two explicit roots whose Trip/ folders carry the SAME rel — the
+    duplicate-rel shape cam.21's root-qualified identity exists for."""
+    root_a = tmp_path / "roots" / "alpha"
+    root_b = tmp_path / "roots" / "beta"
+    make_jpeg(root_a / "Trip" / "same.jpg")
+    make_jpeg(root_b / "Trip" / "same.jpg")
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    cfg = libmod.LibraryConfig(
+        library_id=libmod.mint_library_id(), name="Two roots",
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=root_a, label="A"),
+               libmod.LibraryRoot(id="bbbbbbbb", path=root_b, label="B")],
+        home=home)
+    return cfg, root_a, root_b
+
+
+def test_multiroot_db3_enrichment_is_root_qualified(tmp_path: Path) -> None:
+    """cam.21 acceptance, db3 half: with two roots carrying the same rel,
+    a db3 whose rows live under root A gap-fills ONLY root A's photo, the
+    other root's twin stays untouched, no cross-root false
+    db3_path_unresolved noise appears, and person diagnostics are emitted
+    once — not once per root as the old per-root invocation did."""
+    import main as mainmod
+
+    cfg, root_a, _root_b = _two_root_library_cfg(tmp_path)
+    db3 = _make_person_db3(tmp_path / "db3",
+                           _db3_machine_path(root_a / "Trip"), ["same.jpg"])
+    _write_pmp(db3 / "imagedata_caption.pmp", "string",
+               ["", "root-a caption"])
+
+    cat = mainmod._scan_library_config(cfg, None, {}, None, None, db3)
+    by_root = {(p.root_id, p.rel): p for p in cat.photos}
+    assert by_root[("aaaaaaaa", "Trip/same.jpg")].caption == "root-a caption"
+    assert by_root[("bbbbbbbb", "Trip/same.jpg")].caption is None
+    kinds = [e.kind for e in cat.report.entries]
+    assert kinds.count("db3_caption_rescued") == 1
+    assert kinds.count("db3_person_rescued") == 1
+    assert "db3_path_unresolved" not in kinds
+    assert "db3_path_ambiguous" not in kinds
+    assert CID_DB3 in cat.db3_contacts
+    assert cat.contacts[CID_DB3] == PERSON_DB3
+
+
+def test_multiroot_pal_membership_is_root_qualified(tmp_path: Path) -> None:
+    """cam.21 acceptance, .pal half: a member whose volume-stripped path
+    translates onto root A attaches only there; a bare-rel member both
+    roots could claim attaches NOWHERE and is reported ambiguous; and the
+    unknown_album class is emitted once globally after the .pal pass, not
+    prematurely per root."""
+    import main as mainmod
+
+    cfg, root_a, root_b = _two_root_library_cfg(tmp_path)
+    uid_full, uid_bare, uid_gone = "a" * 32, "b" * 32, "c" * 32
+    for r in (root_a, root_b):
+        (r / "Trip" / ".picasa.ini").write_text(
+            f"[same.jpg]\r\nalbums={uid_gone}\r\n")
+    pal_dir = tmp_path / "pals"
+    # The volume-stripped spelling of root_a's photo: drop only a drive
+    # token (Windows) — on POSIX every component is real path material.
+    parts = [c for c in str(root_a).replace("\\", "/").split("/") if c]
+    if re.fullmatch(r"[A-Za-z]:", parts[0]):
+        parts = parts[1:]
+    a_member = "/".join(parts + ["Trip", "same.jpg"])
+    _write_pal(pal_dir, uid_full, "Root A only", [a_member])
+    _write_pal(pal_dir, uid_bare, "Ambiguous", ["Trip/same.jpg"])
+
+    cat = mainmod._scan_library_config(cfg, None, {}, pal_dir, None, None)
+    idx = {(p.root_id, p.rel): i for i, p in enumerate(cat.photos)}
+    full = cat.albums[uid_full]
+    assert full.pal_sourced
+    assert full.members == [idx[("aaaaaaaa", "Trip/same.jpg")]]
+    assert cat.albums[uid_bare].members == []
+    kinds = [e.kind for e in cat.report.entries]
+    assert kinds.count("pal_member_ambiguous") == 1
+    assert "pal_member_missing" not in kinds
+    assert "pal_divergence" not in kinds
+    unknown = [e for e in cat.report.entries if e.kind == "unknown_album"]
+    assert len(unknown) == 1 and unknown[0].subject == uid_gone
+
+
+def test_db3_join_multiroot_drive_tie_break_and_ambiguity() -> None:
+    """_make_join's multiroot resolution: translate_db3_path is drive-
+    insensitive (§8), so sibling roots differing only by drive both match
+    a stripped path — the row's own drive token must break the tie, and a
+    third drive that matches both is ambiguous, never guessed. (Not
+    constructible through real directories on one volume, hence the
+    direct unit test.)"""
+    from catalog import Photo
+    from db3rescue import _make_join
+
+    pa = Photo(rel="x.jpg", folder="", name="x.jpg", media="image")
+    pa.root_id = "aaaaaaaa"
+    pb = Photo(rel="x.jpg", folder="", name="x.jpg", media="image")
+    pb.root_id = "bbbbbbbb"
+    join = _make_join([("aaaaaaaa", Path("D:/photos")),
+                       ("bbbbbbbb", Path("E:/photos"))], [pa, pb])
+    assert join("D:\\photos\\x.jpg") == (pa, None)
+    assert join("E:\\photos\\x.jpg") == (pb, None)
+    assert join("Q:\\photos\\x.jpg") == (None, "ambiguous")
+    assert join("Q:\\elsewhere\\x.jpg") == (None, "unresolved")
+    assert join("") == (None, "unresolved")
+
+    # An exact-rel match outranks a casefold-only twin in another root
+    # even when the drive token matches neither (P3-c).
+    pc = Photo(rel="Trip/Photo.jpg", folder="Trip", name="Photo.jpg",
+               media="image")
+    pc.root_id = "aaaaaaaa"
+    pd = Photo(rel="Trip/photo.jpg", folder="Trip", name="photo.jpg",
+               media="image")
+    pd.root_id = "bbbbbbbb"
+    join2 = _make_join([("aaaaaaaa", Path("D:/photos")),
+                        ("bbbbbbbb", Path("E:/photos"))], [pc, pd])
+    assert join2("Q:\\photos\\Trip\\Photo.jpg") == (pc, None)
+    assert join2("Q:\\photos\\Trip\\photo.jpg") == (pd, None)
+
+
 def test_db3_person_album_rescue_end_to_end(db3_library: Path,
                                             tmp_path: Path) -> None:
     """The class-4 rescue end to end: a db3 person album (category 8,
