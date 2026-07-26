@@ -6271,6 +6271,19 @@ def test_db3_join_multiroot_drive_tie_break_and_ambiguity() -> None:
     assert join("Q:\\elsewhere\\x.jpg") == (None, "unresolved")
     assert join("") == (None, "unresolved")
 
+    # An exact-rel match outranks a casefold-only twin in another root
+    # even when the drive token matches neither (P3-c).
+    pc = Photo(rel="Trip/Photo.jpg", folder="Trip", name="Photo.jpg",
+               media="image")
+    pc.root_id = "aaaaaaaa"
+    pd = Photo(rel="Trip/photo.jpg", folder="Trip", name="photo.jpg",
+               media="image")
+    pd.root_id = "bbbbbbbb"
+    join2 = _make_join([("aaaaaaaa", Path("D:/photos")),
+                        ("bbbbbbbb", Path("E:/photos"))], [pc, pd])
+    assert join2("Q:\\photos\\Trip\\Photo.jpg") == (pc, None)
+    assert join2("Q:\\photos\\Trip\\photo.jpg") == (pd, None)
+
 
 def test_db3_person_album_rescue_end_to_end(db3_library: Path,
                                             tmp_path: Path) -> None:

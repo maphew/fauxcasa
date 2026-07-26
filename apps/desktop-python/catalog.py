@@ -971,7 +971,12 @@ def merge_pal_albums_config(pal_dir: Path, roots: list[tuple[str, Path]],
     it actually names. A member matching photos in more than one root is
     reported ambiguous and attached NOWHERE — the .pal's volume token is
     a serial read_pal already strips, so no tie-break exists and a guess
-    would silently corrupt membership."""
+    would silently corrupt membership.
+
+    Deliberate divergence from the legacy path (PR #86 review, P3-a): an
+    explicit single-root library resolves full volume-stripped members
+    via translation, where the frozen legacy exact-only reading could
+    not; legacy single-root behavior stays untouched by design."""
     from db3rescue import translate_db3_path
     idx_by_root: dict[str, dict[str, int]] = {}
     fold_by_root: dict[str, dict[str, int]] = {}

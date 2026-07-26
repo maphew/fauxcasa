@@ -156,21 +156,31 @@ def _make_join(roots: list[tuple[str, Path]], photos: list):
             rel = translate_db3_path(abs_path, root_path)
             if rel is None:
                 continue
-            photo = by_rel.get(rel) or by_fold.get(rel.casefold())
+            exact = rel in by_rel
+            photo = by_rel.get(rel) if exact \
+                else by_fold.get(rel.casefold())
             if photo is None:
                 continue
             same_drive = (p_drive is not None and r_drive is not None
                           and p_drive.casefold() == r_drive.casefold())
-            hits.append((photo, same_drive))
+            hits.append((photo, same_drive, exact))
         if not hits:
             return None, "unresolved"
         if len(hits) == 1:
             return hits[0][0], None
+        # A root matching the db3 spelling exactly outranks one matching
+        # only under casefold — the casefold fallback exists for the rare
+        # case-drifted rel, not to manufacture ambiguity against an
+        # exact twin in another root (PR #86 review, P3-c).
+        exact_hits = [h for h in hits if h[2]]
+        if len(exact_hits) == 1:
+            return exact_hits[0][0], None
         # translate_db3_path is drive-insensitive by design (§8), so
         # sibling roots like D:\photos and E:\photos both match a
         # stripped path; the row's own drive token breaks the tie when
         # exactly one root shares it.
-        drive_hits = [h for h in hits if h[1]]
+        pool = exact_hits or hits
+        drive_hits = [h for h in pool if h[1]]
         if len(drive_hits) == 1:
             return drive_hits[0][0], None
         return None, "ambiguous"

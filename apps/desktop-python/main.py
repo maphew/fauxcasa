@@ -776,8 +776,10 @@ def _scan_library_config(
     manifest's (root_id, path) pairs. unknown_album reporting moves with
     the .pal pass: a per-root scan can't know a .pal (or another root)
     resolves the uid, so its premature entries are dropped and the class
-    is re-emitted once after every source has had its say — the same
-    order scan_library keeps internally.
+    is re-emitted once after every source has had its say — preserving
+    scan_library's pal-before-unknown_album order for that class (the
+    composed report's contacts-vs-pal RELATIVE order does shift; no
+    consumer reads entry order — ImportReport.summary() tallies kinds).
     """
     if cfg.is_legacy:
         return scan_library(cfg.roots[0].path, scan_filter, contacts, pal_dir,
@@ -824,7 +826,20 @@ def _scan_library_config(
     from catalog import ImportReport, merge_pal_albums_config
     from db3rescue import rescue_people_config
     report = ImportReport(reports)
-    manifest_roots = [(r.id, r.path) for r in cfg.roots]
+
+    def _resolved(p: Path) -> Path:
+        # scan_library resolves each root before walking ("root =
+        # root.resolve()"), so the joiners must see the SAME spelling — a
+        # symlinked or relative manifest path would otherwise never share
+        # the suffix an absolute db3/.pal member path carries (PR #86
+        # review). Fail-soft: an unresolvable (offline) root keeps its
+        # stored spelling and simply joins nothing.
+        try:
+            return Path(p).resolve()
+        except (OSError, RuntimeError):
+            return Path(p)
+
+    manifest_roots = [(r.id, _resolved(r.path)) for r in cfg.roots]
 
     if pal_dir is not None:
         merge_pal_albums_config(pal_dir, manifest_roots, photos, albums,
