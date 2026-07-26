@@ -155,6 +155,44 @@ def volume_uuid_for(path: Path) -> str | None:
     return None
 
 
+class ProbeCache:
+    """Memoizes volume_uuid_for / mount_for_uuid for ONE operation
+    (fauxcasa-t0a): a library open, a resolve pass, or a reconcile pass.
+
+    Without it an open-and-scan probes every UUID-bound root twice — once
+    in resolve_root_locations/bind_root_location and again in
+    refresh_offline_ids — and on macOS each probe is a blocking
+    ``diskutil info`` subprocess with a 5-second timeout, so N roots cost
+    up to 2N serial subprocess launches per open.
+
+    Scope is deliberately an OPERATION, never the process: callers create
+    one per pass, so a remount between passes is always re-observed;
+    within a pass the volume table is treated as stable. Negative answers
+    are cached too — a slow or absent volume answers once per pass, not
+    once per root. This is NOT a skip-when-path-matches shortcut: every
+    unique path/UUID is still genuinely probed once, so the
+    reused-drive-letter protection is intact (PR #80 review thread)."""
+
+    def __init__(self) -> None:
+        self._uuid_by_path: dict[str, str | None] = {}
+        self._mount_by_uuid: dict[str, Path | None] = {}
+
+    def volume_uuid_for(self, path: Path) -> str | None:
+        key = str(path)
+        if key not in self._uuid_by_path:
+            self._uuid_by_path[key] = volume_uuid_for(path)
+        return self._uuid_by_path[key]
+
+    def mount_for_uuid(self, volume_uuid: str) -> Path | None:
+        # The same normalization _uuid_equal applies: Windows volume GUIDs
+        # are case-insensitive and may carry a trailing slash.
+        key = (volume_uuid or "").rstrip("\\/").casefold() \
+            if isinstance(volume_uuid, str) else ""
+        if key not in self._mount_by_uuid:
+            self._mount_by_uuid[key] = mount_for_uuid(volume_uuid)
+        return self._mount_by_uuid[key]
+
+
 def mount_for_uuid(volume_uuid: str) -> Path | None:
     """Return a current mountpoint for *volume_uuid*, when discoverable."""
     if not isinstance(volume_uuid, str) or not volume_uuid:

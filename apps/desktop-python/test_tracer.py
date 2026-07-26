@@ -10703,6 +10703,42 @@ def test_uuid_remount_clears_stale_home_rel(
     assert cfg.roots[0].path == new_root.resolve()
 
 
+def test_probe_cache_dedupes_one_open_but_not_the_next_pass(
+        tmp_path: Path, monkeypatch) -> None:
+    """fauxcasa-t0a: one volumes.ProbeCache scoped to an open dedupes the
+    volume probes resolve_root_locations and refresh_offline_ids would
+    otherwise EACH pay per UUID-bound root (2N serial subprocess launches
+    on macOS) — while a fresh pass without the cache probes again, so a
+    remount between passes is always re-observed (never a
+    skip-when-path-matches shortcut)."""
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    calls: list[str] = []
+    monkeypatch.setattr(volmod, "volume_uuid_for",
+                        lambda p: calls.append(str(p)) or "VOL-1")
+    monkeypatch.setattr(volmod, "mount_for_uuid", lambda _u: None)
+    root = libmod.LibraryRoot(id="aaaaaaaa", path=photos,
+                              volume_uuid="VOL-1", vol_rel="photos")
+    cfg = libmod.LibraryConfig(library_id=libmod.mint_library_id(),
+                               name="T", roots=[root], home=home)
+
+    probes = volmod.ProbeCache()
+    libmod.resolve_root_locations(cfg, persist=False, probes=probes)
+    assert len(calls) == 1              # healthy-path branch: one probe
+
+    from catalog import Catalog
+    cat = Catalog(root=photos, photos=[], folders={}, albums={},
+                  roots=[root], library_id=cfg.library_id)
+    cat.refresh_offline_ids(probes)     # the open's shared cache
+    assert len(calls) == 1              # no re-probe within the open
+    assert root.id not in cat.offline_ids
+
+    cat.refresh_offline_ids()           # next pass, no cache: fresh probe
+    assert len(calls) == 2
+
+
 def test_uuid_resolution_rejects_overlapping_candidates(
         tmp_path: Path, monkeypatch) -> None:
     """Corrupt/stale bindings cannot self-heal two roots onto one tree."""
