@@ -62,7 +62,7 @@ class SelectionTray(QWidget):
     the readout label (text is computed by the owner — MainWindow knows
     the sidebar view type; the tray only knows what it holds)."""
 
-    navigate = Signal(str)   # a held thumb was clicked: rel path to show
+    navigate = Signal(object)  # clicked held identity (rel or (root_id, rel))
     hold_clicked = Signal()  # Hold button (owner adds the grid selection)
     changed = Signal()       # held set / vanish count changed
 
@@ -71,14 +71,16 @@ class SelectionTray(QWidget):
         super().__init__(parent)
         self.catalog = catalog
         self.thumbs = thumbs
-        # Hold-order rel paths (module docstring: insertion order, no
-        # duplicates) + the vanish count the readout must surface (N7).
-        self.held: list[str] = []
+        # Exact legacy passthrough: a one-root tray still exposes bare rel
+        # strings. A genuine multi-root tray uses (root_id, rel), so two
+        # drives' canonical same-rel photo cannot alias.
+        self._multiroot = len(catalog.roots) > 1
+        self.held: list[str | tuple[str, str]] = []
         self.vanished = 0
-        self._rel_idx: dict[str, int] = {}
-        # rel -> decoded thumb (None = no usable cached pixel: error tile
+        self._rel_idx: dict[str | tuple[str, str], int] = {}
+        # identity -> decoded thumb (None = no usable cached pixel: error tile
         # or unreadable blob). Cleared whenever catalog/cache re-point.
-        self._thumb_imgs: dict[str, QImage | None] = {}
+        self._thumb_imgs: dict[str | tuple[str, str], QImage | None] = {}
         self._rebuild_rel_index()
 
         self.setFixedHeight(TRAY_H)
@@ -122,7 +124,7 @@ class SelectionTray(QWidget):
             self._notify()
         return added
 
-    def remove(self, rel: str) -> None:
+    def remove(self, rel: str | tuple[str, str]) -> None:
         """Drop one held photo (per-item remove: middle-click / context
         menu on its thumb); order of the rest is untouched."""
         if rel not in self.held:
@@ -138,7 +140,7 @@ class SelectionTray(QWidget):
         self.vanished = 0
         self._notify()
 
-    def index_of(self, rel: str) -> int | None:
+    def index_of(self, rel: str | tuple[str, str]) -> int | None:
         """Current catalog index for a held rel (None if it no longer
         resolves — can only happen transiently before a rebind)."""
         return self._rel_idx.get(rel)
@@ -158,6 +160,7 @@ class SelectionTray(QWidget):
         count."""
         self.catalog = catalog
         self.thumbs = thumbs
+        self._multiroot = len(catalog.roots) > 1
         self._rebuild_rel_index()
         survivors = [r for r in self.held if r in self._rel_idx]
         dropped = len(self.held) - len(survivors)
@@ -175,8 +178,12 @@ class SelectionTray(QWidget):
         self.bar.update()
 
     def _rebuild_rel_index(self) -> None:
-        self._rel_idx = {p.rel: i
+        self._rel_idx = {self.photo_key(p): i
                          for i, p in enumerate(self.catalog.photos)}
+
+    def photo_key(self, photo) -> str | tuple[str, str]:
+        """Stable tray identity with byte-for-byte one-root passthrough."""
+        return (photo.root_id, photo.rel) if self._multiroot else photo.rel
 
     def _notify(self) -> None:
         self.clear_btn.setEnabled(bool(self.held))
@@ -185,7 +192,7 @@ class SelectionTray(QWidget):
 
     # ---------- thumbnail decode (synchronous, memoized) ----------
 
-    def thumb_image(self, rel: str) -> QImage | None:
+    def thumb_image(self, rel: str | tuple[str, str]) -> QImage | None:
         """The held thumb for `rel`, decoded on first use from the fcache
         (module docstring: one small synchronous read, no new threads).
         None = no usable cached pixel; nothing is memoized while there is
@@ -199,7 +206,7 @@ class SelectionTray(QWidget):
         self._thumb_imgs[rel] = img
         return img
 
-    def _decode(self, rel: str) -> QImage | None:
+    def _decode(self, rel: str | tuple[str, str]) -> QImage | None:
         """One tray thumb from the cache pair: cheapest level that covers
         THUMB, EXIF-upright in the cache, Picasa rotate= composed on top
         (same contract as the grid/viewer paths). Broad guard like
@@ -324,7 +331,8 @@ class _ThumbsBar(QWidget):
         i = self.item_at(int(event.pos().x()))
         if i >= 0:
             rel = self._tray.held[i]
-            act = menu.addAction(f"Remove from tray — {rel}")
+            shown = rel[1] if isinstance(rel, tuple) else rel
+            act = menu.addAction(f"Remove from tray — {shown}")
             act.triggered.connect(lambda: self._tray.remove(rel))
         if self._tray.held:
             menu.addAction("Clear tray").triggered.connect(self._tray.clear)

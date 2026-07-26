@@ -1,0 +1,31 @@
+{
+ "benchmark": "two-root-cold-start",
+ "photos": 100000,
+ "roots": 2,
+ "runs_ms": [
+  777,
+  781,
+  766,
+  784,
+  773
+ ],
+ "median_ms": 777,
+ "prep_runs_ms": [
+  377,
+  381,
+  381,
+  387,
+  382
+ ],
+ "vm_rss_runs_mb": [
+  223.2,
+  222.7,
+  222.6,
+  222.9,
+  222.9
+ ],
+ "budget_ms_exclusive": 2000,
+ "pass": true,
+ "platform": "win32",
+ "python": "3.13.1"
+}
