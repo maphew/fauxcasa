@@ -477,11 +477,13 @@ def _tracer_db3_video_dims(c: Catalog, r: Reference) -> int:
 
 
 def _tracer_db3_video_filetype(c: Catalog, r: Reference) -> int:
+    # r.db3_video_filetype already holds only _DB3_VIDEO_FILETYPE_CODES
+    # rows (_db3_reference filters on it), so only media routing is
+    # checked here.
     by_rel = _photos_by_rel(c)
     return sum(
-        1 for rel, ftype in r.db3_video_filetype.items()
+        1 for rel in r.db3_video_filetype
         if (p := by_rel.get(rel)) is not None and p.media == "video"
-        and ftype in _DB3_VIDEO_FILETYPE_CODES
     )
 
 
