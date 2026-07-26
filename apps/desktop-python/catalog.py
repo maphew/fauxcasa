@@ -406,7 +406,7 @@ class Catalog:
     def visible_count(self) -> int:
         return sum(1 for p in self.photos if p.visible)
 
-    def refresh_offline_ids(self) -> None:
+    def refresh_offline_ids(self, probes=None) -> None:
         """Recompute `offline_ids` from `roots` (design §8, bead .e): a
         root is offline when library.root_is_online() says its resolved
         path is not a directory — unplugged drive, remapped network share,
@@ -414,8 +414,12 @@ class Catalog:
         is bead .f. Call this whenever the catalog is opened (load_catalog)
         or reconciled (the per-root reconcile loop) so abs() and the
         online_roots()/offline_roots() split reflect current reality
-        before the next UI read."""
-        self.offline_ids = {r.id for r in self.roots if not root_is_online(r)}
+        before the next UI read. `probes` (fauxcasa-t0a) is an optional
+        volumes.ProbeCache scoped to the caller's operation, so an open
+        that just resolved root locations does not re-probe every
+        UUID-bound root; None probes directly, per call."""
+        self.offline_ids = {r.id for r in self.roots
+                            if not root_is_online(r, probes)}
 
     def online_roots(self) -> list[LibraryRoot]:
         """`roots` minus `offline_ids`, in library.json order (design §8/
@@ -1563,7 +1567,8 @@ def save_catalog_retrying(catalog: Catalog, path: Path,
     raise err  # type: ignore[misc]
 
 
-def load_catalog(path: Path, cfg: Path | LibraryConfig) -> Catalog | None:
+def load_catalog(path: Path, cfg: Path | LibraryConfig,
+                 probes=None) -> Catalog | None:
     """Reconstruct a Catalog from a persisted file, or None if absent,
     unreadable, or an older/foreign/corrupt format (-> caller does a cold
     walk). Derives folder/name/visible and folder title/photo_count the
@@ -1738,8 +1743,9 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig) -> Catalog | None:
     # "populated when the catalog is opened" (design §8, bead .e) — a warm
     # load is exactly an open, so check every root's reachability now
     # rather than leaving offline_ids at its all-online default until the
-    # first reconcile.
-    catalog.refresh_offline_ids()
+    # first reconcile. `probes` lets the open's resolve pass share its
+    # volume-probe results here (fauxcasa-t0a).
+    catalog.refresh_offline_ids(probes)
     return catalog
 
 

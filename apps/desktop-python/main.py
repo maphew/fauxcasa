@@ -107,6 +107,7 @@ from grid import (  # noqa: E402
 )
 import keymap  # noqa: E402
 import library  # noqa: E402
+import volumes  # noqa: E402
 from thumbcache import (  # noqa: E402
     THUMB_EDGE,
     CacheError,
@@ -2469,7 +2470,14 @@ def main() -> int:
     root = _resolve_library(args.library, args.cache_root)
     if root is None:
         return 2
-    cfg = library.resolve_open_path(root)
+    # One volume-probe cache for the whole open-and-scan operation
+    # (fauxcasa-t0a): the resolve pass here and load_catalog's
+    # refresh_offline_ids below share results, so N UUID-bound roots cost
+    # N probes per open instead of up to 2N serial subprocess launches
+    # (macOS diskutil). Scoped to THIS open only — later reconcile passes
+    # probe freshly so remounts are always re-observed.
+    open_probes = volumes.ProbeCache()
+    cfg = library.resolve_open_path(root, open_probes)
 
     min_w, min_h = args.min_image_size or (0, 0)
     max_w, max_h = args.max_image_size or (0, 0)
@@ -2559,7 +2567,7 @@ def main() -> int:
 
     t_prep = time.perf_counter()
     if not args.rebuild:
-        loaded = load_catalog(cat_path, cfg)
+        loaded = load_catalog(cat_path, cfg, probes=open_probes)
         if loaded is not None and all(path.is_file()
                                       for _rid, path in cache_paths):
             try:

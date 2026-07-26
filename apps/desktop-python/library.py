@@ -108,8 +108,13 @@ def library_json_path(home: Path) -> Path:
     return home / LIBRARY_DIR / LIBRARY_FILE
 
 
-def root_is_online(root: LibraryRoot) -> bool:
+def root_is_online(root: LibraryRoot,
+                   probes: "volumes.ProbeCache | None" = None) -> bool:
     """Return whether the resolved path is a trustworthy online root.
+
+    `probes` (fauxcasa-t0a) is an optional per-operation
+    volumes.ProbeCache so one open/reconcile pass probes each unique
+    path once; None keeps the direct single-probe behavior.
 
     A root with no durable UUID degrades to the ordinary directory check.
     When a UUID is stored, a missing or mismatched platform probe is treated
@@ -128,7 +133,7 @@ def root_is_online(root: LibraryRoot) -> bool:
             return False
         if root.volume_uuid is None:
             return True
-        observed = volumes.volume_uuid_for(path)
+        observed = (probes or volumes).volume_uuid_for(path)
         return observed is not None and _uuid_equal(observed, root.volume_uuid)
     except (OSError, RuntimeError):
         return False
@@ -169,12 +174,15 @@ def _home_relative(path: Path, home: Path | None) -> str | None:
         return None
 
 
-def _capture_volume_binding(path: Path) -> tuple[str | None, str | None]:
+def _capture_volume_binding(
+        path: Path, probes: "volumes.ProbeCache | None" = None,
+) -> tuple[str | None, str | None]:
     """Capture UUID plus volume-relative path without making either required."""
-    volume_uuid = volumes.volume_uuid_for(path)
+    vol = probes or volumes
+    volume_uuid = vol.volume_uuid_for(path)
     if volume_uuid is None:
         return None, None
-    mount = volumes.mount_for_uuid(volume_uuid)
+    mount = vol.mount_for_uuid(volume_uuid)
     if mount is None:
         return volume_uuid, None
     try:
@@ -197,19 +205,23 @@ def _roots_overlap(roots: list[LibraryRoot]) -> bool:
     return False
 
 
-def bind_root_location(root: LibraryRoot, home: Path) -> Path | None:
+def bind_root_location(root: LibraryRoot, home: Path,
+                       probes: "volumes.ProbeCache | None" = None,
+                       ) -> Path | None:
     """Resolve one root by last-known path, home-relative path, then UUID.
 
     The returned path is also assigned to ``root.path`` when a fallback
     succeeds.  The caller owns persistence so several roots can self-heal in
-    one atomic ``library.json`` write.
+    one atomic ``library.json`` write.  `probes` (fauxcasa-t0a) is the
+    caller's per-operation volumes.ProbeCache; None probes directly.
     """
+    vol = probes or volumes
     current = _existing_dir(root.path)
     observed: str | None = None
     if current is not None:
         if root.volume_uuid is None:
             return current
-        observed = volumes.volume_uuid_for(current)
+        observed = vol.volume_uuid_for(current)
         if observed is not None and _uuid_equal(observed, root.volume_uuid):
             return current
 
@@ -231,12 +243,13 @@ def bind_root_location(root: LibraryRoot, home: Path) -> Path | None:
             root.path = candidate
             # home_rel intentionally outranks UUID: a whole-library copy is a
             # valid move even when it lands on a different volume/platform.
-            root.volume_uuid, root.vol_rel = _capture_volume_binding(candidate)
+            root.volume_uuid, root.vol_rel = _capture_volume_binding(
+                candidate, probes)
             return candidate
 
     vol_rel = _safe_relative(root.vol_rel)
     if root.volume_uuid is not None and vol_rel is not None:
-        mount = volumes.mount_for_uuid(root.volume_uuid)
+        mount = vol.mount_for_uuid(root.volume_uuid)
         if mount is not None:
             candidate = _existing_dir(mount / vol_rel)
             if candidate is not None:
@@ -250,20 +263,27 @@ def bind_root_location(root: LibraryRoot, home: Path) -> Path | None:
     return None
 
 
-def resolve_root_locations(cfg: LibraryConfig, *, persist: bool = True) -> bool:
+def resolve_root_locations(cfg: LibraryConfig, *, persist: bool = True,
+                           probes: "volumes.ProbeCache | None" = None,
+                           ) -> bool:
     """Resolve all explicit roots and self-heal changed last-known paths.
 
     Returns ``True`` when one or more paths changed.  Probe and persistence
     failures are intentionally non-fatal: unresolved roots remain offline,
     while a read-only library-home can still be opened for browsing.
+    One volumes.ProbeCache covers the whole pass (fauxcasa-t0a); callers
+    running a larger operation (open-and-scan) may pass their own so the
+    later refresh_offline_ids shares these probe results.
     """
     if cfg.is_legacy:
         return False
+    if probes is None:
+        probes = volumes.ProbeCache()
     before = [(root.path, root.volume_uuid, root.vol_rel, root.home_rel)
               for root in cfg.roots]
     assert cfg.home is not None
     for root in cfg.roots:
-        bind_root_location(root, cfg.home)
+        bind_root_location(root, cfg.home, probes)
     # A stale/corrupt pair of UUID bindings must never resolve two roots onto
     # overlapping trees. Revert every fallback so those roots remain offline.
     if _roots_overlap(cfg.roots):
@@ -285,7 +305,9 @@ def resolve_root_locations(cfg: LibraryConfig, *, persist: bool = True) -> bool:
 # Load / save
 # ---------------------------------------------------------------------------
 
-def load_library(home: Path) -> LibraryConfig | None:
+def load_library(home: Path,
+                 probes: "volumes.ProbeCache | None" = None,
+                 ) -> LibraryConfig | None:
     """Load library.json from *home*. Fail-soft: return None on any parse
     anomaly, missing file, format mismatch, or structural violation (mirrors
     load_catalog's fail-soft discipline).
@@ -372,7 +394,7 @@ def load_library(home: Path) -> LibraryConfig | None:
         roots=roots,
         home=Path(home),
     )
-    resolve_root_locations(cfg)
+    resolve_root_locations(cfg, probes=probes)
     return cfg
 
 
@@ -413,13 +435,15 @@ def save_library(cfg: LibraryConfig) -> None:
 # Open-by-path handle
 # ---------------------------------------------------------------------------
 
-def resolve_open_path(path: Path) -> LibraryConfig:
+def resolve_open_path(path: Path,
+                      probes: "volumes.ProbeCache | None" = None,
+                      ) -> LibraryConfig:
     """The open-by-path handle. Try to load library.json from *path*; if
     that succeeds return the explicit config. Otherwise return an implicit
     legacy config (fail-soft N3 style — a bare photo dir, or a dir with a
     corrupt/foreign library.json, is an implicit legacy library, keeping
     day-zero single-root behavior unchanged)."""
-    cfg = load_library(path)
+    cfg = load_library(path, probes)
     if cfg is not None:
         return cfg
     return legacy_config(path)
