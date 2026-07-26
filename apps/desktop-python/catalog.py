@@ -920,14 +920,22 @@ def read_pal_dir(pal_dir: Path) -> tuple[list[PalAlbum], list[str]]:
 
 
 def default_pal_dir() -> Path | None:
-    """The machine-local Picasa2Albums directory, if this machine has one:
-    %LocalAppData%\\Google\\Picasa2\\Picasa2Albums (same discovery shape as
-    default_contacts_xml). None when the env var or directory is absent."""
+    """The machine-local Picasa2Albums directory, if this machine has one.
+    Real Picasa puts it at %LocalAppData%\\Google\\Picasa2Albums — a SIBLING
+    of Picasa2\\, not inside it (observed empirically:
+    docs/research/picasastarter-notes.md, wine-oracle.md) — so that location
+    is probed first; Picasa2\\Picasa2Albums second, tolerating data laid out
+    after this function's historical (divergent, fauxcasa-1t6) path. None
+    when the env var or both directories are absent — discovery is
+    best-effort by design, same shape as default_contacts_xml."""
     base = os.environ.get("LOCALAPPDATA")
     if not base:
         return None
-    p = Path(base) / "Google" / "Picasa2" / "Picasa2Albums"
-    return p if p.is_dir() else None
+    google = Path(base) / "Google"
+    for p in (google / "Picasa2Albums", google / "Picasa2" / "Picasa2Albums"):
+        if p.is_dir():
+            return p
+    return None
 
 
 def _merge_pal_albums(pal_dir: Path, photos: list[Photo],

@@ -3838,6 +3838,27 @@ def test_default_contacts_xml_discovery(monkeypatch, tmp_path: Path) -> None:
     assert default_contacts_xml() == p
 
 
+def test_default_pal_dir_discovery(monkeypatch, tmp_path: Path) -> None:
+    """default_pal_dir finds %LocalAppData%\\Google\\Picasa2Albums — real
+    Picasa's layout, a sibling of Picasa2\\ (fauxcasa-1t6) — preferring it
+    over the legacy Picasa2\\Picasa2Albums fallback, and returns None (not a
+    phantom path) when the env var or both directories are absent."""
+    from catalog import default_pal_dir
+
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    assert default_pal_dir() is None
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert default_pal_dir() is None        # Google/ absent entirely
+    legacy = tmp_path / "Google" / "Picasa2" / "Picasa2Albums"
+    legacy.mkdir(parents=True)
+    assert default_pal_dir() == legacy      # fallback still honoured
+    sibling = tmp_path / "Google" / "Picasa2Albums"
+    sibling.mkdir()
+    assert default_pal_dir() == sibling     # real layout wins over fallback
+    legacy.rmdir()
+    assert default_pal_dir() == sibling     # real layout alone, no fallback
+
+
 def test_scan_ingests_faces_regions_and_names(faces_library: Path) -> None:
     """faces= regions land on Photo.faces as (rect, padded id, name):
     rects decode per parse_rect64, short ids join [Contacts2] zero-padded,
