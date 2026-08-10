@@ -35,6 +35,7 @@ scripts/make-thumbcache.py and adopt via --thumbs.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -2429,6 +2430,32 @@ def run_search_probe(win: MainWindow, spec: str) -> list[dict]:
     return events
 
 
+BUNDLE_RUNTIME_MODULES = (
+    "PySide6.QtWidgets",
+    "rawpy",
+    "exiv2",
+    "PIL.Image",
+    "av",
+)
+
+
+def _bundle_dependency_failures() -> dict[str, str]:
+    """Import every lazily loaded shipping dependency inside the artifact.
+
+    PyInstaller can finish successfully when a build environment omits one
+    of these modules: the app then degrades at runtime (missing metadata,
+    RAW/video/PSD support) instead of failing the build. Return only module
+    and exception *type* so CI diagnostics cannot leak paths or file data.
+    """
+    failures: dict[str, str] = {}
+    for name in BUNDLE_RUNTIME_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001 — probe reports all failures
+            failures[name] = type(exc).__name__
+    return failures
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -2514,7 +2541,17 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=30.0,
                     help="scripted runs (--screenshot/--quit-after-ready) "
                          "abort with exit 1 after this many seconds")
+    ap.add_argument("--bundle-self-check", action="store_true",
+                    help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.bundle_self_check:
+        failures = _bundle_dependency_failures()
+        print(json.dumps({
+            "event": "bundle-self-check",
+            "modules": list(BUNDLE_RUNTIME_MODULES),
+            "failures": failures,
+        }, sort_keys=True), flush=True)
+        return 1 if failures else 0
     if args.cache_root is None:
         args.cache_root = _default_cache_root()
 

@@ -34,6 +34,11 @@ jobs:
       # the gated artifact under us (graduate to a lockfile for a release gate)
       PYSIDE6: "PySide6-Essentials==6.11.1"
       PYINSTALLER: "pyinstaller==6.20.0"
+      # Metadata reader and still fallback are lazy imports too. Omitting
+      # either from the build environment produces a green PyInstaller run
+      # but silently drops dates/GPS/ratings or PSD fallback at runtime.
+      EXIV2: "exiv2==0.18.1"
+      PILLOW: "pillow==12.3.0"
       # LibRaw as a wheel (fauxcasa-v46.1): the artifact must bundle RAW
       # decode — rawpy is imported lazily (rawload.py), so a build without
       # it "succeeds" and ships error tiles for every RAW. Pinned like the
@@ -61,8 +66,19 @@ jobs:
         # dist/fauxcasa-tracer-gui (console=False, shipping). See fauxcasa-pqw.
         run: >
           uv run --with "${{ env.PYSIDE6 }}" --with "${{ env.PYINSTALLER }}"
-          --with "${{ env.RAWPY }}" --with "${{ env.AV }}"
+          --with "${{ env.RAWPY }}" --with "${{ env.EXIV2 }}"
+          --with "${{ env.PILLOW }}" --with "${{ env.AV }}"
           pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
+
+      - name: Frozen lazy-dependency self-check
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXE="dist/fauxcasa-tracer/fauxcasa-tracer.exe"
+          else
+            EXE="dist/fauxcasa-tracer/fauxcasa-tracer"
+          fi
+          "$EXE" --bundle-self-check
 
       - name: Generate a smoke library (JPEG fixtures)
         shell: bash
