@@ -695,6 +695,19 @@ def _write_fcache(out: Path, levels: list[int],
     tmp.replace(out)
 
 
+def _index_submission_order(total: int,
+                            priority_indices: Sequence[int] | None) -> list[int]:
+    """Stable de-duplicated priority prefix followed by every other index."""
+    order: list[int] = []
+    seen: set[int] = set()
+    for i in priority_indices or ():
+        if 0 <= i < total and i not in seen:
+            order.append(i)
+            seen.add(i)
+    order.extend(i for i in range(total) if i not in seen)
+    return order
+
+
 def build_cache(
     catalog: Catalog,
     cache_dir: Path,
@@ -702,6 +715,7 @@ def build_cache(
     cancel: threading.Event | None = None,
     levels: Sequence[int] | None = None,
     root_id: str = LEGACY_ROOT_ID,
+    priority_indices: Sequence[int] | None = None,
 ) -> IndexResult | None:
     """Build a thumb cache for a (small) library and fill each photo's
     identity/staleness signals (size, mtime, sha256) into the catalog in
@@ -721,6 +735,12 @@ def build_cache(
     256 px level, i.e. a v1 cache byte-identical to the legacy format). Pass a
     set such as RECOMMENDED_LEVELS = (512, 256, 128) for a multi-resolution v2
     cache (include 256 so the grid's primary level is unaffected).
+
+    `priority_indices` is a best-effort local-index submission order. The
+    GUI supplies its visible gallery order on a cold build, so photos that
+    can actually appear in the current grid are decoded before hidden/cache-
+    only entries. Invalid/duplicate indices are ignored and every omitted
+    index is appended, so output identity and fcache byte order never change.
 
     A thread pool runs the per-photo index work; `progress(i, total,
     qimage_or_None)` fires as each completes (out of order) so the grid
@@ -744,8 +764,10 @@ def build_cache(
         # dispatch (design §6 choke point) — a photo whose root is
         # missing/offline gets None and _index_one/read_photo_meta fail
         # soft on it (error tile), same as an unreadable file today.
-        futs = [pool.submit(_index_one, catalog.abs(p), p, i, levels)
-                for i, p in enumerate(photos)]
+        order = _index_submission_order(total, priority_indices)
+        futs = [pool.submit(_index_one, catalog.abs(photos[i]), photos[i],
+                            i, levels)
+                for i in order]
         for fut in as_completed(futs):
             if cancel is not None and cancel.is_set():
                 pool.shutdown(wait=False, cancel_futures=True)

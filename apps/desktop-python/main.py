@@ -51,10 +51,12 @@ from PySide6.QtGui import QActionGroup, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMenu,
+    QProgressBar,
     QSlider,
     QSplitter,
     QStackedWidget,
@@ -1153,7 +1155,35 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.pages.addWidget(browser)
         self.pages.addWidget(self.viewer)
-        self.setCentralWidget(self.pages)
+
+        # Prominent, non-modal activity row directly below the toolbar.
+        # Cold indexing used to whisper only in the bottom status bar; on a
+        # multi-thousand-photo first run that looked indistinguishable from a
+        # stalled gallery. Keep secondary details below, but put the ongoing
+        # operation and determinate progress where eyes already are.
+        self.activity_row = QWidget()
+        self.activity_row.setStyleSheet(
+            "background: #fff3c4; color: #3c3320; border-bottom: 1px solid "
+            "#d6bd62;")
+        activity_lay = QHBoxLayout(self.activity_row)
+        activity_lay.setContentsMargins(12, 6, 12, 6)
+        self.activity_label = QLabel()
+        self.activity_label.setStyleSheet("font-weight: 600; border: none;")
+        self.activity_progress = QProgressBar()
+        self.activity_progress.setTextVisible(True)
+        self.activity_progress.setMinimumWidth(280)
+        self.activity_progress.setMaximumWidth(320)
+        activity_lay.addWidget(self.activity_label, 1)
+        activity_lay.addWidget(self.activity_progress)
+        self.activity_row.hide()
+
+        central = QWidget()
+        central_lay = QVBoxLayout(central)
+        central_lay.setContentsMargins(0, 0, 0, 0)
+        central_lay.setSpacing(0)
+        central_lay.addWidget(self.activity_row)
+        central_lay.addWidget(self.pages, 1)
+        self.setCentralWidget(central)
 
         # --- status bar ---
         self.setStatusBar(QStatusBar())
@@ -1252,6 +1282,13 @@ class MainWindow(QMainWindow):
         bridge, catalog = self._bridge, self.catalog
         done = [0]  # results arrive out of order; count completions, not idx
         total_photos = len(catalog.photos)
+        # Decode what the gallery can show before hidden/cache-only entries.
+        # The grid's display order is already folder-grouped and begins at the
+        # current viewport, so this is also the most useful publication order.
+        gallery_order = list(self.grid.display)
+        self._show_activity(
+            "Indexing thumbnails — gallery will fill as photos are ready",
+            0, total_photos)
 
         def cb(global_i: int, img) -> None:
             if img is not None:
@@ -1259,8 +1296,7 @@ class MainWindow(QMainWindow):
             else:
                 self.grid.feed_error(global_i)
             done[0] += 1
-            if done[0] % 5 == 0 or done[0] == total_photos:
-                _emit(bridge.progress, done[0], total_photos)
+            _emit(bridge.progress, done[0], total_photos)
 
         def work() -> None:
             try:
@@ -1293,9 +1329,19 @@ class MainWindow(QMainWindow):
                         def root_cb(i, _total, img, start=start):
                             cb(start + i, img)
 
+                        local_by_global = {
+                            global_i: local_i
+                            for local_i, global_i in enumerate(
+                                i for i, photo in enumerate(catalog.photos)
+                                if photo.root_id == root.id)
+                        }
+                        priority = [local_by_global[i] for i in gallery_order
+                                    if i in local_by_global]
+
                         one = build_cache(
                             catalog, build_dir, root_cb,
-                            cancel=self.build_cancel, root_id=root.id)
+                            cancel=self.build_cancel, root_id=root.id,
+                            priority_indices=priority)
                         if one is None:
                             return
                         built.append((root.id, one))
@@ -1311,7 +1357,8 @@ class MainWindow(QMainWindow):
                     result = build_cache(
                         catalog, build_dir,
                         lambda i, _total, img: cb(i, img),
-                        cancel=self.build_cancel)
+                        cancel=self.build_cancel,
+                        priority_indices=gallery_order)
                     if result is None:
                         return  # cancelled
                 save_catalog_retrying(catalog, build_dir / "catalog.json")
@@ -1443,6 +1490,7 @@ class MainWindow(QMainWindow):
         painted star badges, and — if the user is looking at the Recently
         Updated view outside a search — the view itself."""
         self.progress_label.setText("")
+        self._hide_activity()
         if not ok:
             return
         apply_star_overrides(self.catalog, self.star_overrides)
@@ -1459,9 +1507,14 @@ class MainWindow(QMainWindow):
 
     def _on_status(self, text: str) -> None:
         self.progress_label.setText(("   " + text) if text else "")
+        if text:
+            self._show_activity(text)
+        else:
+            self._hide_activity()
 
     def _on_index_finished(self, result, catalog, is_reconcile: bool) -> None:
         self.progress_label.setText("")
+        self._hide_activity()
         if result is None:
             if is_reconcile:
                 # A background refresh failure doesn't invalidate the
@@ -2404,6 +2457,25 @@ class MainWindow(QMainWindow):
 
     def _build_progress(self, done: int, total: int) -> None:
         self.progress_label.setText(f"   indexing {done}/{total}…")
+        self._show_activity(
+            f"Indexing thumbnails — {done:,} of {total:,} ready",
+            done, total)
+
+    def _show_activity(self, text: str, done: int | None = None,
+                       total: int | None = None) -> None:
+        self.activity_label.setText(text)
+        if done is None or total is None:
+            self.activity_progress.setRange(0, 0)  # honest busy indicator
+            self.activity_progress.setFormat("")
+        else:
+            maximum = max(1, total)
+            self.activity_progress.setRange(0, maximum)
+            self.activity_progress.setValue(min(done, maximum))
+            self.activity_progress.setFormat("%v / %m photos   %p%")
+        self.activity_row.show()
+
+    def _hide_activity(self) -> None:
+        self.activity_row.hide()
 
     # ---------- viewer ----------
 
