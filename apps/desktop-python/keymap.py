@@ -29,6 +29,7 @@ Library (grid) surface:
     Ctrl+I                Invert selection           grid.invert (ed5.12)
     Home / End            First / last photo         grid.first / grid.last (ed5.12)
     Ctrl+H                Hold selection in tray     grid.hold (shipped, fauxcasa-q6l.2)
+    Space                 Add / remove star          grid.star_toggle / viewer.star_toggle
     Ctrl+Enter            Locate on Disk             grid.locate / viewer.locate (NEW here)
     Ctrl+Alt (hover)      Full-screen photo preview  PEEK_MODS chord (shipped, fauxcasa-q6l.5)
     Ctrl+1 / Ctrl+2       Small / large thumbnails   superseded by the thumbnail zoom slider
@@ -54,8 +55,8 @@ Picasa Photo Viewer / edit-view surface (our single-photo viewer):
     X                     Exclude (import)           M2 reject (reserved — see RESERVED_KEYS)
     PgUp / PgDn, +/-,     Zoom in / out steps        follow-up rider from PR #45 (not v1-owed)
     mousewheel
-    Space                 Toggle background (edit)   differs: viewer.next includes Space (our
-                                                     triage-loop call); slideshow.pause is Space
+    Space                 Add / remove star          viewer.star_toggle; slideshow.pause is
+                                                     context-specific during playback
     / , .                 Video pause/rew/ff         v46.3 (playback is gated)
 
 Fauxcasa-only bindings (no Picasa equivalent):
@@ -64,8 +65,7 @@ Fauxcasa-only bindings (no Picasa equivalent):
     F                     viewer.faces — face-region overlay (cam.4; Picasa
                                          documents no view-mode key for boxes)
     Ctrl+Alt+0            viewer.zoom_toggle — conflict-free 100% spelling
-    Space                 slideshow.pause (conventional; Picasa slideshow keys
-                                           are undocumented in the corpus)
+    Space                 slideshow.pause (playback context only)
 
 ARBITRATIONS (encoded in the table below):
 
@@ -136,6 +136,9 @@ DEFAULT_SCHEME: dict[str, Binding] = {
     "grid.hold": Binding(
         ("Ctrl+H",),
         note="Picasa: Hold selected photos in Photo Tray (q6l.2)."),
+    "grid.star_toggle": Binding(
+        ("Space",), key_only=True,
+        note="Picasa: add/remove star on the selected/current photo(s)."),
     "grid.deselect": Binding(
         ("Ctrl+D",),
         note="Picasa: Deselect photos (ed5.12). Clears the selection set; "
@@ -210,11 +213,14 @@ DEFAULT_SCHEME: dict[str, Binding] = {
     "viewer.pan_right": Binding(("Ctrl+Right",), note="As viewer.pan_left."),
     "viewer.pan_up": Binding(("Ctrl+Up",), note="As viewer.pan_left."),
     "viewer.pan_down": Binding(("Ctrl+Down",), note="As viewer.pan_left."),
+    "viewer.star_toggle": Binding(
+        ("Space",), key_only=True,
+        note="Picasa library shortcut: add/remove star. Fauxcasa stores "
+             "the override in its own cache; originals remain read-only."),
     "viewer.next": Binding(
-        ("Right", "J", "Space"), key_only=True,
-        note="Picasa: Right/J = next. Space-as-next is our triage-loop "
-             "call (Picasa's edit-view Space toggles the background). "
-             "Checked AFTER pan, so Ctrl+Right pans while zoomed."),
+        ("Right", "J"), key_only=True,
+        note="Picasa: Right/J = next. Checked AFTER pan, so Ctrl+Right "
+             "pans while zoomed."),
     "viewer.prev": Binding(
         ("Left", "K"), key_only=True,
         note="Picasa: Left/K = prev."),

@@ -122,6 +122,12 @@ from thumbcache import (  # noqa: E402
 )
 from peek import PeekPage  # noqa: E402
 from slideshow import SlideshowPage  # noqa: E402
+from starstore import (  # noqa: E402
+    apply_star_overrides,
+    load_star_overrides,
+    photo_key,
+    save_star_overrides,
+)
 from tray import SelectionTray  # noqa: E402
 from viewer import ViewerPage  # noqa: E402
 
@@ -987,6 +993,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
+        # User star choices are overlays in Fauxcasa's machine-local cache,
+        # never writes into originals/.picasa.ini (the tracer's N1/N3 rule).
+        self.star_overrides = load_star_overrides(cache_dir)
+        apply_star_overrides(catalog, self.star_overrides)
         self.scan_filter = scan_filter
         # --thumbs path preserved for any relaunch that walks the same file
         # set as this run; a File-Types change changes the walk and must not
@@ -1071,6 +1081,12 @@ class MainWindow(QMainWindow):
         self.open_action = bar.addAction("Open...")
         self.open_action.setToolTip("Choose a different photo library folder")
         self.open_action.triggered.connect(self._change_library)
+        self.back_action = bar.addAction("← Gallery  (Esc)")
+        self.back_action.setToolTip(
+            "Return to the gallery and folder tree (Esc)")
+        self.back_action.triggered.connect(
+            lambda: self._close_viewer(self.viewer.current_index()))
+        self.back_action.setVisible(False)
         bar.addSeparator()
         # Picasa's green Play (folder/album headers + toolbar) distilled to
         # one toolbar affordance acting on the CURRENT view; F11 is the
@@ -1179,7 +1195,10 @@ class MainWindow(QMainWindow):
         # connections, so the status-bar dual mode (_selection_changed)
         # and _search_changed stay untouched.
         self.grid.hold_requested.connect(self._hold_selection)
+        self.grid.star_toggle_requested.connect(self._toggle_grid_stars)
         self.viewer.hold_requested.connect(self._hold_from_viewer)
+        self.viewer.star_toggle_requested.connect(
+            lambda idx: self._toggle_stars([idx]))
         self.tray.hold_clicked.connect(self._hold_selection)
         self.tray.navigate.connect(self._tray_navigate)
         self.tray.changed.connect(self._refresh_tray_readout)
@@ -1426,6 +1445,7 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("")
         if not ok:
             return
+        apply_star_overrides(self.catalog, self.star_overrides)
         kind, key = self._selected_view()
         self._rebuild_sidebar()
         self._reselect_view(kind, key)
@@ -1484,6 +1504,9 @@ class MainWindow(QMainWindow):
         except CacheError as e:
             log.error("built cache failed to bind: %s", e)
             return
+        # Indexers import source ratings/stars. Explicit Fauxcasa choices
+        # win on this machine and survive both cold builds and rescans.
+        apply_star_overrides(catalog, self.star_overrides)
         if catalog is self.catalog:
             self.grid.set_thumbs(cache)        # cold build: same catalog
             self.viewer.set_thumbs(cache)      # ...so the viewer previews too
@@ -2331,17 +2354,67 @@ class MainWindow(QMainWindow):
             parts.append("Picasa-saved original kept")
         self.meta_label.setText("   ".join(parts) + "  ")
 
+    def _refresh_star_count(self) -> None:
+        reveal = self.grid.reveal
+        n = sum(1 for p in self.catalog.photos
+                if (p.visible or reveal) and p.star)
+        it = QTreeWidgetItemIterator(self.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == ("starred", ""):
+                it.value().setText(0, f"★ Starred  ({n})")
+                return
+            it += 1
+
+    def _toggle_grid_stars(self) -> None:
+        indices = list(self.grid.selection)
+        if not indices and self.grid.current >= 0:
+            indices = [self.grid.current]
+        self._toggle_stars(indices)
+
+    def _toggle_stars(self, indices: list[int]) -> None:
+        """Picasa Space semantics, persisted only in Fauxcasa's cache.
+
+        A mixed selection is normalized to starred; an all-starred selection
+        is cleared. This makes one press deterministic for bulk selection.
+        """
+        indices = sorted({
+            i for i in indices if 0 <= i < len(self.catalog.photos)
+        })
+        if not indices:
+            return
+        target = 0 if all(self.catalog.photos[i].star for i in indices) else 1
+        for i in indices:
+            photo = self.catalog.photos[i]
+            photo.star = target
+            self.star_overrides[photo_key(photo)] = target
+        try:
+            save_star_overrides(self.cache_dir, self.star_overrides)
+        except OSError as e:
+            log.error("could not save star choices: %s", e)
+            self.statusBar().showMessage(
+                "star changed for this session; could not save it", 8000)
+        self.grid.viewport().update()
+        self.viewer.update()
+        self.tray.update()
+        self._refresh_star_count()
+        current = (self.viewer.current_index()
+                   if self.pages.currentWidget() is self.viewer
+                   else self.grid.current)
+        self._photo_selected(current)
+
     def _build_progress(self, done: int, total: int) -> None:
         self.progress_label.setText(f"   indexing {done}/{total}…")
 
     # ---------- viewer ----------
 
     def _open_viewer(self, _idx: int, display: list, pos: int) -> None:
+        self.back_action.setVisible(True)
         self.pages.setCurrentWidget(self.viewer)
         self.viewer.show_photo(list(display), pos)
         self.viewer.setFocus()
 
     def _close_viewer(self, idx: int) -> None:
+        self.back_action.setVisible(False)
         self.pages.setCurrentWidget(self.pages.widget(0))
         if idx >= 0:
             self.grid._select(idx)
