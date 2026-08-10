@@ -1171,6 +1171,7 @@ class MainWindow(QMainWindow):
         self.activity_label.setStyleSheet("font-weight: 600; border: none;")
         self.activity_progress = QProgressBar()
         self.activity_progress.setTextVisible(True)
+        self.activity_progress.setMinimumWidth(280)
         self.activity_progress.setMaximumWidth(320)
         activity_lay.addWidget(self.activity_label, 1)
         activity_lay.addWidget(self.activity_progress)

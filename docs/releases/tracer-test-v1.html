@@ -106,7 +106,7 @@
 
   <figure>
     <img src="tracer-test-v1-gallery.png" alt="Fauxcasa preview showing a folder tree, photo gallery, search bar, zoom control, and indexing status">
-    <figcaption>The tracer-test-v1 gallery on Windows, using the synthetic test library. The folder tree is at left and indexing progress appears along the bottom.</figcaption>
+    <figcaption>The tracer-test-v1 gallery on Windows, using the synthetic test library. The folder tree is at left; the refreshed build keeps indexing progress directly below the toolbar.</figcaption>
   </figure>
 
   <h2>Get the preview</h2>
@@ -121,8 +121,9 @@
   <h2>Essential controls</h2>
   <table>
     <tr><th>Open a photo</th><td>Double-click it, or select it and press <kbd>Enter</kbd>.</td></tr>
-    <tr><th>Return to gallery</th><td>Press <kbd>Esc</kbd> to restore the gallery and folder tree.</td></tr>
+    <tr><th>Return to gallery</th><td>Choose <strong>← Gallery (Esc)</strong> in the toolbar or press <kbd>Esc</kbd> to restore the gallery and folder tree.</td></tr>
     <tr><th>Previous / next</th><td>Use <kbd>←</kbd>/<kbd>→</kbd> or <kbd>J</kbd>/<kbd>K</kbd> while viewing a photo.</td></tr>
+    <tr><th>Add / remove star</th><td>Press <kbd>Space</kbd> in the gallery or single-photo view. The choice is stored only in Fauxcasa’s local cache.</td></tr>
     <tr><th>Actual-size view</th><td>Press <kbd>1</kbd> or <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>0</kbd>; drag to pan.</td></tr>
     <tr><th>Face boxes</th><td>Press <kbd>F</kbd> while viewing a photo that has imported face regions.</td></tr>
     <tr><th>Slideshow</th><td>Choose <strong>Play</strong> in the gallery toolbar; <kbd>Space</kbd> pauses or resumes the slideshow.</td></tr>
@@ -135,17 +136,18 @@
     <li>Imports Picasa <code>.picasa.ini</code>, <code>.pal</code>, contacts, and selected db3 recovery data.</li>
     <li>Displays imported captions, stars, albums, faces, crops, hidden state, dates, GPS, and ratings.</li>
     <li>Searches filenames, captions, keywords, people, and folder names.</li>
+    <li>Shows determinate indexing progress below the toolbar and fills completed gallery thumbnails as they become ready.</li>
     <li>Stills, RAW rendering, PSD fallback, video poster frames, viewer, zoom/pan, hover preview, and slideshow.</li>
     <li>Multi-root libraries and tolerance for temporarily offline volumes.</li>
   </ul>
 
   <h2>Storage and Picasa data</h2>
-  <p>The preview does <strong>not</strong> write to photos, Picasa sidecars, or the Picasa database. It stores only its own rebuildable catalog, configuration, log, and thumbnail cache under the current user’s cache directory.</p>
+  <p>The preview does <strong>not</strong> write to photos, Picasa sidecars, or the Picasa database. It stores only its own catalog, Fauxcasa star choices, configuration, log, and thumbnail cache under the current user’s cache directory.</p>
   <p>It reads existing Picasa sidecars for stars, captions, keywords, rotation, hidden flags, albums, and folder descriptions. It can also read Picasa album, contacts, and db3 sources from the normal Windows locations. Durable write support is future work.</p>
 
   <h2>Important limitations</h2>
   <ul>
-    <li><strong>Read-only alpha:</strong> editing, tagging, exporting, and all other write operations are absent.</li>
+    <li><strong>Source-library read-only alpha:</strong> editing, keyword tagging, exporting, and writes back to Picasa are absent. Space-bar star choices are Fauxcasa-local only.</li>
     <li>Videos show poster frames but do not play yet.</li>
     <li>The initial directory walk happens before the window appears. A large or network-hosted library may take time to show the first window.</li>
     <li>Original-media decoding is not sandboxed yet. Use only files you trust.</li>
