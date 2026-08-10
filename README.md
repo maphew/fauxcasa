@@ -6,6 +6,32 @@ loss of vendor, maintainer, or business model.
 
 It is under active development and not ready for regular use.
 
+## Windows preview
+
+A read-only preview for Windows 10/11 x64 is available for trusted testers:
+
+1. Download
+   [`fauxcasa-tracer-tracer-test-v1-windows-x64.zip`](https://github.com/maphew/fauxcasa/releases/download/tracer-test-v1/fauxcasa-tracer-tracer-test-v1-windows-x64.zip).
+2. Use **Extract All**. The app is not a one-file executable; keep the
+   extracted folder together.
+3. Open `fauxcasa-tracer-gui` and run `fauxcasa-tracer-gui.exe`.
+4. Choose the top-level folder containing the photos you want to browse.
+
+The preview scans photos in place but does **not** modify photos, Picasa
+sidecars, or the Picasa database. It writes only a rebuildable catalog and
+thumbnail cache under your user cache directory. A checksum is published next
+to the download.
+
+This is an unsigned alpha, so Windows SmartScreen may show an unknown-publisher
+warning. The initial folder scan happens before the window appears and can take
+time for a large or network-hosted library. Video files have poster images but
+do not play yet; editing, tagging, exporting, and other write operations are
+not implemented. Original-media decoding is not sandboxed yet, so use only a
+library whose files you trust. See the
+[preview release notes](https://github.com/maphew/fauxcasa/releases/tag/tracer-test-v1)
+for the complete scope and report problems through
+[GitHub Issues](https://github.com/maphew/fauxcasa/issues).
+
 ## Installation
 
 Install uv from [https://docs.astral.sh/uv/](https://docs.astral.sh/uv/).
