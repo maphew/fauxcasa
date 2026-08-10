@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fauxcasa read-only preview — tracer-test-v1</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f1e8;
+      --paper: #fffdf8;
+      --ink: #26231f;
+      --muted: #686158;
+      --accent: #a74824;
+      --accent-soft: #f5dfd3;
+      --line: #d9d0c3;
+      --code: #eee7dc;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1b1917;
+        --paper: #24211e;
+        --ink: #f3eee6;
+        --muted: #c1b8ac;
+        --accent: #f09a70;
+        --accent-soft: #4a2c20;
+        --line: #504941;
+        --code: #35302b;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 17px/1.58 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 48px 28px 72px;
+      background: var(--paper);
+      min-height: 100vh;
+      box-shadow: 0 0 40px rgb(0 0 0 / 8%);
+    }
+    h1, h2 { line-height: 1.18; }
+    h1 { margin: 0 0 10px; font-size: clamp(2rem, 5vw, 3.25rem); }
+    h2 { margin: 42px 0 12px; border-bottom: 1px solid var(--line); padding-bottom: 7px; }
+    p, li { max-width: 74ch; }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    code, kbd {
+      background: var(--code);
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: .08em .36em;
+      font-family: ui-monospace, "Cascadia Code", monospace;
+      font-size: .9em;
+    }
+    kbd { box-shadow: 0 2px 0 var(--line); font-weight: 650; }
+    .lede { color: var(--muted); font-size: 1.15rem; }
+    .callout {
+      margin: 28px 0;
+      padding: 18px 20px;
+      border-left: 6px solid var(--accent);
+      border-radius: 8px;
+      background: var(--accent-soft);
+    }
+    .callout strong { display: block; font-size: 1.16rem; margin-bottom: 4px; }
+    .download {
+      display: inline-block;
+      margin: 8px 0 12px;
+      padding: 11px 17px;
+      border-radius: 7px;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
+      text-decoration: none;
+    }
+    .download:hover { filter: brightness(1.08); }
+    .fine { color: var(--muted); font-size: .92rem; }
+    figure { margin: 30px 0; }
+    figure img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 8px 28px rgb(0 0 0 / 14%);
+    }
+    figcaption { margin-top: 9px; color: var(--muted); font-size: .9rem; }
+    table { border-collapse: collapse; width: 100%; max-width: 760px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 9px 10px; text-align: left; vertical-align: top; }
+    th { width: 13rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Fauxcasa read-only preview</h1>
+  <p class="lede"><strong>tracer-test-v1</strong> for Windows 10/11 x64 — a working, early view of a local photo manager in the spirit of Picasa.</p>
+  <p>Fauxcasa exists because useful personal software should survive the loss of a vendor, maintainer, or business model. This preview is real and useful, but it is not yet ready to replace Picasa for regular use.</p>
+
+  <div class="callout">
+    <strong>Returning from a single photo</strong>
+    Press <kbd>Esc</kbd> to leave the individual-photo view and return to the gallery and folder tree.
+  </div>
+
+  <figure>
+    <img src="tracer-test-v1-gallery.png" alt="Fauxcasa preview showing a folder tree, photo gallery, search bar, zoom control, and indexing status">
+    <figcaption>The tracer-test-v1 gallery on Windows, using the synthetic test library. The folder tree is at left and indexing progress appears along the bottom.</figcaption>
+  </figure>
+
+  <h2>Get the preview</h2>
+  <a class="download" href="https://github.com/maphew/fauxcasa/releases/download/tracer-test-v1/fauxcasa-tracer-tracer-test-v1-windows-x64.zip">Download the Windows preview</a>
+  <ol>
+    <li>Right-click the downloaded zip and choose <strong>Extract All</strong>. Keep the extracted folder together.</li>
+    <li>Open the <code>fauxcasa-tracer-gui</code> folder and run <code>fauxcasa-tracer-gui.exe</code>.</li>
+    <li>Choose the top-level folder containing the photos you want to browse.</li>
+  </ol>
+  <p>The build is unsigned. Windows SmartScreen may show “Windows protected your PC / unknown publisher.” Choose <strong>More info → Run anyway</strong> only if the zip came from the official release page and its SHA-256 matches the <a href="https://github.com/maphew/fauxcasa/releases/download/tracer-test-v1/fauxcasa-tracer-tracer-test-v1-windows-x64.zip.sha256">published checksum</a>.</p>
+
+  <h2>Essential controls</h2>
+  <table>
+    <tr><th>Open a photo</th><td>Double-click it, or select it and press <kbd>Enter</kbd>.</td></tr>
+    <tr><th>Return to gallery</th><td>Press <kbd>Esc</kbd> to restore the gallery and folder tree.</td></tr>
+    <tr><th>Previous / next</th><td>Use <kbd>←</kbd>/<kbd>→</kbd> or <kbd>J</kbd>/<kbd>K</kbd> while viewing a photo.</td></tr>
+    <tr><th>Actual-size view</th><td>Press <kbd>1</kbd> or <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>0</kbd>; drag to pan.</td></tr>
+    <tr><th>Face boxes</th><td>Press <kbd>F</kbd> while viewing a photo that has imported face regions.</td></tr>
+    <tr><th>Slideshow</th><td>Choose <strong>Play</strong> in the gallery toolbar; <kbd>Space</kbd> pauses or resumes the slideshow.</td></tr>
+  </table>
+
+  <h2>What works</h2>
+  <ul>
+    <li>Scans photo folders in place without moving, copying, or modifying their contents.</li>
+    <li>Fast folder, album, Starred, Recently Updated, and People views.</li>
+    <li>Imports Picasa <code>.picasa.ini</code>, <code>.pal</code>, contacts, and selected db3 recovery data.</li>
+    <li>Displays imported captions, stars, albums, faces, crops, hidden state, dates, GPS, and ratings.</li>
+    <li>Searches filenames, captions, keywords, people, and folder names.</li>
+    <li>Stills, RAW rendering, PSD fallback, video poster frames, viewer, zoom/pan, hover preview, and slideshow.</li>
+    <li>Multi-root libraries and tolerance for temporarily offline volumes.</li>
+  </ul>
+
+  <h2>Storage and Picasa data</h2>
+  <p>The preview does <strong>not</strong> write to photos, Picasa sidecars, or the Picasa database. It stores only its own rebuildable catalog, configuration, log, and thumbnail cache under the current user’s cache directory.</p>
+  <p>It reads existing Picasa sidecars for stars, captions, keywords, rotation, hidden flags, albums, and folder descriptions. It can also read Picasa album, contacts, and db3 sources from the normal Windows locations. Durable write support is future work.</p>
+
+  <h2>Important limitations</h2>
+  <ul>
+    <li><strong>Read-only alpha:</strong> editing, tagging, exporting, and all other write operations are absent.</li>
+    <li>Videos show poster frames but do not play yet.</li>
+    <li>The initial directory walk happens before the window appears. A large or network-hosted library may take time to show the first window.</li>
+    <li>Original-media decoding is not sandboxed yet. Use only files you trust.</li>
+    <li>The app is Windows x64 only, unsigned, and supplied as an extracted folder rather than an installer.</li>
+    <li>There is not yet a dedicated keywords/EXIF inspector panel. Selected metadata appears in search, the viewer, and the bottom status area.</li>
+  </ul>
+
+  <h2>Feedback and privacy</h2>
+  <p>Report problems through <a href="https://github.com/maphew/fauxcasa/issues">GitHub Issues</a>. Do not attach private photos, Picasa databases, names, captions, or identifying paths. Describe the behavior and redact personal data.</p>
+
+  <h2>Build provenance</h2>
+  <ul>
+    <li>Application commit: <code>b27a517c7e5db84108407005a2821f7bdf98990f</code></li>
+    <li>Windows and Linux tests, tracer smoke, and frozen bundle workflows passed.</li>
+    <li>Exact Windows artifact passed the frozen dependency check, offscreen smoke, and native Windows rendering check.</li>
+    <li>Test suite at release: 401 passed, 1 skipped.</li>
+  </ul>
+
+  <h2>Licensing</h2>
+  <p>Application code is licensed under <strong>AGPL-3.0-or-later</strong>. Original project documentation is <strong>CC-BY-SA-4.0</strong>. The provisional Fauxcasa name and branding are reserved; the copyright licenses do not grant trademark rights.</p>
+  <p class="fine">This guide combines the project README’s product, storage, and licensing information with the tracer-test-v1 preview notes. The source-checkout Installation and Usage sections are intentionally omitted because they do not apply to the downloadable Windows preview.</p>
+</main>
+</body>
+</html>
