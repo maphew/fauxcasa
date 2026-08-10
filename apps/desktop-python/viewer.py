@@ -266,6 +266,9 @@ class ViewerPage(QWidget):
     # screen in the selection tray, so triage can stage outputs without
     # bouncing back to the grid. Payload: the catalog index shown.
     hold_requested = Signal(int)
+    # Space — Picasa's library shortcut. MainWindow owns persistence and
+    # refreshes every surface after changing this catalog photo.
+    star_toggle_requested = Signal(int)
 
     def __init__(self, catalog: Catalog, thumbs: ThumbCache | None = None,
                  parent=None):
@@ -741,6 +744,10 @@ class ViewerPage(QWidget):
             # F = face overlay (toggle_faces docstring: our own binding —
             # Picasa documents no view-mode key for face boxes).
             self.toggle_faces()
+        elif keymap.matches(event, "viewer.star_toggle"):
+            idx = self.current_index()
+            if idx >= 0:
+                self.star_toggle_requested.emit(idx)
         elif self.zoomed and (pan := _pan_delta(event)) is not None:
             # Ctrl+arrows pan a quarter-viewport at 1:1.
             self._pan_by((self.width() // 4) * pan[0],

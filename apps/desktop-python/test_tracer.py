@@ -4391,6 +4391,76 @@ def test_viewer_zoom_key_toggles_and_arrows_still_navigate(
     assert not v.zoomed
 
 
+def test_viewer_space_requests_star_without_advancing(tmp_path: Path) -> None:
+    """Picasa muscle memory: Space changes the current photo's star; Right/J
+    remain the ways to advance. Slideshow has its own Space pause scope."""
+    from PySide6.QtCore import Qt
+
+    v, _ = _viewer_with_original(tmp_path)
+    requested = []
+    v.star_toggle_requested.connect(requested.append)
+    start_idx = v.current_index()
+    _press(v, Qt.Key.Key_Space)
+    assert requested == [start_idx]
+    assert v.current_index() == start_idx and v.pos == 0
+
+
+def test_mainwindow_back_action_returns_to_exact_gallery_context(
+        library: Path) -> None:
+    """The viewer is not a dead end: its toolbar exposes a mouse-clickable
+    Gallery action, including the Esc hint, and returns to the viewed tile."""
+    from main import MainWindow
+
+    _offscreen_app()
+    win = MainWindow(scan_library(library), None,
+                     cache_dir=None, build_dir=None)
+    display = list(win.grid.display)
+    idx = display[-1]
+    assert not win.back_action.isVisible()
+    win._open_viewer(idx, display, len(display) - 1)
+    assert win.pages.currentWidget() is win.viewer
+    assert win.back_action.isVisible()
+    assert "Esc" in win.back_action.text()
+    win.back_action.trigger()
+    assert win.pages.currentWidget() is win.pages.widget(0)
+    assert not win.back_action.isVisible()
+    assert win.grid.current == idx
+    win.viewer.quiesce()
+
+
+def test_space_star_override_persists_without_writing_library(
+        library: Path, tmp_path: Path) -> None:
+    """Grid Space writes only stars.json in Fauxcasa's cache. The choice
+    overlays a fresh source scan, including an explicit zero over Picasa's
+    imported star=yes value."""
+    from PySide6.QtCore import Qt
+    from main import MainWindow
+    from starstore import STAR_OVERRIDES_NAME
+
+    _offscreen_app()
+    cache_dir = tmp_path / "cache"
+    ini = library / "2020-01-01 Trip" / ".picasa.ini"
+    ini_before = ini.read_bytes()
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=cache_dir, build_dir=None)
+    idx = next(i for i, p in enumerate(cat.photos) if p.name == "a.jpg"
+               and p.folder.endswith("Trip"))
+    assert cat.photos[idx].star == 1
+    win.grid._select(idx)
+    _press(win.grid, Qt.Key.Key_Space)
+    assert cat.photos[idx].star == 0
+    assert (cache_dir / STAR_OVERRIDES_NAME).is_file()
+    assert ini.read_bytes() == ini_before
+
+    fresh = scan_library(library)
+    assert fresh.photos[idx].star == 1       # source itself remains unchanged
+    win2 = MainWindow(fresh, None, cache_dir=cache_dir, build_dir=None)
+    assert fresh.photos[idx].star == 0       # machine-local override reapplied
+    win2.grid._select(idx)
+    _press(win2.grid, Qt.Key.Key_Space)
+    assert fresh.photos[idx].star == 1
+
+
 def test_viewer_zoom_click_anchor_stays_put(tmp_path: Path,
                                             monkeypatch) -> None:
     """Click-to-zoom keeps the clicked image point PUT under the cursor: the

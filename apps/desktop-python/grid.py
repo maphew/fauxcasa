@@ -344,6 +344,9 @@ class GridView(QAbstractScrollArea):
     # the CURRENT selection set to the selection tray. The grid only
     # emits; the tray (rel-path identity, hold order) is MainWindow's.
     hold_requested = Signal()
+    # Space — MainWindow applies Picasa's add/remove-star semantics and owns
+    # the machine-local persistence.
+    star_toggle_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1162,6 +1165,9 @@ class GridView(QAbstractScrollArea):
         if keymap.matches(event, "grid.hold"):
             # Ctrl+H: hold the current selection in the tray (q6l.2).
             self.hold_requested.emit()
+            return
+        if keymap.matches(event, "grid.star_toggle"):
+            self.star_toggle_requested.emit()
             return
         if keymap.matches(event, "grid.select_all"):
             # Ctrl+A (Cmd+A on macOS via the StandardKey): the whole current
