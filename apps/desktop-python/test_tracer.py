@@ -1511,6 +1511,35 @@ def test_mainwindow_wires_viewer_cache_on_build_and_reconcile(
     assert win.viewer.catalog is cat2 and win.viewer.thumbs is cache2
 
 
+def test_index_priority_is_stable_complete_and_filters_bad_indices() -> None:
+    """Gallery-first scheduling changes submission order only: duplicates
+    and nonsense are ignored and every cache index still appears once."""
+    assert thumbcache._index_submission_order(
+        7, [4, 1, 4, -1, 99, 3]) == [4, 1, 3, 0, 2, 5, 6]
+    assert thumbcache._index_submission_order(4, None) == [0, 1, 2, 3]
+
+
+def test_index_activity_row_is_prominent_and_determinate(
+        library: Path) -> None:
+    """Index progress is directly below the toolbar, not discoverable only
+    in the bottom status bar, and is removed once the job finishes."""
+    import main
+
+    _offscreen_app()
+    win = main.MainWindow(scan_library(library), None,
+                          cache_dir=None, build_dir=None)
+    assert win.activity_row.isHidden()
+    win._build_progress(37, 100)
+    assert not win.activity_row.isHidden()
+    assert win.activity_label.text() == \
+        "Indexing thumbnails — 37 of 100 ready"
+    assert win.activity_progress.maximum() == 100
+    assert win.activity_progress.value() == 37
+    assert win.progress_label.text() == "   indexing 37/100…"
+    win._on_index_finished(None, win.catalog, False)
+    assert win.activity_row.isHidden()
+
+
 def test_grid_stop_retires_decode_workers() -> None:
     """GridView.stop() retires its decode-worker pool so the daemons don't
     leak and accumulate across a process (fauxcasa-gfz). After stop() no worker
