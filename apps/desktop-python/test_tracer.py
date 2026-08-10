@@ -1550,6 +1550,40 @@ def test_index_empty_infile_caption_keeps_ini(tmp_path: Path) -> None:
     assert lp.caption == "real ini"  # round-trips; no empty-string leak
 
 
+def test_bundle_dependency_probe_covers_lazy_runtime_matrix(monkeypatch) -> None:
+    """A missing lazy module fails the frozen gate without leaking the
+    exception text (which can contain machine-local paths)."""
+    import main
+
+    seen = []
+
+    def fake_import(name):
+        seen.append(name)
+        if name == "exiv2":
+            raise ImportError("private machine path must not escape")
+        return object()
+
+    monkeypatch.setattr(main.importlib, "import_module", fake_import)
+    assert main._bundle_dependency_failures() == {"exiv2": "ImportError"}
+    assert seen == list(main.BUNDLE_RUNTIME_MODULES)
+
+
+def test_bundle_self_check_cli_exits_before_library_resolution(
+        monkeypatch, capsys) -> None:
+    """The frozen CI probe needs neither a display nor a photo library."""
+    import main
+
+    monkeypatch.setattr(main, "_bundle_dependency_failures", lambda: {})
+    monkeypatch.setattr(sys, "argv", ["main.py", "--bundle-self-check"])
+    assert main.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "event": "bundle-self-check",
+        "failures": {},
+        "modules": list(main.BUNDLE_RUNTIME_MODULES),
+    }
+
+
 def test_default_cache_root_frozen_vs_checkout(monkeypatch, tmp_path: Path) -> None:
     """main._default_cache_root: REPO-relative in a source checkout; a
     per-user writable dir when frozen (REPO then points inside the
