@@ -3,7 +3,11 @@
 **Status:** design deliverable for fauxcasa-i92.2 (blocks i92.3, the
 implementation). Written 2026-07-02. **Decision state: proposed** — owner
 review-by-argument, like every delegated decision; the calls most worth
-fighting over carry **⚖ argue** markers. The parent commitments are
+fighting over carry **⚖ argue** markers. **Two of them are now ruled**
+(maphew, 2026-08-11, fauxcasa-i92.1): the pixels-out-only strengthening
+(§3b) is absorbed into the threat model, and the playback seam (§3) is
+decided as **A — sandboxed streaming**; the QtMultimedia M1 schedule
+valve is declined. The parent commitments are
 `docs/decode-threat-model.md` (mechanism A: broker/worker pool, fd/shm in,
 fixed-shape length-checked pixel buffers out, no format exceptions,
 decoder-bundle versioning, CI escape gates) and spec §5 Formats / §9 M1.
@@ -463,6 +467,17 @@ expiry (M2 — the "trust it with changes" milestone must not ship with an
 in-process video decoder); (4) a standing bead for the A migration. The
 owner should overrule A only by accepting those four in writing — that
 is the ⚖ argument.
+
+**Ruled (maphew, 2026-08-11, fauxcasa-i92.1): A is the design; the
+valve is declined.** v46.3 playback ships as the sandboxed shm
+frame-ring seam. The owner accepted the longer M1 dev time explicitly;
+the deciding factors were the industry mainline (browsers run this
+exact architecture — Firefox's RDD process sandboxes the same ffmpeg,
+with hardware decode later brought *inside* that sandbox, which keeps
+the hw-decode ladder item credible), the Stagefright-shaped automatic
+poster/index exposure, and the fact that the valve builds two media
+stacks (QtMultimedia now + the seam at M2 regardless) where A builds
+one libav, versioned once, serving poster and playback both.
 
 ## 4. Per-platform authority stripping
 

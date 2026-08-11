@@ -4,9 +4,16 @@
 requirement and the timing: the isolation mechanism is "chosen with the
 stack (fauxcasa-6hf) against a written threat model, at M0 exit"; §10
 item 12 separately names wasm's decode-sandbox role. Written 2026-06-12.
-**Decision state: proposed** — agent draft for owner review alongside
-the stack-decision report (`docs/research/stack-balloons.md`),
-overturnable by argument like every delegated decision.
+**Decision state: decided** — ratified by the owner (maphew,
+2026-08-11, fauxcasa-i92.1), absorbing the decode-service design's
+strengthening amendment (workers return *only raw pixels*; the trusted
+side does all encoding — `docs/design/decode-service.md` §3b) and
+**declining the QtMultimedia M1 schedule valve**: video playback ships
+as the sandboxed streaming seam (shm frame ring + PCM audio), per the
+design's own recommendation. Originally an agent draft written
+alongside the stack-decision report
+(`docs/research/stack-balloons.md`); overturnable by argument like
+every decision, but the burden now sits with the challenger.
 
 ## Why this document exists
 
@@ -65,12 +72,17 @@ untrusted bytes ──> [ DECODE SERVICE ]  ──pixels/parsed fields──> tr
 - **Decoder output is data, not code**: fixed-shape pixel buffers and
   length-checked field lists. The receiving side validates dimensions
   and sizes before use.
-- **The app's own cache artifacts are trusted by provenance**: thumbnails
-  are *re-encoded by our encoder from decoded pixels inside the
-  sandbox*, so the cache files the UI reads (the grid's hot path, N4)
-  are our own output, not attacker bytes. The UI process never decodes
-  an original. (This is exactly the architecture the stack trial
-  balloons benchmarked: the grid reads only the packed thumb cache.)
+- **The app's own cache artifacts are trusted by provenance**: workers
+  return *only raw pixel buffers* — never encoded files — and the
+  trusted side does its own JPEG encoding for the thumbnail cache, so
+  nothing a hijacked worker authors is ever re-parsed by trusted code
+  (strengthened from the original "re-encoded inside the sandbox"
+  wording by `docs/design/decode-service.md` §3b, absorbed at
+  ratification). The cache files the UI reads (the grid's hot path,
+  N4) are thus our own output, not attacker bytes. The UI process
+  never decodes an original. (This is exactly the architecture the
+  stack trial balloons benchmarked: the grid reads only the packed
+  thumb cache.)
 
 ## Mechanism options considered
 
@@ -94,7 +106,7 @@ In plain words first:
 | **B. wasm-compiled decoders** (wasmtime/wasmer runtime; codecs compiled to wasm32-wasi) | Capability-based by construction, byte-identical sandbox on all three platforms; in-process speed; the spec already names wasm as the natural decode-sandbox + extension-API substrate (§10 item 12). | Codec coverage is the blocker today: jpeg/png/webp compile well; LibRaw is feasible-with-effort; ffmpeg-class video in wasm is still hard/slow. ~1.2–2× decode-time tax. Runtime maturity risk owned by us. |
 | **C. Memory-safe (Rust) decoders in-process** | Eliminates the memory-corruption bug class at the source for covered formats. | Coverage gaps exactly where risk is highest (vendor RAW matrix, video); "memory-safe" crates still embed unsafe/C under the hood; logic bugs still parse attacker input in-process with full authority — does not meet "no ambient authority" on its own. |
 
-## Decision (proposed — owner confirm-or-argue rides fauxcasa-6hf)
+## Decision (ratified by owner — maphew, 2026-08-11, fauxcasa-i92.1)
 
 **A is the floor, B is the trajectory, C is never sufficient alone.**
 
@@ -110,7 +122,11 @@ In plain words first:
    starting with stills codecs where the wasm port is mature — inside
    the same worker-pool interface, so the host stack never cares which
    engine ran. This is also the seed of the later extension API the
-   spec names. Video stays ffmpeg-in-A for the foreseeable future.
+   spec names. Video stays ffmpeg-in-A for the foreseeable future —
+   including **playback**: the owner declined the QtMultimedia
+   in-process schedule valve (`docs/design/decode-service.md` §3),
+   so v46.3 ships as the sandboxed frame-streaming seam and no
+   residual-risk exception is recorded here.
 4. Memory-safe decoder implementations are welcome *inside* the sandbox
    (defense in depth), never as a substitute for it.
 
