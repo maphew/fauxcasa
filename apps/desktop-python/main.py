@@ -108,6 +108,7 @@ from grid import (  # noqa: E402
     GridView,
     folder_key,
 )
+from inspector import InspectorPanel  # noqa: E402
 import keymap  # noqa: E402
 import library  # noqa: E402
 import volumes  # noqa: E402
@@ -1134,6 +1135,20 @@ class MainWindow(QMainWindow):
             "Hidden Folders category (shown veiled)")
         self.reveal_box.toggled.connect(self._toggle_reveal)
         bar.addWidget(self.reveal_box)
+        # Metadata inspector toggle (fauxcasa-q6l.25). Deliberately NO
+        # QAction shortcut for bare "I" here — a window-level bare-letter
+        # shortcut would fire while the user is typing in the search box
+        # above. The bare-I key is handled per-surface instead (grid.py /
+        # viewer.py keyPressEvent -> info_toggle_requested -> toggle()
+        # below), so this action's checked state stays truthful either way.
+        self.info_action = bar.addAction("Info")
+        self.info_action.setCheckable(True)
+        # Chord text derived from the keymap, same rule as play_action
+        # above (ed5.12) — never hard-code the key.
+        _info_chords = " / ".join(s.toString()
+                                  for s in keymap.shortcuts("app.info"))
+        self.info_action.setToolTip(f"Show photo info ({_info_chords})")
+        self.info_action.toggled.connect(self._toggle_inspector)
 
         # --- pages ---
         browser = QWidget()
@@ -1177,12 +1192,27 @@ class MainWindow(QMainWindow):
         activity_lay.addWidget(self.activity_progress)
         self.activity_row.hide()
 
+        # Metadata inspector panel (fauxcasa-q6l.25): a horizontal splitter
+        # around `pages` rather than inside either page, so ONE panel
+        # instance serves both the grid and the viewer — it stays put
+        # while `pages` switches its current widget. Hidden by default
+        # (default off keeps existing screenshots/tests untouched); the
+        # toolbar's checkable Info action and the bare-I keys below
+        # (grid.py / viewer.py keyPressEvent) show/hide it.
+        self.inspector = InspectorPanel()
+        self.inspector_split = QSplitter()
+        self.inspector_split.addWidget(self.pages)
+        self.inspector_split.addWidget(self.inspector)
+        self.inspector_split.setCollapsible(0, False)
+        self.inspector_split.setStretchFactor(0, 1)
+        self.inspector.hide()
+
         central = QWidget()
         central_lay = QVBoxLayout(central)
         central_lay.setContentsMargins(0, 0, 0, 0)
         central_lay.setSpacing(0)
         central_lay.addWidget(self.activity_row)
-        central_lay.addWidget(self.pages, 1)
+        central_lay.addWidget(self.inspector_split, 1)
         self.setCentralWidget(central)
 
         # --- status bar ---
@@ -1220,6 +1250,11 @@ class MainWindow(QMainWindow):
         self.grid.peek_released.connect(self._hide_peek)
         self.viewer.closed.connect(self._close_viewer)
         self.viewer.photo_shown.connect(self._photo_selected)
+        # Bare I from EITHER surface flips the SAME checkable toolbar
+        # action, so info_action.isChecked() stays the single source of
+        # truth for panel visibility (fauxcasa-q6l.25).
+        self.grid.info_toggle_requested.connect(self.info_action.toggle)
+        self.viewer.info_toggle_requested.connect(self.info_action.toggle)
         # Selection-tray wiring (fauxcasa-q6l.2). The readout also listens
         # to selection_changed and the search box directly — SEPARATE
         # connections, so the status-bar dual mode (_selection_changed)
@@ -1602,6 +1637,13 @@ class MainWindow(QMainWindow):
         self._show_counts("All photos", self._shown_count())
         self._update_import_notes()   # the rescan collected a fresh report
         self.meta_label.setText("")
+        if self.info_action.isChecked():
+            # Re-derive the inspector from the NEW catalog: set_data can
+            # keep the same current index across the swap without
+            # emitting, but that index now names a different photo — a
+            # stale panel would show the old catalog's metadata for a
+            # photo the user may then act on (fauxcasa-q6l.25 review).
+            self._toggle_inspector(True)
 
     def index_busy(self) -> bool:
         return any(t is not None and t.is_alive()
@@ -2373,21 +2415,39 @@ class MainWindow(QMainWindow):
     def _selection_changed(self, selection: set) -> None:
         """Grid multi-select -> status label (spec §5 dual mode): exactly
         one selected shows that photo's metadata; several show the
-        aggregate count; none clears (fauxcasa-q6l.1)."""
+        aggregate count; none clears (fauxcasa-q6l.1). Same dual mode
+        drives the inspector panel (fauxcasa-q6l.25) when it's visible —
+        reusing this existing path rather than adding new plumbing."""
         if len(selection) == 1:
             self._photo_selected(next(iter(selection)))
         elif selection:
             self.meta_label.setText(f"{len(selection)} photos selected  ")
+            if self.info_action.isChecked():
+                self.inspector.set_many(len(selection))
         else:
             self.meta_label.setText("")
+            if self.info_action.isChecked():
+                # Empty selection still has a keyboard-focused current
+                # item — show it, matching what toggling the panel ON
+                # with nothing selected shows (_toggle_inspector).
+                if self.grid.current >= 0:
+                    self._refresh_inspector(
+                        self.catalog.photos[self.grid.current])
+                else:
+                    self.inspector.set_none()
 
     def _photo_selected(self, idx: int) -> None:
         """Single-photo status readout (§5 dual mode): path, star count
         (★ repeated — one glyph per star, so a count > 1 reads at a
         glance), capture date, geotag coordinates (§3 geotag v1 display,
-        fauxcasa-cam.9/.10/.11), caption, keywords."""
+        fauxcasa-cam.9/.10/.11), caption, keywords. Also feeds the
+        inspector panel (fauxcasa-q6l.25) when visible — this one method
+        already fires on grid selection, viewer navigation (photo_shown),
+        and after a star toggle, so the panel needs no new wiring."""
         if idx < 0:
             self.meta_label.setText("")
+            if self.info_action.isChecked():
+                self.inspector.set_none()
             return
         p = self.catalog.photos[idx]
         parts = [p.rel]
@@ -2406,6 +2466,44 @@ class MainWindow(QMainWindow):
             # (fauxcasa-cam.19); restore machinery is M3.
             parts.append("Picasa-saved original kept")
         self.meta_label.setText("   ".join(parts) + "  ")
+        if self.info_action.isChecked():
+            self._refresh_inspector(p)
+
+    def _refresh_inspector(self, photo: Photo) -> None:
+        """Populate the inspector panel for `photo` (fauxcasa-q6l.25).
+        Album UID -> display-name resolution happens HERE, not in
+        inspector.py (spec: "resolution happens in main.py, not the
+        panel") — the same catalog.albums map the sidebar already reads
+        (_build_sidebar)."""
+        names = [self.catalog.albums[uid].name for uid in photo.albums
+                 if uid in self.catalog.albums]
+        self.inspector.set_photo(photo, album_names=names)
+
+    def _toggle_inspector(self, checked: bool) -> None:
+        """Show/hide the inspector panel (fauxcasa-q6l.25) and refresh it
+        from whatever the CURRENT view already has selected on show —
+        "when the panel is hidden, skip populate work but refresh once on
+        show" (spec). Works from either page: the panel is one instance
+        outside the pages stack (module docstring, main.__init__)."""
+        self.inspector.setVisible(checked)
+        if not checked:
+            return
+        if self.pages.currentWidget() is self.viewer:
+            idx = self.viewer.current_index()
+            if idx >= 0:
+                self._refresh_inspector(self.catalog.photos[idx])
+            else:
+                self.inspector.set_none()
+            return
+        sel = self.grid.selection
+        if len(sel) == 1:
+            self._refresh_inspector(self.catalog.photos[next(iter(sel))])
+        elif sel:
+            self.inspector.set_many(len(sel))
+        elif self.grid.current >= 0:
+            self._refresh_inspector(self.catalog.photos[self.grid.current])
+        else:
+            self.inspector.set_none()
 
     def _refresh_star_count(self) -> None:
         reveal = self.grid.reveal
@@ -2450,10 +2548,16 @@ class MainWindow(QMainWindow):
         self.viewer.update()
         self.tray.update()
         self._refresh_star_count()
-        current = (self.viewer.current_index()
-                   if self.pages.currentWidget() is self.viewer
-                   else self.grid.current)
-        self._photo_selected(current)
+        if self.pages.currentWidget() is self.viewer:
+            self._photo_selected(self.viewer.current_index())
+        elif len(self.grid.selection) > 1:
+            # Dual mode (§5): a bulk star over a multi-selection must
+            # keep the status/inspector in "N photos selected" — jumping
+            # to the current photo's single readout would contradict the
+            # grid's still-live selection (fauxcasa-q6l.25 review).
+            self._selection_changed(self.grid.selection)
+        else:
+            self._photo_selected(self.grid.current)
 
     def _build_progress(self, done: int, total: int) -> None:
         self.progress_label.setText(f"   indexing {done}/{total}…")

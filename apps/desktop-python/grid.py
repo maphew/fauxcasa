@@ -347,6 +347,10 @@ class GridView(QAbstractScrollArea):
     # Space — MainWindow applies Picasa's add/remove-star semantics and owns
     # the machine-local persistence.
     star_toggle_requested = Signal()
+    # Bare I — metadata inspector toggle (fauxcasa-q6l.25). The grid only
+    # asks; MainWindow owns the toolbar action's checked state and the
+    # splitter panel's visibility (both views share one InspectorPanel).
+    info_toggle_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1192,6 +1196,13 @@ class GridView(QAbstractScrollArea):
                 cur = (self.current if self.current in self.display_pos
                        else -1)
                 self._set_selection(new_sel, cur, cur)
+            return
+        if keymap.matches(event, "app.info"):
+            # Bare I toggles the metadata inspector (q6l.25). key_only
+            # matching ignores modifiers, so this MUST come after
+            # grid.invert's exact Ctrl+I check above — Ctrl+I stays
+            # Picasa's invert-selection, never the panel toggle.
+            self.info_toggle_requested.emit()
             return
         if keymap.matches(event, "grid.locate"):
             # Ctrl+Enter: Picasa's Locate on Disk — reveal the CURRENT item

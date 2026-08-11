@@ -269,6 +269,11 @@ class ViewerPage(QWidget):
     # Space — Picasa's library shortcut. MainWindow owns persistence and
     # refreshes every surface after changing this catalog photo.
     star_toggle_requested = Signal(int)
+    # Bare I — metadata inspector toggle (fauxcasa-q6l.25), same contract
+    # as the grid's info_toggle_requested. SlideshowPage overrides
+    # keyPressEvent entirely (its own scheme, slideshow.*), so this never
+    # reaches playback.
+    info_toggle_requested = Signal()
 
     def __init__(self, catalog: Catalog, thumbs: ThumbCache | None = None,
                  parent=None):
@@ -756,6 +761,12 @@ class ViewerPage(QWidget):
             self._step(-1)
         elif keymap.matches(event, "viewer.next"):
             self._step(1)
+        elif keymap.matches(event, "app.info"):
+            # Bare I toggles the metadata inspector (q6l.25). key_only
+            # matching ignores modifiers; placed LAST, after every exact
+            # Ctrl-chord check above (pan/hold/locate), per the keymap
+            # dispatch-order contract.
+            self.info_toggle_requested.emit()
         else:
             super().keyPressEvent(event)
 
