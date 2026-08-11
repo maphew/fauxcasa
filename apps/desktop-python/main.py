@@ -1143,7 +1143,11 @@ class MainWindow(QMainWindow):
         # below), so this action's checked state stays truthful either way.
         self.info_action = bar.addAction("Info")
         self.info_action.setCheckable(True)
-        self.info_action.setToolTip("Show photo info (I)")
+        # Chord text derived from the keymap, same rule as play_action
+        # above (ed5.12) — never hard-code the key.
+        _info_chords = " / ".join(s.toString()
+                                  for s in keymap.shortcuts("app.info"))
+        self.info_action.setToolTip(f"Show photo info ({_info_chords})")
         self.info_action.toggled.connect(self._toggle_inspector)
 
         # --- pages ---
@@ -1633,6 +1637,13 @@ class MainWindow(QMainWindow):
         self._show_counts("All photos", self._shown_count())
         self._update_import_notes()   # the rescan collected a fresh report
         self.meta_label.setText("")
+        if self.info_action.isChecked():
+            # Re-derive the inspector from the NEW catalog: set_data can
+            # keep the same current index across the swap without
+            # emitting, but that index now names a different photo — a
+            # stale panel would show the old catalog's metadata for a
+            # photo the user may then act on (fauxcasa-q6l.25 review).
+            self._toggle_inspector(True)
 
     def index_busy(self) -> bool:
         return any(t is not None and t.is_alive()
@@ -2416,7 +2427,14 @@ class MainWindow(QMainWindow):
         else:
             self.meta_label.setText("")
             if self.info_action.isChecked():
-                self.inspector.set_none()
+                # Empty selection still has a keyboard-focused current
+                # item — show it, matching what toggling the panel ON
+                # with nothing selected shows (_toggle_inspector).
+                if self.grid.current >= 0:
+                    self._refresh_inspector(
+                        self.catalog.photos[self.grid.current])
+                else:
+                    self.inspector.set_none()
 
     def _photo_selected(self, idx: int) -> None:
         """Single-photo status readout (§5 dual mode): path, star count
@@ -2530,10 +2548,16 @@ class MainWindow(QMainWindow):
         self.viewer.update()
         self.tray.update()
         self._refresh_star_count()
-        current = (self.viewer.current_index()
-                   if self.pages.currentWidget() is self.viewer
-                   else self.grid.current)
-        self._photo_selected(current)
+        if self.pages.currentWidget() is self.viewer:
+            self._photo_selected(self.viewer.current_index())
+        elif len(self.grid.selection) > 1:
+            # Dual mode (§5): a bulk star over a multi-selection must
+            # keep the status/inspector in "N photos selected" — jumping
+            # to the current photo's single readout would contradict the
+            # grid's still-live selection (fauxcasa-q6l.25 review).
+            self._selection_changed(self.grid.selection)
+        else:
+            self._photo_selected(self.grid.current)
 
     def _build_progress(self, done: int, total: int) -> None:
         self.progress_label.setText(f"   indexing {done}/{total}…")

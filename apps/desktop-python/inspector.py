@@ -46,14 +46,19 @@ _STATE_STYLE = "color: #888; padding: 12px;"
 
 
 def _human_size(n: int) -> str:
-    """KB/MB with one decimal (spec); plain bytes below 1 KB. Caller
-    guarantees n >= 0 (negative = unindexed, filtered out before here)."""
+    """KB/MB/GB with one decimal (spec); plain bytes below 1 KB. Videos
+    are in scope (Photo.media), so the GB tier is real, not theoretical.
+    Caller guarantees n >= 0 (negative = unindexed, filtered out before
+    here)."""
     if n < 1024:
         return f"{n} B"
     kb = n / 1024
     if kb < 1024:
         return f"{kb:.1f} KB"
-    return f"{kb / 1024:.1f} MB"
+    mb = kb / 1024
+    if mb < 1024:
+        return f"{mb:.1f} MB"
+    return f"{mb / 1024:.1f} GB"
 
 
 def _rows_for(photo: Photo, album_names: list[str]) -> list[tuple[str, str]]:
@@ -66,8 +71,12 @@ def _rows_for(photo: Photo, album_names: list[str]) -> list[tuple[str, str]]:
     if photo.root_id:
         # Multiroot only (LEGACY_ROOT_ID == "" is the default single-root
         # id, never shown) — disambiguates two roots' same-rel folders.
-        folder_val = f"[{photo.root_id}] {folder_val}"
-    rows.append(("Folder", folder_val))
+        folder_val = f"[{photo.root_id}] {folder_val}".rstrip()
+    if folder_val:
+        # Library-root photos have folder == "" (catalog.py) — omit the
+        # row rather than render an empty value (same omit rule as the
+        # metadata rows below).
+        rows.append(("Folder", folder_val))
 
     ext = Path(photo.name).suffix.lstrip(".").upper()
     rows.append(("Type", f"{photo.media} ({ext})" if ext else photo.media))

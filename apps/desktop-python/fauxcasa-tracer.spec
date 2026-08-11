@@ -62,6 +62,7 @@ _repo = os.path.dirname(os.path.dirname(_here))
 # poster, or error-tiles every PSD — named here so the graph can never
 # drop them. Wheels only, no system libs.
 _hidden = ["catalog", "grid", "thumbcache", "viewer", "slideshow", "peek",
+           "inspector",
            "picasa_db", "applog", "metareader", "exiv2", "rawload", "rawpy",
            "videoload", "av", "pillowload", "PIL", "PIL.Image", "PIL.ImageOps"]
 
