@@ -66,6 +66,8 @@ Fauxcasa-only bindings (no Picasa equivalent):
                                          documents no view-mode key for boxes)
     Ctrl+Alt+0            viewer.zoom_toggle — conflict-free 100% spelling
     Space                 slideshow.pause (playback context only)
+    I                     app.info — metadata inspector toggle (q6l.25;
+                                     Lightroom-style, no Picasa equivalent)
 
 ARBITRATIONS (encoded in the table below):
 
@@ -128,6 +130,18 @@ DEFAULT_SCHEME: dict[str, Binding] = {
         ("F11", "Ctrl+4"),
         note="Slideshow of the current view (q6l.3). Repurposes Picasa's "
              "F11 full-screen; Ctrl+4 is Picasa's own slideshow chord (ed5.12)."),
+    "app.info": Binding(
+        ("I",), key_only=True,
+        note="Toggle the metadata inspector panel (q6l.25) — this app's "
+             "own pick (Lightroom-style info toggle); the shortcut corpus "
+             "documents no Picasa equivalent. Dispatched PER-SURFACE "
+             "(grid.py / viewer.py keyPressEvent), never as a window-level "
+             "QAction shortcut — a bare-letter global shortcut would fire "
+             "while typing in the search box. key_only ignores modifiers, "
+             "so it is checked AFTER each surface's exact Ctrl-chord "
+             "actions (grid.invert's Ctrl+I above all) — same key_only-"
+             "layering convention as grid.star_toggle's Space vs "
+             "Shift+Space."),
 
     # ---- grid (library) ----
     "grid.select_all": Binding(
