@@ -86,9 +86,37 @@ def per_field_breakdown(rows):
 
 
 # ---------------------------------------------------------------- load real
+# fauxcasa-ed5.5: a v13 catalog is a zstd frame wrapping folder-grouped
+# "photos" ({"p", "ph": [{"n", ...}]}), same on-disk shape save_catalog
+# now writes and catalog.load_catalog/library._promote_upgrade_catalog
+# already sniff+decompress; ungroup back to the flat per-row shape
+# ("r"/"x" hex) every measurement below assumes.
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
 raw = CATALOG.read_bytes()
+if raw[:4] == ZSTD_MAGIC:
+    raw = zstandard.ZstdDecompressor().decompress(raw)
 data = json.loads(raw)
 rows_real = data["photos"]
+if rows_real and isinstance(rows_real[0], dict) and "ph" in rows_real[0]:
+    flat_rows = []
+    for group in rows_real:
+        folder = group.get("p") or ""
+        root_id = group.get("R")
+        for row in group.get("ph", ()):
+            name = row.get("n", "")
+            rel = f"{folder}/{name}" if folder else name
+            new_row = {"r": rel}
+            if root_id:
+                new_row["R"] = root_id
+            for k, v in row.items():
+                if k == "n":
+                    continue
+                if k == "x":
+                    v = base64.b85decode(v).hex()
+                new_row[k] = v
+            flat_rows.append(new_row)
+    rows_real = flat_rows
 n = len(rows_real)
 rels = [r["r"] for r in rows_real]
 

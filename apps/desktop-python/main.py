@@ -2685,6 +2685,7 @@ BUNDLE_RUNTIME_MODULES = (
     "exiv2",
     "PIL.Image",
     "av",
+    "zstandard",
 )
 
 

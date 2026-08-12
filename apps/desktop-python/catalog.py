@@ -1467,11 +1467,14 @@ def scan_library(root: Path,
 # group's root_id lives at "R", absent means roots[0], same convention as
 # the old per-row "R") and each row carries only its basename ("n") plus
 # every other existing field, UNCHANGED (see _group_photo_rows /
-# _ungroup_photo_rows). Grouping relies on walk_library's global
-# path-sorted order, which is folder-contiguous (module docstring) — see
-# _group_photo_rows for why that makes dict-insertion-order grouping safe
-# for album-member index stability. "x" (sha256) is base85 of the raw 32
-# bytes instead of 64 hex chars — lossless, decoded back to hex on load so
+# _ungroup_photo_rows). Grouping is done by RUN (a new group starts
+# whenever (root_id, folder) differs from the previous row's), never by
+# a dict keyed on (root_id, folder) — walk_library's path-sorted order is
+# NOT folder-contiguous whenever a subfolder's name sorts between two of
+# its parent's own files, so dict-insertion-order grouping would silently
+# reorder rows and corrupt album-member index stability; see
+# _group_photo_rows for the worked example. "x" (sha256) is base85 of the
+# raw 32 bytes instead of 64 hex chars — lossless, decoded back to hex on load so
 # every OTHER consumer of Photo.sha256 is unaffected. Detection is by
 # content, not the version field: a file starting with the zstd magic
 # (ZSTD_MAGIC) IS a v13 file; a plain-JSON file is v11 (single-root compat
@@ -1609,29 +1612,36 @@ def _group_photo_rows(rows: list[dict], first_root_id: str) -> list[dict]:
     replaced by a bare basename "n" and "x" re-encoded as base85 of the
     raw 32 bytes (lossless; _ungroup_photo_rows decodes it back to hex).
 
-    SAFE ONLY because `rows` is folder-contiguous: walk_library sorts by
-    full path (component order), so every row of one (root_id, folder)
-    is already adjacent and never recurs later in the list — grouping by
-    first-seen order (a plain dict) then reproduces the exact original
-    flattened order on ungroup, which load_catalog's Photo reconstruction
-    and Album.members' index-based membership both depend on. `rows` may
-    come from freshly-built Photo objects (save_catalog) or straight from
-    an old plain-JSON file's "photos" array (library._promote_upgrade_catalog
-    regrouping a pre-v13 catalog) — both are the same flat shape."""
-    groups: dict[tuple[str, str], dict] = {}
-    order: list[tuple[str, str]] = []
+    ORDER-PRESERVING BY CONSTRUCTION: rows are grouped by RUN, not by a
+    dict keyed on (root_id, folder) — a new group starts whenever the key
+    differs from the PREVIOUS row's key, even if that key was already
+    seen earlier in the list. `rows` is NOT reliably folder-contiguous:
+    walk_library sorts by full path (component order), so a folder's own
+    files are split apart whenever a subfolder's name sorts between them
+    (e.g. "2020/apple.jpg", "2020/summer/b.jpg", "2020/zoo.jpg" — the
+    "2020" folder's two files are not adjacent). Grouping by first-seen
+    key (a plain dict) would silently move "2020/zoo.jpg" into the first
+    "2020" group and corrupt the flattened order on ungroup, which
+    load_catalog's Photo reconstruction and Album.members' index-based
+    membership both depend on. Run-based grouping costs only a repeated
+    folder string in that split case, and reproduces the exact original
+    flattened order unconditionally. `rows` may come from freshly-built
+    Photo objects (save_catalog) or straight from an old plain-JSON
+    file's "photos" array (library._promote_upgrade_catalog regrouping a
+    pre-v13 catalog) — both are the same flat shape."""
+    groups: list[dict] = []
+    prev_key: tuple[str, str] | None = None
     for row in rows:
         rel = row["r"]
         folder, _, name = rel.rpartition("/")
         root_id = row.get("R") or first_root_id
         key = (root_id, folder)
-        group = groups.get(key)
-        if group is None:
-            group = {"p": folder, "ph": []}
+        if key != prev_key:
+            group: dict = {"p": folder, "ph": []}
             if root_id != first_root_id:
                 group["R"] = root_id
-            groups[key] = group
-            order.append(key)
+            groups.append(group)
+            prev_key = key
         new_row: dict = {"n": name}
         for k, v in row.items():
             if k in ("r", "R"):
@@ -1639,8 +1649,8 @@ def _group_photo_rows(rows: list[dict], first_root_id: str) -> list[dict]:
             if k == "x":
                 v = base64.b85encode(bytes.fromhex(v)).decode("ascii")
             new_row[k] = v
-        group["ph"].append(new_row)
-    return [groups[k] for k in order]
+        groups[-1]["ph"].append(new_row)
+    return groups
 
 
 def _ungroup_photo_rows(groups: list, first_root_id: str) -> list[dict]:
@@ -1652,9 +1662,13 @@ def _ungroup_photo_rows(groups: list, first_root_id: str) -> list[dict]:
     rows: list[dict] = []
     for group in groups:
         folder = group.get("p") or ""
+        if not isinstance(folder, str):
+            raise TypeError("group 'p' must be a string")
         root_id = group.get("R") or first_root_id
         for row in group.get("ph", ()):
-            name = row.get("n", "")
+            name = row["n"]  # KeyError on absent -> the defensive net below
+            if not isinstance(name, str):
+                raise TypeError("row 'n' must be a string")
             rel = f"{folder}/{name}" if folder else name
             new_row: dict = {"r": rel}
             if root_id != first_root_id:
@@ -1677,8 +1691,11 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
     are informational/debug only, resolution authority is library.json);
     the implicit legacy library (no library_id) keeps the original
     "library": str(root) header, UNCHANGED, so a single-root catalog's
-    header — and every photo row, via the absent-"R" convention below —
-    round-trips byte-identical (pre-compression) to a pre-multiroot save.
+    header round-trips byte-identical to a pre-multiroot save — and every
+    photo row's CONTENT (via the absent-"R" convention below) is preserved
+    field-for-field, though not byte-identically: fauxcasa-ed5.5 folder-
+    groups the rows and base85-encodes "x" (see _group_photo_rows), so the
+    serialized shape itself differs from a pre-multiroot save.
 
     fauxcasa-ed5.5: the file itself is zstd level 3 over compact-separator
     JSON whose "photos" is folder-grouped (see _group_photo_rows) — the
@@ -1800,9 +1817,14 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig,
     single-root — a plain v12 (or any other plain version) file, and a
     zstd-wrapped file at any version but CATALOG_VERSION, both fail the
     gate below -> None -> cold rebuild. The catalog is a regenerable
-    cache, so there is no migration path for either case, by design."""
-    import zstandard
+    cache, so there is no migration path for either case, by design.
 
+    zstandard is imported lazily, only inside the `if compressed:`
+    branch below — the only place decompression happens — so a
+    zstandard-less environment still degrades to a cold walk (None) for
+    every plain-JSON file (a legacy v11, or any foreign/corrupt file),
+    rather than raising an uncaught ImportError on load_catalog's
+    unguarded call site in main()."""
     if not isinstance(cfg, LibraryConfig):
         cfg = legacy_config(cfg)
     try:
@@ -1810,11 +1832,18 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig,
     except OSError:
         return None
     compressed = raw[:4] == ZSTD_MAGIC
-    try:
-        if compressed:
+    if compressed:
+        try:
+            import zstandard
+        except ImportError:
+            return None
+        try:
             raw = zstandard.ZstdDecompressor().decompress(raw)
+        except (zstandard.ZstdError, MemoryError):
+            return None
+    try:
         data = json.loads(raw)
-    except (ValueError, zstandard.ZstdError, MemoryError):
+    except (ValueError, MemoryError):
         return None
     if not isinstance(data, dict):
         return None

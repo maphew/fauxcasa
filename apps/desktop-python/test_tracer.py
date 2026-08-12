@@ -10494,6 +10494,44 @@ def test_multiroot_two_root_save_load_roundtrip_v13(tmp_path: Path) -> None:
     assert load_catalog(path, wrong_cfg) is None
 
 
+def test_group_photo_rows_preserves_order_when_folder_split_by_subfolder(
+        tmp_path: Path) -> None:
+    """Regression: walk_library sorts by full path, so a folder's own
+    files are NOT always adjacent — a subfolder whose name sorts between
+    two of the parent's own files splits them (e.g. "2020/apple.jpg",
+    "2020/summer/b.jpg", "2020/zoo.jpg": "2020"'s two files are not
+    adjacent). _group_photo_rows must reproduce this exact flattened
+    order on save+load (run-based grouping, not dict-insertion-order
+    grouping keyed on (root_id, folder), which would silently move
+    "2020/zoo.jpg" next to "2020/apple.jpg" and corrupt Album.members'
+    index-based membership)."""
+    from catalog import Album, Catalog, Folder, Photo
+
+    rels = ["2020/apple.jpg", "2020/summer/b.jpg", "2020/zoo.jpg"]
+    photos = [Photo(rel=r, folder=r.rpartition("/")[0],
+                    name=r.rpartition("/")[2]) for r in rels]
+    folders = {
+        "2020": Folder(rel="2020", title="2020", photo_count=2,
+                       total_count=2),
+        "2020/summer": Folder(rel="2020/summer", title="summer",
+                              photo_count=1, total_count=1),
+    }
+    # An album member pointing at the row that a dict-keyed grouping
+    # would silently displace ("2020/summer/b.jpg" is index 1).
+    uid = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    albums = {uid: Album(uid=uid, name="Split", members=[1])}
+    cat = Catalog(root=tmp_path, photos=photos, folders=folders,
+                 albums=albums)
+
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+    loaded = load_catalog(path, tmp_path)
+    assert loaded is not None
+    assert [p.rel for p in loaded.photos] == rels
+    member_rel = loaded.photos[loaded.albums[uid].members[0]].rel
+    assert member_rel == "2020/summer/b.jpg"
+
+
 def test_photo_rows_byte_identical_with_and_without_roots_header(
         tmp_path: Path) -> None:
     """Promotion invariant (design §5/§8): a legacy catalog's photo rows
@@ -10686,6 +10724,32 @@ def test_old_version_compat_single_root_vs_multi_root(
         home=tmp_path,
     )
     assert load_catalog(path, multi_cfg) is None
+
+
+def test_plain_json_v13_file_rejected(tmp_path: Path) -> None:
+    """A v13 file is ALWAYS the zstd-wrapped grouped shape (fauxcasa-
+    ed5.5); a plain-JSON file claiming CATALOG_VERSION is a structural
+    impossibility (never produced by save_catalog) and must cold-walk,
+    not be trusted just because "version" matches."""
+    import catalog as catmod
+
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({"version": catmod.CATALOG_VERSION,
+                                "library": str(tmp_path), "photos": []}))
+    assert load_catalog(path, tmp_path) is None
+
+
+def test_zstd_wrapped_v11_file_rejected(tmp_path: Path) -> None:
+    """The v11 compat carve-out only ever applied to plain JSON (v11
+    predates zstd entirely) — a zstd-wrapped file claiming
+    PRE_MULTIROOT_VERSION is likewise a structural impossibility and
+    must cold-walk."""
+    import catalog as catmod
+
+    path = tmp_path / "catalog.json"
+    _write_raw_catalog(path, {"version": catmod.PRE_MULTIROOT_VERSION,
+                              "library": str(tmp_path), "photos": []})
+    assert load_catalog(path, tmp_path) is None
 
 
 # ---- multiroot cache binding (fauxcasa-ed5.7.3, bead .c) -------------------
@@ -11768,6 +11832,43 @@ def test_promote_upgrades_legacy_plain_json_catalog(tmp_path: Path) -> None:
     assert loaded is not None
     a = next(p for p in loaded.photos if p.rel == "2020/a.jpg")
     assert a.star == 2 and a.caption == "hi" and a.sha256 == "ab" * 32
+
+
+def test_promote_regroups_noncontiguous_legacy_rows(tmp_path: Path) -> None:
+    """Regression for the same non-contiguous-folder hazard as
+    test_group_photo_rows_preserves_order_when_folder_split_by_subfolder,
+    but through _promote_upgrade_catalog's regrouping path (library.py):
+    a legacy flat catalog whose "2020" folder is split by a "2020/summer"
+    subfolder must regroup to the EXACT same flattened row order, not a
+    dict-insertion-order permutation."""
+    import catalog as catmod
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "2020" / "apple.jpg")
+    make_jpeg(root / "2020" / "summer" / "b.jpg")
+    make_jpeg(root / "2020" / "zoo.jpg")
+    cache_root = tmp_path / "cache"
+    old_dir = thumbcache.cache_dir_for(str(root.resolve()), cache_root)
+    old_dir.mkdir(parents=True)
+
+    flat_rows = [
+        {"r": "2020/apple.jpg", "z": 10, "m": 100, "x": "ab" * 32},
+        {"r": "2020/summer/b.jpg", "z": 20, "m": 200, "x": "cd" * 32},
+        {"r": "2020/zoo.jpg", "z": 30, "m": 300, "x": "ef" * 32},
+    ]
+    legacy_data = {
+        "version": catmod.PRE_MULTIROOT_VERSION,
+        "library": str(root.resolve()),
+        "photos": flat_rows,
+        "folders": {}, "hidden_folders": [], "contacts": {},
+        "db3_contacts": [], "albums": [],
+    }
+    (old_dir / "catalog.json").write_text(json.dumps(legacy_data))
+
+    cfg = libmod.promote_library(root, cache_root=cache_root)
+    new_dir = thumbcache.cache_dir_for(cfg.library_id, cache_root)
+    data = _raw_catalog(new_dir / "catalog.json")
+    assert _raw_photo_rows(data) == flat_rows  # exact order preserved
 
 
 def test_promote_rollback_on_injected_failure(tmp_path: Path,
