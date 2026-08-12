@@ -60,6 +60,10 @@ class PeekPage(ViewerPage):
         # a sub-second full-screen flash — boxes and labels there are
         # noise, and the surface takes no keys to toggle them anyway.
         self.face_overlay_allowed = False
+        # Same policy for video playback chrome (fauxcasa-v46.3): a peek
+        # shows the honest poster still — no transport strip, no play
+        # affordance, no playback session on a glance surface.
+        self.video_playback_allowed = False
 
     @staticmethod
     def _target_screen():

@@ -61,6 +61,10 @@ class SlideshowPage(ViewerPage):
         # (This surface's keyPressEvent doesn't route F anyway; the flag
         # makes the policy explicit and testable.)
         self.face_overlay_allowed = False
+        # Same policy for video playback (fauxcasa-v46.3): the slideshow
+        # dwells on the honest poster still — no transport chrome, no
+        # playback session (its own keyPressEvent never routes P anyway).
+        self.video_playback_allowed = False
         self.paused = False
         self._timer = QTimer(self)
         self._timer.setInterval(delay_ms)
