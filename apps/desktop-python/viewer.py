@@ -458,6 +458,7 @@ class _Playback:
         self._stopped = True
         self.playing = False
         self._timer.stop()
+        self._timer.deleteLater()  # one QTimer per session, not per page-life
         if self._sink is not None:
             try:
                 self._sink.stop()
