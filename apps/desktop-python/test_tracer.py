@@ -12746,3 +12746,254 @@ def test_inspector_rederives_after_catalog_reload(
     assert "the beach" not in text
     assert "z.jpg" in text
     assert "Folder" not in text                    # root-level: row omitted
+
+
+# ---------------------------------------------------------------------------
+# Video playback streaming seam (fauxcasa-v46.3, decode-service §3c ruled
+# option A): videostream.py spawns a separate worker PROCESS that decodes
+# with PyAV from a handed-over open descriptor (never a path) and streams
+# rgb24 frames through a shared-memory ring; audio crosses as PCM s16
+# chunks through a dedicated sub-ring. The broker validates every buffer
+# description against the §2.4 checklist before exposing it and treats
+# any violation as evidence of compromise: kill the worker, latch an
+# error, never retry. QtMultimedia decoding is DECLINED and never
+# imported.
+#
+# Fixture provenance (privacy rule: NEVER real family data): clips are
+# synthesized in-test with PyAV — _make_stream_clip extends _make_clip
+# with an optional pcm_s16le mono sine track (mov container, which
+# carries PCM audio; the numpy import rides the rawpy dependency).
+# ---------------------------------------------------------------------------
+
+
+def _make_stream_clip(path: Path, w: int = 64, h: int = 48,
+                      nframes: int = 8, rate: int = 8, gop: int | None = None,
+                      audio: bool = True, audio_rate: int = 8000) -> Path:
+    """_make_clip's shape plus an optional s16 mono 440 Hz sine track.
+    mov container: carries pcm_s16le, so audio frames need no aac/fltp
+    conversion and stay bit-exact s16 end to end."""
+    import math
+
+    import av
+    import numpy as np
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with av.open(str(path), "w") as container:
+        vs = container.add_stream("mpeg4", rate=rate)
+        vs.width, vs.height = w, h
+        vs.pix_fmt = "yuv420p"
+        if gop is not None:
+            vs.codec_context.gop_size = gop
+        ast = None
+        if audio:
+            ast = container.add_stream("pcm_s16le", rate=audio_rate)
+            ast.codec_context.layout = "mono"
+        img = Image.new("RGB", (w, h), (200, 60, 40))
+        for _ in range(nframes):
+            for pkt in vs.encode(av.VideoFrame.from_image(img)):
+                container.mux(pkt)
+        for pkt in vs.encode():
+            container.mux(pkt)
+        if ast is not None:
+            total = int(audio_rate * nframes / rate)
+            t = np.arange(total, dtype=np.float64)
+            sine = (0.3 * 32767 * np.sin(
+                2 * math.pi * 440 * t / audio_rate)).astype(np.int16)
+            pos = 0
+            while pos < total:
+                n = min(1024, total - pos)
+                fr = av.AudioFrame.from_ndarray(
+                    sine[pos:pos + n].reshape(1, -1),
+                    format="s16", layout="mono")
+                fr.sample_rate = audio_rate
+                fr.pts = pos
+                for pkt in ast.encode(fr):
+                    container.mux(pkt)
+                pos += n
+            for pkt in ast.encode():
+                container.mux(pkt)
+    return path
+
+
+def _drain_stream(vs, deadline_s: float = 20.0):
+    """Read a stream to eof/error, freeing each slot after copying the
+    facts out; returns ([(pts_us, w, h, stride, nbytes)...], audio_bytes).
+    Bounded: the deadline caps a wedged stream so a failure is a clean
+    assert, never a hung suite."""
+    import time as _time
+
+    frames: list[tuple[int, int, int, int, int]] = []
+    audio_bytes = 0
+    deadline = _time.monotonic() + deadline_s
+    while _time.monotonic() < deadline:
+        while (chunk := vs.next_audio()) is not None:
+            audio_bytes += len(chunk[0])
+        got = vs.next_frame(timeout_ms=500)
+        if got is None:
+            if vs.at_eof or vs.error is not None or vs.closed:
+                break
+            continue
+        slot, pts_us, w, h, stride, mv = got
+        frames.append((pts_us, w, h, stride, len(mv)))
+        vs.free_slot(slot)
+    while (chunk := vs.next_audio()) is not None:
+        audio_bytes += len(chunk[0])
+    return frames, audio_bytes
+
+
+def test_videostream_open_info_sane(tmp_path: Path) -> None:
+    """stream_open on a 1 s clip with a mono sine track: info reports a
+    ~1 s duration, the true dims and fps, and the audio parameters the
+    worker will resample to (source rate kept, channels capped at 2)."""
+    import videostream
+
+    clip = _make_stream_clip(tmp_path / "clip.mov")   # 8 frames @ 8 fps
+    vs = videostream.VideoStream(clip, max_edge=256)
+    try:
+        info = vs.info()
+        assert 400_000 < info.duration_us < 2_500_000
+        assert (info.w, info.h) == (64, 48)
+        assert 6.0 < info.fps < 10.0
+        assert info.has_audio is True
+        assert info.audio_rate == 8000
+        assert info.audio_channels == 1
+    finally:
+        vs.close()
+
+
+def test_videostream_frames_monotonic_audio_flows(tmp_path: Path) -> None:
+    """Frames arrive with strictly increasing pts, the clip's dims, a
+    %4-padded stride, and a memoryview of exactly stride*h bytes; the
+    sine track arrives as s16 PCM totalling ~1 s at the source rate."""
+    import videostream
+
+    clip = _make_stream_clip(tmp_path / "clip.mov")
+    vs = videostream.VideoStream(clip, max_edge=256)
+    try:
+        frames, audio_bytes = _drain_stream(vs)
+        assert vs.error is None
+        assert len(frames) == 8
+        pts = [f[0] for f in frames]
+        assert pts == sorted(pts) and len(set(pts)) == len(pts)
+        for _pts, w, h, stride, nbytes in frames:
+            assert (w, h) == (64, 48)
+            assert stride % 4 == 0 and stride >= w * 3
+            assert nbytes == stride * h
+        # 1 s of mono s16 at 8 kHz = 16000 bytes (allow container slack)
+        assert 12_000 <= audio_bytes <= 20_000
+    finally:
+        vs.close()
+
+
+def test_videostream_ring_recycles_long_stream(tmp_path: Path) -> None:
+    """free_slot recycling: a 24-frame clip (3x the 8-slot ring) streams
+    to completion, so backpressure + stream_free round-trips work."""
+    import videostream
+
+    clip = _make_stream_clip(tmp_path / "long.mov", nframes=24, audio=False)
+    vs = videostream.VideoStream(clip, max_edge=256)
+    try:
+        frames, _ = _drain_stream(vs)
+        assert vs.error is None
+        assert len(frames) == 24
+        assert vs.at_eof
+    finally:
+        vs.close()
+
+
+def test_videostream_seek_lands_near_target(tmp_path: Path) -> None:
+    """seek(mid) flushes the ring and resumes at the nearest keyframe at
+    or before the target: with gop=4 @ 8 fps (0.5 s keyframe interval),
+    the first post-seek frame is within one interval below 1.5 s, and
+    the stream still runs to its 3 s end."""
+    import videostream
+
+    clip = _make_stream_clip(tmp_path / "seek.mov", nframes=24, gop=4,
+                             audio=False)
+    vs = videostream.VideoStream(clip, max_edge=256)
+    try:
+        first = vs.next_frame(timeout_ms=5000)
+        assert first is not None
+        vs.free_slot(first[0])
+        vs.seek(1_500_000)
+        assert vs.error is None
+        frames, _ = _drain_stream(vs)
+        assert vs.error is None
+        assert frames, "no frames after seek"
+        assert frames[0][0] >= 1_500_000 - 500_000   # target - one keyframe gap
+        assert frames[0][0] <= 1_600_000             # never past the target+1fr
+        pts = [f[0] for f in frames]
+        assert pts == sorted(pts)
+        assert pts[-1] >= 2_500_000                  # ran on to the clip's end
+    finally:
+        vs.close()
+
+
+def test_videostream_close_idempotent_reaps_and_unlinks(tmp_path: Path) -> None:
+    """close() twice is safe; the worker process is reaped (poll() is
+    not None), the shm segment is unlinked (attaching by name fails),
+    and a held frame view is invalidated rather than left dangling."""
+    from multiprocessing import shared_memory
+
+    import videostream
+
+    clip = _make_stream_clip(tmp_path / "clip.mov", audio=False)
+    vs = videostream.VideoStream(clip, max_edge=256)
+    got = vs.next_frame(timeout_ms=5000)
+    assert got is not None
+    mv = got[5]
+    name = vs.shm_name
+    proc = vs._proc
+    vs.close()
+    vs.close()                                       # idempotent
+    assert vs.closed
+    assert proc is not None and proc.poll() is not None
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=name)
+    with pytest.raises(ValueError):
+        mv[0]                                        # released, not dangling
+
+
+def test_videostream_no_audio_clip(tmp_path: Path) -> None:
+    """A clip without an audio track streams video fine: has_audio False,
+    zero audio chunks, all frames delivered."""
+    import videostream
+
+    clip = _make_clip(tmp_path / "mute.mp4")         # v46.2 fixture, no audio
+    vs = videostream.VideoStream(clip, max_edge=256)
+    try:
+        info = vs.info()
+        assert info.has_audio is False
+        assert info.audio_rate == 0 and info.audio_channels == 0
+        frames, audio_bytes = _drain_stream(vs)
+        assert vs.error is None
+        assert len(frames) == 8
+        assert audio_bytes == 0
+        assert vs.next_audio() is None
+    finally:
+        vs.close()
+
+
+def test_videostream_protocol_violation_kills_worker(tmp_path: Path) -> None:
+    """A frame message whose len != stride*h (injected via the broker's
+    test hook, i.e. exactly what a lying worker would send) is treated
+    as evidence of compromise: the worker is killed, an error state is
+    latched, next_frame yields nothing, and there is no retry."""
+    import time as _time
+
+    import videostream
+
+    clip = _make_stream_clip(tmp_path / "evil.mov", audio=False)
+    vs = videostream.VideoStream(
+        clip, max_edge=256,
+        _test_frame_hook=lambda m: {**m, "len": m["len"] + 4})
+    try:
+        deadline = _time.monotonic() + 10
+        while vs.error is None and _time.monotonic() < deadline:
+            assert vs.next_frame(timeout_ms=200) is None
+        assert vs.error is not None and "PROTOCOL" in vs.error
+        assert vs._proc is not None and vs._proc.poll() is not None
+        assert vs.next_frame(timeout_ms=50) is None
+    finally:
+        vs.close()
