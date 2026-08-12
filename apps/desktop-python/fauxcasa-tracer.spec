@@ -170,8 +170,16 @@ _qtmm_veto = ("ffmpegmediaplugin", "windowsmediaplugin", "gstreamer",
 
 
 def _keep_binary(entry):
+    # Judge Qt ownership by the SOURCE path (entry[1]): on Linux PyInstaller
+    # collects Qt's libav support libs (PySide6/Qt/lib/libavcodec.so.61 ...)
+    # to the _internal ROOT, so a dest-only check let them ship. PyAV's own
+    # libav (source under .../av.libs or site-packages/av/) is Qt-free and
+    # always kept.
     dest = entry[0].replace("\\", "/").lower()
-    if "pyside6" not in dest and not dest.startswith("qt"):
+    src = str(entry[1]).replace("\\", "/").lower()
+    qt_owned = ("pyside6" in dest or dest.startswith("qt")
+                or "pyside6" in src or "/qt/" in src)
+    if not qt_owned:
         return True  # non-Qt binaries (incl. PyAV's own libav): keep all
     base = dest.rsplit("/", 1)[-1]
     return not any(t in base for t in _qtmm_veto)
