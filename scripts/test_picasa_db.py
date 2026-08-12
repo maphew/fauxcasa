@@ -269,11 +269,31 @@ def test_parse_faces_short_contact_id_zero_padded():
 
 
 def test_parse_filters():
-    v = "crop64=1,3f845bcb59418507;enhance=1;finetune2=1,0.0,0.0,0.3,0.0,0.0;"
+    # finetune2 shape per oracle fixture 037: slot [4] is 8-hex-digit ARGB
+    # (neutral-color picker, 00000000 = unset), NOT a float — the fields
+    # around it are floats, so a consumer must not float() them all.
+    v = "crop64=1,3f845bcb59418507;enhance=1;finetune2=1,0.2,0.2,0.3,00000000,0.5;"
     ops = pdb.parse_filters(v)
     assert [name for name, _ in ops] == ["crop64", "enhance", "finetune2"]
     assert ops[0][1] == ["1", "3f845bcb59418507"]
     assert ops[2][1][3] == "0.3"
+    assert ops[2][1][4] == "00000000"
+
+
+def test_parse_filters_oracle_captured():
+    # Verbatim filters= values captured at the live Wine oracle
+    # (fixtures/oracle/034..037): the first non-crop tokens in the corpus.
+    cases = {
+        "enhance=1;": ("enhance", ["1"]),                      # 034 one-click
+        "fill=1,0.186916;": ("fill", ["1", "0.186916"]),       # 035 Basic Fixes
+        "tilt=1,0.565155,0.000000;":                           # 036 straighten
+            ("tilt", ["1", "0.565155", "0.000000"]),
+        "finetune2=1,0.280702,0.261053,0.345263,00000000,0.555556;":  # 037 Tuning
+            ("finetune2",
+             ["1", "0.280702", "0.261053", "0.345263", "00000000", "0.555556"]),
+    }
+    for raw, expected in cases.items():
+        assert pdb.parse_filters(raw) == [expected]
 
 
 def test_parse_filters_real_world_crop():

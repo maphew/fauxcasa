@@ -1,0 +1,298 @@
+{
+ "fixture": "036-edit-tilt-straighten-unsaved",
+ "note": "Straighten (Basic Fixes) on Garden Project/photo05.jpg (pristine, portrait 1200x1600). Agent-driven headless :2. UI: select photo05 -> Edit room -> Basic Fixes -> 'Straighten' (row1-col2, ~130,124) enters a SUB-MODE: dashed grid overlay on the image + a horizontal ANGLE SLIDER at the image bottom (~y577) with APPLY/CANCEL buttons -> set angle via a SINGLE CLICK on the slider track right-of-center (no drag) -> APPLY -> Back to Library (NO File->Save). Undo button -> 'Undo Straighten'; image visibly rotated (corner triangles exposed). SYNCHRONOUS (ini-only): new [photo05.jpg] filters=tilt=1,0.565155,0.000000; + backuphash=53094. KEY: 'tilt' pins the TWO-value param shape -> tilt=1,<angle>,<persist>: leading 1=enabled-flag, 0.565155=the normalized straighten angle (slider position, click landed right-of-center), 0.000000=the 2nd slot (backward-compat slider1 / persist, zero here). PROVES tilt is part of the filters= chain and is DISTINCT from the rotate= ini key + imagedata.rotate (fixtures 006/007, which are 90-degree library rotations stored as rotate=rotate(1), NOT in filters=). So: Straighten = fine free-angle rotation serialized as a filter op; Rotate = 90-degree step as its own key. Straighten is a 2-STAGE tool (sub-mode + Apply), unlike one-click enhance (034) or single-slider fill (035). EXPECTED LAZY FLUSH (~2-6min, not waited): imagedata_filters ''->'tilt=1,0.565155,0.000000;', imagedata_edited->1, backuphash mirror. SESSION NOISE (not the edit): albumdata Search-results reshuffle (4501 date sentinel tombstone+append).",
+ "captured": "2026-06-20T23:06:49+00:00",
+ "baseline": {
+  "label": "after 035-edit-fill-light-slider-unsaved",
+  "created": "2026-06-20T23:02:11+00:00"
+ },
+ "files": {
+  "db3/albumdata_category.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9376a15242d8b62865310df77060c9469b6274e433a2a19d90a4d9e0551f3c46",
+    "size": 108
+   },
+   "after": {
+    "sha256": "3e9007c36b430bf2e4eef1ac3a08af7dd2b52960c11ed203b7a21c452187035b",
+    "size": 112
+   }
+  },
+  "db3/albumdata_date.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "645f4997ed8c36c1ae6f27be098d919041699f6e11f46a0619832eed8b7bef81",
+    "size": 196
+   },
+   "after": {
+    "sha256": "6b0bc84c975570b1da1b16ba0edb61719dee320dc8b688c5c6ed1f8856a7c488",
+    "size": 204
+   }
+  },
+  "db3/albumdata_description.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "28af9a250f8cd9a9e5133c2c3e22ec413044c2f9a8e934c950d5dce850e1b5bc",
+    "size": 334
+   },
+   "after": {
+    "sha256": "372a4f385008b200203d7a6ada3f36ffdc988a8271ad8093b02849eb1a9a7bd6",
+    "size": 357
+   }
+  },
+  "db3/albumdata_filename.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "61a9528f8e816ca9fb434f3146511e0a3b85ce71651db96412a835af16a5e255",
+    "size": 201
+   },
+   "after": {
+    "sha256": "2931cc851d649d9e874bdd8738d7a7bd1f5b8a75b6d831477b90c5387b827968",
+    "size": 203
+   }
+  },
+  "db3/albumdata_inisync.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "03ab0e619479151763cb4eb3b70ed739ef5160d16c9a6b8be838f778e6ecc242",
+    "size": 172
+   },
+   "after": {
+    "sha256": "5e171ab0e7cfd3009e7331d39ea06cb34614b6d3a53629e772b1466f89a5a539",
+    "size": 172
+   }
+  },
+  "db3/albumdata_location.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "597ded966e777bddf2cc10948ed8385a78270e4db3ac28e03a64f80d60c58964",
+    "size": 42
+   },
+   "after": {
+    "sha256": "9bf79c8a8ddc014b48bc41f4d5081a63af29494bc3a6ce49048f63a45cb2ca68",
+    "size": 43
+   }
+  },
+  "db3/albumdata_music.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "597ded966e777bddf2cc10948ed8385a78270e4db3ac28e03a64f80d60c58964",
+    "size": 42
+   },
+   "after": {
+    "sha256": "9bf79c8a8ddc014b48bc41f4d5081a63af29494bc3a6ce49048f63a45cb2ca68",
+    "size": 43
+   }
+  },
+  "db3/albumdata_name.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "05461a935786d57626d4f93e4b66c908cfdbbeed595f09b68ea95e4e81e8f484",
+    "size": 191
+   },
+   "after": {
+    "sha256": "6812770850fa356c636fc98f1780ad84ed6fe239814849b860c864420ce182ea",
+    "size": 178
+   }
+  },
+  "db3/albumdata_token.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "81ee9adc19242a2764cc955a4bf728d10ac14b442d0566012bd35db1fb680e6d",
+    "size": 206
+   },
+   "after": {
+    "sha256": "89e33be1afa5533ed5c4fe78fb687891b0e12e66445d2e133c17b7db7d0eb08c",
+    "size": 200
+   }
+  },
+  "db3/albumdata_uid.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "cd3342176eef3cb0f6668d3399bc931d144e17f98916f5d2ae9d5b750e047475",
+    "size": 329
+   },
+   "after": {
+    "sha256": "23562022d5c838ffe02b6964dd0f81af79dbcbf7b5bb797808a7db8ef08ccded",
+    "size": 331
+   }
+  },
+  "db3/bigthumbs_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "4c398a5a82fd50cc89707bd08ac7be8ecb155bc83235cf721b4d330efa1632fa",
+    "size": 166348
+   },
+   "after": {
+    "sha256": "79c9fafea5078f4a84806981b250369cc99851aa7615ba07e6b92c51883739ac",
+    "size": 171386
+   }
+  },
+  "db3/bigthumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "9c7b1268c7244e093e5e70f1f01c5fcdb3043959eac9aa2eb7f507aad4ca23c9",
+    "size": 368
+   },
+   "after": {
+    "sha256": "c856d42279b9b9b9203aa4f52120001e43b2d3adc0708db7e3d5929ae8141514",
+    "size": 368
+   }
+  },
+  "db3/imagedata_backuphash.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "30ac9f5f4a3e62ab15627e0c8b00fd9ee0ce21e994ef05272efb61247b2c25b9",
+    "size": 70
+   },
+   "after": {
+    "sha256": "098e6d383eb6c3deffa57418653c91c4f04b629ac62df7a2ce62cdc14a1ecb5d",
+    "size": 70
+   }
+  },
+  "db3/imagedata_edited.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "bce9a9dea1f5be1e385f2fb9f991f8897674a9625d9f2a77ebd3393b16ec5a0f",
+    "size": 44
+   },
+   "after": {
+    "sha256": "633c1fdb6c3463567bec9a124b600616e26ec40c663c580229dde55131b2105c",
+    "size": 44
+   }
+  },
+  "db3/imagedata_filters.pmp": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "a6cfe0d464c05508c28518c87b2437fc21f9102c8eb0e320a4e6a57913685e17",
+    "size": 54
+   },
+   "after": {
+    "sha256": "83d73b38c27ed04e52a482654a79700a80a6d68741df2c3ce3ab808d5c427392",
+    "size": 70
+   }
+  },
+  "db3/previews_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "16aac458520e5793550acda911b4c0fc687e1158d499ecc145ad68267f629179",
+    "size": 458656
+   },
+   "after": {
+    "sha256": "5a8b30596660233e60f3ea8ef57de391b11037813593cf1ddb55065747e7a718",
+    "size": 473614
+   }
+  },
+  "db3/previews_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "1e8ac6e6d91d51083e61e20a8b162cd6ede21d802c0c8128d387e61d1e579f2f",
+    "size": 356
+   },
+   "after": {
+    "sha256": "3c7b8006cd7d6b16632d3259627eb7486b5169fffac7279431d5c0ee7ffec72f",
+    "size": 356
+   }
+  },
+  "db3/thumbs2_0.db": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "91c2e7954b4db60b5bb1b0b282734737bb12260d351bd4a41120e5a464e180d0",
+    "size": 36376
+   },
+   "after": {
+    "sha256": "384dcafb053ca46ff9b312b8d2337f47fea337d96fc60ed7e5d5921458053425",
+    "size": 37301
+   }
+  },
+  "db3/thumbs2_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "3e223d116d9107cb982b528bb6995ecba6aed2b11a4057280d1c01095d2f3f93",
+    "size": 368
+   },
+   "after": {
+    "sha256": "fdde573817eedd7cfb2a3862dc1a28a7ab6a9fb92a0b48c81991a9a4e6855eb9",
+    "size": 368
+   }
+  },
+  "db3/thumbs_index.db": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "113383aa1934f8b3c3e6e0db8722587489fbe8bb889578cadaf8c43da1d8bde3",
+    "size": 368
+   },
+   "after": {
+    "sha256": "50c1eae886400105c8de76a8512ae3e128d5fec8f7a4f787512d5802999016be",
+    "size": 368
+   }
+  },
+  "db3/wordhash.dat": {
+   "status": "changed",
+   "blob": true,
+   "copied": false,
+   "before": {
+    "sha256": "a5e5ec3df379cf32b572d911fe703ecc9b5a6579ced7842ce7bb4ce690be3db8",
+    "size": 66916
+   },
+   "after": {
+    "sha256": "91a0c960f1853796c204ec0e2652d4d8cb98eaf9d6a9f313c3e5150b17680312",
+    "size": 66920
+   }
+  },
+  "library/2015-03-15 Garden Project/.picasa.ini": {
+   "status": "changed",
+   "blob": false,
+   "copied": true,
+   "before": {
+    "sha256": "b93e748f8d3e01b9c12972006fce1b499529bad738097b3432129e67530b74e3",
+    "size": 558
+   },
+   "after": {
+    "sha256": "d33e39226c161e96eecb7094e16a1367e784d5b773fee03810a1334135eb22a5",
+    "size": 626
+   }
+  }
+ },
+ "correction": "CORRECTION (2026-08-12 salvage review, fauxcasa-nu9): the imagedata_* delta in this diff is NOT this edit \u2014 imagedata_filters[5] ''->'fill=1,0.186916;' and edited[5] 0->1 are fixture 035's photo03 Fill Light flush arriving late (carry-over session noise). This fixture's own tilt flush is NOT captured here; it appears as carry-over in fixture 037's snapshot. The prose's 'flush not waited' claim is accurate for the tilt edit itself."
+}
