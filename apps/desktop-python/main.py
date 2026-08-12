@@ -1572,15 +1572,30 @@ class MainWindow(QMainWindow):
                   f"reindexing…")
             fresh = None
             try:
+                # Reload contacts.xml from disk HERE, right before the
+                # rescan, instead of reusing self.contacts (the map loaded
+                # once at STARTUP) — Codex review finding 4: if
+                # contacts.xml was edited between startup and this
+                # reconcile, self.contacts is already stale, and pairing
+                # it with a signature stat'd from the file's CURRENT
+                # (post-edit) state would persist a contacts_sig that
+                # claims content newer than what was actually resolved
+                # into `fresh` — a later warm start would then trust
+                # those stale names forever instead of ever re-resolving
+                # them. Stat immediately after the read succeeds (same
+                # read-then-stat adjacency as _read_folder_ini's own fix
+                # for the equivalent ini race), so contacts_sig and the
+                # names baked into `fresh` always describe the exact same
+                # snapshot.
+                if self.contacts_path is not None:
+                    rescan_contacts = load_contacts_xml(self.contacts_path)
+                    contacts_sig = stat_sig(self.contacts_path)
+                else:
+                    rescan_contacts, contacts_sig = self.contacts, None
                 fresh = scan_library(old.root, self.scan_filter,
-                                     self.contacts, self.pal_dir,
+                                     rescan_contacts, self.pal_dir,
                                      exts=self.exts, db3_dir=self.db3_dir)
-                # scan_library doesn't know about contacts.xml as a FILE
-                # (only the already-parsed name map) — stamp the fresh
-                # signal here so the rebuilt catalog's persisted
-                # contacts_sig matches what actually triggered/survived
-                # this reconcile (fauxcasa-cam.14 step 4).
-                fresh.contacts_sig = stat_sig(self.contacts_path)
+                fresh.contacts_sig = contacts_sig
                 result = build_cache(fresh, cache_dir, None,
                                      cancel=self.build_cancel)
                 if result is None:

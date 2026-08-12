@@ -679,10 +679,33 @@ def _promote_upgrade_catalog(cat_path: Path, library_id: str, root_id: str,
         "roots": [{"id": root_id, "path": str(root)}],
     }
     for k, v in data.items():
-        if k in ("version", "library", "library_id", "roots", "photos"):
+        if k in ("version", "library", "library_id", "roots", "photos",
+                 "ini_sigs"):
             continue
         new_data[k] = v  # folders/hidden_folders/contacts/albums/... verbatim
     new_data["photos"] = photos
+    # fauxcasa-cam.14 step 4 (Codex review finding 1): "ini_sigs" is nested
+    # by root_id ({root_id: {folder_rel: [size, mtime]}}, catalog.
+    # save_catalog), and unlike photo/folder rows it does NOT use the
+    # absent-means-roots[0] convention — every pre-promotion legacy catalog
+    # nests its signals under the LITERAL LEGACY_ROOT_ID ("") key, which no
+    # longer matches roots[0].id once promotion mints a real `root_id`.
+    # Left verbatim, load_catalog would reconstruct every signal keyed
+    # ("", folder_rel) while reconcile_walk asks for `root_id`'s slice —
+    # a 100%-miss that reads as "every existing ini just appeared" on the
+    # very first warm reconcile after promotion, forcing a spurious full
+    # reindex. Rekey the "" entry (if any) onto the minted root_id instead
+    # of copying it verbatim; a pre-v14 source with no "ini_sigs" key at
+    # all is left with none — load_catalog defaults that to {} and the
+    # first reconcile self-heals (one harmless rebuild re-derives correct
+    # signals, same one-time cost as any other missing-signal warm start).
+    ini_sigs_raw = data.get("ini_sigs")
+    if isinstance(ini_sigs_raw, dict) and LEGACY_ROOT_ID in ini_sigs_raw:
+        rekeyed = dict(ini_sigs_raw)
+        rekeyed[root_id] = rekeyed.pop(LEGACY_ROOT_ID)
+        new_data["ini_sigs"] = rekeyed
+    elif isinstance(ini_sigs_raw, dict):
+        new_data["ini_sigs"] = ini_sigs_raw  # already keyed by a real root
 
     bak_path = cat_path.with_name(cat_path.name + ".bak")
     bak_path.write_bytes(old_bytes)
