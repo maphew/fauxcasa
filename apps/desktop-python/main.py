@@ -1429,6 +1429,19 @@ class MainWindow(QMainWindow):
         # a failed deferred walk apart from a genuinely empty, successful
         # one (both leave the placeholder catalog in place).
         self._scan_failed = False
+        # Set by shutdown() (Codex cross-vendor review round 3): a cold
+        # scan that outlives both a scripted --timeout and shutdown()'s own
+        # 5 s join leaves _scan_thread alive after main() has already
+        # returned. If a later in-process run reuses the same
+        # QApplication (main() supports this — see
+        # test_ready_poll_timer_dies_with_the_run) and restarts the event
+        # loop, the orphaned worker's queued scan_done can fire into this
+        # now-stale window and reload/rebuild against deleted Qt objects.
+        # _on_scan_done checks this FIRST and returns immediately once set;
+        # shutdown() also disconnects the signal itself as a second,
+        # belt-and-braces line of defense for an emit already queued
+        # before the disconnect runs.
+        self._shut_down = False
         # Parks the backfill's readers between photos while set — the
         # low-priority hook (a future consumer can pause on heavy scroll);
         # tests drive it directly.
@@ -1508,7 +1521,20 @@ class MainWindow(QMainWindow):
         --finish-build poll racing it; on success, swaps the real catalog
         in via reload_data (mirrors _on_index_finished's reconcile-swap
         branch) and immediately chains into the cold BUILD, exactly the
-        scan -> reload -> build order a synchronous cold start always had."""
+        scan -> reload -> build order a synchronous cold start always had.
+
+        Checked FIRST, before anything else (Codex cross-vendor review
+        round 3): a scan that outlives shutdown()'s join leaves the worker
+        thread alive after main() has already returned this window to the
+        caller. main() supports reusing the same QApplication across an
+        in-process run (test_ready_poll_timer_dies_with_the_run) — if a
+        later run restarts the event loop, the orphaned worker's queued
+        scan_done can fire into this now-stale window. shutdown() sets
+        _shut_down and disconnects this slot, but an emit already queued
+        before that disconnect runs still needs this guard: reload_data/
+        _start_cold_build must never touch a window past its shutdown."""
+        if self._shut_down:
+            return
         self._cold_scan_pending = False
         build_dir, self._scan_build_dir = self._scan_build_dir, None
         cold_ms = (time.perf_counter() - self._scan_t0) * 1000.0 \
@@ -1946,6 +1972,20 @@ class MainWindow(QMainWindow):
                   self._backfill_thread, self._scan_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=5.0)
+        # Codex cross-vendor review round 3: set unconditionally, whether
+        # the join above reaped _scan_thread or gave up on a walk that
+        # outlived it — either way this window must never react to a
+        # scan_done that fires after this point (see the docstring on
+        # _shut_down in __init__). Disconnecting the signal here is a
+        # second line of defense for an emit already queued before this
+        # runs; swallow the RuntimeError a torn-down C++ bridge or an
+        # already-disconnected slot would raise (shutdown() itself may
+        # run more than once in some call sequences — never fatal here).
+        self._shut_down = True
+        try:
+            self._bridge.scan_done.disconnect(self._on_scan_done)
+        except (RuntimeError, TypeError):
+            pass
 
     def _change_library(self) -> None:
         root = _choose_library_from_dialog(

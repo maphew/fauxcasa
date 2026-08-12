@@ -9305,6 +9305,72 @@ def test_cold_scan_failure_scripted_run_exits_nonzero(
     assert '"event": "ready"' not in out
 
 
+def test_cold_scan_orphan_ignored_after_shutdown(
+        tmp_path: Path, monkeypatch) -> None:
+    """Codex cross-vendor review round 3, working repro: a cold scan that
+    outlives both a scripted --timeout and shutdown()'s own 5 s join
+    leaves _scan_thread alive after main() has already returned this
+    window. main() supports reusing the same QApplication across an
+    in-process run (test_ready_poll_timer_dies_with_the_run) — if a later
+    run restarts the event loop, the orphaned worker's queued scan_done
+    can fire into this now-stale window and reload/rebuild against
+    deleted Qt objects. shutdown() must set _shut_down (whether its join
+    reaped the thread or gave up on it — this test exercises the giving-up
+    shape without paying the real 5 s wait, since a monkeypatched join
+    timeout would diverge from the actual code path being fixed) and
+    _on_scan_done must check it FIRST and be a strict no-op once set —
+    this is exactly the guard a signal delivered after shutdown() would
+    hit, whether or not the belt-and-braces disconnect also won its race."""
+    app = _offscreen_app()
+    import main
+    from catalog import Catalog
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cfg = libmod.legacy_config(root)
+
+    def fake_scan_library_config(cfg_, scan_filter, contacts, pal_dir,
+                                 exts, db3_dir):
+        raise AssertionError("must never run once shut down")
+
+    monkeypatch.setattr(main, "_scan_library_config",
+                        fake_scan_library_config)
+
+    empty = Catalog(root=cfg.roots[0].path, photos=[], folders={},
+                    albums={}, roots=list(cfg.roots),
+                    library_id=cfg.library_id)
+    cache_dir = tmp_path / "cachedir"
+    win = main.MainWindow(empty, None, cache_dir=cache_dir, build_dir=None,
+                          cfg=cfg)
+    win.show()
+    assert not win._shut_down
+
+    win.shutdown()          # no scan ever started here: the join is instant,
+    assert win._shut_down   # same as the "gave up on a stuck join" outcome —
+                             # shutdown() sets the flag unconditionally either way
+
+    # Belt and braces: the signal itself is disconnected too, so a SECOND
+    # disconnect attempt returns False (PySide6's signal for "not
+    # connected", a RuntimeWarning rather than a raise) — proving
+    # shutdown() actually severed it, not just set the flag.
+    assert win._bridge.scan_done.disconnect(win._on_scan_done) is False
+
+    # Simulate the orphaned worker's queued scan_done landing AFTER
+    # shutdown (the exact race the flag exists for, independent of
+    # whether Qt's queued delivery would even still reach a disconnected
+    # slot): a real, non-empty catalog arrives — _on_scan_done must still
+    # be a strict no-op.
+    real_catalog = scan_library(root)
+    win._on_scan_done(real_catalog)
+
+    assert win.catalog is empty          # never reloaded
+    assert not win._cold_scan_pending    # untouched by the no-op guard's
+                                          # early return (shutdown() itself
+                                          # never toggled it — no scan ran)
+    app.processEvents()                  # nothing queued; must not raise
+    win.deleteLater()
+
+
 def test_mainwindow_backfill_persists_report_and_updates_notes(
         tmp_path: Path) -> None:
     """Review findings (fauxcasa-nu9): _start_backfill threads a real
