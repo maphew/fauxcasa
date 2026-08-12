@@ -2,6 +2,5 @@
   "database": "dolt",
   "backend": "dolt",
   "dolt_mode": "embedded",
-  "dolt_database": "fauxcasa",
-  "project_id": "f20b9f8a-2ea9-482a-b371-905bc60336b1"
+  "dolt_database": "beads"
 }

@@ -76,18 +76,28 @@ mouse+keyboard work natively (exact 1:1 px).
    grep -i 'listening on display' /tmp/weston-oracle.log   # -> the DISPLAY, e.g. :3
    ```
 
-2. **Launch Picasa onto it.** Keep `--socket=x11` (winex11 needs that plumbing),
-   but override `DISPLAY` *inside* a shell wrapper and **disable winewayland**
-   (otherwise Wine grabs the user's `wayland-0` and renders there / crashes):
+2. **Launch Picasa onto it.** The target display must be in Flatpak's **host**
+   environment: flatpak bind-mounts only the X socket matching the host
+   `DISPLAY` at launch and forces the sandbox `DISPLAY` to match, so `--env=`
+   alone is clobbered and an inner `export DISPLAY` names a socket that was
+   never mounted, leaving Wine on its null driver (fauxcasa-5kl runs 1-9).
+   Also **disable winewayland** (otherwise Wine grabs the user's `wayland-0`
+   and renders there / crashes):
 
    ```sh
-   flatpak run --filesystem=home \
+   env DISPLAY=:3 flatpak run --filesystem=home \
+     --env=DISPLAY=:3 \
      --env=WINEPREFIX=$PWD/cache/wine-oracle \
      --command=sh org.winehq.Wine -c \
-     'unset WAYLAND_DISPLAY; export DISPLAY=:3; \
+     'unset WAYLAND_DISPLAY; \
       export WINEDLLOVERRIDES="mscoree,mshtml=;winewayland.drv="; \
       exec wine "C:\\Program Files (x86)\\Google\\Picasa3\\Picasa3.exe"'
    ```
+
+   `scripts/launch-oracle-picasa.sh` wraps this exact invocation (display via
+   `ORACLE_DISPLAY`, required — the display is discovered in step 1, not
+   fixed); run it detached so Picasa survives across agent tool calls:
+   `ORACLE_DISPLAY=:3 tmux new-session -d -s oracle scripts/launch-oracle-picasa.sh`.
 
 3. **See + drive** (all on `:3`, 1:1 device px, no HiDPI scaling):
 

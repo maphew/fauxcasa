@@ -5,6 +5,8 @@
 .beads-credential-key
 .beads/proxieddb/
 .beads/*.jsonl
+# bd 1.2.1 workspace gate file, written beside .beads at the repo root
+/.beads.gate.lock
 
 # Oracle fixtures are synthetic Picasa db files, not Dolt artifacts
 !fixtures/oracle/**/*.db
