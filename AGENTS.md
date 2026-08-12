@@ -68,6 +68,31 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## Build & Test
+
+This is a Python/uv project; each script is self-contained (PEP 723) and
+runs via `uv run`, no separate install step. CI (`.github/workflows/tests.yml`,
+`tracer.yml`) runs these gates:
+
+```bash
+uv run scripts/test_delegation_report.py -q
+uv run scripts/test_picasa_db.py -q
+uv run scripts/check-ingest-parity.py
+QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q
+git diff --quiet -- .beads/issues.jsonl   # no beads-jsonl pollution
+
+# one-liner mirroring all of the above locally (fauxcasa-op6):
+uv run scripts/preflight.py            # add --fast to skip the tracer suite
+```
+
+<!--
+  bd-doctor-divergence opt-out: proposed via fauxcasa-op6 for review. AGENTS.md
+  and CLAUDE.md intentionally serve different audiences beyond this "mirrored
+  substance" (the Build & Test section above, kept word-for-word identical in
+  both files) — the rest of each file's user-authored content differs by design.
+-->
+<!-- bd-doctor-divergence: ok -->
+
 <!--
   MAINTAINER NOTE — the managed "BEADS INTEGRATION" block below is
   intentionally customized and diverges from its generator output. It is

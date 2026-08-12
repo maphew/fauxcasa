@@ -161,12 +161,19 @@ a prompt.
 
 ## Build & Test
 
-_Add your build and test commands here_
+This is a Python/uv project; each script is self-contained (PEP 723) and
+runs via `uv run`, no separate install step. CI (`.github/workflows/tests.yml`,
+`tracer.yml`) runs these gates:
 
 ```bash
-# Example:
-# npm install
-# npm test
+uv run scripts/test_delegation_report.py -q
+uv run scripts/test_picasa_db.py -q
+uv run scripts/check-ingest-parity.py
+QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q
+git diff --quiet -- .beads/issues.jsonl   # no beads-jsonl pollution
+
+# one-liner mirroring all of the above locally (fauxcasa-op6):
+uv run scripts/preflight.py            # add --fast to skip the tracer suite
 ```
 
 ## Architecture Overview
