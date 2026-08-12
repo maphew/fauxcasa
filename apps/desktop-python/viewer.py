@@ -319,24 +319,33 @@ class _Playback:
     Clock: when the file has audio AND a QAudioSink is available, the
     audio clock — media pts = _pts0 + (sink.processedUSecs() - _proc0),
     which freezes across suspend (pause) and re-bases across seek (sink
-    reset + restart). Otherwise a monotonic wall clock anchored at every
-    play/resume/seek (_pts0 at _t0). Late frames drop: each tick presents
-    the NEWEST decoded frame whose pts <= clock; earlier due frames are
-    overwritten unpainted. Frames are copied out of the shm view and the
-    slot freed immediately (§2.4 item 6 — the broker side never holds a
-    view the worker could rewrite), so seeks can flush the ring freely.
+    reset + restart). The anchor pts0 is the pts of the FIRST PCM chunk
+    actually written to the sink (not the requested seek target): the
+    worker resumes at the nearest keyframe AT OR BEFORE the target and
+    that pre-target audio plays, so anchoring on the target would leave
+    video permanently ahead of audio by the keyframe gap. Otherwise a
+    monotonic wall clock anchored at every play/resume/seek (_pts0 at
+    _t0). Late frames drop: each tick presents the NEWEST decoded frame
+    whose pts <= clock; earlier due frames are overwritten unpainted.
+    Frames are copied out of the shm view and the slot freed immediately
+    (§2.4 item 6 — the broker side never holds a view the worker could
+    rewrite), so seeks can flush the ring freely.
+
+    Nothing here blocks the GUI thread: the VideoStream is opened OFF
+    the GUI thread (ViewerPage._start_video) and handed in ready-made;
+    seek() is fire-and-forget (stream.seek_async) with the ack picked up
+    by _tick, which also pulls the landing frame while paused.
 
     GUI-thread only, like the ViewerPage that owns it. stop() is
     idempotent and reaps everything: timer, audio sink, worker process
     (VideoStream.close joins its reader thread and unlinks the arena)."""
 
-    def __init__(self, page: "ViewerPage", path: str, max_edge: int) -> None:
-        from videostream import VideoStream
-
+    def __init__(self, page: "ViewerPage", stream) -> None:
         self.page = page
-        # Raises DecodeServiceError on open failure (corrupt file, no
-        # video stream, worker refused) — the caller shows an honest note.
-        self.stream = VideoStream(path, max_edge=max_edge)
+        # An already-open VideoStream (spawned off-thread by
+        # ViewerPage._start_video so pressing P never freezes the window
+        # on worker spawn / a slow or corrupt file).
+        self.stream = stream
         self.info = self.stream.info()
         self.playing = False
         self.at_end = False
@@ -349,6 +358,13 @@ class _Playback:
         self._t0 = time.monotonic()           # wall anchor (no-audio clock)
         self._proc0 = 0                       # processedUSecs at the anchor
         self._last_ui = 0.0                   # ~4 Hz position repaints
+        # (target, resume, epoch goal, deadline) of an in-flight seek —
+        # sent fire-and-forget, settled by _tick when the ack's ring
+        # flush lands (VideoStream.seek_async).
+        self._seek: tuple[int, bool, int, float] | None = None
+        self._want_frame = False              # paused: present next frame
+        self._anchor_audio = True             # re-anchor clock on next PCM
+        self._clock_seen = (-1, time.monotonic())  # stalled-sink watchdog
         self._sink = None
         self._sink_dev = None
         try:
@@ -411,31 +427,46 @@ class _Playback:
             return
         self.at_end = False
         self.playing = True
+        self._want_frame = False
         self._t0 = time.monotonic()           # re-anchor the wall clock
+        self._clock_seen = (-1, time.monotonic())  # watchdog: fresh window
         if self._sink is not None \
                 and self._sink.state().name == "SuspendedState":
             self._sink.resume()
         self.page.update()
 
-    def seek(self, target_us: int) -> None:
-        """Seek, resuming in the prior play/pause state; while paused the
-        sought frame is pulled and shown. Blocks on the worker's ack (the
-        VideoStream.seek flush guarantee — every later frame is post-seek)."""
+    def seek(self, target_us: int, resume: bool | None = None) -> None:
+        """Seek, resuming in the prior play/pause state (or the explicit
+        `resume` override); while paused the sought frame is pulled and
+        shown when it lands. Fire-and-forget: the request is sent here,
+        the worker's ack (the ring-flush guarantee — every later frame is
+        post-seek) is picked up by _tick, so key auto-repeat can never
+        stack GUI-thread waits."""
         if self._stopped:
             return
         dur = self.info.duration_us
         target = max(0, min(int(target_us), dur) if dur > 0 else int(target_us))
-        was_playing = self.playing
-        if was_playing:
+        if resume is None:
+            # A seek issued while one is pending keeps the ORIGINAL
+            # play/pause intent (the first seek already paused us).
+            resume = self._seek[1] if self._seek is not None else self.playing
+        if self.playing:
             self.pause()
-        self.stream.seek(target)              # blocking ring flush
-        if self.stream.error is not None:
-            return                            # the next tick surfaces it
+        goal = self.stream.seek_async(target)
+        if goal is None:
+            return                            # closed/errored: tick surfaces it
+        self._seek = (target, bool(resume), goal, time.monotonic() + 5.0)
+        self.at_end = False
+        self.page.update()
+
+    def _finish_seek(self, target: int, resume: bool) -> None:
+        """The worker acked (ring flushed): apply the post-seek state."""
         self._ahead = None                    # pre-seek frame: stale
         self._pending = b""                   # pre-seek PCM: stale
         self.at_end = False
         self.position_us = target
         self._pts0 = target
+        self._anchor_audio = True             # re-anchor on first PCM chunk
         if self._sink is not None:
             try:
                 self._sink.reset()            # drop buffered pre-seek audio
@@ -444,10 +475,13 @@ class _Playback:
                 self._sink.suspend()
             except Exception:  # noqa: BLE001 — audio dies, video plays on
                 self._drop_sink()
-        if was_playing:
+        if resume or self.playing:
             self.resume()
         else:
-            self._show_paused_frame()
+            # Paused: present the landing frame (the seek target's
+            # keyframe) when it arrives, so the seek bar shows where it
+            # landed — pulled by _tick, never a blocking wait here.
+            self._want_frame = True
         self.page.update()
 
     def stop(self) -> None:
@@ -477,26 +511,19 @@ class _Playback:
         if got is None:
             return False
         slot, pts, w, h, stride, mv = got
-        img = QImage(bytes(mv), w, h, stride,
-                     QImage.Format.Format_RGB888).copy()
+        # One copy, not two: wrap the shm view directly (no bytes()
+        # detour), then .copy() detaches before free_slot lets the
+        # worker rewrite that memory.
+        img = QImage(mv, w, h, stride, QImage.Format.Format_RGB888).copy()
         self.stream.free_slot(slot)
         self._ahead = (pts, img)
         return True
 
-    def _show_paused_frame(self) -> None:
-        """Present the first post-seek frame while paused (the seek target's
-        keyframe) so the seek bar shows where it landed."""
-        got = self.stream.next_frame(timeout_ms=1000)
-        if got is None:
-            return
-        slot, _pts, w, h, stride, mv = got
-        self.frame = QImage(bytes(mv), w, h, stride,
-                            QImage.Format.Format_RGB888).copy()
-        self.stream.free_slot(slot)
-
     def _feed_audio(self) -> None:
         """Move broker-queued PCM into the sink, bounded by bytesFree —
-        never blocking the GUI thread on audio."""
+        never blocking the GUI thread on audio. Popping a chunk is what
+        releases its ring slot back to the worker (backpressure), so this
+        pulls only what the sink can absorb plus one staged chunk."""
         st = self.stream
         if self._sink_dev is None:
             while st.next_audio() is not None:
@@ -507,7 +534,15 @@ class _Playback:
                 got = st.next_audio()
                 if got is None:
                     return
-                self._pending = got[0]
+                data, pts = got
+                if self._anchor_audio and pts >= 0:
+                    # A/V sync anchor: clock = pts of the first chunk
+                    # actually sunk (see the class docstring — after a
+                    # seek this is the keyframe's audio, not the target).
+                    self._pts0 = int(pts)
+                    self._proc0 = int(self._sink.processedUSecs())
+                    self._anchor_audio = False
+                self._pending = data
             free = int(self._sink.bytesFree())
             if free <= 0:
                 return
@@ -530,7 +565,26 @@ class _Playback:
             # live in VideoStream; this is the UI's shrug).
             self.page._video_failed("video decode failed")
             return
+        if self._seek is not None:
+            target, resume, goal, deadline = self._seek
+            if st.epoch >= goal:              # ack landed: ring flushed
+                self._seek = None
+                self._finish_seek(target, resume)
+            elif time.monotonic() > deadline:
+                # No ack within the deadline: the worker is wedged; stop()
+                # (via _video_failed) kills and reaps it.
+                self.page._video_failed("video decode failed")
+                return
+            else:
+                return                        # waiting on the flush
         if not self.playing:
+            if self._want_frame and self._pull_ahead():
+                # Paused post-seek: present the landing frame once.
+                _pts, img = self._ahead
+                self._ahead = None
+                self.frame = img
+                self._want_frame = False
+                self.page.update()
             return
         self._feed_audio()
         if self._sink is not None and st.at_eof and not self._pending \
@@ -538,6 +592,19 @@ class _Playback:
             # Audio track drained at EOF: the audio clock has stopped, so
             # flush the remaining video tail on the wall clock.
             self._drop_sink()
+        if self._sink is not None:
+            # Stalled-sink watchdog: a device that accepts the format but
+            # never consumes (bytesFree stuck, write()->0) freezes the
+            # audio clock and playback with it. If the clock has not
+            # advanced for ~1 s while PCM is queued, fall back to the
+            # wall clock (the mechanism _drop_sink already provides).
+            cur = self._clock_us()
+            val, since = self._clock_seen
+            now = time.monotonic()
+            if cur != val:
+                self._clock_seen = (cur, now)
+            elif now - since > 1.0 and (self._pending or st.audio_pending):
+                self._drop_sink()
         clock = self._clock_us()
         presented = False
         while True:
@@ -577,6 +644,11 @@ class _Loader(QObject):
     # serial, duration_us (0 = unknown): the video's probed duration, so
     # the info bar / transport can show it BEFORE playback starts (v46.3).
     video_meta = Signal(int, int)
+    # serial, VideoStream-or-None: an off-thread stream open finished
+    # (None = open failed). The GUI slot builds the _Playback session, so
+    # pressing P never blocks the window on worker spawn (design §1/§6:
+    # the poster keeps painting until the stream is live).
+    video_stream = Signal(int, object)
 
 
 class ViewerPage(QWidget):
@@ -643,6 +715,14 @@ class ViewerPage(QWidget):
         self._video: _Playback | None = None
         self._video_note: str | None = None
         self._video_duration_us: int | None = None
+        # Async stream open (never blocks the GUI thread): `_video_opening`
+        # gates duplicate opens while the worker spawns off-thread;
+        # `_video_open_play` is the play/pause intent to apply when the
+        # stream lands; `_video_open_seek` an initial seek target (a seek
+        # issued from the poster before any session exists).
+        self._video_opening = False
+        self._video_open_play = False
+        self._video_open_seek: int | None = None
         # Click-vs-drag disambiguation: where the left press landed, and
         # whether it traveled past CLICK_SLOP (then it pans, never toggles).
         self._press_pos = None
@@ -659,6 +739,7 @@ class ViewerPage(QWidget):
         self._loader = _Loader()
         self._loader.loaded.connect(self._on_loaded)
         self._loader.video_meta.connect(self._on_video_meta)
+        self._loader.video_stream.connect(self._on_video_stream)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def _submit(self, job) -> None:
@@ -899,7 +980,12 @@ class ViewerPage(QWidget):
     def _video_max_edge(self) -> int:
         """Decode-scale cap for streamed frames: the screen's device-pixel
         long edge — frames are painted fit, never 1:1, so decoding beyond
-        the screen is pure waste (and ring slots are sized by this)."""
+        the screen is pure waste (and ring slots are sized by this).
+        Capped at 1920 for v1: ring slots are sized worst-case from this
+        edge and Windows charges the whole arena to commit at creation,
+        so a hi-DPI 4K cap would cost hundreds of MB per playback session
+        for no visible win while frames paint fit (arena negotiation from
+        the stream's real dims is the follow-up if 1:1 video ever lands)."""
         scr = self.screen()
         if scr is None:
             from PySide6.QtGui import QGuiApplication
@@ -909,10 +995,17 @@ class ViewerPage(QWidget):
         if scr is not None:
             g = scr.geometry()
             edge = int(max(g.width(), g.height()) * self.devicePixelRatioF())
-        return max(256, min(edge, 8192))
+        return max(256, min(edge, 1920))
 
     def _start_video(self, play: bool) -> None:
-        if self._video is not None or not self.video_playback_allowed:
+        """Open the stream ASYNCHRONOUSLY: the worker spawn + container
+        open (up to VideoStream's 15 s open timeout on a corrupt or slow
+        file) runs on a short-lived helper thread while the poster keeps
+        painting; _on_video_stream builds the session when it lands.
+        The thread touches no Qt objects (the signal emit is queued), so
+        the fauxcasa-gfz short-lived-Qt-thread hazard does not apply."""
+        if self._video is not None or self._video_opening \
+                or not self.video_playback_allowed:
             return
         idx = self.current_index()
         abs_path = self.catalog.abs(self.catalog.photos[idx])
@@ -920,22 +1013,71 @@ class ViewerPage(QWidget):
             self._video_note = "volume offline"
             self.update()
             return
+        self._video_opening = True
+        self._video_open_play = play
+        serial = self._serial
+        path = str(abs_path)
+        max_edge = self._video_max_edge()
+
+        def work() -> None:
+            from videostream import VideoStream
+
+            vs = None
+            try:
+                vs = VideoStream(path, max_edge=max_edge)
+            except Exception:  # noqa: BLE001 — corrupt file / worker refused
+                vs = None
+            if serial != self._serial:
+                if vs is not None:
+                    vs.close()                 # user moved on: reap quietly
+                return
+            try:
+                self._loader.video_stream.emit(serial, vs)
+            except RuntimeError:
+                if vs is not None:
+                    vs.close()                 # loader deleted at shutdown
+
+        threading.Thread(target=work, daemon=True,
+                         name="viewer-video-open").start()
+        self.update()
+
+    def _on_video_stream(self, serial: int, vs) -> None:
+        """GUI-thread half of the async open: adopt the stream into a
+        _Playback session, or close it if the user has moved on."""
+        if serial != self._serial or not self._video_opening \
+                or self._video is not None:
+            if vs is not None:
+                vs.close()
+            return
+        self._video_opening = False
+        seek_to, self._video_open_seek = self._video_open_seek, None
+        if vs is None:
+            self._video_note = "video decode failed"
+            self.update()
+            return
         try:
-            pb = _Playback(self, str(abs_path), self._video_max_edge())
-        except Exception:  # noqa: BLE001 — corrupt file / worker refused
+            pb = _Playback(self, vs)
+        except Exception:  # noqa: BLE001 — sink/timer failure: no session
+            vs.close()
             self._video_note = "video decode failed"
             self.update()
             return
         self._video = pb
         self._video_note = None
-        if play:
+        if seek_to is not None:
+            pb.seek(seek_to, resume=self._video_open_play)
+        elif self._video_open_play:
             pb.resume()
         self.update()
 
     def _stop_video(self) -> None:
         """Stop + reap any live playback session; the poster (self.image)
         resumes painting. Idempotent; never touches _video_note (an error
-        note must survive the stop that raised it)."""
+        note must survive the stop that raised it). Also cancels the
+        INTENT of any in-flight async open — the helper thread's stream,
+        if one lands, is closed by _on_video_stream's gate."""
+        self._video_opening = False
+        self._video_open_seek = None
         pb, self._video = self._video, None
         if pb is not None:
             pb.stop()
@@ -952,11 +1094,15 @@ class ViewerPage(QWidget):
             return
         pb = self._video
         if pb is None:
-            self._start_video(play=True)  # a failed earlier try retries here
+            if self._video_opening:
+                # P during the async open toggles the intent the session
+                # will start with (press-press = open paused).
+                self._video_open_play = not self._video_open_play
+            else:
+                self._start_video(play=True)  # failed earlier try retries here
             return
         if pb.at_end:
-            pb.seek(0)                    # play again from the top
-            pb.resume()
+            pb.seek(0, resume=True)       # play again from the top
         elif pb.playing:
             pb.pause()
         else:
@@ -964,11 +1110,17 @@ class ViewerPage(QWidget):
         self.update()
 
     def _video_seek_to(self, pts_us: int) -> None:
-        if self._video is None:
-            self._start_video(play=False)  # seek from the poster: land paused
         if self._video is not None:
             self._video.seek(pts_us)
             self.update()
+            return
+        if not self._current_is_video() or not self.video_playback_allowed:
+            return
+        # Seek from the poster: remember the target, open async, land
+        # paused on it (_on_video_stream applies _video_open_seek).
+        self._video_open_seek = max(0, int(pts_us))
+        self._start_video(play=False)
+        self.update()
 
     def _video_seek_by(self, delta_us: int) -> None:
         if self._video is not None:

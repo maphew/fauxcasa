@@ -12772,10 +12772,13 @@ def test_inspector_rederives_after_catalog_reload(
 
 def _make_stream_clip(path: Path, w: int = 64, h: int = 48,
                       nframes: int = 8, rate: int = 8, gop: int | None = None,
-                      audio: bool = True, audio_rate: int = 8000) -> Path:
+                      audio: bool = True, audio_rate: int = 8000,
+                      audio_seconds: float | None = None) -> Path:
     """_make_clip's shape plus an optional s16 mono 440 Hz sine track.
     mov container: carries pcm_s16le, so audio frames need no aac/fltp
-    conversion and stay bit-exact s16 end to end."""
+    conversion and stay bit-exact s16 end to end. `audio_seconds`
+    decouples the track length from the video duration (default: match) —
+    the audio-outlives-video shape the backpressure test needs."""
     import math
 
     import av
@@ -12800,7 +12803,8 @@ def _make_stream_clip(path: Path, w: int = 64, h: int = 48,
         for pkt in vs.encode():
             container.mux(pkt)
         if ast is not None:
-            total = int(audio_rate * nframes / rate)
+            total = int(audio_rate * (audio_seconds if audio_seconds
+                                      is not None else nframes / rate))
             t = np.arange(total, dtype=np.float64)
             sine = (0.3 * 32767 * np.sin(
                 2 * math.pi * 440 * t / audio_rate)).astype(np.int16)
@@ -12959,6 +12963,58 @@ def test_videostream_close_idempotent_reaps_and_unlinks(tmp_path: Path) -> None:
         mv[0]                                        # released, not dangling
 
 
+def test_videostream_audio_backpressure_bounds_broker_memory(
+        tmp_path: Path) -> None:
+    """The 32-slot audio ring is REAL backpressure: the broker acks a
+    chunk (audio_free) only when next_audio pops it, so with the consumer
+    not draining audio the worker blocks and the broker never holds more
+    than AUDIO_SLOTS chunks — a hostile file whose audio track far
+    outlives its video (the shape that defeated a receipt-time ack: the
+    video ring stops braking at video EOF) cannot balloon the trusted
+    process. Draining afterwards releases the worker through to EOF."""
+    import time as _time
+
+    import videostream
+
+    # 0.5 s of video but 30 s of 48 kHz mono PCM (~2.9 MB — well past the
+    # ring's 32 x 64 KiB = 2 MiB) in one file.
+    clip = _make_stream_clip(tmp_path / "longaudio.mov", nframes=4,
+                             audio=True, audio_rate=48000,
+                             audio_seconds=30.0)
+    vs = videostream.VideoStream(clip, max_edge=256)
+    try:
+        # Consume video only; audio stays unpopped.
+        deadline = _time.monotonic() + 15
+        frames = 0
+        while _time.monotonic() < deadline and frames < 4:
+            got = vs.next_frame(timeout_ms=200)
+            if got is not None:
+                vs.free_slot(got[0])
+                frames += 1
+        assert frames == 4
+        _time.sleep(0.5)                       # let the worker run ahead
+        assert vs.error is None
+        assert vs._audioq.qsize() <= videostream.AUDIO_SLOTS
+        assert not vs.at_eof                   # worker blocked mid-track
+        # Now drain: consumption acks slots back and the stream finishes.
+        audio_bytes = 0
+        deadline = _time.monotonic() + 20
+        while _time.monotonic() < deadline and not vs.at_eof \
+                and vs.error is None:
+            chunk = vs.next_audio()
+            if chunk is not None:
+                audio_bytes += len(chunk[0])
+            else:
+                _time.sleep(0.01)
+        while (chunk := vs.next_audio()) is not None:
+            audio_bytes += len(chunk[0])
+        assert vs.error is None
+        assert vs.at_eof
+        assert audio_bytes >= 2_700_000        # ~30 s of 48 kHz mono s16
+    finally:
+        vs.close()
+
+
 def test_videostream_no_audio_clip(tmp_path: Path) -> None:
     """A clip without an audio track streams video fine: has_audio False,
     zero audio chunks, all frames delivered."""
@@ -12977,6 +13033,29 @@ def test_videostream_no_audio_clip(tmp_path: Path) -> None:
         assert vs.next_audio() is None
     finally:
         vs.close()
+
+
+def test_main_dispatches_worker_before_argparse() -> None:
+    """main.py hands --worker to videostream._worker_main BEFORE its own
+    argparse (which would exit 2 with usage text on the unknown flag): a
+    FROZEN bundle spawns its playback worker as [sys.executable,
+    "--worker", ...] where sys.executable IS the app, so this dispatch is
+    what keeps video playback alive in the shipped artifact. With stdin
+    at EOF the worker exits 2 through the WIRE protocol — a framed
+    PROTOCOL error on stdout, never argparse's usage text."""
+    import subprocess
+
+    main_py = str(Path(__file__).with_name("main.py"))
+    out = subprocess.run(
+        [sys.executable, main_py, "--worker", "--shm", "nosuch",
+         "--slots", "8", "--max-edge", "256"],
+        input=b"", capture_output=True, timeout=120)
+    assert out.returncode == 2
+    assert b"usage:" not in out.stderr and b"usage:" not in out.stdout
+    n = struct.unpack("<I", out.stdout[:4])[0]
+    msg = json.loads(out.stdout[4:4 + n].decode("utf-8"))
+    assert msg["type"] == "error"
+    assert msg["code"] == "PROTOCOL"
 
 
 def test_videostream_protocol_violation_kills_worker(tmp_path: Path) -> None:
@@ -13060,7 +13139,9 @@ def test_viewer_video_play_streams_frames(tmp_path: Path) -> None:
     app, v, cat, idx = _video_viewer(tmp_path, audio=True, nframes=16)
     assert _spin(app, lambda: v.image is not None)
     _press(v, Qt.Key.Key_P)                            # keymap viewer.play_pause
-    assert v._video is not None                        # session opened
+    # The stream opens ASYNCHRONOUSLY (worker spawn off the GUI thread —
+    # pressing P must never freeze the window), so spin for the session.
+    assert _spin(app, lambda: v._video is not None, 20.0)   # session opened
     assert _spin(app, lambda: v._video is not None
                  and v._video.frame is not None, 20.0)  # a frame painted
     assert v._video_note is None
@@ -13093,8 +13174,10 @@ def test_viewer_video_pause_holds_position_and_seek_keys(tmp_path: Path) -> None
     assert pb.frame is not None                        # frame held
     v.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right,
                               Qt.KeyboardModifier.ControlModifier))
-    assert pb.position_us == min(pos + 5_000_000,
-                                 pb.info.duration_us)  # ±5 s, clamped
+    # Seek is fire-and-forget (never blocks the GUI thread); the position
+    # updates when the worker's ack lands in a tick — spin for it.
+    expected = min(pos + 5_000_000, pb.info.duration_us)  # ±5 s, clamped
+    assert _spin(app, lambda: pb.position_us == expected, 10.0)
     assert not pb.playing                              # still paused
     _press(v, Qt.Key.Key_P)                            # resume
     assert pb.playing
@@ -13156,7 +13239,7 @@ def test_viewer_video_star_toggle_still_works(tmp_path: Path) -> None:
     _press(v, Qt.Key.Key_Space)                        # on the poster
     assert requested == [idx]
     v._video_play_pause()
-    assert v._video is not None
+    assert _spin(app, lambda: v._video is not None, 20.0)  # async open lands
     _press(v, Qt.Key.Key_Space)                        # while playing
     assert requested == [idx, idx]
     v.quiesce()

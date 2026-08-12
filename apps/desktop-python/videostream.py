@@ -19,10 +19,13 @@ This one module holds both sides of the boundary:
   arena bytes. Any violation is treated as evidence of compromise: kill
   the worker, surface an error state, never retry.
 - Worker side: `--worker` entrypoint, spawned as
-  `[sys.executable, videostream.py, "--worker", ...]`. It imports only
-  what it needs (PyAV + stdlib), re-opens nothing by path, demuxes and
-  decodes ahead until the ring is full (backpressure = block until a
-  stream_free arrives), and interleaves resampled s16 audio chunks.
+  `[sys.executable, videostream.py, "--worker", ...]` from source, or as
+  `[sys.executable, "--worker", ...]` when frozen (sys.executable IS the
+  app; main.py dispatches --worker back here before its own argparse).
+  It imports only what it needs (PyAV + stdlib), re-opens nothing by
+  path, demuxes and decodes ahead until the ring is full (backpressure =
+  block until a stream_free arrives), and interleaves resampled s16
+  audio chunks.
 
 Wire protocol (design §2): 4-byte little-endian length prefix, UTF-8
 JSON, hard cap 65536 bytes per message; oversized or malformed input is
@@ -67,11 +70,18 @@ MSG_CAP = 65_536
 
 # Ring geometry. Frame slots default to StreamOpenRequest's 8; the audio
 # sub-region is its own simple ring of fixed-size PCM chunk slots with
-# its own slot accounting (broker acks each consumed chunk back with an
-# audio_free message; the worker blocks when all audio slots are
-# outstanding, mirroring the video ring's backpressure).
+# its own slot accounting (the broker acks a chunk back with audio_free
+# only when the CONSUMER pops it via next_audio, so the worker blocks
+# when all audio slots are outstanding — real backpressure, mirroring
+# the video ring's; the broker never buffers more than the ring holds).
 DEFAULT_SLOTS = 8
-DEFAULT_MAX_EDGE = 3_840
+# 1920 keeps the arena small: slots are sized worst-case from max_edge
+# (align4(edge*3)*edge each), and Windows CreateFileMapping charges the
+# FULL arena to commit at creation — 3840 would charge ~354 MB per
+# playback session, and a hi-DPI desktop edge reached 1.6 GB. Frames are
+# painted fit (never 1:1) in v1, so 1920 loses nothing visible; arena
+# negotiation from the real stream dims is the follow-up if that changes.
+DEFAULT_MAX_EDGE = 1_920
 AUDIO_SLOTS = 32
 AUDIO_SLOT_BYTES = 64 * 1024  # multiple of 4: keeps every off % 4 == 0
 
@@ -210,8 +220,10 @@ class VideoStream:
         self._frames: queue.Queue = queue.Queue()
         self._audioq: queue.Queue = queue.Queue()
         self._epoch = 0            # bumped on every seek_ack (ring flush)
+        self._seeks_sent = 0       # stream_seek requests issued (acks owed)
         self._eof_epoch = -1       # epoch whose stream reached EOF
         self._error: str | None = None
+        self._error_code: ErrorCode | None = None
         self._closed = False
         self._info: StreamInfo | None = None
         self._info_evt = threading.Event()
@@ -238,18 +250,27 @@ class VideoStream:
         _LIVE.add(self)
 
         if not self._info_evt.wait(open_timeout_s) or self._info is None:
+            # §2.5 taxonomy: surface the STRUCTURED code the reader thread
+            # latched (the worker's own UNSUPPORTED/CORRUPT, a PROTOCOL
+            # violation, a WORKER_CRASHED exit) — never substring-match the
+            # detail string; a silent worker is an open TIMEOUT.
             detail = self._error or "worker produced no stream info"
+            code = self._error_code or ErrorCode.TIMEOUT
             self.close()
-            code = ErrorCode.PROTOCOL if "PROTOCOL" in detail else ErrorCode.CORRUPT
             raise DecodeServiceError(code, detail)
 
     # -- lifecycle ----------------------------------------------------------
 
     def _spawn(self, path: str) -> None:
-        argv = [sys.executable, os.path.abspath(__file__), "--worker",
-                "--shm", self.shm_name,
-                "--slots", str(self._slots),
-                "--max-edge", str(self._max_edge)]
+        worker_flags = ["--worker", "--shm", self.shm_name,
+                        "--slots", str(self._slots),
+                        "--max-edge", str(self._max_edge)]
+        if getattr(sys, "frozen", False):
+            # Frozen bundle: sys.executable IS the app; main.py dispatches
+            # --worker back to _worker_main before its own argparse.
+            argv = [sys.executable] + worker_flags
+        else:
+            argv = [sys.executable, os.path.abspath(__file__)] + worker_flags
         # The broker opens the file; the worker NEVER sees a path — only
         # the already-open, read-only descriptor (design §2 item 2).
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
@@ -262,15 +283,25 @@ class VideoStream:
                     pass_fds=(fd,), close_fds=True)
                 file_ref = {"fd": fd}
             else:
-                # Windows: inherit the OS handle; the child re-opens it
-                # via msvcrt.open_osfhandle + os.fdopen("rb").
+                # Windows: the child adopts the OS handle via
+                # msvcrt.open_osfhandle + os.fdopen("rb"). The handle is
+                # granted through PROC_THREAD_ATTRIBUTE_HANDLE_LIST so the
+                # child inherits EXACTLY this one handle (design §2 item 2:
+                # "a hijacked worker holds exactly one file") — never
+                # close_fds=False, which would leak every inheritable
+                # handle in the app and race concurrent spawns.
+                # CREATE_NO_WINDOW: a windowed build must not flash a
+                # console per playback.
                 import msvcrt
 
                 handle = msvcrt.get_osfhandle(fd)
                 os.set_handle_inheritable(handle, True)
+                si = subprocess.STARTUPINFO()
+                si.lpAttributeList = {"handle_list": [handle]}
                 self._proc = subprocess.Popen(
                     argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    close_fds=False)
+                    close_fds=True, startupinfo=si,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
                 file_ref = {"handle": handle}
         finally:
             # The child holds its own copy now (or spawn failed).
@@ -297,17 +328,18 @@ class VideoStream:
         if proc is None:
             return
         if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            # Design §1: TerminateProcess / SIGKILL — never a polite
+            # request to possibly-owned code (a compromised worker could
+            # trap SIGTERM and stall the GUI thread in wait()).
+            proc.kill()
+            proc.wait()
 
-    def _latch_error(self, msg: str) -> None:
+    def _latch_error(self, msg: str,
+                     code: ErrorCode = ErrorCode.WORKER_CRASHED) -> None:
         with self._state_lock:
             if self._error is None and not self._closed:
                 self._error = msg
+                self._error_code = code
 
     def close(self) -> None:
         """Idempotent teardown: always reaps the child and unlinks the
@@ -366,7 +398,8 @@ class VideoStream:
                 self._last_progress = time.monotonic()
                 self._dispatch(msg)
         except (ProtocolViolation, DecodeServiceError) as e:
-            self._latch_error(f"PROTOCOL: {getattr(e, 'detail', e)}")
+            self._latch_error(f"PROTOCOL: {getattr(e, 'detail', e)}",
+                              ErrorCode.PROTOCOL)
             self._kill_worker()
         except (OSError, ValueError):
             if not self._closed:
@@ -407,7 +440,14 @@ class VideoStream:
             detail = msg.get("detail")
             if not isinstance(code, str) or not isinstance(detail, str):
                 raise ProtocolViolation("malformed error message")
-            self._latch_error(f"{code[:32]}: {detail[:512]}")
+            # Keep the worker's structured §2.5 code (UNSUPPORTED vs
+            # CORRUPT is load-bearing for the maintenance surface and the
+            # bundle-update retry); an unknown code collapses to CORRUPT.
+            try:
+                ecode = ErrorCode(code)
+            except ValueError:
+                ecode = ErrorCode.CORRUPT
+            self._latch_error(f"{code[:32]}: {detail[:512]}", ecode)
             self._info_evt.set()
         else:
             raise ProtocolViolation(f"unknown message type {t!r}")
@@ -481,14 +521,14 @@ class VideoStream:
                     f"audio slot {slot} written while not worker-owned")
             self._audio_fillable.discard(slot)
             epoch = self._epoch
-        # Copy the PCM out of the arena immediately (§2.4 item 6), then
-        # hand the slot straight back — the audio ring is a staging
-        # buffer, its accounting purely worker backpressure.
+        # Copy the PCM out of the arena immediately (§2.4 item 6). The
+        # audio_free ack is deliberately DEFERRED to next_audio(): acking
+        # here would defeat the worker's 32-slot backpressure gate and
+        # let a hostile file with a long audio track buffer unbounded PCM
+        # into this trusted process. The ring bounds the broker-held
+        # audio to AUDIO_SLOTS chunks, exactly like the video ring.
         data = bytes(self._shm.buf[off:off + ln])
-        self._audioq.put((epoch, data, pts_us))
-        with self._state_lock:
-            self._audio_fillable.add(slot)
-        self._send_req({"op": "audio_free", "slot": slot})
+        self._audioq.put((epoch, slot, data, pts_us))
 
     # -- StreamHandle-shaped API ---------------------------------------------
 
@@ -501,6 +541,11 @@ class VideoStream:
         return self._error
 
     @property
+    def error_code(self) -> ErrorCode | None:
+        """The latched failure's §2.5 taxonomy code (None while live)."""
+        return self._error_code
+
+    @property
     def closed(self) -> bool:
         return self._closed
 
@@ -508,6 +553,20 @@ class VideoStream:
     def at_eof(self) -> bool:
         with self._state_lock:
             return self._eof_epoch == self._epoch and self._frames.empty()
+
+    @property
+    def epoch(self) -> int:
+        """Ring-flush generation: bumps once per acknowledged seek. A
+        caller that issued seek_async() waits for epoch >= the returned
+        goal before treating its post-seek state as settled."""
+        with self._state_lock:
+            return self._epoch
+
+    @property
+    def audio_pending(self) -> bool:
+        """True when PCM is queued for next_audio (a consumer watchdog
+        input: audio owed but a sink not draining)."""
+        return not self._audioq.empty()
 
     def next_frame(self, timeout_ms: int = 1000):
         """The next decoded frame as (slot, pts_us, w, h, stride,
@@ -533,10 +592,16 @@ class VideoStream:
                 item = None
             if item is not None:
                 iepoch, slot, pts_us, w, h, stride, off, ln = item
-                if iepoch != epoch:
-                    continue  # stale pre-seek frame: slot already flushed
-                mv = self._shm.buf[off:off + ln]
-                self._views[slot] = mv
+                # Epoch re-check + view registration under ONE lock hold:
+                # a seek_ack landing between them would flush _views and
+                # hand the slot back to the worker while the caller still
+                # holds a view of it (torn frame + a leaked buffer export
+                # that pins the mapping at close()).
+                with self._state_lock:
+                    if iepoch != self._epoch:
+                        continue  # stale pre-seek frame: already flushed
+                    mv = self._shm.buf[off:off + ln]
+                    self._views[slot] = mv
                 return (slot, pts_us, w, h, stride, mv)
             self._check_stall()
             if time.monotonic() >= deadline:
@@ -544,17 +609,25 @@ class VideoStream:
 
     def next_audio(self):
         """The next PCM s16 chunk as (bytes, pts_us), or None when no
-        audio is queued (non-blocking; chunks are already copied out of
-        the arena, so no free call exists or is needed)."""
+        audio is queued (non-blocking; the chunk is already copied out of
+        the arena). Popping a chunk is what acks its slot back to the
+        worker (audio_free) — consumption IS the backpressure release, so
+        a stalled consumer stalls the worker instead of buffering
+        unbounded PCM broker-side."""
         while True:
             try:
-                epoch, data, pts_us = self._audioq.get_nowait()
+                epoch, slot, data, pts_us = self._audioq.get_nowait()
             except queue.Empty:
                 return None
             with self._state_lock:
-                if epoch == self._epoch:
-                    return (data, pts_us)
-            # stale pre-seek audio: drop and keep draining
+                live = epoch == self._epoch
+                if live:
+                    self._audio_fillable.add(slot)
+            if live:
+                self._send_req({"op": "audio_free", "slot": slot})
+                return (data, pts_us)
+            # stale pre-seek audio: drop unacked (the worker's seek reset
+            # already zeroed its outstanding count) and keep draining
 
     def free_slot(self, slot: int) -> None:
         """Return a frame slot to the worker. The frame's memoryview is
@@ -576,27 +649,39 @@ class VideoStream:
         self._last_progress = time.monotonic()
         self._send_req({"op": "stream_free", "slot": int(slot)})
 
-    def seek(self, pts_us: int, timeout_ms: int = 5000) -> None:
-        """Seek to the nearest keyframe at or before pts_us. Blocks
-        until the worker acknowledges (then ALL ring slots are flushed
-        back to the worker and every outstanding frame view is
-        invalidated — §3c semantics); a worker that never acks within
-        the deadline is killed."""
+    def seek_async(self, pts_us: int) -> int | None:
+        """Fire-and-forget seek to the nearest keyframe at or before
+        pts_us: sends the request and returns the epoch goal the ack will
+        reach (poll `epoch >= goal` to know it settled — then ALL ring
+        slots are flushed back to the worker and every outstanding frame
+        view is invalidated, §3c semantics). None when closed/errored.
+        Never blocks: safe from the GUI thread; the caller owns any
+        deadline on the ack."""
         with self._state_lock:
             if self._closed or self._error is not None:
-                return
-            target = self._epoch + 1
+                return None
+            self._seeks_sent += 1
+            goal = self._seeks_sent
         self._last_progress = time.monotonic()
         self._send_req({"op": "stream_seek", "pts_us": max(0, int(pts_us))})
+        return goal
+
+    def seek(self, pts_us: int, timeout_ms: int = 5000) -> None:
+        """Blocking seek_async: waits for the worker's ack; a worker
+        that never acks within the deadline is killed."""
+        goal = self.seek_async(pts_us)
+        if goal is None:
+            return
         deadline = time.monotonic() + timeout_ms / 1000.0
         while time.monotonic() < deadline:
             with self._state_lock:
-                if self._epoch >= target:
+                if self._epoch >= goal:
                     return
             if self._closed or self._error is not None:
                 return
             time.sleep(0.005)
-        self._latch_error("TIMEOUT: seek not acknowledged")
+        self._latch_error("TIMEOUT: seek not acknowledged",
+                          ErrorCode.TIMEOUT)
         self._kill_worker()
 
     # -- timeouts -----------------------------------------------------------
@@ -616,7 +701,8 @@ class VideoStream:
             self._latch_error("WORKER_CRASHED: worker exited mid-stream")
             return
         if time.monotonic() - self._last_progress > FRAME_DEADLINE_S:
-            self._latch_error("TIMEOUT: no frame progress within deadline")
+            self._latch_error("TIMEOUT: no frame progress within deadline",
+                              ErrorCode.TIMEOUT)
             self._kill_worker()
 
 
@@ -730,16 +816,19 @@ def _fit_dims(w: int, h: int, max_edge: int) -> tuple[int, int]:
     return max(1, int(w * scale)), max(1, int(h * scale))
 
 
-def _frame_to_padded_rgb(frame, max_edge: int) -> tuple[bytes, int, int, int]:
+def _frame_to_padded_rgb(frame, max_edge: int,
+                         reformatter) -> tuple[bytes, int, int, int]:
     """Decoded VideoFrame -> (rgb24 rows padded to stride%4==0, w, h,
     stride), scaled down if a side exceeds max_edge. The stride-stripping
     core mirrors videoload._frame_rgb; the %4 pad is the §2.4 stride
-    invariant the broker validates."""
+    invariant the broker validates. `reformatter` is ONE stream-lifetime
+    av VideoReformatter (sws_getCachedContext reuses the scaler across
+    frames; per-frame frame.reformat built a fresh SwsContext each time)."""
     w, h = _fit_dims(frame.width, frame.height, max_edge)
     if (w, h) != (frame.width, frame.height):
-        rgb = frame.reformat(width=w, height=h, format="rgb24")
+        rgb = reformatter.reformat(frame, width=w, height=h, format="rgb24")
     else:
-        rgb = frame.reformat(format="rgb24")
+        rgb = reformatter.reformat(frame, format="rgb24")
     plane = rgb.planes[0]
     w, h = rgb.width, rgb.height
     src = bytes(plane)
@@ -760,8 +849,8 @@ def _pts_us(frame) -> int:
     return int(round(t * 1_000_000)) if t is not None else -1
 
 
-def _emit_video(ws: _WorkerIO, frame, max_edge: int) -> None:
-    buf, w, h, stride = _frame_to_padded_rgb(frame, max_edge)
+def _emit_video(ws: _WorkerIO, frame, max_edge: int, reformatter) -> None:
+    buf, w, h, stride = _frame_to_padded_rgb(frame, max_edge, reformatter)
     slot = ws.acquire_frame_slot()  # backpressure: blocks on a full ring
     base = ws.layout.frame_slot_base(slot)
     ws.shm.buf[base:base + len(buf)] = buf
@@ -868,6 +957,7 @@ def _worker_main(argv: list[str]) -> int:
     shm = _attach_shm(args.shm)
 
     import av  # the one heavy dependency this worker exists to contain
+    from av.video.reformatter import VideoReformatter
 
     try:
         container = av.open(fileobj)  # seekable file object, never a path
@@ -909,6 +999,7 @@ def _worker_main(argv: list[str]) -> int:
              "audio_channels": out_channels})
 
     streams = [vstream] + ([astream] if astream is not None else [])
+    reformatter = VideoReformatter()  # one cached scaler for the stream
     pending_seek: int | None = None
     try:
         while True:
@@ -935,7 +1026,7 @@ def _worker_main(argv: list[str]) -> int:
                     ws.poll_control()  # seeks/frees between packets
                     for frame in packet.decode():
                         if packet.stream.type == "video":
-                            _emit_video(ws, frame, args.max_edge)
+                            _emit_video(ws, frame, args.max_edge, reformatter)
                         elif resampler is not None:
                             for out in resampler.resample(frame):
                                 _emit_audio(ws, out, out_channels)

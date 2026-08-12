@@ -2681,6 +2681,12 @@ def run_search_probe(win: MainWindow, spec: str) -> list[dict]:
 
 BUNDLE_RUNTIME_MODULES = (
     "PySide6.QtWidgets",
+    # QtMultimedia ships from PySide6-Addons for QAudioSink ONLY (video
+    # playback audio, fauxcasa-v46.3). viewer._make_audio_sink guards its
+    # import, so a bundle built without Addons — or a binary filter that
+    # over-strips Qt6Multimedia — would be silently MUTE; this probe makes
+    # --bundle-self-check fail loudly instead.
+    "PySide6.QtMultimedia",
     "rawpy",
     "exiv2",
     "PIL.Image",
@@ -2707,6 +2713,15 @@ def _bundle_dependency_failures() -> dict[str, str]:
 
 
 def main() -> int:
+    if "--worker" in sys.argv[1:]:
+        # Video-decode worker re-entry (fauxcasa-v46.3): a FROZEN bundle
+        # spawns its videostream worker as [sys.executable, "--worker",
+        # ...] — sys.executable IS this app — so dispatch to the worker
+        # entrypoint BEFORE argparse can reject the flag (and before any
+        # stdout print corrupts the framed wire protocol).
+        import videostream
+
+        return videostream._worker_main(sys.argv[1:])
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)

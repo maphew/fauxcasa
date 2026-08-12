@@ -79,14 +79,17 @@ _hidden = ["catalog", "grid", "thumbcache", "viewer", "slideshow", "peek",
            # entrypoint; decodesvc carries its typed errors/StreamInfo. "av"
            # above (v46.2) is the worker's decoder — PyAV ships its OWN
            # libav wheels, untouched by the Qt-ffmpeg filter below.
-           # KNOWN GAP (flagged, follow-up with fauxcasa-i92.3's launcher):
-           # videostream spawns its worker as [sys.executable, __file__,
-           # "--worker"], which a FROZEN onedir bundle cannot satisfy as-is
-           # (sys.executable is the app exe); the frozen smoke gate covers
-           # posters, not playback, until the sandbox launcher lands.
+           # Frozen worker spawn: videostream spawns [sys.executable,
+           # "--worker", ...] when frozen (sys.executable is the app exe)
+           # and main.py dispatches --worker to videostream._worker_main
+           # BEFORE its argparse, so the bundle's playback worker is the
+           # bundle itself — no separate launcher needed until
+           # fauxcasa-i92.3's sandbox launcher supersedes it.
            # PySide6.QtMultimedia is imported lazily+guarded (viewer.
            # _make_audio_sink) for QAudioSink ONLY — see the i92.1 note at
-           # the binary filter below for why that import is compliant.
+           # the binary filter below for why that import is compliant; it
+           # is ALSO in main.BUNDLE_RUNTIME_MODULES so --bundle-self-check
+           # fails loudly on a build without PySide6-Addons.
            "videostream", "decodesvc", "PySide6.QtMultimedia",
            "zstandard"]
 
