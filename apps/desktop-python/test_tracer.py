@@ -893,6 +893,161 @@ def test_evict_wantband_over_budget_and_entry_floor(monkeypatch) -> None:
     assert max(g.tiles) == 199 and min(g.tiles) == 0
 
 
+def test_prefetch_margin_caps_band_to_byte_budget() -> None:
+    """The want-band cap (fauxcasa-q6l.14): prefetch_margin is a pure
+    function that shrinks the prefetch margin so the whole band fits the
+    byte budget in native tile bytes — full PREFETCH_SCREENS on a normal
+    viewport, monotonically shrinking as the tile count grows, 0 once the
+    visible set alone exceeds the budget (visible is never dropped; only
+    prefetch gives way)."""
+    from grid import PREFETCH_SCREENS, prefetch_margin
+
+    native = 256 * 256 * 4  # dpr-1 native tile bytes (256 KB)
+
+    # normal viewport at default zoom (160 px tiles): the band fits with
+    # room to spare -> the full PREFETCH_SCREENS margin, unchanged behavior
+    full = int(800 * PREFETCH_SCREENS)
+    assert prefetch_margin(1280, 800, 160, native) == full
+
+    # Regime assertions use an EXPLICIT band_budget so they pin the pure
+    # function's behavior at a known point, not today's module CACHE_BYTES
+    # (raising the cache budget must not fail this test).
+    budget = 1024 * native  # ~1024-tile budget (256 MiB at dpr 1)
+
+    # margin never grows as tiles shrink (more visible per screen)
+    margins = [prefetch_margin(3840, 2160, t, native, band_budget=budget)
+               for t in (256, 192, 128, 96, 64)]
+    assert all(a >= b for a, b in zip(margins, margins[1:]))
+    assert margins[0] == int(2160 * PREFETCH_SCREENS)  # roomy at max zoom
+
+    # 4K fullscreen at min zoom: the visible set alone (~1700 cells backed
+    # by 256 KB native tiles) exceeds the 1024-tile budget -> margin 0
+    assert prefetch_margin(3840, 2160, 64, native, band_budget=budget) == 0
+
+    # explicit budget: visible alone over a tiny budget -> 0; a huge
+    # budget -> the full margin again
+    assert prefetch_margin(1280, 800, 64, native, band_budget=native * 4) == 0
+    assert prefetch_margin(1280, 800, 64, native, band_budget=1 << 40) == full
+
+
+def test_scaled_paint_cache_reuses_and_invalidates(tmp_path: Path) -> None:
+    """The scaled-paint cache (fauxcasa-q6l.14): painting below native tile
+    size smooth-scales each tile ONCE and caches the result in the entry
+    (slots 3/4); the next frame blits the SAME image object with no
+    transform work. A zoom change drops every variant (they are keyed to
+    device-pixel size) and releases their bytes; the variant's bytes are folded
+    into the entry's nbytes slot and _cache_bytes so eviction stays honest.
+    At max zoom (tile == native) no variant is ever created."""
+    from PySide6.QtGui import QColor, QImage
+
+    g = _selection_grid(tmp_path)
+    native_nbytes = 256 * 256 * 4
+
+    for i in g.display:  # inject decoded native-resolution tiles
+        img = QImage(256, 256, QImage.Format.Format_RGB32)
+        img.fill(QColor(40 + i * 8, 80, 120))
+        assert img.sizeInBytes() == native_nbytes
+        g.tiles[i] = [img, 0, native_nbytes, None, 0]
+        g._cache_bytes += native_nbytes
+    native_sum = g._cache_bytes
+
+    g.set_zoom(64)                        # min zoom: all 9 tiles visible
+    assert not g.grab().isNull()          # first paint: scales + caches
+    t0 = g.tiles[g.display[0]]
+    assert t0[3] is not None and t0[4] == (64, 64)  # keyed by device size
+    assert t0[3].width() == 64            # offscreen dpr 1 -> 64 px variant
+    scaled0 = t0[3]
+    # bytes accounting includes the scaled variant, exactly
+    assert t0[2] == native_nbytes + scaled0.sizeInBytes()
+    assert g._cache_bytes == sum(t[2] for t in g.tiles.values())
+    assert g._cache_bytes > native_sum
+
+    g.grab()                              # second paint: pure reuse
+    assert g.tiles[g.display[0]][3] is scaled0  # same object, no re-scale
+
+    g.set_zoom(128)                       # zoom change invalidates variants
+    assert all(t[3] is None and t[4] == 0 for t in g.tiles.values())
+    assert g._cache_bytes == native_sum   # scaled bytes released
+    g.grab()                              # re-caches at the new zoom
+    t0 = g.tiles[g.display[0]]
+    assert t0[3] is not None and t0[4] == (128, 128)
+    assert t0[3].width() == 128
+
+    g.set_zoom(256)                       # max zoom == native size
+    g.grab()
+    assert all(t[3] is None for t in g.tiles.values())  # guard: no variants
+    assert g._cache_bytes == native_sum
+
+
+def test_scaled_paint_cache_skips_marginal_downscale(tmp_path: Path) -> None:
+    """Regression for the hi-DPI rounding duplicate (q6l.14 review): the
+    paint cache must only cache a MEANINGFUL downscale (>= 2x area
+    reduction). At dpr 2 and max zoom a landscape 512x341 native tile
+    aspect-fits to 256x170 logical -> 512x340 DEVICE px: a 1-px rounding
+    artifact, not a downscale. The old `sw < width or sh < height` gate
+    cached a near-full-resolution duplicate of every such tile (doubling
+    _cache_bytes and halving the effective tile cache); the area gate draws
+    the native image directly and caches nothing. A real downscale (min
+    zoom) still caches, keyed by device-pixel size."""
+    from PySide6.QtGui import QColor, QImage
+
+    g = _selection_grid(tmp_path)
+    g.devicePixelRatioF = lambda: 2.0     # hi-DPI paint path
+    g.grab()                              # _refresh_tile_native picks it up
+    assert g._tile_native == 512
+
+    for i in g.display:  # inject landscape native tiles (aspect != 1)
+        img = QImage(512, 341, QImage.Format.Format_RGB32)
+        img.fill(QColor(40 + i * 8, 80, 120))
+        g.tiles[i] = [img, 0, img.sizeInBytes(), None, 0]
+        g._cache_bytes += img.sizeInBytes()
+    native_sum = g._cache_bytes
+
+    g.set_zoom(256)                       # max zoom
+    g.grab()                              # sw=512, sh=340: rounding only
+    assert all(t[3] is None for t in g.tiles.values())  # nothing cached
+    assert g._cache_bytes == native_sum   # no duplicated bytes charged
+
+    g.set_zoom(64)                        # min zoom: a REAL downscale
+    g.grab()                              # 64x43 logical -> 128x86 device
+    t0 = g.tiles[g.display[0]]
+    assert t0[3] is not None
+    assert t0[4] == (t0[3].width(), t0[3].height()) == (128, 86)
+    assert g._cache_bytes == sum(t[2] for t in g.tiles.values())
+    assert g._cache_bytes > native_sum
+
+
+def test_wanted_band_capped_on_huge_viewport() -> None:
+    """4K fullscreen at min zoom (fauxcasa-q6l.14): once the visible set
+    alone exceeds the byte budget the published want-band is EXACTLY the
+    visible set (margin 0) — prefetch no longer amplifies the extreme
+    viewport into a 1 GB never-evicted band."""
+    _offscreen_app()
+    from catalog import Catalog, Folder, Photo
+    from grid import GridView, prefetch_margin
+
+    n = 4000
+    cat = Catalog(root=Path("/x"),
+                  photos=[Photo(rel=f"p{i:04d}.jpg", folder="",
+                                name=f"p{i:04d}.jpg") for i in range(n)],
+                  folders={"": Folder(rel="", title="x", photo_count=n)},
+                  albums={})
+    g = GridView()
+    g.resize(3840, 2160)          # simulated 4K fullscreen
+    g.show()                      # hidden widgets keep a stale viewport size
+    g.set_data(cat, None)         # no thumbs: band math only, no decodes
+    g.set_zoom(64)                # min zoom
+    g.grab()                      # paints -> publishes self.wanted
+
+    vp = g.viewport()
+    native = g._tile_native * g._tile_native * 4
+    assert prefetch_margin(vp.width(), vp.height(), g.tile, native) == 0
+    top = g.verticalScrollBar().value()
+    visible = sum(1 for _ in g._visible_items(top, top + vp.height()))
+    assert visible > 1000                 # really is an extreme viewport
+    assert len(g.wanted) == visible       # margin 0: wanted == visible
+
+
 def test_load_catalog_survives_malformed_rows(library: Path,
                                                tmp_path: Path) -> None:
     cat = scan_library(library)
