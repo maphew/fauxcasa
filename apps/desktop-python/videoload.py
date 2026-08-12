@@ -39,6 +39,7 @@ the decode-service §3c sandbox-valve ruling — not this module's scope.
 from __future__ import annotations
 
 import io
+from datetime import datetime
 
 # Picasa 3's documented video list ("For playback in Picasa",
 # files-supported-by-picasa3.md): mpg, mod, mmv, tod, wmv, asf, avi,
@@ -186,10 +187,17 @@ def _parse_creation_time(value: str | None) -> str | None:
     dot = s.find(".")
     if dot >= 19:
         s = s[:dot]
-    # Validate the canonical 19-char shape 'YYYY-MM-DDTHH:MM:SS'.
+    # Validate the canonical 19-char shape 'YYYY-MM-DDTHH:MM:SS', then the
+    # actual calendar: cameras emit all-zero placeholders (0000-00-00...)
+    # and garbage fields, which must fall back to mtime, not sort as dates.
     if (len(s) == 19 and s[4] == "-" and s[7] == "-"
             and s[10].upper() == "T" and s[13] == ":" and s[16] == ":"):
-        return s[:10] + "T" + s[11:19]
+        canon = s[:10] + "T" + s[11:19]
+        try:
+            datetime.strptime(canon, "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return None
+        return canon
     return None
 
 

@@ -8439,6 +8439,24 @@ def test_probe_creation_time(tmp_path: Path) -> None:
     assert videoload.probe_creation_time(tmp_path / "nosuch.mp4") is None
 
 
+def test_parse_creation_time_rejects_malformed() -> None:
+    """_parse_creation_time validates the calendar, not just punctuation:
+    all-zero placeholders and out-of-range fields (real camera output)
+    must return None so date grouping falls back to mtime, never sorting
+    a fake date (codex cross-review finding, fauxcasa-v46.6)."""
+    from videoload import _parse_creation_time
+
+    assert _parse_creation_time("2023-05-15T10:30:00.000000Z") == \
+        "2023-05-15T10:30:00"
+    assert _parse_creation_time("2023-05-15 10:30:00+05:00") == \
+        "2023-05-15T10:30:00"
+    assert _parse_creation_time("0000-00-00T00:00:00Z") is None
+    assert _parse_creation_time("2023-99-99T99:99:99Z") is None
+    assert _parse_creation_time("2023-02-30T10:30:00") is None
+    assert _parse_creation_time("") is None
+    assert _parse_creation_time(None) is None
+
+
 def test_video_date_taken_fill_when_empty(tmp_path: Path) -> None:
     """apply_photo_meta fills date_taken only when the field is empty (§4
     fill-when-empty rule for probe_creation_time): an existing value —
