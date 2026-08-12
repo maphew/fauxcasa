@@ -724,6 +724,68 @@ def test_reconcile_walk_cancels(library: Path) -> None:
     assert reconcile_walk(cat, library, cancel=ev) is None
 
 
+def test_reconcile_detects_ini_drift(library: Path, tmp_path: Path) -> None:
+    """Externally editing a folder's .picasa.ini between scans sets
+    Drift.ini_changed (fauxcasa-cam.14 step 4) even though no PHOTO file's
+    own size/mtime changed — before this signal, a caption/keyword/star
+    baked into the catalog at scan time would never refresh on a warm
+    start until some unrelated photo drift happened to force a rebuild.
+    Covers all three edit shapes: modified, newly added, and removed."""
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    assert not reconcile_walk(cat, library).changed  # baseline: clean
+
+    # Modified: the Trip folder's existing ini gains a line (size+mtime
+    # both change; a photo-only diff would miss this entirely).
+    ini = library / "2020-01-01 Trip" / ".picasa.ini"
+    ini.write_text(ini.read_text() + "caption=edited externally\r\n")
+    drift = reconcile_walk(cat, library)
+    assert drift.ini_changed and drift.changed
+    assert drift.added == 0 and drift.removed == 0 and drift.modified == 0
+
+    # Added: the Picnic folder in the `library` fixture has no ini at all
+    # yet — a brand-new one appearing must be caught too, not just an
+    # edit to an ini the catalog already knew about.
+    cat2 = scan_library(library)  # fresh baseline, post-Trip-edit
+    thumbcache.build_cache(cat2, tmp_path / "c2")
+    assert not reconcile_walk(cat2, library).changed
+    (library / "2021-05-05 Picnic" / ".picasa.ini").write_text(
+        "[Picasa]\r\nname=Picnic!\r\n")
+    assert reconcile_walk(cat2, library).ini_changed
+
+    # Removed: deleting an ini the catalog DOES have a signal for.
+    cat3 = scan_library(library)  # fresh baseline, post-Picnic-added
+    thumbcache.build_cache(cat3, tmp_path / "c3")
+    assert not reconcile_walk(cat3, library).changed
+    ini.unlink()
+    assert reconcile_walk(cat3, library).ini_changed
+
+
+def test_reconcile_clean_after_warm_load_no_ini_changes(
+        library: Path, tmp_path: Path) -> None:
+    """A genuinely unchanged library reconciles clean end-to-end through a
+    full save_catalog/load_catalog round trip (fauxcasa-cam.14 step 4):
+    ini_sigs and contacts_sig persist and reload exactly, so a warm start
+    with no external edits never spuriously flags Drift.ini_changed."""
+    from catalog import stat_sig
+
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    cat.contacts_sig = stat_sig(
+        _write_faces_contacts_xml(tmp_path / "contacts.xml"))
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, library)
+    assert loaded is not None
+    assert loaded.ini_sigs == cat.ini_sigs
+    assert loaded.ini_sigs  # the fixture's Trip folder does carry an ini
+    assert loaded.contacts_sig == cat.contacts_sig
+
+    drift = reconcile_walk(loaded, library)
+    assert not drift.changed and not drift.ini_changed
+
+
 def test_set_data_invalidates_tiles() -> None:
     """The reconcile swap goes through grid.set_data; it must invalidate
     the decoded-tile cache or a rebuilt catalog paints stale thumbnails
@@ -12097,6 +12159,31 @@ def test_zstd_wrapped_v11_file_rejected(tmp_path: Path) -> None:
     assert load_catalog(path, tmp_path) is None
 
 
+def test_v13_catalog_rejected_after_v14_bump(
+        library: Path, tmp_path: Path) -> None:
+    """fauxcasa-cam.14 step 4 bumped CATALOG_VERSION 13->14 (new ini_sigs/
+    contacts_sig fields): a genuine pre-bump v13 file — the PREVIOUS
+    current format, zstd-wrapped, with neither field present — is now
+    rejected outright and cold-rebuilds, per the module's existing
+    'no migration path, the catalog is a regenerable cache' posture (same
+    treatment every prior version bump gave its immediate predecessor)."""
+    import catalog as catmod
+
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    data = _raw_catalog(path)
+    assert data["version"] == catmod.CATALOG_VERSION == 14
+    data.pop("ini_sigs", None)      # a real v13 file never had these
+    data.pop("contacts_sig", None)
+    data["version"] = 13
+    _write_raw_catalog(path, data)  # still zstd-wrapped: v13 always was
+
+    assert load_catalog(path, library) is None
+
+
 # ---- multiroot cache binding (fauxcasa-ed5.7.3, bead .c) -------------------
 
 
@@ -12939,6 +13026,69 @@ def test_reconcile_never_removes_offline_root_entries(tmp_path: Path) -> None:
 
     # The catalog itself still carries root B's photo row untouched.
     assert any(p.rel == "3.jpg" and p.root_id == id_b for p in cat.photos)
+
+
+def test_reconcile_online_roots_detects_contacts_xml_drift_once(
+        tmp_path: Path) -> None:
+    """The one machine-local contacts.xml is checked ONCE by
+    main._reconcile_online_roots (fauxcasa-cam.14 step 4), not inside the
+    per-root reconcile_walk loop it calls: editing contacts.xml between
+    scans is invisible to a bare reconcile_walk call (it has no
+    contacts_path to check — that is explicitly not its job) on EITHER of
+    a 2-root library's roots, but IS caught by the multiroot helper —
+    resolving the PR-37 rider that editing contacts.xml never refreshed a
+    warm start."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+    from catalog import Catalog, Photo, stat_sig
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    make_jpeg(root_a / "1.jpg")
+    make_jpeg(root_b / "2.jpg")
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+
+    contacts_path = _write_faces_contacts_xml(tmp_path / "contacts.xml")
+
+    def sig(p: Path) -> tuple[int, int]:
+        st = p.stat()
+        return st.st_size, int(st.st_mtime)
+
+    s1, s2 = sig(root_a / "1.jpg"), sig(root_b / "2.jpg")
+    photos = [
+        Photo(rel="1.jpg", folder="", name="1.jpg", root_id=id_a,
+             size=s1[0], mtime=s1[1]),
+        Photo(rel="2.jpg", folder="", name="2.jpg", root_id=id_b,
+             size=s2[0], mtime=s2[1]),
+    ]
+    cat = Catalog(root=root_a, photos=photos, folders={}, albums={},
+                 contacts_sig=stat_sig(contacts_path),
+                 roots=[libmod.LibraryRoot(id=id_a, path=root_a),
+                        libmod.LibraryRoot(id=id_b, path=root_b)])
+
+    # Baseline: clean on both individual roots and via the multiroot
+    # helper.
+    assert not reconcile_walk(cat, root_a, root_id=id_a).changed
+    assert not reconcile_walk(cat, root_b, root_id=id_b).changed
+    drift, _ = main._reconcile_online_roots(cat, None, None, None,
+                                            contacts_path)
+    assert drift is not None and not drift.changed
+
+    # Edit contacts.xml externally (rename one contact).
+    contacts_path.write_text(
+        contacts_path.read_text().replace("Carol Xml", "Carol Renamed"))
+
+    # A bare reconcile_walk call — no contacts_path parameter exists on
+    # it at all — cannot see the edit, on EITHER root.
+    assert not reconcile_walk(cat, root_a, root_id=id_a).ini_changed
+    assert not reconcile_walk(cat, root_b, root_id=id_b).ini_changed
+
+    # The multiroot helper DOES see it — exactly once, not doubled by
+    # having two online roots.
+    drift2, _ = main._reconcile_online_roots(cat, None, None, None,
+                                             contacts_path)
+    assert drift2 is not None
+    assert drift2.ini_changed and drift2.changed
+    assert drift2.added == 0 and drift2.removed == 0 and drift2.modified == 0
 
 
 def test_offline_root_labels_empty_for_single_root_library(
