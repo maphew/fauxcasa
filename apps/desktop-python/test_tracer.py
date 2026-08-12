@@ -9714,6 +9714,294 @@ def test_folder_sort_context_menu_wiring(tmp_path: Path) -> None:
     assert win2.grid.display == [2, 1, 0]            # sorted from first paint
 
 
+def test_folder_view_flat_listing(tmp_path: Path) -> None:
+    """Flat mode (fauxcasa-q6l.10): all non-empty folders appear as direct
+    children of the Folders root (not nested), ordered alphabetically by leaf
+    name (case-insensitive), each carrying the full on-disk path as tooltip."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+    from main import MainWindow
+    from catalog import scan_library
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "Animals" / "cat.jpg")
+    make_jpeg(root / "Animals" / "Dog" / "dog.jpg")
+    make_jpeg(root / "Zebra" / "z.jpg")
+    make_jpeg(root / "apples" / "a.jpg")   # lowercase leaf: sorts between Animals and Zebra
+
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    # Default state: tree mode (flat toggle is off).
+    assert not win._flat_check.isChecked()
+
+    # Switch to flat mode.
+    win._flat_check.setChecked(True)
+
+    # Collect all ("folder", rel) items from the rebuilt sidebar.
+    folder_items = []
+    it = QTreeWidgetItemIterator(win.tree)
+    while it.value():
+        d = it.value().data(0, Qt.ItemDataRole.UserRole)
+        if d is not None and d[0] == "folder":
+            folder_items.append((d[1], it.value()))
+        it += 1
+
+    rels = [r for r, _ in folder_items]
+
+    # All non-empty folders are present.
+    expected_rels = set(cat.folders.keys())
+    assert set(rels) == expected_rels, f"missing: {expected_rels - set(rels)}"
+
+    # Items are sorted by leaf name, case-insensitive.
+    leaf_names = [r.rsplit("/", 1)[-1].lower() for r in rels]
+    assert leaf_names == sorted(leaf_names), f"not alphabetical: {leaf_names}"
+
+    # Each item's tooltip is the full on-disk path.
+    for rel, item in folder_items:
+        expected_tip = str(cat.root / rel)
+        assert item.toolTip(0) == expected_tip, (
+            f"wrong tooltip for {rel!r}: {item.toolTip(0)!r}")
+
+    # All items are direct children of the Folders root (no nesting).
+    it2 = QTreeWidgetItemIterator(win.tree)
+    while it2.value():
+        d = it2.value().data(0, Qt.ItemDataRole.UserRole)
+        if d is not None and d[0] == "folder":
+            parent_data = it2.value().parent().data(
+                0, Qt.ItemDataRole.UserRole)
+            # Parent carries no UserRole data (it is the unselectable root).
+            assert parent_data is None, (
+                f"folder item {d[1]!r} has parent with data {parent_data!r}")
+        it2 += 1
+
+
+def test_folder_view_flat_root_rel_photos(tmp_path: Path) -> None:
+    """Photos directly in the library root (rel == "") must not render an
+    unlabeled flat item: the leaf label falls back to the root's on-disk
+    folder name, and tree mode's stand-in root node carries the path
+    tooltip (codex cross-review finding, fauxcasa-q6l.10)."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+    from main import MainWindow
+    from catalog import scan_library
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "rootpic.jpg")          # photo directly in the root
+    make_jpeg(root / "Animals" / "cat.jpg")
+
+    cat = scan_library(root)
+    assert "" in cat.folders  # precondition: root folder is a real entry
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._flat_check.setChecked(True)
+
+    def folder_items():
+        found = {}
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            d = it.value().data(0, Qt.ItemDataRole.UserRole)
+            if d is not None and d[0] == "folder":
+                found[d[1]] = it.value()
+            it += 1
+        return found
+
+    flat = folder_items()
+    root_item = flat[""]
+    assert root_item.text(0).startswith("lib  ("), root_item.text(0)
+    assert root_item.toolTip(0) == str(cat.root)
+
+    # Tree mode: the stand-in root node (the "Folders" header, which carries
+    # no ("folder", rel) item data) keeps the path-on-demand tooltip.
+    win._flat_check.setChecked(False)
+    headers = [win.tree.topLevelItem(i)
+               for i in range(win.tree.topLevelItemCount())]
+    folders_header = [h for h in headers
+                      if h.data(0, Qt.ItemDataRole.UserRole) is None]
+    assert folders_header, "Folders header not found"
+    assert folders_header[0].toolTip(0) == str(cat.root)
+
+
+def test_multiroot_flat_folder_listing(tmp_path: Path) -> None:
+    """Flat mode across a genuine (>1-root) multiroot library (fauxcasa-
+    q6l.10): items are alphabetical by leaf name across ALL roots, keyed by
+    the root-qualified folder_key (not bare rel — two roots' same-named
+    folders must stay distinct), tooltip is the OWNING root's on-disk path,
+    and an offline root's folders stay listed (browseable from cache) but
+    styled italic/dim rather than skipped."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+    from catalog import Catalog, Folder
+    from grid import folder_key
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root_a, root_b = tmp_path / "root-a", tmp_path / "root-b"
+    root_a.mkdir(parents=True)
+    # root_b deliberately never created -> offline (mirrors
+    # test_sidebar_shows_offline_root_badge's fixture pattern).
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    folders = {
+        "Zebra": Folder(rel="Zebra", title="Zebra", photo_count=1,
+                        total_count=1, root_id=id_a),
+        "apples": Folder(rel="apples", title="apples", photo_count=1,
+                         total_count=1, root_id=id_a),
+        f"{id_b}/Mango": Folder(rel="Mango", title="Mango", photo_count=1,
+                                total_count=1, root_id=id_b),
+    }
+    roots = [libmod.LibraryRoot(id=id_a, path=root_a, label="A"),
+             libmod.LibraryRoot(id=id_b, path=root_b, label="B")]
+    cat = Catalog(root=root_a, photos=[], folders=folders, albums={},
+                 roots=roots, library_id=libmod.mint_library_id())
+    cat.refresh_offline_ids()
+    assert cat.offline_ids == {id_b}
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._flat_check.setChecked(True)
+
+    folder_items = []
+    it = QTreeWidgetItemIterator(win.tree)
+    while it.value():
+        d = it.value().data(0, Qt.ItemDataRole.UserRole)
+        if d is not None and d[0] == "folder":
+            folder_items.append((d[1], it.value()))
+        it += 1
+
+    # Keyed by folder_key (root-qualified), not bare rel.
+    keys = [k for k, _ in folder_items]
+    assert keys == [folder_key(cat, id_a, "apples"),
+                    folder_key(cat, id_b, "Mango"),
+                    folder_key(cat, id_a, "Zebra")]
+    assert set(keys) == set(folders)   # matches the folders dict's own keys
+
+    by_key = dict(folder_items)
+    # Tooltip carries the OWNING root's on-disk path, not root_a's for both.
+    assert by_key[folder_key(cat, id_a, "apples")].toolTip(0) == \
+        str(root_a / "apples")
+    assert by_key[folder_key(cat, id_a, "Zebra")].toolTip(0) == \
+        str(root_a / "Zebra")
+    assert by_key[folder_key(cat, id_b, "Mango")].toolTip(0) == \
+        str(root_b / "Mango")
+
+    # The offline root's folder item is still listed (not skipped)...
+    mango_item = by_key[folder_key(cat, id_b, "Mango")]
+    assert mango_item.text(0) == "Mango  (1)"
+    # ...but styled the same italic/dim cue the tree mode gives its root
+    # header, since flat mode has no header row to carry the cue instead.
+    assert mango_item.font(0).italic()
+    # The online root's items are not styled offline.
+    assert not by_key[folder_key(cat, id_a, "Zebra")].font(0).italic()
+
+
+def test_folder_view_toggle_persistence(tmp_path: Path) -> None:
+    """Flat/tree choice persists to the per-library config.json (q6l.10).
+    save_folder_view / load_folder_view round-trip; default (tree) is absent
+    rather than False; the toggle merges with sort_modes in the same doc."""
+    from main import load_folder_view, save_folder_view, save_sort_modes
+
+    # Default: tree mode (no key in file yet).
+    assert load_folder_view(None) is False
+    assert load_folder_view(tmp_path / "nowhere") is False
+
+    # Persist flat=True; default (tree=False) is absent, not stored.
+    save_folder_view(tmp_path, True)
+    assert load_folder_view(tmp_path) is True
+    doc = json.loads((tmp_path / "config.json").read_text())
+    assert doc.get("folder_view_flat") is True
+
+    # Switching back to tree removes the key.
+    save_folder_view(tmp_path, False)
+    assert load_folder_view(tmp_path) is False
+    doc2 = json.loads((tmp_path / "config.json").read_text())
+    assert "folder_view_flat" not in doc2
+
+    # save_folder_view merges with sort_modes — neither key clobbers the other.
+    save_sort_modes(tmp_path, {"x": "date"})
+    save_folder_view(tmp_path, True)
+    merged = json.loads((tmp_path / "config.json").read_text())
+    assert merged["sort_modes"] == {"x": "date"}
+    assert merged["folder_view_flat"] is True
+
+    save_folder_view(tmp_path, False)
+    merged2 = json.loads((tmp_path / "config.json").read_text())
+    assert merged2["sort_modes"] == {"x": "date"}   # sort_modes untouched
+    assert "folder_view_flat" not in merged2
+
+    # Garbage / non-object inputs are tolerated.
+    (tmp_path / "config.json").write_text("{not json")
+    assert load_folder_view(tmp_path) is False
+    (tmp_path / "config.json").write_text("null")
+    assert load_folder_view(tmp_path) is False
+    (tmp_path / "config.json").write_text('{"folder_view_flat": "yes"}')
+    assert load_folder_view(tmp_path) is False   # non-bool value ignored
+
+
+def test_folder_view_toggle_wires_and_persists_in_window(
+        tmp_path: Path) -> None:
+    """The flat-check in a MainWindow switches the sidebar view and persists
+    the choice to the per-library config.json; a second window over the same
+    cache dir wakes up in flat mode."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+    from main import MainWindow
+    from catalog import scan_library
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "Bees" / "b.jpg")
+    make_jpeg(root / "Ants" / "a.jpg")
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=cache_dir, build_dir=None)
+
+    # Tree mode by default: "Ants" and "Bees" appear nested under Folders.
+    assert not win._flat_check.isChecked()
+
+    def folder_items(win2):
+        items = []
+        it = QTreeWidgetItemIterator(win2.tree)
+        while it.value():
+            d = it.value().data(0, Qt.ItemDataRole.UserRole)
+            if d is not None and d[0] == "folder":
+                items.append((d[1], it.value()))
+            it += 1
+        return items
+
+    tree_items = folder_items(win)
+    assert {r for r, _ in tree_items} == {"Ants", "Bees"}
+
+    # Toggle to flat — persists.
+    win._flat_check.setChecked(True)
+    assert (cache_dir / "config.json").is_file()
+    cfg = json.loads((cache_dir / "config.json").read_text())
+    assert cfg.get("folder_view_flat") is True
+
+    flat_items = folder_items(win)
+    leaf_names = [r.rsplit("/", 1)[-1] for r, _ in flat_items]
+    assert sorted(leaf_names, key=str.lower) == leaf_names   # alphabetical
+
+    # Clicking a flat-mode folder item still selects the grid view correctly:
+    # folder clicks show all photos (no filter) and scroll to the folder;
+    # verify it doesn't crash and the grid has the correct item count.
+    _, first_item = flat_items[0]
+    first_item.setSelected(True)
+    win._sidebar_clicked(first_item, 0)
+    # Folder click keeps all photos visible (no filter set).
+    assert win.grid.filter_label == ""
+    assert len(win.grid.display) == len(cat.photos)
+
+    # A second window over the same cache dir starts in flat mode.
+    cat2 = scan_library(root)
+    win2 = MainWindow(cat2, None, cache_dir=cache_dir, build_dir=None)
+    assert win2._flat_check.isChecked()
+
+
 def test_slideshow_follows_folder_sort_order(tmp_path: Path) -> None:
     """The slideshow (and viewer activation) consume grid.display, so a
     folder's sort mode carries through with no code of its own: Play on a
