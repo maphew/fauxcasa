@@ -124,5 +124,6 @@
     "size": 558
    }
   }
- }
+ },
+ "correction": "CORRECTION (2026-08-12 salvage review, fauxcasa-nu9): the ini-only/'flush not waited' claim is accurate for this fixture \u2014 no imagedata_* rows changed in this diff. Note the flush of THIS edit (imagedata_filters[5] ''->'fill=1,0.186916;', edited[5] 0->1) appears as carry-over in fixture 036's snapshot."
 }

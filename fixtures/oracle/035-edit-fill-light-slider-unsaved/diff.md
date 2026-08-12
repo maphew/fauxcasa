@@ -49,3 +49,5 @@ baseline: 'after 034-edit-enhance-oneclick-unsaved' (2026-06-20T22:54:05+00:00)
 -- blob/cache changes (not copied into fixtures by default):
    changed: db3/thumbs_0.db — binary; 99629 -> 99629 bytes; first difference at offset 0xe9b2
 ```
+
+**CORRECTION (2026-08-12 salvage review, fauxcasa-nu9): the ini-only/'flush not waited' claim is accurate for this fixture — no imagedata_* rows changed in this diff. Note the flush of THIS edit (imagedata_filters[5] ''->'fill=1,0.186916;', edited[5] 0->1) appears as carry-over in fixture 036's snapshot.**

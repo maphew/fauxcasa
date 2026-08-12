@@ -106,3 +106,5 @@ baseline: 'manual' (2026-06-20T22:40:47+00:00)
    changed: db3/thumbs_0.db — binary; 96886 -> 99629 bytes; common prefix; 2743 bytes appended: ffd8ffe000104a46494600010100000100010000ffdb0043000302020302020303030304030304050805050404050a070706080c0a0c0c0b0a0b0b0d0e12100d...
    changed: db3/wordhash.dat — binary; 66912 -> 66916 bytes; first difference at offset 0x1038c
 ```
+
+**CORRECTION (2026-08-12 salvage review, fauxcasa-nu9): the 'EXPECTED LAZY FLUSH ... NOT waited/captured here' claim is contradicted by this fixture's own diff — the db3 flush of THIS edit WAS captured: imagedata_filters[6] ''->'enhance=1;', imagedata_edited[6] 0->1, imagedata_backuphash[6] mirror. So 034 additionally pins that the lazy flush can land within ~14min of the baseline (22:40->22:54), and this snapshot is ini+db3, not ini-only.**

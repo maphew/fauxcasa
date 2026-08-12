@@ -293,5 +293,6 @@
     "size": 626
    }
   }
- }
+ },
+ "correction": "CORRECTION (2026-08-12 salvage review, fauxcasa-nu9): the imagedata_* delta in this diff is NOT this edit \u2014 imagedata_filters[5] ''->'fill=1,0.186916;' and edited[5] 0->1 are fixture 035's photo03 Fill Light flush arriving late (carry-over session noise). This fixture's own tilt flush is NOT captured here; it appears as carry-over in fixture 037's snapshot. The prose's 'flush not waited' claim is accurate for the tilt edit itself."
 }

@@ -105,3 +105,5 @@ baseline: 'after 035-edit-fill-light-slider-unsaved' (2026-06-20T23:02:11+00:00)
    changed: db3/thumbs2_0.db — binary; 36376 -> 37301 bytes; common prefix; 925 bytes appended: ffd8ffe000104a46494600010100000100010000ffdb0043000302020302020303030304030304050805050404050a070706080c0a0c0c0b0a0b0b0d0e12100d...
    changed: db3/wordhash.dat — binary; 66916 -> 66920 bytes; first difference at offset 0x1038c
 ```
+
+**CORRECTION (2026-08-12 salvage review, fauxcasa-nu9): the imagedata_* delta in this diff is NOT this edit — imagedata_filters[5] ''->'fill=1,0.186916;' and edited[5] 0->1 are fixture 035's photo03 Fill Light flush arriving late (carry-over session noise). This fixture's own tilt flush is NOT captured here; it appears as carry-over in fixture 037's snapshot. The prose's 'flush not waited' claim is accurate for the tilt edit itself.**

@@ -96,3 +96,5 @@ baseline: 'after 036-edit-tilt-straighten-unsaved' (2026-06-20T23:06:49+00:00)
    changed: db3/thumbs_0.db — binary; 99629 -> 104791 bytes; common prefix; 5162 bytes appended: ffd8ffe000104a46494600010100000100010000ffdb0043000302020302020303030304030304050805050404050a070706080c0a0c0c0b0a0b0b0d0e12100d...
    changed: db3/wordhash.dat — binary; 66920 -> 66928 bytes; first difference at offset 0x1038c
 ```
+
+**CORRECTION (2026-08-12 salvage review, fauxcasa-nu9): this diff's imagedata_* delta mixes two edits — imagedata_filters[7] ''->'tilt=...' and edited[7] 0->1 are fixture 036's carry-over flush, while imagedata_filters[8] ''->'finetune2=...' IS this fixture's own filters flush, captured after all (contradicting 'flush not waited'). Partial flush: edited[8] had NOT yet flushed at snapshot time — filters and edited flush independently.**

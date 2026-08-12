@@ -306,5 +306,6 @@
     "size": 500
    }
   }
- }
+ },
+ "correction": "CORRECTION (2026-08-12 salvage review, fauxcasa-nu9): the 'EXPECTED LAZY FLUSH ... NOT waited/captured here' claim is contradicted by this fixture's own diff \u2014 the db3 flush of THIS edit WAS captured: imagedata_filters[6] ''->'enhance=1;', imagedata_edited[6] 0->1, imagedata_backuphash[6] mirror. So 034 additionally pins that the lazy flush can land within ~14min of the baseline (22:40->22:54), and this snapshot is ini+db3, not ini-only."
 }
