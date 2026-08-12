@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["PySide6"]
+# dependencies = ["PySide6", "zstandard"]
 # ///
 """Scroll benchmark for the tracer GridView on a REAL display (fauxcasa-ncv).
 

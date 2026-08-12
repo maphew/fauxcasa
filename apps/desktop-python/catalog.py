@@ -83,6 +83,7 @@ album indices across a regroup.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -91,6 +92,16 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# `zstandard` is imported LAZILY, inside save_catalog/load_catalog only
+# (fauxcasa-ed5.5): every other function in this module (scan_library,
+# Catalog/Photo, _group_photo_rows/_ungroup_photo_rows, ...) stays usable
+# by a script that has catalog.py's OTHER deps but not this one — see
+# scripts/bench-raw-indexing.py / check-ingest-parity.py, which import
+# catalog.py but never call save_catalog/load_catalog. Scripts that DO call
+# either (test_tracer.py, main.py, bench_scroll.py,
+# scripts/bench-multiroot-startup.py) list "zstandard" in their own PEP 723
+# dependencies block.
 
 _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "scripts"))
@@ -1448,12 +1459,43 @@ def scan_library(root: Path,
 # all implicitly roots[0] — see load_catalog's compat path); a v11 file
 # is rejected outright for a multi-root library (cold walk), since a v11
 # file predates root disambiguation entirely and cannot express it.
-CATALOG_VERSION = 12
+#
+# v13: on-disk size budget (fauxcasa-ed5.5, spec §10 item 20 re-baseline
+# — see docs/research/catalog-size-analysis.md option f2). The file is now
+# zstd level 3 over a FOLDER-GROUPED compact-JSON body: rows are grouped
+# by (root_id, folder) — folder path stored once per group (as "p"; a
+# group's root_id lives at "R", absent means roots[0], same convention as
+# the old per-row "R") and each row carries only its basename ("n") plus
+# every other existing field, UNCHANGED (see _group_photo_rows /
+# _ungroup_photo_rows). Grouping is done by RUN (a new group starts
+# whenever (root_id, folder) differs from the previous row's), never by
+# a dict keyed on (root_id, folder) — walk_library's path-sorted order is
+# NOT folder-contiguous whenever a subfolder's name sorts between two of
+# its parent's own files, so dict-insertion-order grouping would silently
+# reorder rows and corrupt album-member index stability; see
+# _group_photo_rows for the worked example. "x" (sha256) is base85 of the
+# raw 32 bytes instead of 64 hex chars — lossless, decoded back to hex on load so
+# every OTHER consumer of Photo.sha256 is unaffected. Detection is by
+# content, not the version field: a file starting with the zstd magic
+# (ZSTD_MAGIC) IS a v13 file; a plain-JSON file is v11 (single-root compat
+# only) or older/foreign (cold walk) — see load_catalog. There is no
+# migration path for a plain v12 file (never a shipped format for more
+# than this same release) — it now simply fails the version gate like any
+# older format; the catalog is a regenerable cache, not a document.
+CATALOG_VERSION = 13
 # The last pre-multiroot format (fauxcasa-ed5.7.2, bead .b): load_catalog's
 # ONLY version-compat carve-out, and only when the library has exactly one
 # root (see load_catalog). A fixed number, not "CATALOG_VERSION - 1" — see
 # load_catalog's comment for why that distinction matters going forward.
 PRE_MULTIROOT_VERSION = 11
+
+# zstd frame magic (RFC 8878 §3.1.1): the four bytes every
+# zstandard-produced frame starts with. save_catalog (v13+) always writes
+# a zstd frame; load_catalog uses this, not the "version" field, to decide
+# whether a file is the current grouped format or a legacy plain-JSON one
+# (see the v13 comment above) — content-sniffing, not a header field,
+# because a legacy file has no way to say "I am plain JSON" either.
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 # The import report's file name, written beside catalog.json (same cache
 # dir) by save_report and re-attached on warm starts via load_report.
@@ -1560,6 +1602,87 @@ def _photo_to_row(p: Photo, first_root_id: str) -> dict:
     return row
 
 
+def _group_photo_rows(rows: list[dict], first_root_id: str) -> list[dict]:
+    """Fold flat per-photo rows (each shaped like _photo_to_row's output —
+    "r" rel path, absent-means-roots[0] "R", hex "x") into the v13
+    folder-grouped shape (fauxcasa-ed5.5): one entry per (root_id, folder)
+    — "p" the folder path, "R" the group's root id (same absent-means-
+    roots[0] convention, now hoisted to the group since every row in a
+    group shares one root_id by construction), "ph" the rows with "r"/"R"
+    replaced by a bare basename "n" and "x" re-encoded as base85 of the
+    raw 32 bytes (lossless; _ungroup_photo_rows decodes it back to hex).
+
+    ORDER-PRESERVING BY CONSTRUCTION: rows are grouped by RUN, not by a
+    dict keyed on (root_id, folder) — a new group starts whenever the key
+    differs from the PREVIOUS row's key, even if that key was already
+    seen earlier in the list. `rows` is NOT reliably folder-contiguous:
+    walk_library sorts by full path (component order), so a folder's own
+    files are split apart whenever a subfolder's name sorts between them
+    (e.g. "2020/apple.jpg", "2020/summer/b.jpg", "2020/zoo.jpg" — the
+    "2020" folder's two files are not adjacent). Grouping by first-seen
+    key (a plain dict) would silently move "2020/zoo.jpg" into the first
+    "2020" group and corrupt the flattened order on ungroup, which
+    load_catalog's Photo reconstruction and Album.members' index-based
+    membership both depend on. Run-based grouping costs only a repeated
+    folder string in that split case, and reproduces the exact original
+    flattened order unconditionally. `rows` may come from freshly-built
+    Photo objects (save_catalog) or straight from an old plain-JSON
+    file's "photos" array (library._promote_upgrade_catalog regrouping a
+    pre-v13 catalog) — both are the same flat shape."""
+    groups: list[dict] = []
+    prev_key: tuple[str, str] | None = None
+    for row in rows:
+        rel = row["r"]
+        folder, _, name = rel.rpartition("/")
+        root_id = row.get("R") or first_root_id
+        key = (root_id, folder)
+        if key != prev_key:
+            group: dict = {"p": folder, "ph": []}
+            if root_id != first_root_id:
+                group["R"] = root_id
+            groups.append(group)
+            prev_key = key
+        new_row: dict = {"n": name}
+        for k, v in row.items():
+            if k in ("r", "R"):
+                continue
+            if k == "x":
+                v = base64.b85encode(bytes.fromhex(v)).decode("ascii")
+            new_row[k] = v
+        groups[-1]["ph"].append(new_row)
+    return groups
+
+
+def _ungroup_photo_rows(groups: list, first_root_id: str) -> list[dict]:
+    """Inverse of _group_photo_rows: expand the v13 grouped "photos" array
+    back into the flat per-row shape load_catalog's Photo-reconstruction
+    loop already expects ("r"/absent-means-roots[0] "R"/hex "x"), in the
+    exact original flattened order (group order, then row order within
+    each group — see _group_photo_rows' ordering guarantee)."""
+    rows: list[dict] = []
+    for group in groups:
+        folder = group.get("p") or ""
+        if not isinstance(folder, str):
+            raise TypeError("group 'p' must be a string")
+        root_id = group.get("R") or first_root_id
+        for row in group.get("ph", ()):
+            name = row["n"]  # KeyError on absent -> the defensive net below
+            if not isinstance(name, str):
+                raise TypeError("row 'n' must be a string")
+            rel = f"{folder}/{name}" if folder else name
+            new_row: dict = {"r": rel}
+            if root_id != first_root_id:
+                new_row["R"] = root_id
+            for k, v in row.items():
+                if k == "n":
+                    continue
+                if k == "x":
+                    v = base64.b85decode(v).hex()
+                new_row[k] = v
+            rows.append(new_row)
+    return rows
+
+
 def save_catalog(catalog: Catalog, path: Path) -> None:
     """Atomically serialize the catalog to `path` (write-temp-rename).
 
@@ -1568,8 +1691,20 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
     are informational/debug only, resolution authority is library.json);
     the implicit legacy library (no library_id) keeps the original
     "library": str(root) header, UNCHANGED, so a single-root catalog's
-    header — and every photo row, via the absent-"R" convention below —
-    round-trips byte-identical to a pre-multiroot save."""
+    header round-trips byte-identical to a pre-multiroot save — and every
+    photo row's CONTENT (via the absent-"R" convention below) is preserved
+    field-for-field, though not byte-identically: fauxcasa-ed5.5 folder-
+    groups the rows and base85-encodes "x" (see _group_photo_rows), so the
+    serialized shape itself differs from a pre-multiroot save.
+
+    fauxcasa-ed5.5: the file itself is zstd level 3 over compact-separator
+    JSON whose "photos" is folder-grouped (see _group_photo_rows) — the
+    on-disk size budget (spec §10 item 20); see
+    docs/research/catalog-size-analysis.md for the measurements behind
+    this shape. load_catalog detects the format by content (ZSTD_MAGIC),
+    not by trusting "version" alone."""
+    import zstandard
+
     first_root_id = _expand_root_id(None, catalog.roots)
     if catalog.library_id:
         header: dict = {
@@ -1579,10 +1714,11 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
         }
     else:
         header = {"library": str(catalog.root)}
+    flat_rows = [_photo_to_row(p, first_root_id) for p in catalog.photos]
     data = {
         "version": CATALOG_VERSION,
         **header,
-        "photos": [_photo_to_row(p, first_root_id) for p in catalog.photos],
+        "photos": _group_photo_rows(flat_rows, first_root_id),
         # only folders that carry a description (title/count are derived);
         # the dict KEY already carries the root-id prefix convention (see
         # _folder_json_key, applied when the folders dict is BUILT in
@@ -1618,7 +1754,8 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
                             "cursor": catalog.backfill_cursor}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".catalog.tmp")
-    tmp.write_text(json.dumps(data))
+    payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+    tmp.write_bytes(zstandard.ZstdCompressor(level=3).compress(payload))
     tmp.replace(path)
 
 
@@ -1672,17 +1809,48 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig,
     accepted, but ONLY when `cfg` has exactly one root — its rows carry no
     "R" key at all, so every photo is unambiguously roots[0]. A
     previous-version file for a multi-root library returns None (cold
-    walk): that format cannot express root disambiguation."""
+    walk): that format cannot express root disambiguation.
+
+    FORMAT (fauxcasa-ed5.5): a v13 file is ALWAYS a zstd frame (ZSTD_MAGIC)
+    wrapping folder-grouped compact JSON (see _group_photo_rows); a plain
+    (uncompressed) file is only ever accepted at PRE_MULTIROOT_VERSION,
+    single-root — a plain v12 (or any other plain version) file, and a
+    zstd-wrapped file at any version but CATALOG_VERSION, both fail the
+    gate below -> None -> cold rebuild. The catalog is a regenerable
+    cache, so there is no migration path for either case, by design.
+
+    zstandard is imported lazily, only inside the `if compressed:`
+    branch below — the only place decompression happens — so a
+    zstandard-less environment still degrades to a cold walk (None) for
+    every plain-JSON file (a legacy v11, or any foreign/corrupt file),
+    rather than raising an uncaught ImportError on load_catalog's
+    unguarded call site in main()."""
     if not isinstance(cfg, LibraryConfig):
         cfg = legacy_config(cfg)
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    compressed = raw[:4] == ZSTD_MAGIC
+    if compressed:
+        try:
+            import zstandard
+        except ImportError:
+            return None
+        try:
+            raw = zstandard.ZstdDecompressor().decompress(raw)
+        except (zstandard.ZstdError, MemoryError):
+            return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, MemoryError):
         return None
     if not isinstance(data, dict):
         return None
     version = data.get("version")
     if version == CATALOG_VERSION:
+        if not compressed:
+            return None  # v13 is only ever the zstd-wrapped grouped shape
         current = True
     elif version == PRE_MULTIROOT_VERSION and len(cfg.roots) == 1:
         # Compat path (design §5): a v11 file predates root
@@ -1693,6 +1861,8 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig,
         # v11->v12 multiroot transition and must not silently reopen for
         # some future unrelated bump the same way every prior bump (v1
         # through v11) rejected its immediate predecessor outright.
+        if compressed:
+            return None  # the v11 carve-out only ever applied to plain JSON
         current = False
     else:
         return None
@@ -1704,14 +1874,20 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig,
     root = cfg.roots[0].path
     root_by_id = {r.id: r for r in cfg.roots}
     first_root_id = _expand_root_id(None, cfg.roots)
-    rows = data.get("photos")
-    if not isinstance(rows, list):
+    rows_field = data.get("photos")
+    if not isinstance(rows_field, list):
         return None
 
     # Any structural defect in a version-tagged file (the case the version
     # gate is meant to guard) degrades to a cold walk rather than crashing
     # startup — main() calls this unguarded.
     try:
+        # v13's "photos" is folder-grouped; ungroup it back into the flat
+        # per-row shape the loop below has always expected (hex "x", plain
+        # "r"/"R") so the rest of this function is unchanged either way.
+        rows = (_ungroup_photo_rows(rows_field, first_root_id)
+                if compressed else rows_field)
+
         hidden_folders = data.get("hidden_folders", [])
         if not isinstance(hidden_folders, list):
             hidden_folders = []

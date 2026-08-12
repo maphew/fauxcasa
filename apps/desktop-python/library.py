@@ -10,9 +10,16 @@ library: a degenerate LibraryConfig with one root of id "" and no home.
 This keeps day-zero (single-root) behavior byte-identical — no migration
 runs, no prompts appear, no caches are rebuilt.
 
-This module is stdlib-only (json, re, uuid, dataclasses, pathlib).
-It carries NO PEP 723 header — only entry scripts (main.py, test_tracer.py)
-carry that. It imports from no other app module (one-directional, no circularity).
+This module is otherwise stdlib-only (json, re, uuid, dataclasses, pathlib);
+the sole exception is _promote_upgrade_catalog, which needs `zstandard` to
+read/rewrite the v13 compressed catalog format (fauxcasa-ed5.5) — it relies
+on the entry script's PEP 723 environment (main.py/test_tracer.py) already
+providing it, exactly like rawload.py/metareader.py lean on their own
+third-party deps without a header of their own. It carries NO PEP 723 header
+— only entry scripts carry that. It imports from no other app module at
+MODULE SCOPE (one-directional, no circularity); a couple of functions do a
+DEFERRED (inside-the-function) `import catalog`/`import thumbcache` once it's
+safe to (see promote_library's comment on why that's safe).
 """
 
 from __future__ import annotations
@@ -622,22 +629,49 @@ def _promote_upgrade_catalog(cat_path: Path, library_id: str, root_id: str,
     """Header-only in-place upgrade of catalog.json (design §5/§10 — the
     migrator N3 says could be skipped, kept only to preserve expensive
     sha256 backfill): add "library_id"/"roots", drop "library", bump
-    "version" — PHOTO ROWS (data["photos"]) are copied over VERBATIM, never
-    touched, which is exactly what keeps the promoted-rows-equal-old-rows
-    property true. The original file is preserved as "catalog.json.bak"
-    BEFORE the atomic write-temp-rename, so a crash between the two leaves
-    either the untouched original or the fully-upgraded file, never a
-    half-written one. Returns False (no-op) if `cat_path` doesn't exist yet
-    (a never-scanned legacy library has no catalog to upgrade). Any parse
-    anomaly (malformed JSON, non-dict document) raises — promote_library
+    "version" — PHOTO ROW CONTENT is copied over VERBATIM, never touched,
+    which is exactly what keeps the promoted-rows-equal-old-rows property
+    true.
+
+    fauxcasa-ed5.5: the persisted format is now zstd level 3 over
+    folder-grouped compact JSON (catalog.CATALOG_VERSION 13 — see
+    catalog.save_catalog/_group_photo_rows and
+    docs/research/catalog-size-analysis.md). This upgrade fully parses the
+    payload (decompressing first if the file is already zstd-wrapped) so
+    it can regroup a still-flat pre-multiroot row shape (an on-disk
+    catalog.json predating this change, or any legacy plain-JSON version)
+    into that shape; a file that's ALREADY grouped (built by today's
+    save_catalog before promotion ever ran) is left row-for-row untouched,
+    just re-wrapped under the new header — neither path re-derives or
+    re-hashes a single field. The original file is preserved BYTE-FOR-BYTE
+    as "catalog.json.bak" BEFORE the atomic write-temp-rename, so a crash
+    between the two leaves either the untouched original or the fully-
+    upgraded file, never a half-written one. Returns False (no-op) if
+    `cat_path` doesn't exist yet (a never-scanned legacy library has no
+    catalog to upgrade). Any parse anomaly (malformed/truncated zstd
+    frame, malformed JSON, non-dict document) raises — promote_library
     treats that as a failure of THIS step and rolls the whole promotion
     back, per design §10 point 4 ("on any failure at any step")."""
+    import zstandard
+
+    from catalog import ZSTD_MAGIC, _group_photo_rows
+
     if not cat_path.is_file():
         return False
-    old_text = cat_path.read_text(encoding="utf-8")
-    data = json.loads(old_text)  # ValueError on malformed JSON -> caller rolls back
+    old_bytes = cat_path.read_bytes()
+    payload = old_bytes
+    if old_bytes[:4] == ZSTD_MAGIC:
+        payload = zstandard.ZstdDecompressor().decompress(old_bytes)
+    data = json.loads(payload)  # ValueError on malformed JSON -> caller rolls back
     if not isinstance(data, dict):
         raise PromotionError(f"{cat_path}: not a JSON object")
+
+    photos = data.get("photos", [])
+    if photos and isinstance(photos[0], dict) and "ph" not in photos[0]:
+        # Still-flat rows (a pre-v13 plain-JSON catalog): LEGACY_ROOT_ID is
+        # the only root_id such a file can carry (it predates "R" entirely
+        # — design §5), so grouping it needs no other root context.
+        photos = _group_photo_rows(photos, LEGACY_ROOT_ID)
 
     new_data: dict = {
         "version": catalog_version,
@@ -645,14 +679,16 @@ def _promote_upgrade_catalog(cat_path: Path, library_id: str, root_id: str,
         "roots": [{"id": root_id, "path": str(root)}],
     }
     for k, v in data.items():
-        if k in ("version", "library", "library_id", "roots"):
+        if k in ("version", "library", "library_id", "roots", "photos"):
             continue
-        new_data[k] = v  # "photos" et al. copied verbatim, never touched
+        new_data[k] = v  # folders/hidden_folders/contacts/albums/... verbatim
+    new_data["photos"] = photos
 
     bak_path = cat_path.with_name(cat_path.name + ".bak")
-    bak_path.write_text(old_text, encoding="utf-8")
+    bak_path.write_bytes(old_bytes)
     tmp = cat_path.with_name(cat_path.name + ".tmp")
-    tmp.write_text(json.dumps(new_data), encoding="utf-8")
+    new_payload = json.dumps(new_data, separators=(",", ":")).encode("utf-8")
+    tmp.write_bytes(zstandard.ZstdCompressor(level=3).compress(new_payload))
     tmp.replace(cat_path)
     return True
 
@@ -680,8 +716,12 @@ def _promote_rollback(root: Path, home: Path, old_dir: Path, new_dir: Path,
         renamed_sidecar = renamed_fcache.with_suffix(".fcache.json")
         try:
             if bak_path.is_file():
-                cat_path.write_text(bak_path.read_text(encoding="utf-8"),
-                                    encoding="utf-8")
+                # Bytes, not text (fauxcasa-ed5.5): the .bak is a
+                # byte-for-byte copy of whatever catalog.json was
+                # (zstd-compressed since CATALOG_VERSION 13), and
+                # read_text/write_text would corrupt it via utf-8
+                # decode/encode.
+                cat_path.write_bytes(bak_path.read_bytes())
                 bak_path.unlink()
         except OSError:
             pass

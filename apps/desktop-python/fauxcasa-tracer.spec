@@ -60,11 +60,16 @@ _repo = os.path.dirname(os.path.dirname(_here))
 # otherwise let a missed collection ship a build that silently reads no
 # dates/GPS/Rating, error-tiles every RAW, error-tiles every video
 # poster, or error-tiles every PSD — named here so the graph can never
-# drop them. Wheels only, no system libs.
+# drop them. "zstandard" (fauxcasa-ed5.5) is the same story: catalog.py's
+# save_catalog/load_catalog import it lazily inside the function bodies
+# (so scripts that never persist a catalog don't need it), which would
+# otherwise let a missed collection ship a build that silently fails to
+# save/load catalog.json at all. Wheels only, no system libs.
 _hidden = ["catalog", "grid", "thumbcache", "viewer", "slideshow", "peek",
            "inspector",
            "picasa_db", "applog", "metareader", "exiv2", "rawload", "rawpy",
-           "videoload", "av", "pillowload", "PIL", "PIL.Image", "PIL.ImageOps"]
+           "videoload", "av", "pillowload", "PIL", "PIL.Image", "PIL.ImageOps",
+           "zstandard"]
 
 # Qt modules the tracer never touches (QtCore/QtGui/QtWidgets only). Mostly
 # no-ops under PySide6-Essentials, but they make the build self-documenting

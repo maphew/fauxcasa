@@ -51,6 +51,12 @@ jobs:
       # "succeeds" and ships error tiles for every video. Same deliberate-
       # bump rule as rawpy (it vendors ffmpeg's libs).
       AV: "av==18.0.0"
+      # zstd catalog compression (fauxcasa-ed5.5): catalog.py's
+      # save_catalog/load_catalog import zstandard lazily, so a build
+      # environment without it "succeeds" but the frozen artifact raises
+      # ImportError on the very first launch (load_catalog is called
+      # unconditionally). Pinned/deliberate-bump like the others.
+      ZSTD: "zstandard==0.23.0"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -67,7 +73,7 @@ jobs:
         run: >
           uv run --with "${{ env.PYSIDE6 }}" --with "${{ env.PYINSTALLER }}"
           --with "${{ env.RAWPY }}" --with "${{ env.EXIV2 }}"
-          --with "${{ env.PILLOW }}" --with "${{ env.AV }}"
+          --with "${{ env.PILLOW }}" --with "${{ env.AV }}" --with "${{ env.ZSTD }}"
           pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 
       - name: Frozen lazy-dependency self-check

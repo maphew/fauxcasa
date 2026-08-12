@@ -28,9 +28,11 @@ The important calls, in plain words:
 2. **Promotion is a rename, not a re-index.** When the user adds a
    second root for the first time, Fauxcasa mints a library identity, renames
    one cache directory, and additively rewrites only the header lines of
-   `catalog.json`. Photo rows are untouched. No re-walk, no re-hash, no
-   thumbnail rebuild. Worst case on any failure: delete `.fauxcasa/` and
-   the app falls back to the original cold walk.
+   `catalog.json`. Photo row CONTENT is preserved field-for-field (fauxcasa-
+   ed5.5 update: the on-disk row *shape* is folder-grouped/base85-encoded
+   for size, so this is no longer byte-identical — see §5). No re-walk, no
+   re-hash, no thumbnail rebuild. Worst case on any failure: delete
+   `.fauxcasa/` and the app falls back to the original cold walk.
 3. **Picasa users have a direct onboarding path.** Fauxcasa can read the
    Picasa watched-folders list from the Windows registry
    (`HKCU\Software\Google\Picasa\...`) or from a manually-selected list,
@@ -80,7 +82,9 @@ live at `cache_root/<sha256(D:/Photos)[:16]>/` containing `catalog.json`,
 `thumbs.fcache`, `thumbs.fcache.json`, `config.json`, `import-report.json`.
 They click "Add folder to library…" for the first time. This triggers
 **promotion** (§10): mint a library-home, rename the cache dir, additively
-rewrite `catalog.json`'s header. No re-walk, no re-hash, no thumbnail
+rewrite `catalog.json`'s header. Photo row content is preserved field-for-
+field (see the fauxcasa-ed5.5 note in §5/§10 — the row shape itself is
+regrouped, not byte-identical). No re-walk, no re-hash, no thumbnail
 rebuild. Reversible by deleting `.fauxcasa/` — worst case is a cold walk,
 which N3 guarantees is lossless.
 
@@ -264,10 +268,13 @@ escape hatch. But a cold walk at 100k re-hashes everything (backfilled
 sha256s live only in the catalog), so promotion (§10) does a
 **header-only in-place upgrade**: load old JSON, add `library_id`/`roots`,
 bump version, atomic write with the old file preserved as
-`catalog.json.bak`. Photo rows are untouched — sha256 backfill is
-preserved. Any parse anomaly → skip the rewrite, cold walk. The
-acceptance test for this migrator staying header-only: it must preserve
-every per-row sha256 without touching row bytes. ⚖ This is the one piece
+`catalog.json.bak`. Photo row content is untouched — sha256 backfill is
+preserved field-for-field (fauxcasa-ed5.5: the migrator now also folder-
+groups still-flat legacy rows into the v13 on-disk shape, so row *bytes*
+are no longer preserved verbatim, only row *content*). Any parse anomaly
+→ skip the rewrite, cold walk. The acceptance test for this migrator
+staying header-only: it must preserve every per-row sha256 without
+altering row content. ⚖ This is the one piece
 of migration code N3 says we could skip (degrading to cold walk is safe);
 the migrator exists solely to preserve expensive sha256 backfill. A bug in
 it degrades to cold walk (safe) but costs a 100k re-hash (annoying).
