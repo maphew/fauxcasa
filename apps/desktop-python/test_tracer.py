@@ -8088,17 +8088,23 @@ def test_tray_overflow_paints_plus_n_tail(tmp_path: Path) -> None:
 
 
 def _make_clip(path: Path, color=(200, 60, 40), w: int = 64, h: int = 48,
-               nframes: int = 8, rate: int = 8) -> Path:
+               nframes: int = 8, rate: int = 8,
+               creation_time: str | None = None) -> Path:
     """A tiny real video: solid-`color` frames, mpeg4, in whatever
     container the extension names (.mp4 muxes moov-at-end by default —
     exactly the shape that defeats pipe input and needs seekable reads).
     8 frames at 8 fps = 1 s; pass nframes=2 for a sub-second clip that
-    forces the poster's seek-past-the-end fallback."""
+    forces the poster's seek-past-the-end fallback.
+    Pass creation_time (ISO 8601 UTC, e.g. '2023-05-15T10:30:00.000000Z')
+    to embed container creation_time metadata for probe_creation_time tests
+    (synthetic data only — privacy rule)."""
     import av
     from PIL import Image
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with av.open(str(path), "w") as container:
+        if creation_time is not None:
+            container.metadata["creation_time"] = creation_time
         stream = container.add_stream("mpeg4", rate=rate)
         stream.width, stream.height = w, h
         stream.pix_fmt = "yuv420p"
@@ -8396,6 +8402,106 @@ def test_make_thumbcache_video_paths(tmp_path: Path) -> None:
     bad = tmp_path / "bad.wmv"
     bad.write_bytes(b"not a movie")
     assert mtc._make_thumb(bad, [256]) == [(b"", 0, 0)]
+
+
+# ---------------------------------------------------------------------------
+# Video date_taken + streaming hash (fauxcasa-v46.6): probe_creation_time
+# reads container metadata via PyAV; video indexing streams sha256 instead
+# of loading whole-file bytes; §4 fill-when-empty rule for video dates.
+# ---------------------------------------------------------------------------
+
+
+def test_probe_creation_time(tmp_path: Path) -> None:
+    """probe_creation_time returns a canonical 'YYYY-MM-DDTHH:MM:SS' string
+    when the container carries creation_time metadata; returns None for
+    garbage bytes or a nonexistent path; agrees between path and bytes."""
+    import av
+    import videoload
+
+    # Clip with an explicit creation_time in container metadata.
+    clip = _make_clip(tmp_path / "ts.mp4",
+                      creation_time="2023-05-15T10:30:00.000000Z")
+
+    # Verify what the muxer actually wrote, then compare to probe output.
+    with av.open(str(clip)) as c:
+        raw = c.metadata.get("creation_time")
+    if raw is not None:
+        # Muxer preserved it: probe must canonicalise it.
+        dt = videoload.probe_creation_time(clip)
+        assert dt == "2023-05-15T10:30:00", (
+            f"probe returned {dt!r}; raw container value was {raw!r}")
+        # Path and bytes sources must agree.
+        assert videoload.probe_creation_time(clip.read_bytes()) == dt
+
+    # Fail-soft: garbage bytes must not raise.
+    assert videoload.probe_creation_time(b"not a video") is None
+    # Fail-soft: nonexistent path must not raise.
+    assert videoload.probe_creation_time(tmp_path / "nosuch.mp4") is None
+
+
+def test_video_date_taken_fill_when_empty(tmp_path: Path) -> None:
+    """apply_photo_meta fills date_taken only when the field is empty (§4
+    fill-when-empty rule for probe_creation_time): an existing value —
+    e.g. from a prior index or a future ini source — must be preserved."""
+    from catalog import Photo
+    from metareader import FileMeta
+
+    # Gap-fill: date_taken was None — probe result must be accepted.
+    p_empty = Photo(rel="a.mp4", folder="", name="a.mp4")
+    fmeta = FileMeta(date_taken="2023-05-15T10:30:00")
+    thumbcache.apply_photo_meta(p_empty, 100, 1000, "a" * 64,
+                                inmeta.EMPTY, fmeta)
+    assert p_empty.date_taken == "2023-05-15T10:30:00"
+
+    # Existing value preserved: probe must not override.
+    p_set = Photo(rel="b.mp4", folder="", name="b.mp4")
+    p_set.date_taken = "2020-01-01T12:00:00"
+    thumbcache.apply_photo_meta(p_set, 100, 1000, "a" * 64,
+                                inmeta.EMPTY, fmeta)
+    assert p_set.date_taken == "2020-01-01T12:00:00"
+
+
+def test_video_index_no_readbytes(tmp_path: Path, monkeypatch) -> None:
+    """Video indexing must stream sha256 from disk; Path.read_bytes must
+    not be called for any video file (multi-GB videos would spike RSS).
+    Photo files still use the read_bytes path unchanged."""
+    root = tmp_path / "lib"
+    _make_clip(root / "clip.mp4")
+    make_jpeg(root / "still.jpg")
+    cat = scan_library(root)
+
+    called: set[str] = set()
+    real_rb = Path.read_bytes
+
+    def _spy(self: Path) -> bytes:
+        called.add(self.name)
+        return real_rb(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _spy)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    assert "clip.mp4" not in called   # streaming hash: no read_bytes for video
+    assert "still.jpg" in called       # photo path unchanged
+
+
+def test_video_read_photo_meta_src_none(tmp_path: Path) -> None:
+    """read_photo_meta's video branch, src=None (multiroot unresolved/
+    offline root — bead .e): fails soft exactly like the still-photo
+    OSError path — empty bytes, -1 signals, the empty-string sha256, no
+    date_taken (probe_creation_time never runs without a path)."""
+    import hashlib
+
+    from catalog import Photo
+
+    photo = Photo(rel="clip.mp4", folder="", name="clip.mp4")
+    data, size, mtime, sha, meta, fmeta = thumbcache.read_photo_meta(
+        None, photo)
+    assert data == b""
+    assert (size, mtime) == (-1, -1)
+    assert sha == hashlib.sha256(b"").hexdigest()
+    assert meta is inmeta.EMPTY
+    assert fmeta is metareader.EMPTY
+    assert fmeta.date_taken is None
 
 
 # ---------------------------------------------------------------------------
