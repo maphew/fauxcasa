@@ -778,8 +778,9 @@ _HIDDEN_FOLDERS_CATEGORY = "hidden folders"
 def _is_folder_hidden(psec: picasa_db.IniSection | None) -> bool:
     if psec is None:
         return False
-    return (psec.get("P2category") or "").strip().lower() \
-        == _HIDDEN_FOLDERS_CATEGORY
+    # P2category= is Picasa 3.x; category= is the legacy Picasa 2 spelling.
+    val = (psec.get("P2category") or psec.get("category") or "").strip().lower()
+    return val == _HIDDEN_FOLDERS_CATEGORY
 
 
 # ---- faces/people: contacts.xml + [Contacts2] harvest --------------------

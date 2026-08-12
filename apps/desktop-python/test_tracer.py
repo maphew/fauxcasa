@@ -2327,6 +2327,37 @@ def test_folder_hidden_matcher_is_defensive() -> None:
     assert not catalog._is_folder_hidden(None)  # no [Picasa] section at all
 
 
+def test_folder_hidden_legacy_category_key() -> None:
+    """Legacy Picasa 2 used category= (not P2category=); _is_folder_hidden
+    accepts both so pre-3.x folders are hidden correctly (fauxcasa-cam.14)."""
+    import catalog
+    from picasa_db import IniSection
+
+    def mk_legacy(v: str) -> IniSection:
+        return IniSection(name="Picasa", items=[("category", v)])
+
+    assert catalog._is_folder_hidden(mk_legacy("Hidden Folders"))
+    assert catalog._is_folder_hidden(mk_legacy("hidden folders"))
+    assert not catalog._is_folder_hidden(mk_legacy("Folders on Disk"))
+    assert not catalog._is_folder_hidden(mk_legacy(""))
+
+
+def test_scan_folder_hidden_legacy_category(tmp_path: Path) -> None:
+    """A folder with [Picasa] category=Hidden Folders (legacy spelling) is
+    also hidden — same result as P2category= (fauxcasa-cam.14)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "visible" / "a.jpg")
+    (root / "visible" / ".picasa.ini").write_text(
+        "[Picasa]\r\nP2category=Folders on Disk\r\n")
+    make_jpeg(root / "hidden" / "b.jpg")
+    (root / "hidden" / ".picasa.ini").write_text(
+        "[Picasa]\r\ncategory=Hidden Folders\r\n")
+    cat = scan_library(root)
+    assert not cat.folders["visible"].folder_hidden
+    assert cat.folders["hidden"].folder_hidden
+    assert cat.visible_count == 1
+
+
 def test_folder_hidden_survives_catalog_roundtrip(
         folder_hidden_library: Path, tmp_path: Path) -> None:
     """folder_hidden + the derived per-photo visibility round-trip through the
@@ -6769,6 +6800,57 @@ def test_catalog_v6_roundtrips_album_flags(
     data["version"] = 5
     path.write_text(json.dumps(data))  # plain JSON: a version this old never zstd-wrapped
     assert load_catalog(path, album_library) is None
+
+
+def test_album_tooltip_date_description(tmp_path: Path) -> None:
+    """A regular album with date and/or description surfaces those as sidebar
+    tooltip lines; placeholder and pal-sourced albums keep their own tooltips
+    (fauxcasa-cam.14)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    uid_dated = "aaaabbbbccccdddd" * 2
+    uid_nodesc = "0000111122223333" * 2
+    (root / "f" / ".picasa.ini").write_text(
+        f"[.album:{uid_dated}]\r\n"
+        "name=Summer Trip\r\n"
+        "date=2022-07-15\r\n"
+        "description=Beach holiday\r\n"
+        f"token=]album:{uid_dated}\r\n"
+        f"[.album:{uid_nodesc}]\r\n"
+        "name=No Desc\r\n"
+        f"token=]album:{uid_nodesc}\r\n"
+        "[a.jpg]\r\n"
+        f"albums={uid_dated},{uid_nodesc}\r\n"
+    )
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    def item_for(kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    dated = item_for("album", uid_dated)
+    assert dated is not None
+    tip = dated.toolTip(0)
+    assert "2022-07-15" in tip
+    assert "Beach holiday" in tip
+
+    no_desc = item_for("album", uid_nodesc)
+    assert no_desc is not None
+    # No date/description — no tooltip set (empty string)
+    assert no_desc.toolTip(0) == ""
 
 
 # ---------------------------------------------------------------------------

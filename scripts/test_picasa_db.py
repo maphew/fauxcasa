@@ -374,12 +374,28 @@ def test_ini_bom_and_unicode(tmp_path):
 
 
 def test_ini_undecodable_bytes_survive(tmp_path):
+    # A file with [encoding] utf8=1 but non-UTF-8 bytes (mixed-encoding
+    # file from different Picasa versions): surrogateescape keeps every byte
+    # intact — the UTF-8-path round-trip guarantee is untouched.
     p = tmp_path / ".picasa.ini"
-    p.write_bytes(b"[photo.jpg]\ncaption=caf\xe9 latin1\n")  # not valid UTF-8
+    p.write_bytes(b"[encoding]\nutf8=1\n[photo.jpg]\ncaption=caf\xe9 latin1\n")
     ini = pdb.read_picasa_ini(p)
-    cap = ini.sections[0].get("caption")
+    cap = ini.sections[1].get("caption")  # sections[0] = [encoding]
     assert cap is not None
     assert cap.encode("utf-8", "surrogateescape") == b"caf\xe9 latin1"
+
+
+def test_ini_cp1252_caption(tmp_path, monkeypatch):
+    """Without [encoding] utf8=1 and with non-strict-UTF-8 bytes, decode
+    falls through to the locale codepage (pre-UTF8 Picasa behavior).
+    Monkeypatch forces cp1252 so the assertion is portable."""
+    monkeypatch.setattr(pdb.locale, "getpreferredencoding",
+                        lambda do_setlocale=True: "cp1252")
+    p = tmp_path / ".picasa.ini"
+    # "Straße" in cp1252: ß = 0xDF; no [encoding] utf8=1 marker
+    p.write_bytes(b"[photo.jpg]\ncaption=Stra\xdfe\n")
+    ini = pdb.read_picasa_ini(p)
+    assert ini.sections[0].get("caption") == "Straße"
 
 
 def test_ini_key_before_section(tmp_path):

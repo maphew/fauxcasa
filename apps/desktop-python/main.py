@@ -1959,6 +1959,15 @@ class MainWindow(QMainWindow):
                 elif album.pal_sourced:
                     item.setToolTip(
                         0, "Album definition from a Picasa2Albums .pal file")
+                else:
+                    # Regular album: show date and/or description if present.
+                    tip_parts = []
+                    if album.date:
+                        tip_parts.append(album.date)
+                    if album.description:
+                        tip_parts.append(album.description)
+                    if tip_parts:
+                        item.setToolTip(0, "\n".join(tip_parts))
             albums_root.setExpanded(True)
 
         # People (read-only v1 slice, fauxcasa-cam.3): named people with
