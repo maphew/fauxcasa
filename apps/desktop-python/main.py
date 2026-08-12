@@ -1422,6 +1422,13 @@ class MainWindow(QMainWindow):
         self._scan_build_dir: Path | None = None
         self._scan_t0: float | None = None
         self._cold_scan_pending = False
+        # Set by _on_scan_done when the background walk raised (Codex
+        # cross-vendor review finding 2): the synchronous cold path let
+        # that exception propagate out of main() and crash the process —
+        # never a fake READY. This flag is how main()'s check_ready tells
+        # a failed deferred walk apart from a genuinely empty, successful
+        # one (both leave the placeholder catalog in place).
+        self._scan_failed = False
         # Parks the backfill's readers between photos while set — the
         # low-priority hook (a future consumer can pause on heavy scroll);
         # tests drive it directly.
@@ -1507,14 +1514,42 @@ class MainWindow(QMainWindow):
         cold_ms = (time.perf_counter() - self._scan_t0) * 1000.0 \
             if self._scan_t0 is not None else 0.0
         if catalog is None:
+            # Codex cross-vendor review finding 2: the synchronous cold
+            # path let a scan exception propagate out of main() and crash
+            # the process (never a fake READY, always a nonzero exit for
+            # scripted runs). _scan_failed is how main()'s check_ready
+            # tells this apart from a genuinely empty, successful walk —
+            # both leave the placeholder catalog in win.catalog. An
+            # interactive run isn't killed outright (the window already
+            # exists and is otherwise usable) — the failure surfaces via
+            # the activity row/status bar/log instead, closer to old
+            # behavior than a hard crash would be for THIS entry point.
+            self._scan_failed = True
             self._hide_activity()
             self.build_failed = True
             self.statusBar().showMessage(
                 "library scan failed — see stderr", 10000)
             return
+        # User star choices are overlays in Fauxcasa's machine-local cache
+        # (self.star_overrides, loaded once in __init__ from cache_dir) —
+        # the ctor's own apply_star_overrides call only ever touched the
+        # EMPTY placeholder catalog on this path, so the just-scanned REAL
+        # catalog needs the same reapply here, BEFORE reload_data builds
+        # the Starred count/filter and before the cold build starts
+        # (Codex cross-vendor review finding 1: a --rebuild/invalidated-
+        # cache cold run must not silently drop existing star choices).
+        apply_star_overrides(catalog, self.star_overrides)
         log.info("cold-scan: %d photos, %d folders, %d albums in %.0f ms",
                  len(catalog.photos), len(catalog.folders),
                  len(catalog.albums), cold_ms)
+        if catalog.report.entries:
+            # §4 conflicts surfaced, never silent — main()'s own "import
+            # report" log only ever covers the EMPTY placeholder on this
+            # path (always report-free, so it's a silent no-op there, not
+            # a duplicate of this one) — the real summary is only known
+            # once the walk lands here (Codex cross-vendor review finding
+            # 3).
+            log.info("import report: %s", catalog.report.summary())
         # Distinct from the "indexed" event _on_index_finished emits for
         # the BUILD below — prep_ms in the READY line no longer measures
         # this walk (fauxcasa-q6l.13), so it gets its own duration event.
@@ -3450,6 +3485,11 @@ def main() -> int:
         # §4: conflicts are surfaced, never silent — the applog line plus
         # the status-bar count are the minimal v1 surface (full inspector
         # is N7/M2). Details live in the persisted import-report.json.
+        # On the cold_scan_needed path `catalog` here is the EMPTY
+        # placeholder — its report is always entry-free, so this is
+        # naturally a no-op, never a duplicate of _on_scan_done's own
+        # "import report" log for the real, just-scanned catalog
+        # (fauxcasa-q6l.13, Codex cross-vendor review finding 3).
         log.info("import report: %s", catalog.report.summary())
 
     # A frozen first-run picker may already have created the app.
@@ -3477,7 +3517,12 @@ def main() -> int:
     # READY instrumentation (§7 cold start): poll until every visible
     # tile is decoded, then report cold start + RSS on stdout.
     state = {"scrolled": False, "shot": False, "opened": False,
-             "probed": False}
+             "probed": False, "scan_failure_handled": False}
+    # A scripted probe (any of the three) implies quit — same set the hard
+    # timeout below arms on; reused by check_ready's scan-failure gate
+    # (fauxcasa-q6l.13, Codex cross-vendor review finding 2).
+    scripted_run = (args.screenshot is not None or args.quit_after_ready
+                    or args.search_probe is not None)
 
     def may_quit() -> bool:
         if not args.finish_build:
@@ -3493,6 +3538,22 @@ def main() -> int:
         return True
 
     def check_ready() -> None:
+        if win._scan_failed:
+            # Codex cross-vendor review finding 2: never let a failed
+            # deferred walk report a fake READY against the still-empty
+            # placeholder catalog — _on_scan_done already surfaced the
+            # failure via the activity row/status bar/log. A scripted
+            # probe gets an immediate nonzero exit here (mirrors the crash
+            # an unhandled scan exception caused on the old synchronous
+            # path, just without waiting out the full --timeout); a plain
+            # interactive run simply stays open with the window it already
+            # has — not killed outright, since unlike the old path the
+            # window exists and is otherwise usable.
+            if scripted_run and not state["scan_failure_handled"]:
+                state["scan_failure_handled"] = True
+                log.error("cold scan failed — exiting nonzero, no READY")
+                app.exit(1)
+            return
         # fauxcasa-q6l.13: while the deferred cold scan is still in flight
         # the grid is genuinely empty (0 items), so all_visible_decoded()
         # would trivially read True and fire READY against the EMPTY
@@ -3598,8 +3659,7 @@ def main() -> int:
     poll.start()
     # Hard stop for scripted runs: a stuck decode must fail loudly, not
     # hang CI or masquerade as success.
-    if args.screenshot is not None or args.quit_after_ready \
-            or args.search_probe is not None:
+    if scripted_run:
         def on_timeout() -> None:
             log.error("TIMEOUT after %ss — ready=%s state=%s",
                       args.timeout, win.ready_reported, state)
