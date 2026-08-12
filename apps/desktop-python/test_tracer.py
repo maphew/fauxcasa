@@ -13196,21 +13196,95 @@ def test_reconcile_rebuild_reloads_contacts_xml_for_sig_pairing(
     win.shutdown()
 
 
-def test_read_folder_ini_signature_captured_at_parse_time(
+def test_reconcile_rebuild_contacts_sig_captured_before_read(
         tmp_path: Path) -> None:
-    """Codex review finding 3 (fauxcasa-cam.14 step 4): _read_folder_ini's
-    signature must be stat'd immediately after read_picasa_ini succeeds,
-    of the EXACT file that was just read — not a later, independent
-    re-probe (the pre-fix end-of-scan_library _folder_ini_sig call, which
-    could race a concurrent edit across the entire rest of the scan).
+    """Codex review round-2 finding 2 (fauxcasa-cam.14 step 4): the
+    reconcile rebuild branch must stat contacts.xml BEFORE calling
+    load_contacts_xml, not after — same guiding principle as
+    catalog._read_folder_ini's round-2 pre-read stat fix (round-1 shipped
+    this branch stat-AFTER-read). Simulated by mutating contacts.xml from
+    inside a monkeypatched main.load_contacts_xml (a rewrite landing
+    DURING that read): the persisted contacts_sig must be the
+    PRE-mutation signature, so a subsequent reconcile correctly detects
+    drift against the file's actual (post-mutation) state instead of
+    trusting a signature that already looks current."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import time as _time
+    import unittest.mock as mock
+
+    import main as mainmod
+    from catalog import load_contacts_xml as real_load_contacts_xml
+    from catalog import stat_sig
+    from main import MainWindow
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+
+    contacts_path = tmp_path / "contacts.xml"
+    contacts_path.write_text("<contacts>\n</contacts>\n")
+    before_sig = stat_sig(contacts_path)
+
+    cat = scan_library(root)
+    cat.contacts_sig = before_sig
+    cache_dir = tmp_path / "cachedir"
+    win = MainWindow(cat, None, cache_dir=cache_dir, build_dir=None,
+                     contacts_path=contacts_path)
+
+    # A genuine photo drift is the simplest reliable trigger onto the
+    # rebuild branch — the race under test happens once that branch
+    # actually calls load_contacts_xml below, regardless of what tripped
+    # drift detection in the first place.
+    make_jpeg(root / "b.jpg")
+
+    def racing_load(path):
+        result = real_load_contacts_xml(path)
+        # A rewrite landing DURING the read — appends text so size
+        # changes (not just mtime, which truncates to whole seconds).
+        Path(path).write_text(
+            Path(path).read_text() + "<!-- edited mid-read -->\n")
+        return result
+
+    with mock.patch.object(mainmod, "load_contacts_xml",
+                           side_effect=racing_load):
+        win._start_reconcile()
+        assert win._reconcile_thread is not None
+        deadline = _time.time() + 20
+        while win._reconcile_thread.is_alive() and _time.time() < deadline:
+            app.processEvents()
+            _time.sleep(0.01)
+        assert not win._reconcile_thread.is_alive()
+        app.processEvents()
+
+    disk = load_catalog(cache_dir / "catalog.json", root)
+    assert disk is not None
+    # THE fix: the persisted signature is the PRE-mutation one, not the
+    # file's current (post-mutation, mid-read-edited) state.
+    assert disk.contacts_sig == before_sig
+    assert disk.contacts_sig != stat_sig(contacts_path)
+    win.shutdown()
+
+
+def test_read_folder_ini_signature_captured_before_parse_time(
+        tmp_path: Path) -> None:
+    """Codex review round-2 finding 1 (fauxcasa-cam.14 step 4): a
+    freshness signature must never be NEWER than the content it
+    describes — _read_folder_ini now stats the winning path BEFORE
+    calling read_picasa_ini, correcting the prior (round-1) stat-AFTER-
+    read version, which paired NEW content with a signature that already
+    read as current whenever a rewrite landed DURING the parse.
     Simulated by mutating the ini file from inside a monkeypatched
-    read_picasa_ini — an edit landing exactly between the parse and any
-    later stat: the signature _read_folder_ini returns must describe the
-    file's state AT THE TIME IT RETURNS (i.e. the post-mutation content),
-    proving the stat happens adjacent to the read, not decoupled from
-    it — a stat taken BEFORE the read (or independently, later) would
-    instead describe the pre-mutation "Before" content and fail this
-    assertion."""
+    read_picasa_ini (a rewrite landing exactly during the "read"): the
+    signature _read_folder_ini returns must be the PRE-mutation one,
+    stat'd before the mock ever ran — never the file's post-mutation
+    state — so a subsequent reconcile (which re-stats fresh) correctly
+    sees a MISMATCH against that stored signature and flags drift,
+    self-healing with one rebuild instead of silently persisting stale
+    content forever (the round-1 stat-after-read version would instead
+    store the post-mutation signature and never flag drift again)."""
     import unittest.mock as mock
 
     import catalog as catmod
@@ -13220,6 +13294,7 @@ def test_read_folder_ini_signature_captured_at_parse_time(
     folder.mkdir()
     ini_path = folder / ".picasa.ini"
     ini_path.write_text("[Picasa]\r\nname=Before\r\n")
+    before_sig = catmod.stat_sig(ini_path)
 
     real_read = picasa_db.read_picasa_ini
 
@@ -13234,7 +13309,74 @@ def test_read_folder_ini_signature_captured_at_parse_time(
     assert result is not None
     ini, sig = result
     assert ini.section("Picasa").get("name") == "Before"    # parsed content
-    assert sig == catmod.stat_sig(ini_path)  # signature is CURRENT (post-race)
+    # THE fix: the signature is the PRE-mutation one, not the file's
+    # current (post-mutation) state.
+    assert sig == before_sig
+    after_sig = catmod.stat_sig(ini_path)
+    assert sig != after_sig  # size differs: "Before" vs "After\r\n\r\n"
+
+    # A subsequent reconcile WOULD flag this as drift (self-heals with
+    # one rebuild) rather than silently trusting the stale "Before" name
+    # forever — reconcile's fresh probe reads the file's CURRENT state,
+    # which no longer matches the stored (pre-mutation) signature.
+    assert catmod._folder_ini_sig(folder) == after_sig != sig
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"),
+                    reason="chmod 000 does not reliably block reads on Windows")
+def test_ini_variant_selection_agrees_when_first_candidate_unreadable(
+        tmp_path: Path) -> None:
+    """Codex review round-2 finding 3 (fauxcasa-cam.14 step 4): an
+    exists-but-UNREADABLE first INI_NAMES candidate (a real-world
+    permission hiccup) must not make the scan side (_read_folder_ini,
+    which falls through past it to a later readable name) and the
+    reconcile side (_folder_ini_sig) pick DIFFERENT variants — a plain
+    stat-only probe on the reconcile side would happily "succeed" on the
+    unreadable file (stat needs only directory permission, not file-read
+    permission) and report ITS signature, which would never match what
+    the scan actually indexed from the SECOND file — every reconcile
+    would then report drift forever, never converging. Both paths now
+    share _select_ini_variant, so they agree exactly. Skipped when
+    running as root: root ignores file-mode permission bits, so chmod
+    000 would not actually block the read and the test would be
+    meaningless (root is also skipped implicitly by the OSError below
+    never being raised, but an explicit skip is clearer)."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("running as root: chmod 000 does not block reads")
+
+    import catalog as catmod
+
+    folder = tmp_path / "lib"
+    folder.mkdir()
+    unreadable = folder / ".picasa.ini"   # first INI_NAMES candidate
+    unreadable.write_text("[Picasa]\r\nname=Unreadable\r\n")
+    readable = folder / "Picasa.ini"      # second INI_NAMES candidate
+    readable.write_text("[Picasa]\r\nname=Readable\r\n")
+    unreadable.chmod(0o000)
+    try:
+        with open(unreadable, "rb"):
+            pytest.skip("unreadable file was still readable in this "
+                       "environment (e.g. running as an unaffected "
+                       "privileged/container user) — chmod 000 didn't "
+                       "actually block the read here")
+    except OSError:
+        pass  # confirmed: this environment DOES enforce the permission
+
+    try:
+        # The scan side falls through to the readable second candidate.
+        result = catmod._read_folder_ini(folder)
+        assert result is not None
+        ini, sig = result
+        assert ini.path == readable
+        assert ini.section("Picasa").get("name") == "Readable"
+        assert sig == catmod.stat_sig(readable)
+
+        # The reconcile side's independent probe must pick the SAME
+        # (second, readable) variant — never the unreadable first one —
+        # so a reconcile right after this "scan" sees no drift.
+        assert catmod._folder_ini_sig(folder) == sig
+    finally:
+        unreadable.chmod(0o644)  # restore so tmp_path cleanup can remove it
 
 
 def test_offline_root_labels_empty_for_single_root_library(
