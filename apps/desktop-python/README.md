@@ -101,6 +101,23 @@ mismatch and rebuilds via the existing path.
   re-decodes); the min-zoom scaling issue is systemic (tile-count ×
   device-area, present at dpr 1 on large viewports too) and tracked as
   `fauxcasa-q6l.14`.
+- **Min-zoom 4K re-measure after the q6l.14 fix (`fauxcasa-q6l.26`),
+  measured 2026-08-12** (same Windows 4K box, fullscreen, 100k library;
+  raw runs in `docs/research/ncv-results/scroll-win4k-q6l26.jsonl`): the
+  scaled-paint cache + want-band cap **improve but do not close** the
+  min-zoom violation. Exact-dpr methodology (`QT_ENABLE_HIGHDPI_SCALING=0`
+  + `QT_SCALE_FACTOR`): dpr 1 p99 140 → **71 ms** (deadline hits 55%),
+  dpr 2 p99 **58 ms** (47%); RSS steady ~835 MB (was 1.0–1.1 GB), peak
+  still 1.0–1.2 GB. The box's *native* config (Windows 125 % scaling →
+  dpr 1.25, no overrides) is the worst case measured: min-zoom p99
+  **584 ms**, deadline hits 1.6 % — it combines a near-max column count
+  (42) with the 512-px source level (native edge 256×1.25 = 320 → 512).
+  Mechanism: the scaled-paint cache only pays on *re*-paints; during a
+  2.5-screens/s flick nearly every tile is a first paint doing a smooth
+  scale off a 4× source, plus in-paint decode-pump. Default zoom stays
+  healthy (dpr 2.5 p99 11 ms / 100 % deadline; dpr 1.25 p99 26 ms).
+  Remaining work (first-paint scale amortization / paint batching) is
+  tracked as `fauxcasa-q6l.27`.
 
 ## Run it
 
