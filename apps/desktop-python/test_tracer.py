@@ -9128,6 +9128,84 @@ def test_mainwindow_adopt_backfill_end_to_end(tmp_path: Path) -> None:
     win.shutdown()
 
 
+def test_cold_scan_nonblocking(tmp_path: Path, monkeypatch) -> None:
+    """Non-blocking first run (fauxcasa-q6l.13): main()'s cold non-adopt
+    branch hands MainWindow an EMPTY cfg-shaped catalog and calls
+    _start_cold_scan after show() — the window must stay responsive/
+    paintable while the walk is in flight, index_busy() must read True for
+    the whole time _cold_scan_pending is set (this is what keeps a
+    scripted --finish-build run from quitting mid-walk), and landing the
+    walk (_on_scan_done) must populate the real catalog via reload_data and
+    chain straight into the cold BUILD — the scan -> reload -> build gate
+    design."""
+    app = _offscreen_app()
+    import threading
+    import time as _time
+
+    import main
+    from catalog import Catalog
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    make_jpeg(root / "b.jpg")
+    cfg = libmod.legacy_config(root)
+
+    real_catalog = scan_library(root)
+    release = threading.Event()
+    calls = []
+
+    def fake_scan_library_config(cfg_, scan_filter, contacts, pal_dir,
+                                 exts, db3_dir):
+        calls.append(cfg_)
+        assert release.wait(5.0), "test never released the fake scan"
+        return real_catalog
+
+    monkeypatch.setattr(main, "_scan_library_config",
+                        fake_scan_library_config)
+
+    empty = Catalog(root=cfg.roots[0].path, photos=[], folders={},
+                    albums={}, roots=list(cfg.roots),
+                    library_id=cfg.library_id)
+    cache_dir = tmp_path / "cachedir"
+    win = main.MainWindow(empty, None, cache_dir=cache_dir, build_dir=None,
+                          cfg=cfg)
+    win.show()
+
+    # Constructing/showing the window must NOT itself have started a scan
+    # or build — main() calls _start_cold_scan explicitly, after show().
+    assert not win.index_busy()
+    assert win._scan_thread is None
+
+    win._start_cold_scan(cache_dir)
+    assert win._cold_scan_pending
+    assert win.index_busy()          # folded into index_busy from the start
+    assert win.catalog is empty      # not yet swapped — the walk is blocked
+
+    # The window stays responsive while the walk (blocked on `release`) is
+    # in flight: the event loop keeps pumping and the window is still the
+    # empty placeholder's — nothing here waits on the walk thread.
+    for _ in range(5):
+        app.processEvents()
+    assert win.isVisible()
+    assert win._cold_scan_pending     # still pending — release() not yet set
+    assert win.catalog is empty
+
+    release.set()
+    deadline = _time.time() + 5.0
+    while win._cold_scan_pending and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    app.processEvents()  # deliver the queued bridge.scan_done signal
+
+    assert not win._cold_scan_pending
+    assert win.catalog is real_catalog          # reload_data swapped it in
+    assert len(win.catalog.photos) == 2
+    assert win._build_thread is not None        # the cold BUILD was chained
+    assert calls == [cfg]                       # _scan_library_config args
+
+    win.shutdown()
+
+
 def test_mainwindow_backfill_persists_report_and_updates_notes(
         tmp_path: Path) -> None:
     """Review findings (fauxcasa-nu9): _start_backfill threads a real
