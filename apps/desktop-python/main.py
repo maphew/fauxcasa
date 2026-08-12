@@ -796,6 +796,18 @@ def _reconcile_online_roots(
     return total, labels
 
 
+def _folder_tooltip(path, description: str | None) -> str:
+    """Sidebar folder-item tooltip text (fauxcasa-cam.14): the on-disk path
+    (path on demand, per q6l.10) followed by the folder's .picasa.ini
+    [Picasa] description= on its own line when non-empty. Kept as a pure
+    function so all four sidebar shapes (single/multi-root x tree/flat)
+    share one formatting rule instead of drifting."""
+    tip = str(path)
+    if description:
+        tip += "\n" + description
+    return tip
+
+
 def _offline_root_labels(catalog: Catalog) -> list[str]:
     """Sidebar/status-bar badge labels for offline roots (design §12, bead
     .e). Only meaningful once a library actually HAS more than one root —
@@ -1950,7 +1962,8 @@ class MainWindow(QMainWindow):
                     item = QTreeWidgetItem(
                         folders_root, [f"{leaf}  ({fcount(folder)})"])
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
-                    item.setToolTip(0, str(root_path / rel))
+                    item.setToolTip(
+                        0, _folder_tooltip(root_path / rel, folder.description))
             else:
                 # Tree mode (default): hierarchical, with full-path tooltips.
                 nodes: dict[str, QTreeWidgetItem] = {"": folders_root}
@@ -1970,12 +1983,15 @@ class MainWindow(QMainWindow):
                     if fcount(folder) == 0:
                         continue
                     item = node_for(rel)
-                    if not rel:
-                        # node_for("") is the preseeded "Folders" header
-                        # standing in for the root folder — it skips the
-                        # tooltip assignment above, so keep the path-on-
-                        # demand promise here.
-                        item.setToolTip(0, str(root_path))
+                    # node_for() only sets a bare-path tooltip (it doesn't
+                    # know the Folder object); recompute here with the
+                    # description appended, whether rel is a real subfolder
+                    # or "" (node_for("") is the preseeded "Folders" header
+                    # standing in for the root folder — keep the path-on-
+                    # demand promise there too).
+                    item.setToolTip(0, _folder_tooltip(
+                        root_path if not rel else root_path / rel,
+                        folder.description))
                     item.setText(0, f"{folder.title}  ({fcount(folder)})")
         else:
             # Genuine multiroot: durable manifest order is display order in
@@ -2014,7 +2030,8 @@ class MainWindow(QMainWindow):
                         text = f"{label}  ({fcount(folder)})"
                     item = QTreeWidgetItem(folders_root, [text])
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
-                    item.setToolTip(0, str(root.path / folder.rel))
+                    item.setToolTip(0, _folder_tooltip(
+                        root.path / folder.rel, folder.description))
                     if folder.root_id in cat.offline_ids:
                         font = item.font(0)
                         font.setItalic(True)
@@ -2061,6 +2078,16 @@ class MainWindow(QMainWindow):
                     if fcount(folder) == 0 or folder.root_id not in root_nodes:
                         continue
                     item = node_for_root(folder.root_id, folder.rel)
+                    # node_for_root() only sets a bare-path tooltip (it
+                    # doesn't know the Folder object, and the root header
+                    # nodes created above never see one either); recompute
+                    # here with the description appended, using the owning
+                    # root's manifest path exactly as the bare-path tooltip
+                    # already does.
+                    root = roots_by_id[folder.root_id]
+                    item.setToolTip(0, _folder_tooltip(
+                        root.path if not folder.rel else root.path / folder.rel,
+                        folder.description))
                     if folder.rel:
                         item.setText(0, f"{folder.title}  ({fcount(folder)})")
                     else:

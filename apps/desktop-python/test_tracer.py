@@ -9897,6 +9897,84 @@ def test_multiroot_flat_folder_listing(tmp_path: Path) -> None:
     assert not by_key[folder_key(cat, id_a, "Zebra")].font(0).italic()
 
 
+def test_folder_tooltip_description(tmp_path: Path) -> None:
+    """Folder sidebar tooltips append the .picasa.ini [Picasa] description=
+    (if present) after the on-disk path, on its own line, in all four
+    sidebar shapes the flat/tree x single/multi-root toggle produces
+    (fauxcasa-cam.14, rebuilt against the q6l.10 flat/tree sidebar rework).
+    A folder with no description keeps the bare path-only tooltip."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+    from main import MainWindow
+    from catalog import scan_library, Catalog, Folder
+
+    def folder_tooltip(win, rel: str) -> str | None:
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == ("folder", rel):
+                return it.value().toolTip(0)
+            it += 1
+        return None
+
+    # --- single-root: tree mode and flat mode ---------------------------
+    root = tmp_path / "lib"
+    make_jpeg(root / "trip" / "a.jpg")
+    (root / "trip" / ".picasa.ini").write_text(
+        "[Picasa]\r\ndescription=Summer 2020\r\n")
+    make_jpeg(root / "plain" / "b.jpg")  # no ini, no description
+
+    cat = scan_library(root)
+    assert cat.folders["trip"].description == "Summer 2020"
+    assert cat.folders["plain"].description is None
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    # Tree mode (default)
+    tip = folder_tooltip(win, "trip")
+    assert tip is not None
+    assert str(root / "trip") in tip and "Summer 2020" in tip
+    assert folder_tooltip(win, "plain") == str(root / "plain")
+
+    # Flat mode
+    win._flat_check.setChecked(True)
+    tip_flat = folder_tooltip(win, "trip")
+    assert tip_flat is not None
+    assert str(root / "trip") in tip_flat and "Summer 2020" in tip_flat
+    assert folder_tooltip(win, "plain") == str(root / "plain")
+
+    # --- multiroot: tree mode and flat mode -----------------------------
+    root_a, root_b = tmp_path / "root-a", tmp_path / "root-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    folders = {
+        "2019": Folder(rel="2019", title="A 2019", description="Alpha album",
+                       photo_count=1, total_count=1, root_id=id_a),
+        f"{id_b}/2019": Folder(rel="2019", title="B 2019",
+                               photo_count=1, total_count=1, root_id=id_b),
+    }
+    roots = [libmod.LibraryRoot(id=id_a, path=root_a, label="Primary"),
+             libmod.LibraryRoot(id=id_b, path=root_b, label="Archive")]
+    mcat = Catalog(root=root_a, photos=[], folders=folders, albums={},
+                   roots=roots, library_id=libmod.mint_library_id())
+
+    mwin = MainWindow(mcat, None, cache_dir=None, build_dir=None)
+
+    # Tree mode (default): tooltip uses the OWNING root's manifest path.
+    tip_a = folder_tooltip(mwin, "2019")
+    assert tip_a is not None
+    assert str(root_a / "2019") in tip_a and "Alpha album" in tip_a
+    assert folder_tooltip(mwin, f"{id_b}/2019") == str(root_b / "2019")
+
+    # Flat mode
+    mwin._flat_check.setChecked(True)
+    tip_a_flat = folder_tooltip(mwin, "2019")
+    assert tip_a_flat is not None
+    assert str(root_a / "2019") in tip_a_flat and "Alpha album" in tip_a_flat
+    assert folder_tooltip(mwin, f"{id_b}/2019") == str(root_b / "2019")
+
+
 def test_folder_view_toggle_persistence(tmp_path: Path) -> None:
     """Flat/tree choice persists to the per-library config.json (q6l.10).
     save_folder_view / load_folder_view round-trip; default (tree) is absent
