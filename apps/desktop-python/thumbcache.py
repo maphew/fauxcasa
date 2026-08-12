@@ -36,6 +36,7 @@ from catalog import (
     ImportReport,
     save_catalog,
     save_catalog_retrying,
+    save_report,
 )
 from cropmap import crop_pixel_box, crop_qimage_upright
 from inmeta import read_jpeg_metadata
@@ -391,7 +392,9 @@ def apply_photo_meta(photo, size: int, mtime: int, sha: str,
 
     `report`: when supplied, a conflict entry is added for each field where
     an in-file value REPLACES a DIFFERENT non-empty ini value (fauxcasa-cam.17).
-    A gap-fill — ini had nothing, in-file supplies a value — is NOT reported."""
+    A gap-fill — ini had nothing, in-file supplies a value — is NOT reported.
+    star is excluded even though it can be overridden: see the inline
+    comment at the star assignment below."""
     photo.size, photo.mtime, photo.sha256 = size, mtime, sha
     if meta.caption:
         if report is not None and photo.caption and photo.caption != meta.caption:
@@ -414,9 +417,11 @@ def apply_photo_meta(photo, size: int, mtime: int, sha: str,
                        f"geotag: ini {photo.geotag} -> in-file {fmeta.gps}")
         photo.geotag = fmeta.gps
     if fmeta.rating:
-        if report is not None and photo.star and photo.star != fmeta.rating:
-            report.add("file", "infile_override", photo.rel,
-                       f"star: ini {photo.star} -> in-file {fmeta.rating}")
+        # star is excluded from infile_override reporting: machine-local
+        # star overlays (apply_star_overrides) are applied to the catalog
+        # BEFORE build_cache/backfill run, so photo.star here may already be
+        # this machine's override rather than the ini-original value — a
+        # report entry would misattribute the overlay's value to "ini".
         photo.star = fmeta.rating
 
 
@@ -523,10 +528,12 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
                 # RAW embedded preview: `data` is in-memory bytes extracted
                 # by rawpy, not the file on disk, so there is no path a
                 # reader could open directly -- a QBuffer is the only
-                # option. But the format is guaranteed JPEG (rawpy's
-                # extract_thumb only ever returns ThumbFormat.JPEG here,
-                # checked in rawload.raw_preview_jpeg), so an explicit
-                # "jpeg" format hint is safe: it names one battle-tested
+                # option. But the format is guaranteed JPEG: rawload.
+                # raw_preview_jpeg always returns JPEG bytes here — either
+                # rawpy's own ThumbFormat.JPEG preview as-is, or a
+                # ThumbFormat.BITMAP numpy array re-encoded to JPEG
+                # (fauxcasa-v46.5) — so an explicit "jpeg" format hint is
+                # safe: it names one battle-tested
                 # plugin directly, so Qt's format-probe loop (device.read()/
                 # peek() per candidate plugin, serialized under the
                 # image-plugin factory mutex) never runs, and this
@@ -884,6 +891,7 @@ def backfill_catalog(
     pause: threading.Event | None = None,
     workers: int = BACKFILL_WORKERS,
     persist_every: int = BACKFILL_PERSIST_EVERY,
+    report_path: Path | None = None,
 ) -> BackfillResult | None:
     """Fill an adopt-mode catalog's identity signals + in-file metadata in
     place, resumably, persisting to `catalog_path` as it goes. Returns a
@@ -899,7 +907,15 @@ def backfill_catalog(
     never starve the UI thread's grid scrolling; a set `pause` event parks
     the pass (checked between photos) until cleared or cancelled. Periodic
     checkpoints are fail-soft against transient Windows sharing violations
-    (see checkpoint below); only the terminal saves must land."""
+    (see checkpoint below); only the terminal saves must land.
+
+    `report_path`: when supplied, checkpoint() also persists catalog.report
+    (save_report) alongside the catalog — apply_photo_meta appends
+    infile_override entries to it as the pass runs (fauxcasa-cam.17), and
+    without this the entries for already-applied photos [0, cursor) would
+    be silently lost on cancel/resume (the cursor skips re-processing
+    them, so a dropped report is never regenerated). None preserves the
+    old catalog-only behavior for callers that don't pass it."""
     total = len(catalog.photos)
     start = 0
     if catalog.backfill_state == BACKFILL_IN_PROGRESS:
@@ -921,10 +937,20 @@ def backfill_catalog(
         if not must:
             try:
                 save_catalog(catalog, catalog_path)
+                if report_path is not None:
+                    save_report(catalog.report, report_path)
                 return True
             except OSError:
                 return False
         save_catalog_retrying(catalog, catalog_path)
+        if report_path is not None:
+            # Best-effort: a lost report on the terminal save is a
+            # diagnostics gap, never a reason to fail the backfill pass
+            # (ImportReport is explicitly non-gating — see save_report).
+            try:
+                save_report(catalog.report, report_path)
+            except OSError:
+                pass
         return True
 
     def wait_while_paused() -> None:

@@ -1281,7 +1281,7 @@ class GridView(QAbstractScrollArea):
         # Header play-glyph check (fauxcasa-q6l.16): intercept before the
         # photo/selection machinery; a glyph click never alters selection.
         folder_key = self._header_glyph_at(vx, vy)
-        if folder_key is not None:
+        if folder_key is not None and event.button() == Qt.MouseButton.LeftButton:
             self.play_group.emit(folder_key)
             return
         idx = self.photo_at(vx, vy)

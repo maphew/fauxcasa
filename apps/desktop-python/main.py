@@ -1496,6 +1496,7 @@ class MainWindow(QMainWindow):
         values photo by photo as the pass reaches them (§4 tier-1)."""
         bridge, catalog = self._bridge, self.catalog
         cat_path = self.cache_dir / "catalog.json"
+        report_path = self.cache_dir / REPORT_NAME
 
         def cb(done: int, total: int) -> None:
             if done % 100 == 0 or done == total:
@@ -1506,7 +1507,8 @@ class MainWindow(QMainWindow):
             try:
                 result = backfill_catalog(catalog, cat_path, progress=cb,
                                           cancel=self.build_cancel,
-                                          pause=self.backfill_pause)
+                                          pause=self.backfill_pause,
+                                          report_path=report_path)
             except Exception as e:  # report, never crash the UI
                 log.error("metadata backfill failed: %s", e)
                 _emit(bridge.backfill_done, False)
@@ -1538,6 +1540,7 @@ class MainWindow(QMainWindow):
         if kind == "recent" and not self.search.text().strip():
             self._apply_view(kind, key)   # the collection just populated
         self.grid.viewport().update()     # star badges may have changed
+        self._update_import_notes()       # infile_override entries landed
         self.statusBar().showMessage("metadata backfill complete", 8000)
         if self._reconcile_after_backfill:
             self._reconcile_after_backfill = False
@@ -1606,6 +1609,7 @@ class MainWindow(QMainWindow):
             # build_cache merged in-file captions/keywords into these SAME
             # Photo objects in place — the prebuilt haystacks are stale.
             self._rebuild_search_index()
+            self._update_import_notes()  # the cold build collected a fresh report
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
         self.statusBar().showMessage(
@@ -2452,10 +2456,13 @@ class MainWindow(QMainWindow):
         """Single-photo status readout (§5 dual mode): path, star count
         (★ repeated — one glyph per star, so a count > 1 reads at a
         glance), capture date, geotag coordinates (§3 geotag v1 display,
-        fauxcasa-cam.9/.10/.11), caption, keywords. Also feeds the
-        inspector panel (fauxcasa-q6l.25) when visible — this one method
-        already fires on grid selection, viewer navigation (photo_shown),
-        and after a star toggle, so the panel needs no new wiring."""
+        fauxcasa-cam.9/.10/.11), caption, keywords, a "Picasa-saved
+        original kept" chip when a stash copy exists (fauxcasa-cam.19),
+        and image dimensions + human-readable file size when known
+        (fauxcasa-q6l.12). Also feeds the inspector panel (fauxcasa-q6l.25)
+        when visible — this one method already fires on grid selection,
+        viewer navigation (photo_shown), and after a star toggle, so the
+        panel needs no new wiring."""
         if idx < 0:
             self.meta_label.setText("")
             if self.info_action.isChecked():

@@ -14,11 +14,15 @@ on:
     paths:
       - "apps/desktop-python/**"
       - "scripts/picasa_db.py"
+      - "scripts/make-synthetic-dng.py"
+      - "fixtures/raw-smoke/**"
       - ".github/workflows/bundle.yml"
   pull_request:
     paths:
       - "apps/desktop-python/**"
       - "scripts/picasa_db.py"
+      - "scripts/make-synthetic-dng.py"
+      - "fixtures/raw-smoke/**"
       - ".github/workflows/bundle.yml"
 
 jobs:

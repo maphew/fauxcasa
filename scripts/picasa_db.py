@@ -47,7 +47,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import locale
 import math
 import re
 import struct
@@ -666,28 +665,39 @@ def read_picasa_ini(path: Path | str) -> PicasaIni:
     - Bytes with [encoding] utf8=1 marker but not valid strict UTF-8
       (mixed-encoding file): surrogateescape keeps every byte intact.
     - Bytes that are NOT valid strict UTF-8 AND have no utf8=1 marker:
-      decode with the locale codepage (pre-UTF8 Picasa wrote the system
-      codepage), fail-soft back to surrogateescape if the codepage errors.
+      decode as cp1252 (Picasa was Windows-only, so cp1252 — not the
+      *running* machine's locale codepage, which would make ingest
+      platform-dependent and a no-op on UTF-8 locales like Linux/macOS —
+      is the codepage pre-UTF8 Picasa actually wrote), fail-soft back to
+      surrogateescape for the handful of cp1252 code points with no
+      mapping.
+
+    The byte-exact round-trip guarantee (every byte survives a decode +
+    re-encode cycle) holds for utf8=1-marked files and strictly-valid-UTF-8
+    files, both of which go through surrogateescape. Unmarked legacy
+    (cp1252) files round-trip only where cp1252's mapping is total — a
+    cp1252-undefined byte falls through to surrogateescape same as the
+    other paths.
     """
     path = Path(path)
     raw = path.read_bytes()
     if raw.startswith(b"\xef\xbb\xbf"):
         raw = raw[3:]
-    # Fast path: valid strict UTF-8 always uses surrogateescape.
     try:
-        raw.decode("utf-8")
-        text = raw.decode("utf-8", "surrogateescape")
+        # Fast path: strict decode succeeds -> no invalid byte to escape,
+        # so plain "utf-8" and "utf-8"+surrogateescape agree; no need to
+        # decode twice.
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
         if _has_utf8_marker(raw):
             # UTF-8 marked but bytes contain non-UTF-8 sequences (mixed-
             # encoding file); surrogateescape preserves every byte.
             text = raw.decode("utf-8", "surrogateescape")
         else:
-            # Pre-UTF8 Picasa: try the locale codepage.
-            enc = locale.getpreferredencoding(False) or "mbcs"
+            # Pre-UTF8 Picasa: Windows-only app, so cp1252.
             try:
-                text = raw.decode(enc)
-            except (UnicodeDecodeError, LookupError):
+                text = raw.decode("cp1252")
+            except UnicodeDecodeError:
                 text = raw.decode("utf-8", "surrogateescape")
 
     sections: list[IniSection] = []
@@ -1344,7 +1354,7 @@ def _count_contacts_xml(xml_path: Path) -> int:
     try:
         text = xml_path.read_text("utf-8")
         return len(re.findall(r"<contact\b", text))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return 0
 
 

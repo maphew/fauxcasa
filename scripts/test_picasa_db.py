@@ -385,12 +385,11 @@ def test_ini_undecodable_bytes_survive(tmp_path):
     assert cap.encode("utf-8", "surrogateescape") == b"caf\xe9 latin1"
 
 
-def test_ini_cp1252_caption(tmp_path, monkeypatch):
+def test_ini_cp1252_caption(tmp_path):
     """Without [encoding] utf8=1 and with non-strict-UTF-8 bytes, decode
-    falls through to the locale codepage (pre-UTF8 Picasa behavior).
-    Monkeypatch forces cp1252 so the assertion is portable."""
-    monkeypatch.setattr(pdb.locale, "getpreferredencoding",
-                        lambda do_setlocale=True: "cp1252")
+    falls through to cp1252 (pre-UTF8 Picasa was Windows-only, so cp1252 —
+    not the running machine's locale — is always the fallback codepage;
+    no monkeypatch needed, the real path is portable by construction)."""
     p = tmp_path / ".picasa.ini"
     # "Straße" in cp1252: ß = 0xDF; no [encoding] utf8=1 marker
     p.write_bytes(b"[photo.jpg]\ncaption=Stra\xdfe\n")

@@ -1244,8 +1244,11 @@ def test_infile_metadata_survives_catalog_roundtrip(tmp_path: Path) -> None:
 def test_infile_override_reported(tmp_path: Path) -> None:
     """When an in-file value replaces a DIFFERENT non-empty ini value, an
     infile_override entry is added to the catalog's import report (§4).
-    Covers caption, keywords, geotag, and star; date_taken has no ini key
-    so it is always a gap-fill and never produces an entry."""
+    Covers caption and keywords here (see test_infile_override_geotag_reported
+    for geotag); date_taken has no ini key so it is always a gap-fill and
+    never produces an entry, and star is deliberately excluded (machine-local
+    star overlays make the ini-original value unobservable at this point —
+    see apply_photo_meta)."""
     root = tmp_path / "lib"
     write_jpeg_meta(root / "f" / "p.jpg",
                     xmp=_xmp_app1(caption="file cap", keywords=("fkw",)))
@@ -1266,9 +1269,14 @@ def test_infile_override_reported(tmp_path: Path) -> None:
     assert '"ikw"' in kw_e.detail and '"fkw"' in kw_e.detail
 
 
-def test_infile_override_geotag_and_star_reported(tmp_path: Path) -> None:
-    """geotag and star overrides (ini geotag=/star=yes beaten by in-file
-    EXIF GPS/XMP Rating) each produce an infile_override entry."""
+def test_infile_override_geotag_reported(tmp_path: Path) -> None:
+    """A geotag override (ini geotag= beaten by in-file EXIF GPS) produces an
+    infile_override entry. star is deliberately NOT reported here even
+    though XMP Rating=3 beats ini star=yes: machine-local star overlays
+    (apply_star_overrides) are applied before build_cache runs, so
+    photo.star may already be an overlay value rather than the ini-original
+    — a report entry would misattribute the overlay to "ini" (see
+    apply_photo_meta)."""
     root = tmp_path / "mlib"
     _meta_jpeg(root / "f" / "a.jpg", gps=WHITEHORSE, rating=3)
     (root / "f" / ".picasa.ini").write_text(
@@ -1279,8 +1287,9 @@ def test_infile_override_geotag_and_star_reported(tmp_path: Path) -> None:
     overrides = {e.detail.split(":")[0]: e
                  for e in cat.report.entries if e.kind == "infile_override"}
     assert "geotag" in overrides
-    assert "star" in overrides
-    assert "ini 1" in overrides["star"].detail and "in-file 3" in overrides["star"].detail
+    assert "star" not in overrides
+    a = next(p for p in cat.photos if p.rel == "f/a.jpg")
+    assert a.star == 3  # in-file rating still WINS on the photo itself
 
 
 def test_infile_override_no_flood(tmp_path: Path) -> None:
@@ -6299,6 +6308,40 @@ def test_search_haystack_rebuilt_on_cold_index_finish(
     capsys.readouterr()                         # swallow the indexed event
 
 
+def test_import_notes_refresh_on_cold_index_finish(
+        tmp_path: Path, capsys) -> None:
+    """Review finding (fauxcasa-nu9): the cold-build branch of
+    _on_index_finished must also call _update_import_notes, same as the
+    reconcile branch (reload_data) already does — otherwise a fresh
+    infile_override entry from build_cache's §4 tier-1 merge stays
+    invisible in the status bar until relaunch."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    # in-file caption conflicts with ini -> one infile_override entry,
+    # recorded only once build_cache (the indexer) actually runs.
+    write_jpeg_meta(root / "f" / "p.jpg", xmp=_xmp_app1(caption="file cap"))
+    (root / "f" / ".picasa.ini").write_text(
+        "[p.jpg]\r\ncaption=ini cap\r\n")
+
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+    assert win.notes_label.text() == ""          # nothing yet: pre-index
+
+    result = thumbcache.build_cache(win.catalog, tmp_path / "cache")
+    assert result is not None
+    win._on_index_finished(result, win.catalog, False)  # cold-build finish
+
+    assert win.notes_label.isVisibleTo(win)
+    assert "1 import note" in win.notes_label.text()
+    assert "caption" in win.notes_label.toolTip()
+    capsys.readouterr()                         # swallow the indexed event
+
+
 def test_search_haystack_visible_subset_and_reveal(tmp_path: Path) -> None:
     """The precomputed visible-only pair list serves off-reveal searches
     (hidden photos excluded); reveal searches scan the full list. Semantics
@@ -8699,6 +8742,70 @@ def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
     assert load_catalog(path, root) is None
 
 
+def test_backfill_persists_report_across_resume(tmp_path: Path) -> None:
+    """A cancel/resume cycle must not lose infile_override report entries
+    for photos already applied before the cursor (review finding: the
+    cursor skips re-processing them, so a report dropped at cancel time is
+    gone forever). With report_path supplied, checkpoint() persists
+    catalog.report alongside the catalog on both the periodic and the
+    terminal save — the entry recorded for photo 0 survives a simulated
+    relaunch (fresh catalog load + report re-attach) and the finished
+    resume pass."""
+    import threading
+
+    from catalog import REPORT_NAME, load_report
+
+    root = tmp_path / "lib"
+    # p0: in-file caption conflicts with ini -> one infile_override entry
+    write_jpeg_meta(root / "f" / "p0.jpg",
+                    xmp=_xmp_app1(caption="file cap"))
+    (root / "f" / ".picasa.ini").write_text(
+        "[p0.jpg]\r\ncaption=ini cap\r\n")
+    make_jpeg(root / "f" / "p1.jpg")
+    cat, cat_path = _adopted_catalog(root, tmp_path)
+    report_path = tmp_path / REPORT_NAME
+
+    stop = threading.Event()
+    assert thumbcache.backfill_catalog(
+        cat, cat_path, cancel=stop, persist_every=1, report_path=report_path,
+        progress=lambda done, total: stop.set() if done >= 1 else None,
+    ) is None  # cancelled after photo 0's checkpoint
+
+    # The checkpoint after photo 0 must have persisted the override entry —
+    # not just the catalog.
+    on_disk = load_report(report_path)
+    overrides = [e for e in on_disk.entries if e.kind == "infile_override"]
+    assert len(overrides) == 1 and "caption" in overrides[0].detail
+
+    # Simulate the next launch: fresh catalog load + report re-attach
+    # (mirrors main()'s warm-start path), exactly as main.py does.
+    disk = load_catalog(cat_path, root)
+    assert disk is not None
+    disk.report = load_report(report_path)
+    assert len(disk.report.entries) == 1  # survived the "relaunch"
+
+    result = thumbcache.backfill_catalog(disk, cat_path,
+                                         report_path=report_path)
+    assert result is not None and result.photos == 1  # the tail only (p1)
+    # p0's entry is still there after the resumed pass completes — it was
+    # never re-derived (p0 wasn't re-processed) and never lost.
+    final = load_report(report_path)
+    final_overrides = [e for e in final.entries if e.kind == "infile_override"]
+    assert len(final_overrides) == 1 and "caption" in final_overrides[0].detail
+
+
+def test_backfill_report_path_none_preserves_old_behavior(
+        tmp_path: Path) -> None:
+    """The default report_path=None never writes a report file — existing
+    callers that don't pass it see no behavior change."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    cat, cat_path = _adopted_catalog(root, tmp_path)
+    result = thumbcache.backfill_catalog(cat, cat_path)
+    assert result is not None
+    assert not (tmp_path / "import-report.json").exists()
+
+
 def test_recent_empty_state_hint_while_backfill_pending(
         tmp_path: Path) -> None:
     """§1 modes-not-modals honesty (the PR #41 rider): while an adopt-mode
@@ -8803,6 +8910,62 @@ def test_mainwindow_adopt_backfill_end_to_end(tmp_path: Path) -> None:
     assert disk.backfill_state == BACKFILL_COMPLETE
     assert all(p.sha256 and p.mtime >= 0 for p in disk.photos)
     assert win._reconcile_thread is not None     # the deferred reconcile ran
+    win.shutdown()
+
+
+def test_mainwindow_backfill_persists_report_and_updates_notes(
+        tmp_path: Path) -> None:
+    """Review findings (fauxcasa-nu9): _start_backfill threads a real
+    report_path into backfill_catalog (reusing the same cache_dir/
+    REPORT_NAME the adopt path already saves to at scan time), so an
+    infile_override entry survives the pass on disk; and _on_backfill_done
+    calls _update_import_notes so the status-bar note appears without
+    requiring a relaunch."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import time as _time
+
+    from catalog import REPORT_NAME, load_report
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    # in-file caption conflicts with ini -> one infile_override entry
+    write_jpeg_meta(root / "f" / "p.jpg", xmp=_xmp_app1(caption="file cap"))
+    (root / "f" / ".picasa.ini").write_text(
+        "[p.jpg]\r\ncaption=ini cap\r\n")
+
+    built = thumbcache.build_cache(scan_library(root), tmp_path / "prebuilt")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(built.path)
+    thumbcache.bind(cache, cat)
+    cat.backfill_state = BACKFILL_NOT_STARTED
+    cache_dir = tmp_path / "cachedir"
+    save_catalog(cat, cache_dir / "catalog.json")
+
+    win = MainWindow(cat, cache, cache_dir=cache_dir, build_dir=None,
+                     warm=True, adopt=True)
+    assert win._backfill_thread is not None
+    assert win.notes_label.text() == ""  # nothing yet: backfill hasn't run
+
+    deadline = _time.time() + 20
+    while win._backfill_thread.is_alive() and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    assert not win._backfill_thread.is_alive()
+    app.processEvents()  # deliver backfill_done -> _on_backfill_done
+
+    # _update_import_notes ran without a relaunch (item A/B of the review).
+    assert win.notes_label.isVisibleTo(win)
+    assert "1 import note" in win.notes_label.text()
+
+    # report_path was threaded through: the entry is on disk, not just
+    # in the live catalog's report.
+    on_disk = load_report(cache_dir / REPORT_NAME)
+    overrides = [e for e in on_disk.entries if e.kind == "infile_override"]
+    assert len(overrides) == 1 and "caption" in overrides[0].detail
     win.shutdown()
 
 

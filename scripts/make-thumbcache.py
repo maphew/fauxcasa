@@ -216,9 +216,32 @@ def _open_source(path: Path):
     JPEG, its own EXIF tag applied by exif_transpose, once — else a
     half-size demosaic whose flip LibRaw already baked (so NO
     exif_transpose on that branch: orientation lands exactly once).
+
+    PREVIEW-ORIENTATION EDGE (fauxcasa-v46.5), mirrored PIL-side: some
+    vendors store the flip ONLY in the container (LibRaw sizes.flip) and
+    omit EXIF Orientation from the embedded JPEG preview, so a plain
+    exif_transpose silently no-ops and this script's cache would show the
+    preview sideways while the app (which injects a synthetic EXIF tag in
+    rawload.raw_preview_jpeg, then relies on QImageReader.setAutoTransform
+    to apply it) is corrected. Mirror strategy: when the preview JPEG
+    carries NO EXIF Orientation tag of its own AND sizes.flip is nonzero,
+    apply the equivalent PIL transpose directly — no synthetic-tag
+    injection needed here since there is no downstream EXIF-reading
+    consumer, only this script's own encode step. _LIBRAW_FLIP_TO_PIL_
+    TRANSPOSE mirrors rawload.py's _LIBRAW_FLIP_TO_EXIF_ORIENTATION mapping
+    (TIFF/EXIF Orientation 3/6/8 <-> flip 3/6/5), translated to the
+    matching Image.Transpose op instead of an EXIF tag value. Deliberately
+    NOT importing rawload here — this script stays self-contained (PEP 723).
+
     Video files route BY EXTENSION to the PyAV poster path (never PIL).
     Raises on failure; _make_thumb's broad except is the error tile."""
     from PIL import Image, ImageOps
+
+    _LIBRAW_FLIP_TO_PIL_TRANSPOSE = {
+        3: Image.Transpose.ROTATE_180,   # flip 3 -> EXIF 3 (180 deg)
+        5: Image.Transpose.ROTATE_90,    # flip 5 -> EXIF 8 (90 deg CCW)
+        6: Image.Transpose.ROTATE_270,   # flip 6 -> EXIF 6 (90 deg CW)
+    }
 
     if path.suffix.lower() in VIDEO_EXTS:
         return _video_poster(path)
@@ -236,8 +259,14 @@ def _open_source(path: Path):
                 jpeg = None  # no/unsupported preview -> demosaic below
             if jpeg is None:
                 return Image.fromarray(raw.postprocess(half_size=True))
+            flip = raw.sizes.flip  # read before the rawpy context closes
         with Image.open(io.BytesIO(jpeg)) as img:
-            return ImageOps.exif_transpose(img).convert("RGB")
+            if img.getexif().get(0x0112):  # 274: Orientation, own tag wins
+                return ImageOps.exif_transpose(img).convert("RGB")
+            op = _LIBRAW_FLIP_TO_PIL_TRANSPOSE.get(flip)
+            if op is not None:
+                img = img.transpose(op)
+            return img.convert("RGB")
     with Image.open(path) as img:
         # Bake EXIF orientation (all 8 cases, mirrors too) so this builder
         # agrees with the in-app one (apps/desktop-python/thumbcache.py) and
