@@ -1284,12 +1284,54 @@ _INI_EDIT_KEYS = frozenset(
 )
 
 
-def _survey_ini_tree(root: Path) -> dict[str, Any]:
+def _count_pal_files(albums_dir: Path) -> int:
+    """Count *.pal files in a Picasa2Albums directory; 0 if absent.
+
+    Counts only — the file names are internal UIDs (32 hex), not personal
+    data, but we count without reading them so the output is always safe.
+    """
+    if not albums_dir.is_dir():
+        return 0
+    return sum(1 for _ in albums_dir.glob("*.pal"))
+
+
+def _count_contacts_xml(xml_path: Path) -> int:
+    """Count <contact> elements in a Picasa contacts.xml file; 0 if absent.
+
+    Uses a tag-scan rather than an XML parser so the file path never
+    appears in any error path (privacy-safe like the survey functions).
+    """
+    if not xml_path.is_file():
+        return 0
+    try:
+        text = xml_path.read_text("utf-8")
+        return len(re.findall(r"<contact\b", text))
+    except OSError:
+        return 0
+
+
+def _survey_ini_tree(root: Path, *,
+                     image_exts: frozenset[str] | None = None,
+                     video_exts: frozenset[str] | None = None) -> dict[str, Any]:
     """Aggregate .picasa.ini usage across a library tree.
 
     Counts only — no paths, section names, key names outside the known
     vocabulary, or values appear in the output, so this is safe to run on
     a private library by construction.
+
+    When ``image_exts`` is provided (a frozenset of lower-case dot-suffixes
+    such as ``{".jpg", ".avi"}``), the result also contains a ``media``
+    sub-dict with survey-owned counts so callers do not need their own
+    filesystem walks:
+
+    - ``files``   — total media files matching ``image_exts``
+    - ``folders`` — directories containing at least one media file
+    - ``videos``  — subset matching ``video_exts`` (None when not provided)
+
+    These three fields are the reference side of the ingest-parity gate
+    (fauxcasa-ed5.11): promoting them here means the gate's entire
+    reference side is survey-owned and the generator's manifest.json is
+    the only other source of truth.
     """
     n_files = 0
     n_dirs = 0
@@ -1298,11 +1340,24 @@ def _survey_ini_tree(root: Path) -> dict[str, Any]:
     sections: Counter[str] = Counter()
     keys: Counter[str] = Counter()
     feats: Counter[str] = Counter()
+    # media-counting state — only populated when image_exts is provided
+    n_media = 0
+    n_video = 0
+    media_folders: set[Path] = set()
     for p in sorted(root.rglob("*")):
         if p.is_dir():
             n_dirs += 1
             continue
-        if p.name.lower() not in (".picasa.ini", "picasa.ini") or not p.is_file():
+        if not p.is_file():
+            continue
+        if image_exts is not None:
+            ext = p.suffix.lower()
+            if ext in image_exts:
+                n_media += 1
+                media_folders.add(p.parent)
+                if video_exts is not None and ext in video_exts:
+                    n_video += 1
+        if p.name.lower() not in (".picasa.ini", "picasa.ini"):
             continue
         n_files += 1
         try:
@@ -1344,7 +1399,7 @@ def _survey_ini_tree(root: Path) -> dict[str, Any]:
                     )
                 if kl in _INI_EDIT_KEYS:
                     feats["edit_keys"] += 1
-    return {
+    result: dict[str, Any] = {
         "ini_files": n_files,
         # distinguishes "library has no ini files" from a near-empty walk
         "dirs_walked": n_dirs,
@@ -1354,6 +1409,13 @@ def _survey_ini_tree(root: Path) -> dict[str, Any]:
         "keys": dict(sorted(keys.items())),
         "features": dict(sorted(feats.items())),
     }
+    if image_exts is not None:
+        result["media"] = {
+            "files": n_media,
+            "videos": n_video if video_exts is not None else None,
+            "folders": len(media_folders),
+        }
+    return result
 
 
 def cmd_survey(args: argparse.Namespace) -> int:
