@@ -609,19 +609,56 @@ def stat_sig(path: Path | None) -> tuple[int, int] | None:
     return (st.st_size, int(st.st_mtime))
 
 
+def _select_ini_variant(folder: Path) -> Path | None:
+    """Pick whichever INI_NAMES variant `folder` carries THE SAME WAY
+    _read_folder_ini's parse actually will (fauxcasa-cam.14 step 4, Codex
+    review round-2 finding 3): the first name that both stats as a file
+    AND opens for read without an OSError — not just the first that
+    stats. A plain existence/stat check alone is NOT enough: an
+    exists-but-permission-denied first candidate stats fine (stat only
+    needs directory-list permission, not file-read permission) but
+    `read_picasa_ini` (path.read_bytes()) would fail on it and fall
+    through to a LATER name — so a probe that only checks `is_file()`
+    would pick a DIFFERENT variant than the scan actually parses. That
+    mismatch never converges: every reconcile re-derives the (wrong)
+    first candidate's signature, which never matches what was stored for
+    the (correct, later) variant the scan indexed, so Drift.ini_changed
+    stays permanently set — a perpetual full reindex, not a one-time
+    self-heal. The open-for-read probe (open+immediately close, no
+    read()) is a lightweight proxy for read_picasa_ini's own
+    path.read_bytes() open — a permission failure raises OSError at
+    open() time for both, so the two agree without this reconcile-side
+    probe needing to actually parse ini content (Drift stays a cheap
+    size+mtime signal, no hashing, no parsing). Shared by both
+    _folder_ini_sig (reconcile) and _read_folder_ini (scan) so they
+    cannot drift apart again."""
+    for name in INI_NAMES:
+        p = folder / name
+        if not p.is_file():
+            continue
+        try:
+            with open(p, "rb"):
+                pass
+        except OSError:
+            continue  # exists but unreadable (e.g. permission denied)
+        return p
+    return None
+
+
 def _folder_ini_sig(folder: Path) -> tuple[int, int] | None:
     """The freshness signal for whichever INI_NAMES variant `folder`
-    carries (first match wins, same probe order as _read_folder_ini), or
-    None when the folder has no ini under any of the legacy names.
-    scan_library uses this to populate Catalog.ini_sigs at scan time;
-    reconcile_walk recomputes it fresh per folder to detect Drift.
-    ini_changed — both sides read the exact same signal, so an externally
-    modified/added/removed ini is never missed by one but not the other."""
-    for name in INI_NAMES:
-        sig = stat_sig(folder / name)
-        if sig is not None:
-            return sig
-    return None
+    carries (_select_ini_variant — the exact same selection
+    _read_folder_ini's parse uses), or None when the folder has no
+    readable ini under any of the legacy names. scan_library uses
+    _read_folder_ini to populate Catalog.ini_sigs at scan time;
+    reconcile_walk calls this to recompute it fresh per folder and
+    detect Drift.ini_changed — both sides read the exact same signal
+    for the exact same file, so an externally modified/added/removed
+    ini is never missed by one but not the other, and an
+    exists-but-unreadable variant can never make the two sides pick
+    different files."""
+    p = _select_ini_variant(folder)
+    return stat_sig(p) if p is not None else None
 
 
 def _ancestor_closure(folder_rels: set[str]) -> set[str]:
@@ -649,30 +686,40 @@ def _ancestor_closure(folder_rels: set[str]) -> set[str]:
 
 def _read_folder_ini(
         folder: Path) -> tuple[picasa_db.PicasaIni, tuple[int, int] | None] | None:
-    """Read whichever INI_NAMES variant `folder` carries, paired with that
-    EXACT file's freshness signature stat'd immediately after the read
-    succeeds (fauxcasa-cam.14 step 4, Codex review finding 3) — not a
-    separate `_folder_ini_sig` call made later (end of scan_library, after
-    every OTHER folder's ini has also been read and every photo file has
-    been walked): a real-world edit landing in that much larger window
-    would persist the OLD parsed content under the NEW signature, so
-    reconcile would never notice the edit again. Stat-right-after-read
-    also closes the variant-fallback race: the signature is guaranteed to
-    describe the SAME path `read_picasa_ini` actually parsed, never a
-    DIFFERENT INI_NAMES variant a second independent probe might pick if
-    the folder's ini file changed identity between the two calls. None
-    sig (file vanished between the read and the stat, vanishingly rare)
-    just means no freshness signal for this folder, same as no ini at
-    all — never a crash, matching every other stat_sig fail-soft case."""
-    for name in INI_NAMES:
-        p = folder / name
-        if p.is_file():
-            try:
-                ini = picasa_db.read_picasa_ini(p)
-            except OSError:
-                continue  # unreadable file; try the legacy names
-            return ini, stat_sig(p)
-    return None
+    """Read whichever INI_NAMES variant `folder` carries (_select_ini_variant
+    — the same selection _folder_ini_sig's reconcile-side probe uses, Codex
+    review round-2 finding 3), paired with that EXACT file's freshness
+    signature stat'd BEFORE the parse read (round-2 finding 1, correcting
+    the prior stat-AFTER-read version this bead first shipped).
+
+    THE GUIDING PRINCIPLE (round-2): a freshness signature must never be
+    NEWER than the content it describes. Stat-after-read got this
+    backwards — an external rewrite landing DURING `read_picasa_ini`'s own
+    read would parse (some mix of) the NEW content but then stat the
+    file in its already-rewritten state, storing NEW content under a
+    signature that also already reads as "current" — reconcile would
+    then see no drift and never notice the edit, forever. Stat-BEFORE-
+    read instead pairs whatever content actually gets parsed (old, or a
+    torn mix if the rewrite lands mid-read) with the OLDER pre-read
+    signature: the next reconcile re-stats, sees a MISMATCH against that
+    stored (now-stale) signature, and rebuilds — a rewrite mid-parse is
+    self-healed by one spurious rebuild instead of persisting stale
+    content permanently. (No fallback-on-parse-failure loop is needed
+    beyond _select_ini_variant's own readability probe: that probe
+    already opens the exact winning path immediately before this
+    function stats and parses it, so a `read_picasa_ini` failure here
+    would only happen in the vanishingly rare gap between the probe and
+    this call — treated the same as "no ini" rather than re-probing
+    further names, keeping this simple.)"""
+    p = _select_ini_variant(folder)
+    if p is None:
+        return None
+    sig = stat_sig(p)  # BEFORE the read — see the docstring above
+    try:
+        ini = picasa_db.read_picasa_ini(p)
+    except OSError:
+        return None
+    return ini, sig
 
 
 def _section_map(ini: picasa_db.PicasaIni) -> dict[str, picasa_db.IniSection]:

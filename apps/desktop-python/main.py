@@ -1574,22 +1574,22 @@ class MainWindow(QMainWindow):
             try:
                 # Reload contacts.xml from disk HERE, right before the
                 # rescan, instead of reusing self.contacts (the map loaded
-                # once at STARTUP) — Codex review finding 4: if
-                # contacts.xml was edited between startup and this
-                # reconcile, self.contacts is already stale, and pairing
-                # it with a signature stat'd from the file's CURRENT
-                # (post-edit) state would persist a contacts_sig that
-                # claims content newer than what was actually resolved
-                # into `fresh` — a later warm start would then trust
-                # those stale names forever instead of ever re-resolving
-                # them. Stat immediately after the read succeeds (same
-                # read-then-stat adjacency as _read_folder_ini's own fix
-                # for the equivalent ini race), so contacts_sig and the
-                # names baked into `fresh` always describe the exact same
-                # snapshot.
+                # once at STARTUP) — fauxcasa-cam.14 step 4: if contacts.xml
+                # was edited between startup and this reconcile,
+                # self.contacts is already stale. Stat BEFORE the read, not
+                # after (Codex review round-2 finding 2 — same guiding
+                # principle as catalog._read_folder_ini's pre-read stat: a
+                # signature must never be NEWER than the content it
+                # describes). Stat-after-read would let an edit landing
+                # DURING load_contacts_xml's own read pair NEW content with
+                # a signature that already reads as current, so a later
+                # warm start would trust that content forever. Stat-before
+                # instead pairs whatever gets parsed with the OLDER
+                # pre-read signature, so a rewrite mid-read is self-healed
+                # by one spurious rebuild on the NEXT reconcile.
                 if self.contacts_path is not None:
-                    rescan_contacts = load_contacts_xml(self.contacts_path)
                     contacts_sig = stat_sig(self.contacts_path)
+                    rescan_contacts = load_contacts_xml(self.contacts_path)
                 else:
                     rescan_contacts, contacts_sig = self.contacts, None
                 fresh = scan_library(old.root, self.scan_filter,
@@ -3142,6 +3142,19 @@ def main() -> int:
     # but an explicitly named file that yields nothing is worth a warning.
     contacts: dict[str, str] = {}
     contacts_path = args.contacts or default_contacts_xml()
+    # Stat BEFORE the read (Codex review round-2 finding 2 — same
+    # guiding principle as catalog._read_folder_ini's own pre-read stat:
+    # a freshness signature must never be NEWER than the content it
+    # describes). _scan_library_config below can take a long time on a
+    # big library; stamping stat_sig(contacts_path) only AFTER it returns
+    # would let an external contacts.xml edit DURING the scan pair NEW
+    # content with a signature that already reads as current, so a later
+    # reconcile would never notice the edit. Capturing it here instead —
+    # right before contacts.xml is actually read — pairs whatever gets
+    # parsed with the OLDER pre-read signature, so a rewrite mid-scan is
+    # self-healed by one spurious rebuild on the next reconcile instead
+    # of persisting stale content forever.
+    contacts_sig = stat_sig(contacts_path)
     if contacts_path is not None:
         contacts = load_contacts_xml(contacts_path)
         if contacts:
@@ -3245,10 +3258,14 @@ def main() -> int:
             cfg, scan_filter, contacts, pal_dir, exts, db3_dir)
         # scan_library/_scan_library_config only see the already-parsed
         # `contacts` name map, never the contacts.xml PATH — stamp the
-        # freshness signal here, once, so it covers both the legacy and
-        # composed multi-root shapes and both the adopt and normal cold
-        # paths below (fauxcasa-cam.14 step 4).
-        catalog.contacts_sig = stat_sig(contacts_path)
+        # freshness signal captured BEFORE load_contacts_xml ran (above),
+        # not a fresh re-stat here (Codex review round-2 finding 2): the
+        # scan this cold path just ran can take a long time, and
+        # re-statting only now would risk pairing a mid-scan external
+        # edit's NEW content with a signature that already looks current.
+        # Covers both the legacy and composed multi-root shapes and both
+        # the adopt and normal cold paths below (fauxcasa-cam.14 step 4).
+        catalog.contacts_sig = contacts_sig
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
