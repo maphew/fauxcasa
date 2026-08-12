@@ -200,17 +200,18 @@ PREFETCH_SCREENS = 1.0
 
 
 def prefetch_margin(viewport_w: int, viewport_h: int, tile_px: int,
-                    native_bytes: int, band_budget: int | None = None) -> int:
+                    tile_bytes: int, band_budget: int | None = None) -> int:
     """Prefetch margin in px above/below the viewport (fauxcasa-q6l.14).
 
     Pure function of the viewport size, the current tile size, and the
-    native decoded-tile byte cost, so the want-band (visible + one margin
-    each way) stays within a byte budget (CACHE_BYTES by default; wanted
-    tiles are decoded at native resolution regardless of zoom, so the band's
-    RAM cost is band_tiles * native_bytes). Shrinks from the full
-    PREFETCH_SCREENS margin as the tile count grows; hits 0 when the visible
-    set alone exceeds the budget — visible tiles are ALWAYS wanted (never
-    dropped), only prefetch gives way. Cell math mirrors _relayout/_cell."""
+    per-tile byte cost, so the want-band (visible + one margin each way)
+    stays within a byte budget (CACHE_BYTES by default). The band's RAM
+    cost is band_tiles * tile_bytes; the caller decides what a band tile
+    costs (paintEvent passes native decode bytes plus the scaled-paint
+    variant's worst case). Shrinks from the full PREFETCH_SCREENS margin as
+    the tile count grows; hits 0 when the visible set alone exceeds the
+    budget — visible tiles are ALWAYS wanted (never dropped), only prefetch
+    gives way. Cell math mirrors _relayout/_cell."""
     if band_budget is None:
         band_budget = CACHE_BYTES  # resolved at call time (tests patch it)
     cell = tile_px + PAD
@@ -218,7 +219,7 @@ def prefetch_margin(viewport_w: int, viewport_h: int, tile_px: int,
     # rows the viewport can intersect: full rows + a partial at each edge
     visible_rows = (viewport_h + cell - 1) // cell + 1
     visible = cols * visible_rows
-    max_band_tiles = max(1, band_budget // max(1, native_bytes))
+    max_band_tiles = max(1, band_budget // max(1, tile_bytes))
     if visible >= max_band_tiles:
         return 0
     # spare tiles -> whole rows, split across the two margins (above/below)
@@ -618,11 +619,14 @@ class GridView(QAbstractScrollArea):
 
     def _drop_scaled(self) -> None:
         """Release every cached scaled-paint variant (fauxcasa-q6l.14).
-        Called on zoom change: the variants are keyed to self.tile, so all
-        of them just went stale. Their bytes leave the accounting; the
+        Called on zoom change: the variants are keyed to their device-pixel
+        size, so all of them just went stale. Paint would detect the key
+        mismatch and re-scale visible tiles anyway — this eager pass exists
+        to release the bytes of NON-visible cached tiles too (they are never
+        repainted, so their stale variants would otherwise linger). The
         native images stay (z1e: zoom never re-decodes)."""
         for t in self.tiles.values():
-            if len(t) >= 5 and t[3] is not None:
+            if t[3] is not None:
                 b = t[3].sizeInBytes()
                 t[2] -= b
                 self._cache_bytes -= b
@@ -991,11 +995,16 @@ class GridView(QAbstractScrollArea):
 
         # The want-band (visible + prefetch) gates worker dequeues and
         # eviction, so publish it before drawing or requesting anything.
-        # The margin is capped so the band's native-tile bytes fit the
-        # cache budget (q6l.14) — on huge viewports at small zoom it hits
-        # 0 and the band is exactly the visible set.
+        # The margin is capped so the band's bytes fit the cache budget
+        # (q6l.14) — on huge viewports at small zoom it hits 0 and the band
+        # is exactly the visible set. Each band tile is budgeted at native
+        # bytes PLUS the scaled-paint variant painted tiles carry: the
+        # paint gate caps a variant at half the native area, so 1.5x native
+        # is a true per-tile bound and the band (exempt from eviction)
+        # cannot push steady-state bytes past CACHE_BYTES.
+        native_bytes = self._tile_native * self._tile_native * 4
         margin = prefetch_margin(vp.width(), vp.height(), self.tile,
-                                 self._tile_native * self._tile_native * 4)
+                                 native_bytes + native_bytes // 2)
         band = [(g, n, idx) for g, n, idx in
                 self._visible_items(top - margin, bottom + margin)]
         self.wanted = frozenset(idx for _g, _n, idx in band)
@@ -1037,16 +1046,17 @@ class GridView(QAbstractScrollArea):
                 target = QRect(r.x() + (self.tile - dw) // 2,
                                r.y() + (self.tile - dh) // 2, dw, dh)
                 # Device-pixel size of the blit (q7m: dw logical px cover
-                # dw*dpr device px). Cache only a REAL downscale — when the
-                # device target already needs img's full resolution (max
-                # zoom, or hi-DPI filling native pixels), draw img directly.
+                # dw*dpr device px). Cache only a MEANINGFUL downscale — at
+                # least a 2x area reduction. A `sw < img.width()` test would
+                # also fire on 1-px aspect-fit rounding (e.g. dpr 2, native
+                # 512x341 -> sh 340), caching a near-full-resolution
+                # duplicate of the tile for no paint benefit and halving the
+                # effective cache; near-native sizes draw img directly.
                 sw = max(1, round(dw * dpr))
                 sh = max(1, round(dh * dpr))
-                if sw < img.width() or sh < img.height():
-                    if len(t) < 5:  # hand-built 3-slot entry (tests)
-                        t.extend((None, 0))
-                    if t[3] is None or t[4] != self.tile:
-                        if t[3] is not None:  # stale zoom: release bytes
+                if sw * sh * 2 <= img.width() * img.height():
+                    if t[3] is None or t[4] != (sw, sh):
+                        if t[3] is not None:  # stale size: release bytes
                             old = t[3].sizeInBytes()
                             t[2] -= old
                             self._cache_bytes -= old
@@ -1056,12 +1066,24 @@ class GridView(QAbstractScrollArea):
                             Qt.TransformationMode.SmoothTransformation)
                         simg.setDevicePixelRatio(dpr)
                         t[3] = simg
-                        t[4] = self.tile
+                        # Key on the DEVICE size actually painted, not the
+                        # logical self.tile: a dpr change that leaves
+                        # _tile_native alone (sub-1 ratios floor at
+                        # TILE_NATIVE) must not keep blitting a wrong-sized
+                        # variant. This also makes _drop_scaled a pure
+                        # byte-release optimization, not a correctness need.
+                        t[4] = (sw, sh)
                         sb = simg.sizeInBytes()
                         t[2] += sb
                         self._cache_bytes += sb
                     painter.drawImage(target, t[3])
                 else:
+                    if t[3] is not None:  # size grew past the gate (dpr
+                        old = t[3].sizeInBytes()  # change): release bytes
+                        t[2] -= old
+                        self._cache_bytes -= old
+                        t[3] = None
+                        t[4] = 0
                     painter.drawImage(target, img)
             photo = self.catalog.photos[idx]
             # Reveal mode shows hidden=yes / stash files; veil them so they
