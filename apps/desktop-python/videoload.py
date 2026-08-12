@@ -39,6 +39,7 @@ the decode-service §3c sandbox-valve ruling — not this module's scope.
 from __future__ import annotations
 
 import io
+from datetime import datetime
 
 # Picasa 3's documented video list ("For playback in Picasa",
 # files-supported-by-picasa3.md): mpg, mod, mmv, tod, wmv, asf, avi,
@@ -162,5 +163,61 @@ def probe_duration(source) -> float | None:
                         and s.time_base is not None:
                     return float(s.duration * s.time_base)
     except Exception:  # noqa: BLE001 — fail-soft: duration is decoration
+        pass
+    return None
+
+
+def _parse_creation_time(value: str | None) -> str | None:
+    """ISO 8601 container creation_time -> 'YYYY-MM-DDTHH:MM:SS', or None.
+    Accepts 'YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH:MM]' and the rare
+    space-separated variant; ignores unparseable values (all-zeros
+    placeholders, out-of-range fields, etc.)."""
+    if not value:
+        return None
+    s = value.strip()
+    # Normalise the space-separated ISO 8601 variant to 'T'.
+    if len(s) >= 11 and s[10] == " ":
+        s = s[:10] + "T" + s[11:]
+    # Strip timezone suffix: 'Z', or the first '+'/'-' at position >= 19.
+    for i, c in enumerate(s):
+        if i >= 19 and c in ("Z", "+", "-"):
+            s = s[:i]
+            break
+    # Strip sub-second fraction at position >= 19.
+    dot = s.find(".")
+    if dot >= 19:
+        s = s[:dot]
+    # Validate the canonical 19-char shape 'YYYY-MM-DDTHH:MM:SS', then the
+    # actual calendar: cameras emit all-zero placeholders (0000-00-00...)
+    # and garbage fields, which must fall back to mtime, not sort as dates.
+    if (len(s) == 19 and s[4] == "-" and s[7] == "-"
+            and s[10].upper() == "T" and s[13] == ":" and s[16] == ":"):
+        canon = s[:10] + "T" + s[11:19]
+        try:
+            datetime.strptime(canon, "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return None
+        return canon
+    return None
+
+
+def probe_creation_time(source) -> str | None:
+    """The container's creation_time as 'YYYY-MM-DDTHH:MM:SS', or None.
+    Tries container-level metadata first, then the video stream's own
+    metadata dict; returns None when absent, undecodable, or unparseable.
+    Same fail-soft shape as probe_duration — a missing timestamp is
+    decoration, never a reason to abort an index."""
+    try:
+        with _open_container(source) as container:
+            dt = _parse_creation_time(container.metadata.get("creation_time"))
+            if dt is not None:
+                return dt
+            for s in container.streams:
+                if s.type == "video":
+                    dt = _parse_creation_time(
+                        s.metadata.get("creation_time"))
+                    if dt is not None:
+                        return dt
+    except Exception:  # noqa: BLE001 — fail-soft: creation_time is decoration
         pass
     return None
