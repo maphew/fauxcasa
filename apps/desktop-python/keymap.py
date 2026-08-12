@@ -57,7 +57,11 @@ Picasa Photo Viewer / edit-view surface (our single-photo viewer):
     mousewheel
     Space                 Add / remove star          viewer.star_toggle; slideshow.pause is
                                                      context-specific during playback
-    / , .                 Video pause/rew/ff         v46.3 (playback is gated)
+    / , .                 Video pause/rew/ff         v46.3 ships viewer.play_pause on P and
+                                                     viewer.seek_back/seek_fwd on Ctrl+Left/
+                                                     Ctrl+Right instead — Space is taken by
+                                                     star_toggle (the triage loop's key), and
+                                                     / , . remain unclaimed for a follow-up
 
 Fauxcasa-only bindings (no Picasa equivalent):
 
@@ -238,6 +242,24 @@ DEFAULT_SCHEME: dict[str, Binding] = {
     "viewer.prev": Binding(
         ("Left", "K"), key_only=True,
         note="Picasa: Left/K = prev."),
+    "viewer.play_pause": Binding(
+        ("P",),
+        note="Video playback (fauxcasa-v46.3): play/pause the shown video. "
+             "Our own pick — Picasa's documented video keys are / (pause) "
+             "and , . (rew/ff), but Space is claimed by star_toggle (the "
+             "triage loop's key, which must keep working on videos), so P "
+             "carries play/pause; / , . stay unclaimed (module docstring)."),
+    "viewer.seek_back": Binding(
+        ("Ctrl+Left",),
+        note="Skip back 5 s during video playback (v46.3). CONTEXT-LAYERED "
+             "on viewer.pan_left's chord deliberately: pan fires only while "
+             "zoomed and 1:1 is unsupported for video in v1, seek only while "
+             "a playback session is live — mutually exclusive by handler "
+             "gates, encoded in _CONTEXT_LAYERED so conflicts() stays green."),
+    "viewer.seek_fwd": Binding(
+        ("Ctrl+Right",),
+        note="Skip forward 5 s during video playback. As viewer.seek_back "
+             "(context-layered on viewer.pan_right)."),
 
     # ---- slideshow ----
     "slideshow.pause": Binding(
@@ -268,6 +290,18 @@ RESERVED_KEYS: dict[str, str] = {
 # The one binding allowed to sit on a reserved key until M2 claims it.
 _GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     {("viewer.zoom_toggle", "1")})
+
+# Deliberate same-chord pairs resolved by mutually exclusive handler gates
+# (the exact-vs-key_only layering rule's sibling for two EXACT chords):
+# viewer.pan_* fires only while zoomed — and 1:1 is unsupported for video
+# in v1 — while viewer.seek_* fires only while a video playback session is
+# live (fauxcasa-v46.3), so the same Ctrl+arrow can never reach both.
+# conflicts() skips exactly these pairs; any OTHER exact duplicate still
+# fails the suite.
+_CONTEXT_LAYERED: frozenset[frozenset[str]] = frozenset({
+    frozenset({"viewer.pan_left", "viewer.seek_back"}),
+    frozenset({"viewer.pan_right", "viewer.seek_fwd"}),
+})
 
 # Modifiers stripped before exact matching: keypad Enter/digits count as
 # their main-row keys (the pre-keymap handlers accepted KeypadModifier).
@@ -330,6 +364,10 @@ def conflicts(scheme: dict[str, Binding] | None = None,
     * an exact chord vs a key_only binding on the same key is ALLOWED —
       that is deliberate layering, resolved by handler order (e.g.
       viewer.pan_left Ctrl+Left before viewer.prev's key_only Left);
+    * an exact-chord pair listed in _CONTEXT_LAYERED is ALLOWED — the
+      same deliberate layering between two exact chords whose handler
+      gates are mutually exclusive (pan-while-zoomed vs seek-while-
+      video-plays);
     * any binding claiming a RESERVED_KEYS bare key collides with the
       reservation, except the _GRANDFATHERED tenant.
 
@@ -370,6 +408,8 @@ def conflicts(scheme: dict[str, Binding] | None = None,
                                       f"both bind key {QKeySequence(k).toString()}"
                                       f" (key_only) in scope {scope!r}"))
                 elif ba.key_only == bo.key_only:  # both exact
+                    if frozenset({a, other}) in _CONTEXT_LAYERED:
+                        continue  # deliberate gate-resolved layering
                     for sa in _compiled(ba):
                         for so in _compiled(bo):
                             if sa == so:

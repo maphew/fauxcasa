@@ -7607,8 +7607,9 @@ def test_viewer_video_poster_and_pending_note(tmp_path: Path) -> None:
     a clip's poster decodes at native size (proven by dimensions AND the
     frame color), the Picasa rotate= turns compose on top exactly like any
     format, a corrupt video returns a null QImage (fail-soft), and the
-    viewer's info line carries the honest M1 placeholder — the poster is
-    shown, playback is named as pending v46.3, never attempted."""
+    viewer's info line carries the honest video chip — the poster is
+    shown with the P-plays hint (v46.3 replaced the old "playback
+    pending" placeholder); playback never starts until asked."""
     _offscreen_app()
     from viewer import ViewerPage, load_original
 
@@ -7632,10 +7633,13 @@ def test_viewer_video_poster_and_pending_note(tmp_path: Path) -> None:
     v.show()
     idx = next(i for i, p in enumerate(cat.photos) if p.rel == "clip.mp4")
     v.show_photo([idx], 0)
-    assert "video — playback pending (v46.3)" in v._info_text(cat.photos[idx])
+    txt = v._info_text(cat.photos[idx])
+    assert "video" in txt and "P plays" in txt   # honest chip + play hint
+    assert "playback pending" not in txt         # the placeholder is gone
+    assert v._video is None                      # playback never auto-starts
     still = next(p for p in cat.photos if p.rel == "p.jpg")
-    assert "playback pending" not in v._info_text(still)
-    assert not v.grab().isNull()               # the note paints w/o incident
+    assert "video" not in v._info_text(still)
+    assert not v.grab().isNull()               # the chrome paints w/o incident
     v.quiesce()
 
 
@@ -12997,3 +13001,162 @@ def test_videostream_protocol_violation_kills_worker(tmp_path: Path) -> None:
         assert vs.next_frame(timeout_ms=50) is None
     finally:
         vs.close()
+
+
+# ---------------------------------------------------------------------------
+# Viewer playback integration (fauxcasa-v46.3, task 2): the ViewerPage
+# plays videos through the videostream seam. The poster stays the pre-play
+# stand-in with a painted centered play affordance + transport strip; P
+# plays/pauses; Ctrl+Left/Right seek ±5 s; playback stops cleanly on
+# navigation / hide / quiesce (worker process reaped, shm unlinked); a
+# stream failure reverts to the poster with an honest note. Audio rides a
+# GUARDED QAudioSink (None on headless CI -> wall clock), so nothing here
+# requires an audio device. Offscreen-safe: ticks are pumped via _spin.
+# ---------------------------------------------------------------------------
+
+
+def _video_viewer(tmp_path: Path, audio: bool = False, nframes: int = 8):
+    """A shown ViewerPage on a synthetic clip (plus a still neighbour for
+    navigation): (app, viewer, catalog, clip_idx)."""
+    app = _offscreen_app()
+    from viewer import ViewerPage
+
+    root = tmp_path / "lib"
+    _make_stream_clip(root / "clip.mov", audio=audio, nframes=nframes)
+    make_jpeg(root / "still.jpg")
+    cat = scan_library(root)
+    v = ViewerPage(cat, None)
+    v.resize(480, 360)
+    v.show()
+    idx = next(i for i, p in enumerate(cat.photos) if p.rel == "clip.mov")
+    v.show_photo(list(range(len(cat.photos))), idx)
+    return app, v, cat, idx
+
+
+def test_viewer_video_shows_poster_and_play_affordance(tmp_path: Path) -> None:
+    """Pre-play, a video photo paints its poster with the centered play
+    affordance (white triangle over the disc — checked by pixel at the
+    widget center) and the transport strip; no playback session exists."""
+    app, v, cat, idx = _video_viewer(tmp_path)
+    assert _spin(app, lambda: v.image is not None)     # poster landed
+    assert v._video is None                            # nothing auto-plays
+    img = v.grab().toImage()
+    c = img.pixelColor(v.width() // 2, v.height() // 2)
+    assert c.red() > 180 and c.green() > 180 and c.blue() > 180  # triangle
+    strip = v._transport_rect()
+    assert strip.width() == v.width() and strip.height() > 0
+    sc = img.pixelColor(strip.center())                # strip painted dark
+    assert sc.red() < 120 and sc.blue() < 120
+    v.quiesce()
+
+
+def test_viewer_video_play_streams_frames(tmp_path: Path) -> None:
+    """P starts a playback session over the sandboxed stream; at least one
+    streamed frame is presented (viewer state swaps from the poster to
+    pb.frame), the info bar shows position/duration, and the audio path
+    (guarded QAudioSink or wall-clock fallback) never crashes headless."""
+    from PySide6.QtCore import Qt
+
+    app, v, cat, idx = _video_viewer(tmp_path, audio=True, nframes=16)
+    assert _spin(app, lambda: v.image is not None)
+    _press(v, Qt.Key.Key_P)                            # keymap viewer.play_pause
+    assert v._video is not None                        # session opened
+    assert _spin(app, lambda: v._video is not None
+                 and v._video.frame is not None, 20.0)  # a frame painted
+    assert v._video_note is None
+    assert v._video.stream.error is None
+    txt = v._info_text(cat.photos[idx])
+    assert "video" in txt and "/" in txt               # position / duration
+    assert not v.grab().isNull()                       # frame + chrome paint
+    v.quiesce()
+
+
+def test_viewer_video_pause_holds_position_and_seek_keys(tmp_path: Path) -> None:
+    """P again pauses: the position freezes (pumping the loop does not
+    advance it) and the shown frame stays. Ctrl+Right seeks +5 s (clamped
+    to the clip) WITHOUT resuming — seek preserves the pause state — and
+    P resumes."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+
+    app, v, cat, idx = _video_viewer(tmp_path, nframes=24)   # 3 s clip
+    assert _spin(app, lambda: v.image is not None)
+    v._video_play_pause()                              # programmatic play
+    assert _spin(app, lambda: v._video is not None
+                 and v._video.frame is not None, 20.0)
+    _press(v, Qt.Key.Key_P)                            # pause
+    pb = v._video
+    assert pb is not None and not pb.playing
+    pos = pb.position_us
+    _pump(app, 0.6)                                    # ticks keep firing...
+    assert pb.position_us == pos                       # ...position frozen
+    assert pb.frame is not None                        # frame held
+    v.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right,
+                              Qt.KeyboardModifier.ControlModifier))
+    assert pb.position_us == min(pos + 5_000_000,
+                                 pb.info.duration_us)  # ±5 s, clamped
+    assert not pb.playing                              # still paused
+    _press(v, Qt.Key.Key_P)                            # resume
+    assert pb.playing
+    v.quiesce()
+
+
+def test_viewer_video_navigation_stops_stream(tmp_path: Path) -> None:
+    """Navigating next mid-playback stops the session cleanly: the stream
+    closes, the worker child is reaped, and the next photo (a still)
+    shows normally."""
+    app, v, cat, idx = _video_viewer(tmp_path, nframes=24)
+    assert _spin(app, lambda: v.image is not None)
+    v._video_play_pause()
+    assert _spin(app, lambda: v._video is not None
+                 and v._video.frame is not None, 20.0)
+    stream = v._video.stream
+    proc = stream._proc
+    v._step(1)                                         # -> still.jpg
+    assert v._video is None
+    assert stream.closed
+    assert proc is not None and proc.poll() is not None  # child reaped
+    assert _spin(app, lambda: v.image is not None)     # the still loads
+    v.quiesce()
+
+
+def test_viewer_video_quiesce_reaps_everything(tmp_path: Path) -> None:
+    """quiesce() mid-playback leaks nothing: session gone, consumer timer
+    stopped, worker process reaped, shm arena unlinked — the same
+    test-safe teardown discipline as the decode worker."""
+    from multiprocessing import shared_memory
+
+    app, v, cat, idx = _video_viewer(tmp_path, audio=True, nframes=24)
+    assert _spin(app, lambda: v.image is not None)
+    v._video_play_pause()
+    assert _spin(app, lambda: v._video is not None
+                 and v._video.frame is not None, 20.0)
+    pb = v._video
+    stream, proc, name = pb.stream, pb.stream._proc, pb.stream.shm_name
+    v.quiesce()
+    assert v._video is None
+    assert not pb._timer.isActive()                    # consumer loop stopped
+    assert stream.closed
+    assert proc is not None and proc.poll() is not None
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=name)          # arena unlinked
+    v.quiesce()                                        # idempotent
+
+
+def test_viewer_video_star_toggle_still_works(tmp_path: Path) -> None:
+    """Space keeps meaning star toggle on a video photo — before AND
+    during playback (the v46.3 bindings claim P and Ctrl+arrows only;
+    Space/arrows are untouched)."""
+    from PySide6.QtCore import Qt
+
+    app, v, cat, idx = _video_viewer(tmp_path)
+    assert _spin(app, lambda: v.image is not None)
+    requested: list[int] = []
+    v.star_toggle_requested.connect(requested.append)
+    _press(v, Qt.Key.Key_Space)                        # on the poster
+    assert requested == [idx]
+    v._video_play_pause()
+    assert v._video is not None
+    _press(v, Qt.Key.Key_Space)                        # while playing
+    assert requested == [idx, idx]
+    v.quiesce()

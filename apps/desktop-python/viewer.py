@@ -63,10 +63,11 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter
+from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 import keymap
@@ -87,6 +88,60 @@ CLICK_SLOP = 6
 # Face-overlay chrome (fauxcasa-cam.4): subtle, non-blocking outlines.
 FACE_PEN = QColor(255, 255, 255, 215)
 FACE_RADIUS = 6  # rounded-rect corner, logical px (chrome, so zoom-invariant)
+# Video transport chrome (fauxcasa-v46.3): painted-in-widget, like every
+# other viewer overlay — no child widget tree, keyboard keeps working.
+TRANSPORT_H = 34            # transport strip height, above the 30 px info bar
+TRANSPORT_FG = QColor(235, 235, 235)   # glyphs + seek progress (grid PLAY_WHITE)
+TRANSPORT_TRACK = QColor(255, 255, 255, 60)  # unplayed seek-bar track
+AFFORDANCE_BG = QColor(0, 0, 0, 140)   # centered play badge disc
+SEEK_STEP_US = 5_000_000    # Ctrl+Left / Ctrl+Right skip (±5 s)
+
+
+def _play_triangle(cx: float, cy: float, r: float) -> QPolygonF:
+    """Right-pointing play triangle, grid._play_polygon's proportions
+    ((cx, cy) center, r half-height, width trimmed 0.75r each way) so the
+    viewer's play affordance and the grid's corner badge read as a set."""
+    return QPolygonF([QPointF(cx - r * 0.75, cy - r),
+                      QPointF(cx + r * 0.75, cy),
+                      QPointF(cx - r * 0.75, cy + r)])
+
+
+def _format_us(us: int) -> str:
+    """Microseconds -> m:ss for the transport / info bar (video durations
+    in a family archive are minutes, not hours; hours roll into minutes)."""
+    s = max(0, int(us)) // 1_000_000
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _make_audio_sink(rate: int, channels: int):
+    """A QAudioSink for the worker-produced PCM s16 stream, or None when
+    audio output is unusable (headless CI, no output device, unsupported
+    format, QtMultimedia absent) — playback then paces on the wall clock.
+
+    Import ruling (owner, 2026-08-11, fauxcasa-i92.1 / PR #96): what is
+    DECLINED is QtMultimedia *decoding* attacker bytes in-process
+    (QMediaPlayer / QVideoWidget). QAudioSink consuming PCM that OUR
+    sandboxed worker produced is exactly what decode-service §3c
+    prescribes — its input is the sandbox's output, not attacker bytes."""
+    try:
+        from PySide6.QtMultimedia import (
+            QAudioFormat,
+            QAudioSink,
+            QMediaDevices,
+        )
+    except Exception:  # noqa: BLE001 — bundle without QtMultimedia: no audio
+        return None
+    try:
+        fmt = QAudioFormat()
+        fmt.setSampleRate(int(rate))
+        fmt.setChannelCount(int(channels))
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        dev = QMediaDevices.defaultAudioOutput()
+        if dev.isNull() or not dev.isFormatSupported(fmt):
+            return None
+        return QAudioSink(dev, fmt)
+    except Exception:  # noqa: BLE001 — any audio-stack failure: silent video
+        return None
 
 
 def _pan_delta(event) -> tuple[int, int] | None:
@@ -145,12 +200,13 @@ def load_original_oriented(path: str, rotate: int,
     this is the documented best guess, fail-soft by construction.
 
     Video files route by extension to the videoload poster seam
-    (fauxcasa-v46.2): the poster frame IS the M1 "original" for a video —
-    an honest still, painted with the "playback pending (v46.3)" note in
-    the info bar; no playback is attempted (v46.3 is gated on the
-    decode-service §3c sandbox-valve ruling). PyAV opens the path
-    seekably, so a multi-GB video is never read whole here; a decoded
-    poster carries no EXIF orientation, so it reports 1."""
+    (fauxcasa-v46.2): the poster frame IS the decoded "original" for a
+    video — an honest still that stands in until the user PLAYS it
+    (fauxcasa-v46.3: playback streams frames from a sandboxed worker
+    process via videostream.py, per the ruled decode-service §3c seam;
+    this function never starts playback). PyAV opens the path seekably,
+    so a multi-GB video is never read whole here; a decoded poster
+    carries no EXIF orientation, so it reports 1."""
     from inmeta import apply_orientation
     from metareader import read_orientation
     from rawload import is_raw_suffix, load_raw_qimage
@@ -253,10 +309,273 @@ def face_widget_rect(rect: tuple[float, float, float, float],
                   (bottom - top) * shown_rect.height())
 
 
+class _Playback:
+    """One live video playback session (fauxcasa-v46.3): owns the
+    sandboxed VideoStream (a separate decode PROCESS streaming rgb24
+    frames + PCM through shared memory — the ruled §3c seam; QtMultimedia
+    never decodes here), a QTimer consumer loop on the GUI thread, and
+    the presentation clock.
+
+    Clock: when the file has audio AND a QAudioSink is available, the
+    audio clock — media pts = _pts0 + (sink.processedUSecs() - _proc0),
+    which freezes across suspend (pause) and re-bases across seek (sink
+    reset + restart). Otherwise a monotonic wall clock anchored at every
+    play/resume/seek (_pts0 at _t0). Late frames drop: each tick presents
+    the NEWEST decoded frame whose pts <= clock; earlier due frames are
+    overwritten unpainted. Frames are copied out of the shm view and the
+    slot freed immediately (§2.4 item 6 — the broker side never holds a
+    view the worker could rewrite), so seeks can flush the ring freely.
+
+    GUI-thread only, like the ViewerPage that owns it. stop() is
+    idempotent and reaps everything: timer, audio sink, worker process
+    (VideoStream.close joins its reader thread and unlinks the arena)."""
+
+    def __init__(self, page: "ViewerPage", path: str, max_edge: int) -> None:
+        from videostream import VideoStream
+
+        self.page = page
+        # Raises DecodeServiceError on open failure (corrupt file, no
+        # video stream, worker refused) — the caller shows an honest note.
+        self.stream = VideoStream(path, max_edge=max_edge)
+        self.info = self.stream.info()
+        self.playing = False
+        self.at_end = False
+        self.position_us = 0
+        self.frame: QImage | None = None      # last presented frame
+        self._ahead: tuple[int, QImage] | None = None  # decoded, not yet due
+        self._pending = b""                   # PCM copied out, not yet sunk
+        self._stopped = False
+        self._pts0 = 0                        # media pts at the clock anchor
+        self._t0 = time.monotonic()           # wall anchor (no-audio clock)
+        self._proc0 = 0                       # processedUSecs at the anchor
+        self._last_ui = 0.0                   # ~4 Hz position repaints
+        self._sink = None
+        self._sink_dev = None
+        try:
+            if self.info.has_audio:
+                self._sink = _make_audio_sink(self.info.audio_rate,
+                                              self.info.audio_channels)
+                if self._sink is not None:
+                    try:
+                        self._sink_dev = self._sink.start()
+                    except Exception:  # noqa: BLE001 — audio never blocks video
+                        self._sink_dev = None
+                    if self._sink_dev is None:
+                        self._sink = None
+                    else:
+                        self._sink.suspend()  # created paused
+            self._timer = QTimer(page)
+            self._timer.setInterval(15)       # consumer budget: pts vs clock
+            self._timer.timeout.connect(self._tick)
+            self._timer.start()
+        except BaseException:
+            self.stream.close()               # never leak the worker process
+            raise
+
+    # -- clock ---------------------------------------------------------------
+
+    def _clock_us(self) -> int:
+        if self._sink is not None:
+            return self._pts0 + int(self._sink.processedUSecs()) - self._proc0
+        if self.playing:
+            return self._pts0 + int((time.monotonic() - self._t0) * 1_000_000)
+        return self._pts0
+
+    def _drop_sink(self) -> None:
+        """Fall back to the wall clock mid-flight (sink died or drained at
+        EOF), re-anchored so the position is continuous."""
+        cur = self._clock_us()
+        sink, self._sink, self._sink_dev = self._sink, None, None
+        self._pts0, self._t0 = cur, time.monotonic()
+        if sink is not None:
+            try:
+                sink.stop()
+            except Exception:  # noqa: BLE001 — teardown best effort
+                pass
+
+    # -- transport -----------------------------------------------------------
+
+    def pause(self) -> None:
+        if not self.playing or self._stopped:
+            return
+        cur = self._clock_us()
+        self.playing = False
+        if self._sink is not None:
+            self._sink.suspend()              # processedUSecs freezes with it
+        else:
+            self._pts0 = cur                  # freeze the wall clock
+        self.page.update()
+
+    def resume(self) -> None:
+        if self._stopped:
+            return
+        self.at_end = False
+        self.playing = True
+        self._t0 = time.monotonic()           # re-anchor the wall clock
+        if self._sink is not None \
+                and self._sink.state().name == "SuspendedState":
+            self._sink.resume()
+        self.page.update()
+
+    def seek(self, target_us: int) -> None:
+        """Seek, resuming in the prior play/pause state; while paused the
+        sought frame is pulled and shown. Blocks on the worker's ack (the
+        VideoStream.seek flush guarantee — every later frame is post-seek)."""
+        if self._stopped:
+            return
+        dur = self.info.duration_us
+        target = max(0, min(int(target_us), dur) if dur > 0 else int(target_us))
+        was_playing = self.playing
+        if was_playing:
+            self.pause()
+        self.stream.seek(target)              # blocking ring flush
+        if self.stream.error is not None:
+            return                            # the next tick surfaces it
+        self._ahead = None                    # pre-seek frame: stale
+        self._pending = b""                   # pre-seek PCM: stale
+        self.at_end = False
+        self.position_us = target
+        self._pts0 = target
+        if self._sink is not None:
+            try:
+                self._sink.reset()            # drop buffered pre-seek audio
+                self._sink_dev = self._sink.start()
+                self._proc0 = int(self._sink.processedUSecs())
+                self._sink.suspend()
+            except Exception:  # noqa: BLE001 — audio dies, video plays on
+                self._drop_sink()
+        if was_playing:
+            self.resume()
+        else:
+            self._show_paused_frame()
+        self.page.update()
+
+    def stop(self) -> None:
+        """Idempotent teardown: timer, sink, worker process + reader
+        thread + shm (VideoStream.close). Safe from the tick itself."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self.playing = False
+        self._timer.stop()
+        if self._sink is not None:
+            try:
+                self._sink.stop()
+            except Exception:  # noqa: BLE001 — teardown best effort
+                pass
+            self._sink = None
+            self._sink_dev = None
+        self.stream.close()
+
+    # -- consumer loop ---------------------------------------------------------
+
+    def _pull_ahead(self) -> bool:
+        """Copy the next decoded frame out of the ring (freeing its slot
+        promptly) into _ahead; False when none is queued right now."""
+        got = self.stream.next_frame(timeout_ms=0)
+        if got is None:
+            return False
+        slot, pts, w, h, stride, mv = got
+        img = QImage(bytes(mv), w, h, stride,
+                     QImage.Format.Format_RGB888).copy()
+        self.stream.free_slot(slot)
+        self._ahead = (pts, img)
+        return True
+
+    def _show_paused_frame(self) -> None:
+        """Present the first post-seek frame while paused (the seek target's
+        keyframe) so the seek bar shows where it landed."""
+        got = self.stream.next_frame(timeout_ms=1000)
+        if got is None:
+            return
+        slot, _pts, w, h, stride, mv = got
+        self.frame = QImage(bytes(mv), w, h, stride,
+                            QImage.Format.Format_RGB888).copy()
+        self.stream.free_slot(slot)
+
+    def _feed_audio(self) -> None:
+        """Move broker-queued PCM into the sink, bounded by bytesFree —
+        never blocking the GUI thread on audio."""
+        st = self.stream
+        if self._sink_dev is None:
+            while st.next_audio() is not None:
+                pass                          # no sink: wall clock, PCM dropped
+            return
+        while True:
+            if not self._pending:
+                got = st.next_audio()
+                if got is None:
+                    return
+                self._pending = got[0]
+            free = int(self._sink.bytesFree())
+            if free <= 0:
+                return
+            try:
+                n = self._sink_dev.write(self._pending[:free])
+            except Exception:  # noqa: BLE001 — device died: wall fallback
+                self._drop_sink()
+                return
+            if not n or n <= 0:
+                return
+            self._pending = self._pending[int(n):]
+
+    def _tick(self) -> None:
+        if self._stopped:
+            return
+        st = self.stream
+        if st.error is not None:
+            # Stream/protocol/timeout failure: stop playback, revert to
+            # the poster, short honest note — never a crash (§1 semantics
+            # live in VideoStream; this is the UI's shrug).
+            self.page._video_failed("video decode failed")
+            return
+        if not self.playing:
+            return
+        self._feed_audio()
+        if self._sink is not None and st.at_eof and not self._pending \
+                and self._sink.state().name == "IdleState":
+            # Audio track drained at EOF: the audio clock has stopped, so
+            # flush the remaining video tail on the wall clock.
+            self._drop_sink()
+        clock = self._clock_us()
+        presented = False
+        while True:
+            if self._ahead is None and not self._pull_ahead():
+                break
+            pts, img = self._ahead
+            if pts > clock:
+                break                          # not due yet: hold it
+            # Present-newest: a frame already due is overwritten by any
+            # LATER frame also <= clock before the single repaint below —
+            # late frames drop without ever painting.
+            self.frame = img
+            self.position_us = pts if pts >= 0 else clock
+            self._ahead = None
+            presented = True
+        now = time.monotonic()
+        if presented:
+            self.page.update()
+            self._last_ui = now
+        elif self._ahead is None and st.at_eof and not self._pending:
+            dur = self.info.duration_us
+            self.position_us = dur if dur > 0 else self.position_us
+            self.playing = False
+            self.at_end = True                # play again = seek(0) + resume
+            if self._sink is not None:
+                self._sink.suspend()
+            self.page.update()
+        elif now - self._last_ui > 0.25:
+            self.page.update()                # ~4 Hz position label refresh
+            self._last_ui = now
+
+
 class _Loader(QObject):
     # serial, image (null = failed), stored EXIF orientation (1..8; 1 =
     # unknown/none — the face overlay's un-mapping input, fauxcasa-cam.4)
     loaded = Signal(int, QImage, int)
+    # serial, duration_us (0 = unknown): the video's probed duration, so
+    # the info bar / transport can show it BEFORE playback starts (v46.3).
+    video_meta = Signal(int, int)
 
 
 class ViewerPage(QWidget):
@@ -311,6 +630,18 @@ class ViewerPage(QWidget):
         self.face_overlay_allowed = True
         self.faces_visible = False
         self._orientation = 1
+        # Video playback (fauxcasa-v46.3). `video_playback_allowed` is the
+        # per-SURFACE policy, exactly like face_overlay_allowed: True here
+        # (the viewer is the inspection surface); the peek and slideshow
+        # subclasses set it False — glance surfaces keep showing the
+        # honest poster still. `_video` is the live _Playback session
+        # (None until the user plays), `_video_note` a short honest error
+        # ("video decode failed"), `_video_duration_us` the async-probed
+        # duration for the pre-play transport/info bar.
+        self.video_playback_allowed = True
+        self._video: _Playback | None = None
+        self._video_note: str | None = None
+        self._video_duration_us: int | None = None
         # Click-vs-drag disambiguation: where the left press landed, and
         # whether it traveled past CLICK_SLOP (then it pans, never toggles).
         self._press_pos = None
@@ -326,6 +657,7 @@ class ViewerPage(QWidget):
         self._decoder: threading.Thread | None = None
         self._loader = _Loader()
         self._loader.loaded.connect(self._on_loaded)
+        self._loader.video_meta.connect(self._on_video_meta)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def _submit(self, job) -> None:
@@ -354,7 +686,13 @@ class ViewerPage(QWidget):
         Deliberately NOT called on ordinary navigation or viewer close: the
         serial guards handle staleness there, and joining a decode mid-read
         could stall the UI on a slow volume — this is for teardown paths
-        (tests delete widgets aggressively)."""
+        (tests delete widgets aggressively).
+
+        Also stops any live video playback FIRST (fauxcasa-v46.3): the
+        session's QTimer must stop and its worker process / reader thread
+        / shm arena be reaped before the widget goes away — the same
+        no-leaked-threads discipline as the decode worker below."""
+        self._stop_video()
         self._serial += 1
         t = self._decoder
         if t is not None and t.is_alive():
@@ -389,6 +727,12 @@ class ViewerPage(QWidget):
         idx = self.current_index()
         if idx < 0:
             return
+        # Any live video playback stops on EVERY photo change (v46.3):
+        # navigation away must reap the streaming worker cleanly, and a
+        # new video starts from its poster (the pre-play stand-in).
+        self._stop_video()
+        self._video_note = None
+        self._video_duration_us = None
         # Zoom state resets to fit on EVERY photo change (Picasa behavior) —
         # this is the one funnel all changes pass through: show_photo, the
         # viewer's _step, the slideshow's wrap _step and timed advance.
@@ -439,6 +783,8 @@ class ViewerPage(QWidget):
         # growing backlog — unlike the original, which needs the stale guards.
         self.preview = self._load_preview(idx, rotate)
 
+        is_video = self.catalog.photos[idx].media == "video"
+
         def work() -> None:
             # Stale checks bound the decode backlog when the user holds
             # an arrow key: superseded loads bail before the expensive
@@ -451,7 +797,21 @@ class ViewerPage(QWidget):
             try:
                 self._loader.loaded.emit(serial, img, orientation)
             except RuntimeError:
-                pass  # loader deleted at shutdown
+                return  # loader deleted at shutdown
+            if is_video:
+                # Probe the duration off-thread for the pre-play
+                # transport / info bar (videoload's declared v46.3
+                # consumer seam); 0 = unknown, fail-soft.
+                from videoload import probe_duration
+
+                d = probe_duration(path)
+                if serial != self._serial:
+                    return
+                try:
+                    self._loader.video_meta.emit(
+                        serial, int(d * 1_000_000) if d else 0)
+                except RuntimeError:
+                    pass  # loader deleted at shutdown
 
         self._submit(work)
         self.photo_shown.emit(idx)
@@ -517,6 +877,130 @@ class ViewerPage(QWidget):
             self._orientation = orientation  # arrives WITH its image
         self.update()
 
+    # ---------- video playback (fauxcasa-v46.3) ----------
+    #
+    # The poster stays the pre-play stand-in; playing opens a _Playback
+    # session over the sandboxed videostream seam (§3c, ruled option A).
+    # Everything here is painted-in-widget (play affordance + transport
+    # strip in paintEvent) and lifecycle-tied: _load_current, hideEvent
+    # and quiesce all stop the session and reap the worker process.
+
+    def _on_video_meta(self, serial: int, duration_us: int) -> None:
+        if serial != self._serial:
+            return  # user already moved on
+        self._video_duration_us = duration_us or None
+        self.update()
+
+    def _current_is_video(self) -> bool:
+        idx = self.current_index()
+        return idx >= 0 and self.catalog.photos[idx].media == "video"
+
+    def _video_max_edge(self) -> int:
+        """Decode-scale cap for streamed frames: the screen's device-pixel
+        long edge — frames are painted fit, never 1:1, so decoding beyond
+        the screen is pure waste (and ring slots are sized by this)."""
+        scr = self.screen()
+        if scr is None:
+            from PySide6.QtGui import QGuiApplication
+
+            scr = QGuiApplication.primaryScreen()
+        edge = 1920
+        if scr is not None:
+            g = scr.geometry()
+            edge = int(max(g.width(), g.height()) * self.devicePixelRatioF())
+        return max(256, min(edge, 8192))
+
+    def _start_video(self, play: bool) -> None:
+        if self._video is not None or not self.video_playback_allowed:
+            return
+        idx = self.current_index()
+        abs_path = self.catalog.abs(self.catalog.photos[idx])
+        if abs_path is None:
+            self._video_note = "volume offline"
+            self.update()
+            return
+        try:
+            pb = _Playback(self, str(abs_path), self._video_max_edge())
+        except Exception:  # noqa: BLE001 — corrupt file / worker refused
+            self._video_note = "video decode failed"
+            self.update()
+            return
+        self._video = pb
+        self._video_note = None
+        if play:
+            pb.resume()
+        self.update()
+
+    def _stop_video(self) -> None:
+        """Stop + reap any live playback session; the poster (self.image)
+        resumes painting. Idempotent; never touches _video_note (an error
+        note must survive the stop that raised it)."""
+        pb, self._video = self._video, None
+        if pb is not None:
+            pb.stop()
+            self.update()
+
+    def _video_failed(self, note: str) -> None:
+        """Stream/system failure during playback: stop, revert to the
+        poster, show a short honest note in the info bar — never crash."""
+        self._video_note = note
+        self._stop_video()
+
+    def _video_play_pause(self) -> None:
+        if not self._current_is_video() or not self.video_playback_allowed:
+            return
+        pb = self._video
+        if pb is None:
+            self._start_video(play=True)  # a failed earlier try retries here
+            return
+        if pb.at_end:
+            pb.seek(0)                    # play again from the top
+            pb.resume()
+        elif pb.playing:
+            pb.pause()
+        else:
+            pb.resume()
+        self.update()
+
+    def _video_seek_to(self, pts_us: int) -> None:
+        if self._video is None:
+            self._start_video(play=False)  # seek from the poster: land paused
+        if self._video is not None:
+            self._video.seek(pts_us)
+            self.update()
+
+    def _video_seek_by(self, delta_us: int) -> None:
+        if self._video is not None:
+            self._video_seek_to(self._video.position_us + delta_us)
+
+    # -- transport strip geometry (hit-testing + painting share these) --
+
+    def _transport_rect(self) -> QRect:
+        return QRect(0, self.height() - 30 - TRANSPORT_H,
+                     self.width(), TRANSPORT_H)
+
+    def _transport_seek_rect(self) -> QRect:
+        r = self._transport_rect()
+        left, right = r.x() + 150, r.right() - 14
+        if right - left < 40:               # tiny window: bar over the text
+            left = r.x() + 8
+        return QRect(left, r.center().y() - 2, max(1, right - left), 4)
+
+    def _video_click(self, posf) -> None:
+        """A clean click on a video photo: the seek bar seeks (click-to-
+        seek), anywhere else toggles play/pause — the centered affordance
+        is the visual anchor, but the whole surface is the target."""
+        bar = self._transport_seek_rect()
+        if bar.adjusted(-4, -10, 4, 10).contains(posf.toPoint()):
+            pb = self._video
+            dur = pb.info.duration_us if pb is not None \
+                else (self._video_duration_us or 0)
+            if dur > 0:
+                frac = (posf.x() - bar.x()) / max(1, bar.width())
+                self._video_seek_to(int(max(0.0, min(1.0, frac)) * dur))
+            return
+        self._video_play_pause()
+
     # ---------- explicit 1:1 zoom + pan (fauxcasa-q6l.4) ----------
 
     def _shown_now(self) -> QImage | None:
@@ -542,6 +1026,8 @@ class ViewerPage(QWidget):
         small stand-in preview the clamp would collapse to center and lose
         the anchor the user meant for the original; _zoom_rect clamps
         per-paint instead."""
+        if self._current_is_video():
+            return  # 1:1 is unsupported for video in v1 (fauxcasa-v46.3)
         if self.zoomed:
             self._reset_zoom()
             self.update()
@@ -753,6 +1239,21 @@ class ViewerPage(QWidget):
             idx = self.current_index()
             if idx >= 0:
                 self.star_toggle_requested.emit(idx)
+        elif self._current_is_video() \
+                and keymap.matches(event, "viewer.play_pause"):
+            # P = play/pause the shown video (v46.3). Gated on media kind,
+            # so P on a still falls through to the default handler.
+            self._video_play_pause()
+        elif self._video is not None \
+                and keymap.matches(event, "viewer.seek_back"):
+            # Ctrl+Left/Right = ±5 s ONLY while a playback session is
+            # live — the keymap's _CONTEXT_LAYERED pair with pan (which
+            # needs zoomed, unsupported for video); with no session the
+            # chord falls through exactly as before.
+            self._video_seek_by(-SEEK_STEP_US)
+        elif self._video is not None \
+                and keymap.matches(event, "viewer.seek_fwd"):
+            self._video_seek_by(SEEK_STEP_US)
         elif self.zoomed and (pan := _pan_delta(event)) is not None:
             # Ctrl+arrows pan a quarter-viewport at 1:1.
             self._pan_by((self.width() // 4) * pan[0],
@@ -797,13 +1298,26 @@ class ViewerPage(QWidget):
         if event.button() == Qt.MouseButton.LeftButton \
                 and self._press_pos is not None:
             if not self._dragging:
-                # A clean click: toggle fit <-> 1:1 anchored at the click
-                # point (Picasa's click-to-zoom muscle memory).
-                self.toggle_zoom(event.position())
+                if self._current_is_video() and self.video_playback_allowed:
+                    # Video (v46.3): the seek bar seeks, anywhere else
+                    # toggles play/pause — click-to-zoom is a still-photo
+                    # gesture (1:1 is unsupported for video in v1).
+                    self._video_click(event.position())
+                else:
+                    # A clean click: toggle fit <-> 1:1 anchored at the
+                    # click point (Picasa's click-to-zoom muscle memory).
+                    self.toggle_zoom(event.position())
             self._press_pos = None
             self._dragging = False
         else:
             super().mouseReleaseEvent(event)
+
+    def hideEvent(self, event) -> None:
+        # Leaving the viewer (the pages stack switched away, or teardown)
+        # stops playback and reaps the streaming worker (v46.3): a hidden
+        # page must never keep a decode process or audio sink alive.
+        self._stop_video()
+        super().hideEvent(event)
 
     def mouseDoubleClickEvent(self, _event) -> None:
         # Note the first press/release of a double-click already toggled the
@@ -816,11 +1330,21 @@ class ViewerPage(QWidget):
         state (extracted from paintEvent so tests can assert the text)."""
         parts = [f"{self.pos + 1}/{len(self.display)}", photo.rel]
         if photo.media == "video":
-            # M1 honest placeholder (fauxcasa-v46.2): what the viewer
-            # paints is the POSTER frame; playback is v46.3 (gated on the
-            # decode-service §3c sandbox-valve ruling), so say so rather
-            # than pretending the still is the video.
-            parts.append("video — playback pending (v46.3)")
+            # Video chip (fauxcasa-v46.3): position/duration while a
+            # playback session is live, the probed duration + play hint
+            # before one, a short honest note after a failure. Replaces
+            # v46.2's "playback pending" placeholder now playback ships.
+            if self._video_note:
+                parts.append(f"video — {self._video_note}")
+            elif self._video is not None:
+                pb = self._video
+                parts.append(f"video · {_format_us(pb.position_us)} / "
+                             f"{_format_us(pb.info.duration_us)}")
+            elif self._video_duration_us:
+                parts.append(f"video · {_format_us(self._video_duration_us)}"
+                             " — P plays")
+            else:
+                parts.append("video — P plays")
         if self.zoomed:
             # The mode chip doubles as the binding hint (drag pans;
             # 1 / Ctrl+Alt+0 / click return to fit).
@@ -866,6 +1390,49 @@ class ViewerPage(QWidget):
         dh = max(1, round(src_h * fit))
         return QRect((box_w - dw) // 2, (box_h - dh) // 2, dw, dh)
 
+    def _paint_video_chrome(self, painter: QPainter, w: int, h: int) -> None:
+        """Painted video controls (fauxcasa-v46.3): a centered play
+        affordance whenever the video is NOT playing (poster, paused, or
+        ended — it doubles as the paused indicator), and a minimal
+        transport strip above the info bar: play/pause glyph, elapsed /
+        total time, and a thin click-to-seek bar. All chrome, no child
+        widgets — keyboard focus and every key binding keep working."""
+        pb = self._video
+        playing = pb is not None and pb.playing
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if not playing:
+            cx, cy = w / 2.0, h / 2.0
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(AFFORDANCE_BG)
+            painter.drawEllipse(QPointF(cx, cy), 34.0, 34.0)
+            painter.setBrush(TRANSPORT_FG)
+            # +3 px: optically center the triangle inside the disc.
+            painter.drawPolygon(_play_triangle(cx + 3, cy, 16))
+        strip = self._transport_rect()
+        painter.fillRect(strip, CAPTION_BG)
+        gy = strip.center().y()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(TRANSPORT_FG)
+        if playing:                               # pause: two bars
+            painter.fillRect(QRect(14, gy - 7, 4, 14), TRANSPORT_FG)
+            painter.fillRect(QRect(22, gy - 7, 4, 14), TRANSPORT_FG)
+        else:                                     # play triangle
+            painter.drawPolygon(_play_triangle(20, gy, 8))
+        dur = pb.info.duration_us if pb is not None \
+            else (self._video_duration_us or 0)
+        posn = pb.position_us if pb is not None else 0
+        painter.setPen(QColor(220, 220, 220))
+        painter.drawText(QRect(36, strip.y(), 110, strip.height()),
+                         Qt.AlignmentFlag.AlignVCenter,
+                         f"{_format_us(posn)} / {_format_us(dur)}")
+        bar = self._transport_seek_rect()
+        painter.fillRect(bar, TRANSPORT_TRACK)
+        if dur > 0:
+            frac = max(0.0, min(1.0, posn / dur))
+            painter.fillRect(QRect(bar.x(), bar.y(),
+                                   round(bar.width() * frac), bar.height()),
+                             TRANSPORT_FG)
+
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), BACKGROUND)
@@ -874,10 +1441,18 @@ class ViewerPage(QWidget):
         if idx < 0:
             painter.end()
             return
-        # The full original once it has arrived, else the instant cached
-        # preview; only when neither exists do we fall back to text.
+        # A live playback session's latest streamed frame wins (painted
+        # into the same fit rect the poster used — cap=True, video never
+        # upscales past native, matching the poster's own paint); then
+        # the full original once it has arrived, else the instant cached
+        # preview; only when none exists do we fall back to text.
+        vframe = self._video.frame if self._video is not None else None
         shown = self._shown_now()
-        if shown is not None:
+        if vframe is not None and not vframe.isNull():
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.drawImage(self._display_rect(
+                w, h, vframe.width(), vframe.height(), cap=True), vframe)
+        elif shown is not None:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.drawImage(self._shown_rect(w, h, shown), shown)
             self._paint_faces(painter)   # no-op unless toggled on + faces
@@ -885,6 +1460,10 @@ class ViewerPage(QWidget):
             painter.setPen(QColor(150, 150, 150))
             msg = "loading…" if self.loading else "could not decode this file"
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, msg)
+
+        if self.video_playback_allowed \
+                and self.catalog.photos[idx].media == "video":
+            self._paint_video_chrome(painter, w, h)
 
         bar = self._info_text(self.catalog.photos[idx])
         painter.fillRect(0, h - 30, w, 30, CAPTION_BG)
