@@ -17,8 +17,10 @@ Checks (derived from .github/workflows/tests.yml and tracer.yml):
   - uv run scripts/test_picasa_db.py -q
   - uv run scripts/check-ingest-parity.py
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q   (skipped with --fast)
-  - git diff --quiet -- .beads/issues.jsonl                                  (the one bd preflight
-    check that still applies here: no beads-jsonl pollution)
+  - git ls-files --error-unmatch -- .beads/issues.jsonl must FAIL            (the one bd preflight
+    check that still applies here: no beads-jsonl pollution — the file is
+    pollution iff git tracks it, whether staged or committed; a plain
+    `git diff` can never see it because the path is gitignored)
 
 Deliberately NOT run: scripts/perf-canary.py. It's the CI-only §7
 perf-canary job (cold start / search latency / catalog size probes on a
@@ -83,9 +85,11 @@ def checks(root: Path, fast: bool) -> list[dict]:
         })
     result.append({
         "name": "no beads-jsonl pollution",
-        "command": ["git", "diff", "--quiet", "--", ".beads/issues.jsonl"],
+        "command": ["git", "ls-files", "--error-unmatch", "--", ".beads/issues.jsonl"],
         "cwd": root,
         "env": None,
+        # rc 0 means git tracks the file (staged or committed) == pollution
+        "expect_nonzero": True,
     })
     return result
 
@@ -112,7 +116,10 @@ def run_check(check: dict) -> dict:
             text=True,
             timeout=TIMEOUT_SECONDS,
         )
-        passed = proc.returncode == 0
+        passed = (
+            proc.returncode != 0 if check.get("expect_nonzero")
+            else proc.returncode == 0
+        )
         output = proc.stdout + proc.stderr
     except subprocess.TimeoutExpired as e:
         passed = False

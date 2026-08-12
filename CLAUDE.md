@@ -170,7 +170,10 @@ uv run scripts/test_delegation_report.py -q
 uv run scripts/test_picasa_db.py -q
 uv run scripts/check-ingest-parity.py
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q
-git diff --quiet -- .beads/issues.jsonl   # no beads-jsonl pollution
+
+# local-only gate (not a CI job): no beads-jsonl pollution —
+# .beads/issues.jsonl must stay untracked, so this command must FAIL
+git ls-files --error-unmatch -- .beads/issues.jsonl
 
 # one-liner mirroring all of the above locally (fauxcasa-op6):
 uv run scripts/preflight.py            # add --fast to skip the tracer suite
