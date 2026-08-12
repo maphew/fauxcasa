@@ -724,6 +724,97 @@ def test_reconcile_walk_cancels(library: Path) -> None:
     assert reconcile_walk(cat, library, cancel=ev) is None
 
 
+def test_reconcile_detects_ini_drift(library: Path, tmp_path: Path) -> None:
+    """Externally editing a folder's .picasa.ini between scans sets
+    Drift.ini_changed (fauxcasa-cam.14 step 4) even though no PHOTO file's
+    own size/mtime changed — before this signal, a caption/keyword/star
+    baked into the catalog at scan time would never refresh on a warm
+    start until some unrelated photo drift happened to force a rebuild.
+    Covers all three edit shapes: modified, newly added, and removed."""
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    assert not reconcile_walk(cat, library).changed  # baseline: clean
+
+    # Modified: the Trip folder's existing ini gains a line (size+mtime
+    # both change; a photo-only diff would miss this entirely).
+    ini = library / "2020-01-01 Trip" / ".picasa.ini"
+    ini.write_text(ini.read_text() + "caption=edited externally\r\n")
+    drift = reconcile_walk(cat, library)
+    assert drift.ini_changed and drift.changed
+    assert drift.added == 0 and drift.removed == 0 and drift.modified == 0
+
+    # Added: the Picnic folder in the `library` fixture has no ini at all
+    # yet — a brand-new one appearing must be caught too, not just an
+    # edit to an ini the catalog already knew about.
+    cat2 = scan_library(library)  # fresh baseline, post-Trip-edit
+    thumbcache.build_cache(cat2, tmp_path / "c2")
+    assert not reconcile_walk(cat2, library).changed
+    (library / "2021-05-05 Picnic" / ".picasa.ini").write_text(
+        "[Picasa]\r\nname=Picnic!\r\n")
+    assert reconcile_walk(cat2, library).ini_changed
+
+    # Removed: deleting an ini the catalog DOES have a signal for.
+    cat3 = scan_library(library)  # fresh baseline, post-Picnic-added
+    thumbcache.build_cache(cat3, tmp_path / "c3")
+    assert not reconcile_walk(cat3, library).changed
+    ini.unlink()
+    assert reconcile_walk(cat3, library).ini_changed
+
+
+def test_reconcile_clean_after_warm_load_no_ini_changes(
+        library: Path, tmp_path: Path) -> None:
+    """A genuinely unchanged library reconciles clean end-to-end through a
+    full save_catalog/load_catalog round trip (fauxcasa-cam.14 step 4):
+    ini_sigs and contacts_sig persist and reload exactly, so a warm start
+    with no external edits never spuriously flags Drift.ini_changed."""
+    from catalog import stat_sig
+
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    cat.contacts_sig = stat_sig(
+        _write_faces_contacts_xml(tmp_path / "contacts.xml"))
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, library)
+    assert loaded is not None
+    assert loaded.ini_sigs == cat.ini_sigs
+    assert loaded.ini_sigs  # the fixture's Trip folder does carry an ini
+    assert loaded.contacts_sig == cat.contacts_sig
+
+    drift = reconcile_walk(loaded, library)
+    assert not drift.changed and not drift.ini_changed
+
+
+def test_reconcile_detects_ancestor_root_ini_drift(
+        library: Path, tmp_path: Path) -> None:
+    """Codex review finding 2 (fauxcasa-cam.14 step 4): a .picasa.ini newly
+    created in an ANCESTOR folder that owns no photo directly — including
+    the bare library root — must set Drift.ini_changed even though
+    reconcile_walk's fresh-side folder_rels (derived from walked PHOTO
+    files) never puts "" in that set on its own. `catalog.ini_sigs` has
+    no prior entry for "" either (the `library` fixture's root carries no
+    ini and no photo lives directly at the root — every photo is under
+    "2020-01-01 Trip" or "2021-05-05 Picnic"), so before the ancestor-
+    closure fix this drift was invisible: neither side of the union ever
+    contained the root."""
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    assert ("", "") not in cat.ini_sigs   # baseline: no root-level ini yet
+    assert not reconcile_walk(cat, library).changed
+
+    (library / ".picasa.ini").write_text("[Picasa]\r\nname=Library!\r\n")
+    drift = reconcile_walk(cat, library)
+    assert drift.ini_changed and drift.changed
+    assert drift.added == 0 and drift.removed == 0 and drift.modified == 0
+
+    # And the ini this reconcile just discovered is now correctly tracked
+    # by a fresh scan — an ancestor-only ini registers in ini_sigs (§
+    # folder_contacts' inheritance walk), same as any photo-owning one.
+    cat2 = scan_library(library)
+    assert ("", "") in cat2.ini_sigs
+
+
 def test_set_data_invalidates_tiles() -> None:
     """The reconcile swap goes through grid.set_data; it must invalidate
     the decoded-tile cache or a rebuilt catalog paints stale thumbnails
@@ -11775,11 +11866,12 @@ def test_multiroot_two_root_save_load_roundtrip_v13(tmp_path: Path) -> None:
     explicit "R" (fauxcasa-ed5.5: now at the GROUP level, since grouping
     is by (root_id, folder) — see _group_photo_rows), and
     Catalog.roots/library_id survive the reload.
-    (== 13: the newest version-gate test pins the exact value.)"""
+    (== 14: the newest version-gate test pins the exact value — bumped
+    from 13 by fauxcasa-cam.14 step 4's ini_sigs/contacts_sig fields.)"""
     import catalog as catmod
     from catalog import Catalog, Folder, Photo
 
-    assert catmod.CATALOG_VERSION == 13
+    assert catmod.CATALOG_VERSION == 14
     root_a, root_b = tmp_path / "a", tmp_path / "b"
     root_a.mkdir()
     root_b.mkdir()
@@ -12094,6 +12186,31 @@ def test_zstd_wrapped_v11_file_rejected(tmp_path: Path) -> None:
     _write_raw_catalog(path, {"version": catmod.PRE_MULTIROOT_VERSION,
                               "library": str(tmp_path), "photos": []})
     assert load_catalog(path, tmp_path) is None
+
+
+def test_v13_catalog_rejected_after_v14_bump(
+        library: Path, tmp_path: Path) -> None:
+    """fauxcasa-cam.14 step 4 bumped CATALOG_VERSION 13->14 (new ini_sigs/
+    contacts_sig fields): a genuine pre-bump v13 file — the PREVIOUS
+    current format, zstd-wrapped, with neither field present — is now
+    rejected outright and cold-rebuilds, per the module's existing
+    'no migration path, the catalog is a regenerable cache' posture (same
+    treatment every prior version bump gave its immediate predecessor)."""
+    import catalog as catmod
+
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    data = _raw_catalog(path)
+    assert data["version"] == catmod.CATALOG_VERSION == 14
+    data.pop("ini_sigs", None)      # a real v13 file never had these
+    data.pop("contacts_sig", None)
+    data["version"] = 13
+    _write_raw_catalog(path, data)  # still zstd-wrapped: v13 always was
+
+    assert load_catalog(path, library) is None
 
 
 # ---- multiroot cache binding (fauxcasa-ed5.7.3, bead .c) -------------------
@@ -12940,6 +13057,328 @@ def test_reconcile_never_removes_offline_root_entries(tmp_path: Path) -> None:
     assert any(p.rel == "3.jpg" and p.root_id == id_b for p in cat.photos)
 
 
+def test_reconcile_online_roots_detects_contacts_xml_drift_once(
+        tmp_path: Path) -> None:
+    """The one machine-local contacts.xml is checked ONCE by
+    main._reconcile_online_roots (fauxcasa-cam.14 step 4), not inside the
+    per-root reconcile_walk loop it calls: editing contacts.xml between
+    scans is invisible to a bare reconcile_walk call (it has no
+    contacts_path to check — that is explicitly not its job) on EITHER of
+    a 2-root library's roots, but IS caught by the multiroot helper —
+    resolving the PR-37 rider that editing contacts.xml never refreshed a
+    warm start."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+    from catalog import Catalog, Photo, stat_sig
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    make_jpeg(root_a / "1.jpg")
+    make_jpeg(root_b / "2.jpg")
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+
+    contacts_path = _write_faces_contacts_xml(tmp_path / "contacts.xml")
+
+    def sig(p: Path) -> tuple[int, int]:
+        st = p.stat()
+        return st.st_size, int(st.st_mtime)
+
+    s1, s2 = sig(root_a / "1.jpg"), sig(root_b / "2.jpg")
+    photos = [
+        Photo(rel="1.jpg", folder="", name="1.jpg", root_id=id_a,
+             size=s1[0], mtime=s1[1]),
+        Photo(rel="2.jpg", folder="", name="2.jpg", root_id=id_b,
+             size=s2[0], mtime=s2[1]),
+    ]
+    cat = Catalog(root=root_a, photos=photos, folders={}, albums={},
+                 contacts_sig=stat_sig(contacts_path),
+                 roots=[libmod.LibraryRoot(id=id_a, path=root_a),
+                        libmod.LibraryRoot(id=id_b, path=root_b)])
+
+    # Baseline: clean on both individual roots and via the multiroot
+    # helper.
+    assert not reconcile_walk(cat, root_a, root_id=id_a).changed
+    assert not reconcile_walk(cat, root_b, root_id=id_b).changed
+    drift, _ = main._reconcile_online_roots(cat, None, None, None,
+                                            contacts_path)
+    assert drift is not None and not drift.changed
+
+    # Edit contacts.xml externally (rename one contact).
+    contacts_path.write_text(
+        contacts_path.read_text().replace("Carol Xml", "Carol Renamed"))
+
+    # A bare reconcile_walk call — no contacts_path parameter exists on
+    # it at all — cannot see the edit, on EITHER root.
+    assert not reconcile_walk(cat, root_a, root_id=id_a).ini_changed
+    assert not reconcile_walk(cat, root_b, root_id=id_b).ini_changed
+
+    # The multiroot helper DOES see it — exactly once, not doubled by
+    # having two online roots.
+    drift2, _ = main._reconcile_online_roots(cat, None, None, None,
+                                             contacts_path)
+    assert drift2 is not None
+    assert drift2.ini_changed and drift2.changed
+    assert drift2.added == 0 and drift2.removed == 0 and drift2.modified == 0
+
+
+def test_reconcile_rebuild_reloads_contacts_xml_for_sig_pairing(
+        tmp_path: Path) -> None:
+    """Codex review finding 4 (fauxcasa-cam.14 step 4): the reconcile
+    REBUILD path must reload contacts.xml from disk — not reuse
+    self.contacts, the name map loaded once at startup — so the persisted
+    contacts_sig and the resolved face names always describe the SAME
+    snapshot. Before this fix, an edit landing between startup and
+    reconcile would persist the NEW (post-edit) signature paired with the
+    OLD (stale, startup) names, and a later warm start would trust that
+    stale content forever since the signature claims nothing changed."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import time as _time
+
+    from catalog import load_contacts_xml, stat_sig
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cid = "cccccccccccccccc"
+    (root / ".picasa.ini").write_text(
+        f"[Contacts2]\r\n{cid}=Ini Name;;\r\n"
+        f"[a.jpg]\r\nfaces=rect64(1234),{cid}\r\n")
+
+    contacts_path = tmp_path / "contacts.xml"
+    contacts_path.write_text(
+        '<contacts>\n'
+        f' <contact id="{cid}" name="Startup Name" '
+        'modified_time="2026-01-01T00:00:00-07:00" local_contact="1"/>\n'
+        '</contacts>\n')
+    startup_contacts = load_contacts_xml(contacts_path)
+    assert startup_contacts[cid] == "Startup Name"
+
+    cat = scan_library(root, None, startup_contacts)
+    face = next(p for p in cat.photos if p.rel == "a.jpg").faces[0]
+    assert face[2] == "Startup Name"          # contacts.xml wins over ini
+    cat.contacts_sig = stat_sig(contacts_path)
+
+    cache_dir = tmp_path / "cachedir"
+    win = MainWindow(cat, None, cache_dir=cache_dir, build_dir=None,
+                     contacts=startup_contacts, contacts_path=contacts_path)
+
+    # A real external edit AFTER startup — a rename in contacts.xml. The
+    # new name is a different LENGTH than "Startup Name" (size, not just
+    # mtime, must differ — int(st_mtime) truncates to whole seconds, and
+    # two writes inside the same test can easily land in the same second).
+    contacts_path.write_text(
+        '<contacts>\n'
+        f' <contact id="{cid}" name="Renamed To Somebody Else" '
+        'modified_time="2026-01-02T00:00:00-07:00" local_contact="1"/>\n'
+        '</contacts>\n')
+    edited_sig = stat_sig(contacts_path)
+    assert edited_sig != cat.contacts_sig      # baseline: a real edit happened
+
+    win._start_reconcile()
+    assert win._reconcile_thread is not None
+    deadline = _time.time() + 20
+    while win._reconcile_thread.is_alive() and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    assert not win._reconcile_thread.is_alive()
+    app.processEvents()  # deliver the queued bridge.finished signal
+
+    disk = load_catalog(cache_dir / "catalog.json", root)
+    assert disk is not None
+    assert disk.contacts_sig == edited_sig
+    # THE regression: the persisted signature must be paired with the
+    # NAMES it actually describes, never the stale startup map.
+    disk_face = next(p for p in disk.photos if p.rel == "a.jpg").faces[0]
+    assert disk_face[2] == "Renamed To Somebody Else"
+    win.shutdown()
+
+
+def test_reconcile_rebuild_contacts_sig_captured_before_read(
+        tmp_path: Path) -> None:
+    """Codex review round-2 finding 2 (fauxcasa-cam.14 step 4): the
+    reconcile rebuild branch must stat contacts.xml BEFORE calling
+    load_contacts_xml, not after — same guiding principle as
+    catalog._read_folder_ini's round-2 pre-read stat fix (round-1 shipped
+    this branch stat-AFTER-read). Simulated by mutating contacts.xml from
+    inside a monkeypatched main.load_contacts_xml (a rewrite landing
+    DURING that read): the persisted contacts_sig must be the
+    PRE-mutation signature, so a subsequent reconcile correctly detects
+    drift against the file's actual (post-mutation) state instead of
+    trusting a signature that already looks current."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import time as _time
+    import unittest.mock as mock
+
+    import main as mainmod
+    from catalog import load_contacts_xml as real_load_contacts_xml
+    from catalog import stat_sig
+    from main import MainWindow
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+
+    contacts_path = tmp_path / "contacts.xml"
+    contacts_path.write_text("<contacts>\n</contacts>\n")
+    before_sig = stat_sig(contacts_path)
+
+    cat = scan_library(root)
+    cat.contacts_sig = before_sig
+    cache_dir = tmp_path / "cachedir"
+    win = MainWindow(cat, None, cache_dir=cache_dir, build_dir=None,
+                     contacts_path=contacts_path)
+
+    # A genuine photo drift is the simplest reliable trigger onto the
+    # rebuild branch — the race under test happens once that branch
+    # actually calls load_contacts_xml below, regardless of what tripped
+    # drift detection in the first place.
+    make_jpeg(root / "b.jpg")
+
+    def racing_load(path):
+        result = real_load_contacts_xml(path)
+        # A rewrite landing DURING the read — appends text so size
+        # changes (not just mtime, which truncates to whole seconds).
+        Path(path).write_text(
+            Path(path).read_text() + "<!-- edited mid-read -->\n")
+        return result
+
+    with mock.patch.object(mainmod, "load_contacts_xml",
+                           side_effect=racing_load):
+        win._start_reconcile()
+        assert win._reconcile_thread is not None
+        deadline = _time.time() + 20
+        while win._reconcile_thread.is_alive() and _time.time() < deadline:
+            app.processEvents()
+            _time.sleep(0.01)
+        assert not win._reconcile_thread.is_alive()
+        app.processEvents()
+
+    disk = load_catalog(cache_dir / "catalog.json", root)
+    assert disk is not None
+    # THE fix: the persisted signature is the PRE-mutation one, not the
+    # file's current (post-mutation, mid-read-edited) state.
+    assert disk.contacts_sig == before_sig
+    assert disk.contacts_sig != stat_sig(contacts_path)
+    win.shutdown()
+
+
+def test_read_folder_ini_signature_captured_before_parse_time(
+        tmp_path: Path) -> None:
+    """Codex review round-2 finding 1 (fauxcasa-cam.14 step 4): a
+    freshness signature must never be NEWER than the content it
+    describes — _read_folder_ini now stats the winning path BEFORE
+    calling read_picasa_ini, correcting the prior (round-1) stat-AFTER-
+    read version, which paired NEW content with a signature that already
+    read as current whenever a rewrite landed DURING the parse.
+    Simulated by mutating the ini file from inside a monkeypatched
+    read_picasa_ini (a rewrite landing exactly during the "read"): the
+    signature _read_folder_ini returns must be the PRE-mutation one,
+    stat'd before the mock ever ran — never the file's post-mutation
+    state — so a subsequent reconcile (which re-stats fresh) correctly
+    sees a MISMATCH against that stored signature and flags drift,
+    self-healing with one rebuild instead of silently persisting stale
+    content forever (the round-1 stat-after-read version would instead
+    store the post-mutation signature and never flag drift again)."""
+    import unittest.mock as mock
+
+    import catalog as catmod
+    import picasa_db
+
+    folder = tmp_path / "lib"
+    folder.mkdir()
+    ini_path = folder / ".picasa.ini"
+    ini_path.write_text("[Picasa]\r\nname=Before\r\n")
+    before_sig = catmod.stat_sig(ini_path)
+
+    real_read = picasa_db.read_picasa_ini
+
+    def racing_read(path):
+        result = real_read(path)                     # parses "Before"
+        ini_path.write_text("[Picasa]\r\nname=After\r\n\r\n")  # the race
+        return result
+
+    with mock.patch("picasa_db.read_picasa_ini", side_effect=racing_read):
+        result = catmod._read_folder_ini(folder)
+
+    assert result is not None
+    ini, sig = result
+    assert ini.section("Picasa").get("name") == "Before"    # parsed content
+    # THE fix: the signature is the PRE-mutation one, not the file's
+    # current (post-mutation) state.
+    assert sig == before_sig
+    after_sig = catmod.stat_sig(ini_path)
+    assert sig != after_sig  # size differs: "Before" vs "After\r\n\r\n"
+
+    # A subsequent reconcile WOULD flag this as drift (self-heals with
+    # one rebuild) rather than silently trusting the stale "Before" name
+    # forever — reconcile's fresh probe reads the file's CURRENT state,
+    # which no longer matches the stored (pre-mutation) signature.
+    assert catmod._folder_ini_sig(folder) == after_sig != sig
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"),
+                    reason="chmod 000 does not reliably block reads on Windows")
+def test_ini_variant_selection_agrees_when_first_candidate_unreadable(
+        tmp_path: Path) -> None:
+    """Codex review round-2 finding 3 (fauxcasa-cam.14 step 4): an
+    exists-but-UNREADABLE first INI_NAMES candidate (a real-world
+    permission hiccup) must not make the scan side (_read_folder_ini,
+    which falls through past it to a later readable name) and the
+    reconcile side (_folder_ini_sig) pick DIFFERENT variants — a plain
+    stat-only probe on the reconcile side would happily "succeed" on the
+    unreadable file (stat needs only directory permission, not file-read
+    permission) and report ITS signature, which would never match what
+    the scan actually indexed from the SECOND file — every reconcile
+    would then report drift forever, never converging. Both paths now
+    share _select_ini_variant, so they agree exactly. Skipped when
+    running as root: root ignores file-mode permission bits, so chmod
+    000 would not actually block the read and the test would be
+    meaningless (root is also skipped implicitly by the OSError below
+    never being raised, but an explicit skip is clearer)."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("running as root: chmod 000 does not block reads")
+
+    import catalog as catmod
+
+    folder = tmp_path / "lib"
+    folder.mkdir()
+    unreadable = folder / ".picasa.ini"   # first INI_NAMES candidate
+    unreadable.write_text("[Picasa]\r\nname=Unreadable\r\n")
+    readable = folder / "Picasa.ini"      # second INI_NAMES candidate
+    readable.write_text("[Picasa]\r\nname=Readable\r\n")
+    unreadable.chmod(0o000)
+    try:
+        with open(unreadable, "rb"):
+            pytest.skip("unreadable file was still readable in this "
+                       "environment (e.g. running as an unaffected "
+                       "privileged/container user) — chmod 000 didn't "
+                       "actually block the read here")
+    except OSError:
+        pass  # confirmed: this environment DOES enforce the permission
+
+    try:
+        # The scan side falls through to the readable second candidate.
+        result = catmod._read_folder_ini(folder)
+        assert result is not None
+        ini, sig = result
+        assert ini.path == readable
+        assert ini.section("Picasa").get("name") == "Readable"
+        assert sig == catmod.stat_sig(readable)
+
+        # The reconcile side's independent probe must pick the SAME
+        # (second, readable) variant — never the unreadable first one —
+        # so a reconcile right after this "scan" sees no drift.
+        assert catmod._folder_ini_sig(folder) == sig
+    finally:
+        unreadable.chmod(0o644)  # restore so tmp_path cleanup can remove it
+
+
 def test_offline_root_labels_empty_for_single_root_library(
         tmp_path: Path) -> None:
     """_offline_root_labels (design §12, bead .e) is a no-op for a
@@ -13093,6 +13532,45 @@ def test_promote_happy_path(tmp_path: Path) -> None:
     loaded_cat = load_catalog(new_dir / "catalog.json", cfg)
     assert loaded_cat is not None
     thumbcache.bind(loaded_cache, loaded_cat, root_id=root_id)
+
+
+def test_promote_rekeys_ini_sigs_to_minted_root_id(tmp_path: Path) -> None:
+    """Codex review finding 1 (fauxcasa-cam.14 step 4): ini_sigs is nested
+    by root_id and does NOT use the absent-means-roots[0] convention
+    photo/folder rows do (save_catalog's comment), so a legacy catalog's
+    ini signatures — persisted under the literal LEGACY_ROOT_ID ("") key —
+    must be REKEYED onto the minted root_id during promotion, or every
+    existing ini reads as newly added on the first warm reconcile (a
+    100%-miss lookup against the new root_id) and forces a spurious full
+    reindex."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    (root / ".picasa.ini").write_text("[Picasa]\r\nname=Lib\r\n")
+    cache_root = tmp_path / "cache"
+    cat = scan_library(root)
+    assert cat.ini_sigs  # baseline: the fixture's root ini WAS captured
+    old_dir = thumbcache.cache_dir_for(str(root.resolve()), cache_root)
+    thumbcache.build_cache(cat, old_dir)
+    save_catalog(cat, old_dir / "catalog.json")
+
+    raw_before = _raw_catalog(old_dir / "catalog.json")
+    assert list(raw_before["ini_sigs"]) == [""]  # legacy: LEGACY_ROOT_ID key
+
+    cfg = libmod.promote_library(root, cache_root=cache_root)
+    new_dir = thumbcache.cache_dir_for(cfg.library_id, cache_root)
+    root_id = cfg.roots[0].id
+
+    raw_after = _raw_catalog(new_dir / "catalog.json")
+    assert list(raw_after["ini_sigs"]) == [root_id]  # rekeyed, not "" anymore
+
+    loaded = load_catalog(new_dir / "catalog.json", cfg)
+    assert loaded is not None
+    assert loaded.ini_sigs == {(root_id, ""): cat.ini_sigs[("", "")]}
+
+    # THE regression: a clean warm reconcile right after promotion must
+    # not see the pre-existing ini as newly added.
+    drift = reconcile_walk(loaded, root, root_id=root_id)
+    assert not drift.ini_changed
 
 
 def test_promoted_rows_equal_old_rows(tmp_path: Path) -> None:
