@@ -112,7 +112,12 @@ _qt_excludes = [
     "PySide6.Qt3DLogic", "PySide6.Qt3DAnimation", "PySide6.Qt3DExtras",
     "PySide6.QtCharts", "PySide6.QtDataVisualization", "PySide6.QtGraphs",
     "PySide6.QtPdf", "PySide6.QtPdfWidgets", "PySide6.QtSql",
-    "PySide6.QtTest", "PySide6.QtNetwork", "PySide6.QtBluetooth",
+    # PySide6.QtNetwork is NOT excluded: the QtMultimedia python binding
+    # imports it at module level (verified 6.11.1), so excluding it makes
+    # `import PySide6.QtMultimedia` an ImportError in the frozen app —
+    # exactly what --bundle-self-check caught. The tracer itself never
+    # touches QtNetwork; it ships only as QtMultimedia's import dependency.
+    "PySide6.QtTest", "PySide6.QtBluetooth",
     "PySide6.QtNfc", "PySide6.QtPositioning", "PySide6.QtLocation",
     "PySide6.QtSensors", "PySide6.QtSerialPort", "PySide6.QtSerialBus",
     "PySide6.QtDesigner", "PySide6.QtUiTools", "PySide6.QtHelp",
