@@ -93,6 +93,7 @@ from catalog import (  # noqa: E402
     save_catalog_retrying,
     save_report,
     scan_library,
+    stat_sig,
 )
 from db3rescue import default_db3_dir  # noqa: E402
 from filetypes import (  # noqa: E402
@@ -742,6 +743,7 @@ def _emit(signal, *args) -> None:
 def _reconcile_online_roots(
         catalog: Catalog, scan_filter: ScanFilter | None, cancel,
         exts: frozenset[str] | set[str] | None,
+        contacts_path: Path | None = None,
         ) -> tuple[Drift | None, list[str]]:
     """Per-online-root reconcile (fauxcasa-ed5.7.5, bead .e, design §8/§9).
 
@@ -766,7 +768,16 @@ def _reconcile_online_roots(
     existing `drift is None` check keeps working unmodified). Otherwise
     returns `(aggregated Drift, offline root labels)` — the labels are for
     the caller's status-bar text; whether to act on `Drift.changed` is
-    still the caller's call, same as before this bead."""
+    still the caller's call, same as before this bead.
+
+    `contacts_path` (fauxcasa-cam.14 step 4): the machine-local
+    contacts.xml's freshness is checked HERE, ONCE for the whole library
+    — not inside the per-root reconcile_walk loop below — because
+    contacts.xml is a single machine-local file, not a per-root artifact;
+    checking it once per root would just repeat the same stat N times and
+    (for a multi-root library) fold the SAME drift into every root's
+    result. None (the default) skips the check entirely, matching every
+    existing call site that never threaded a contacts path through."""
     catalog.refresh_offline_ids()
     # NOTE (hi2 item 6): this stays inline rather than calling
     # catalog.online_roots()/offline_roots() directly. Those helpers filter
@@ -791,6 +802,16 @@ def _reconcile_online_roots(
         total.added += d.added
         total.removed += d.removed
         total.modified += d.modified
+        total.ini_changed = total.ini_changed or d.ini_changed
+
+    # The single machine-local contacts.xml check (see the docstring
+    # above): folded into the same `ini_changed` flag reconcile_walk
+    # already uses for per-root ini drift, since both trigger the exact
+    # same rebuild/re-resolve path in the caller (fauxcasa-cam.14 step 4 —
+    # also the PR-37 rider: editing contacts.xml now refreshes a warm
+    # start instead of never being noticed).
+    if stat_sig(contacts_path) != catalog.contacts_sig:
+        total.ini_changed = True
 
     labels = [r.label or r.path.name or str(r.path) for r in offline]
     return total, labels
@@ -865,6 +886,11 @@ def _scan_library_config(
     albums = {}
     merged_contacts = {}
     reports = []
+    # ini freshness signals (fauxcasa-cam.14 step 4): each root's
+    # scan_library() call returns them keyed LEGACY_ROOT_ID (it never
+    # knows the real root id) — root-qualify by re-keying onto the actual
+    # root.id, same composition shape as Catalog.ini_sigs' Python type.
+    ini_sigs: dict[tuple[str, str], tuple[int, int]] = {}
     identity_catalog = Catalog(
         root=cfg.roots[0].path, photos=[], folders={}, albums={},
         roots=list(cfg.roots), library_id=cfg.library_id)
@@ -878,6 +904,8 @@ def _scan_library_config(
         for folder in one.folders.values():
             folder.root_id = root.id
             folders[folder_key(identity_catalog, root.id, folder.rel)] = folder
+        for (_rid, folder_rel), sig in one.ini_sigs.items():
+            ini_sigs[(root.id, folder_rel)] = sig
         for uid, album in one.albums.items():
             shifted = [offset + i for i in album.members]
             existing = albums.get(uid)
@@ -943,6 +971,7 @@ def _scan_library_config(
         contacts=merged_contacts,
         db3_contacts=db3_contacts,
         report=report,
+        ini_sigs=ini_sigs,
         roots=list(cfg.roots),
         library_id=cfg.library_id,
     )
@@ -1039,7 +1068,8 @@ class MainWindow(QMainWindow):
                  pal_dir: Path | None = None,
                  excluded_exts: set[str] | None = None,
                  thumbs_path: Path | None = None,
-                 db3_dir: Path | None = None):
+                 db3_dir: Path | None = None,
+                 contacts_path: Path | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
@@ -1061,6 +1091,13 @@ class MainWindow(QMainWindow):
         # machine-local contacts.xml names, kept so a reconcile rebuild's
         # rescan resolves faces the same way the startup scan did
         self.contacts = contacts or {}
+        # machine-local contacts.xml PATH (fauxcasa-cam.14 step 4, distinct
+        # from `contacts` above — the already-parsed name map): kept so a
+        # reconcile can re-stat it and notice an external edit even when no
+        # photo file itself changed (the PR-37 rider). None when no
+        # contacts.xml was configured/found at startup, same as `catalog.
+        # contacts_sig` in that case.
+        self.contacts_path = contacts_path
         # Picasa2Albums .pal directory, kept for the same reason: a
         # reconcile rescan must merge albums the way the startup scan did
         self.pal_dir = pal_dir
@@ -1494,7 +1531,8 @@ class MainWindow(QMainWindow):
         def work() -> None:
             try:
                 drift, offline_labels = _reconcile_online_roots(
-                    old, self.scan_filter, self.build_cancel, self.exts)
+                    old, self.scan_filter, self.build_cancel, self.exts,
+                    self.contacts_path)
             except Exception as e:
                 log.error("reconcile walk failed: %s", e)
                 return
@@ -1537,6 +1575,12 @@ class MainWindow(QMainWindow):
                 fresh = scan_library(old.root, self.scan_filter,
                                      self.contacts, self.pal_dir,
                                      exts=self.exts, db3_dir=self.db3_dir)
+                # scan_library doesn't know about contacts.xml as a FILE
+                # (only the already-parsed name map) — stamp the fresh
+                # signal here so the rebuilt catalog's persisted
+                # contacts_sig matches what actually triggered/survived
+                # this reconcile (fauxcasa-cam.14 step 4).
+                fresh.contacts_sig = stat_sig(self.contacts_path)
                 result = build_cache(fresh, cache_dir, None,
                                      cancel=self.build_cancel)
                 if result is None:
@@ -3184,6 +3228,12 @@ def main() -> int:
     if catalog is None:  # cold path
         catalog = _scan_library_config(
             cfg, scan_filter, contacts, pal_dir, exts, db3_dir)
+        # scan_library/_scan_library_config only see the already-parsed
+        # `contacts` name map, never the contacts.xml PATH — stamp the
+        # freshness signal here, once, so it covers both the legacy and
+        # composed multi-root shapes and both the adopt and normal cold
+        # paths below (fauxcasa-cam.14 step 4).
+        catalog.contacts_sig = stat_sig(contacts_path)
         if adopt:
             try:
                 thumbs = load_cache(args.thumbs)
@@ -3228,7 +3278,8 @@ def main() -> int:
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
                      contacts=contacts, pal_dir=pal_dir,
                      excluded_exts=excluded_exts,
-                     thumbs_path=args.thumbs, db3_dir=db3_dir)
+                     thumbs_path=args.thumbs, db3_dir=db3_dir,
+                     contacts_path=contacts_path)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)

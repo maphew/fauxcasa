@@ -412,6 +412,27 @@ class Catalog:
     # a freshly scan_library()-built catalog just walked every one of its
     # roots successfully, so nothing in it can be offline yet.
     offline_ids: set[str] = field(default_factory=set)
+    # Freshness signals for externally-modified ini/contacts sidecars
+    # (fauxcasa-cam.14 step 4): names/metadata baked into the persisted
+    # catalog at scan time never refresh on a warm start until UNRELATED
+    # photo drift happens to force a rebuild — a size+mtime signal on each
+    # folder's .picasa.ini (keyed (root_id, folder_rel); a folder with no
+    # ini has no entry) and on the machine-local contacts.xml closes that
+    # gap. Same cheap-signal idiom as Photo.size/mtime and Drift (no
+    # hashing — see stat_sig/_folder_ini_sig). Populated by scan_library /
+    # _scan_library_config at scan time, persisted (save_catalog v14), and
+    # re-derived fresh at reconcile time (reconcile_walk's Drift.
+    # ini_changed for the per-folder inis; the contacts_sig comparison in
+    # main._reconcile_online_roots, done ONCE for the whole library since
+    # contacts.xml is one machine-local file, not a per-root artifact).
+    ini_sigs: dict[tuple[str, str], tuple[int, int]] = field(
+        default_factory=dict)
+    # The one machine-local contacts.xml's signal, or None when no
+    # contacts.xml was configured/found at scan time — collapsing "never
+    # configured" and "file vanished" to the same value (via stat_sig())
+    # so a library with no contacts.xml never phantom-drifts against
+    # itself.
+    contacts_sig: tuple[int, int] | None = None
 
     @property
     def visible_count(self) -> int:
@@ -568,6 +589,39 @@ def walk_roots(cfg: LibraryConfig,
         for p in walk_library(r.path, scan_filter, exts):
             hits.append((r.id, p))
     return hits
+
+
+def stat_sig(path: Path | None) -> tuple[int, int] | None:
+    """Cheap size+mtime freshness signal for a single file (fauxcasa-
+    cam.14 step 4) — the same no-parse, no-hash idiom Photo.size/mtime and
+    Drift already use for photos, generalized to one arbitrary sidecar
+    file. None when `path` is None or unreadable, so "never configured"
+    and "vanished since the last scan" collapse to the same value — a
+    caller comparing two None-vs-None signals never phantom-drifts.
+    Shared by `_folder_ini_sig` (below) and main.py's contacts.xml
+    signature."""
+    if path is None:
+        return None
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_size, int(st.st_mtime))
+
+
+def _folder_ini_sig(folder: Path) -> tuple[int, int] | None:
+    """The freshness signal for whichever INI_NAMES variant `folder`
+    carries (first match wins, same probe order as _read_folder_ini), or
+    None when the folder has no ini under any of the legacy names.
+    scan_library uses this to populate Catalog.ini_sigs at scan time;
+    reconcile_walk recomputes it fresh per folder to detect Drift.
+    ini_changed — both sides read the exact same signal, so an externally
+    modified/added/removed ini is never missed by one but not the other."""
+    for name in INI_NAMES:
+        sig = stat_sig(folder / name)
+        if sig is not None:
+            return sig
+    return None
 
 
 def _read_folder_ini(folder: Path) -> picasa_db.PicasaIni | None:
@@ -1414,9 +1468,22 @@ def scan_library(root: Path,
     if db3_dir is not None:
         db3_contacts = rescue_people(db3_dir, root, photos, registry, report)
 
+    # ini freshness signals (fauxcasa-cam.14 step 4): every folder_rel
+    # this scan actually queried an ini for (ini_by_folder — both
+    # photo-owning folders and the ancestor folders folder_contacts()
+    # walked for [Contacts2] inheritance, so a contacts-only ancestor ini
+    # is covered too), keyed (root_id, folder_rel); a folder without an
+    # ini (or where the ini couldn't be stat'd) has no entry, same as
+    # reconcile_walk's fresh-side convention.
+    ini_sigs: dict[tuple[str, str], tuple[int, int]] = {}
+    for folder_rel in ini_by_folder:
+        sig = _folder_ini_sig(root / folder_rel if folder_rel else root)
+        if sig is not None:
+            ini_sigs[(LEGACY_ROOT_ID, folder_rel)] = sig
+
     return Catalog(root=root, photos=photos, folders=folders, albums=albums,
                    contacts=registry, db3_contacts=db3_contacts,
-                   report=report,
+                   report=report, ini_sigs=ini_sigs,
                    roots=[LibraryRoot(id=LEGACY_ROOT_ID, path=root)])
 
 
@@ -1527,7 +1594,21 @@ def scan_library(root: Path,
 # migration path for a plain v12 file (never a shipped format for more
 # than this same release) — it now simply fails the version gate like any
 # older format; the catalog is a regenerable cache, not a document.
-CATALOG_VERSION = 13
+#
+# v14 (fauxcasa-cam.14 step 4): persists Catalog.ini_sigs (per-folder
+# .picasa.ini size+mtime, nested "ini_sigs": {root_id: {folder_rel:
+# [size, mtime]}}) and Catalog.contacts_sig (the one machine-local
+# contacts.xml's size+mtime, "contacts_sig": [size, mtime], key absent
+# when None) — see save_catalog/load_catalog. Neither signal existed on
+# any v13 (or older) file, so a v13 zstd frame now fails the version gate
+# below like any other older format and cold-rebuilds; there is no
+# migration, same regenerable-cache posture as the v12 note above. Before
+# this bump, an externally-edited ini or contacts.xml never refreshed a
+# warm start until unrelated photo drift happened to force a rebuild —
+# these signals close that gap (reconcile_walk's Drift.ini_changed; the
+# contacts_sig check in main._reconcile_online_roots, done ONCE per
+# library, not per root).
+CATALOG_VERSION = 14
 # The last pre-multiroot format (fauxcasa-ed5.7.2, bead .b): load_catalog's
 # ONLY version-compat carve-out, and only when the library has exactly one
 # root (see load_catalog). A fixed number, not "CATALOG_VERSION - 1" — see
@@ -1760,10 +1841,20 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
     else:
         header = {"library": str(catalog.root)}
     flat_rows = [_photo_to_row(p, first_root_id) for p in catalog.photos]
+    # v14 ini freshness signals (fauxcasa-cam.14 step 4): nested by the
+    # ACTUAL root_id (never the absent-means-roots[0] trick the photo/
+    # folder rows use) — ini_sigs has one entry per ini-bearing folder,
+    # far fewer than photo rows, so the byte-shaving isn't worth the
+    # ambiguity a root_id-prefixed folder_rel could theoretically
+    # introduce. See load_catalog for the inverse.
+    ini_sigs_by_root: dict[str, dict[str, list[int]]] = {}
+    for (root_id, folder_rel), sig in catalog.ini_sigs.items():
+        ini_sigs_by_root.setdefault(root_id, {})[folder_rel] = list(sig)
     data = {
         "version": CATALOG_VERSION,
         **header,
         "photos": _group_photo_rows(flat_rows, first_root_id),
+        "ini_sigs": ini_sigs_by_root,
         # only folders that carry a description (title/count are derived);
         # the dict KEY already carries the root-id prefix convention (see
         # _folder_json_key, applied when the folders dict is BUILT in
@@ -1790,6 +1881,12 @@ def save_catalog(catalog: Catalog, path: Path) -> None:
             for a in catalog.albums.values()
         ],
     }
+    # v14 contacts.xml freshness signal: key absent (not null) when None,
+    # same "only present when it means something" convention as
+    # "backfill" below — a legacy catalog with no contacts.xml configured
+    # writes no key at all, matching a warm load's data.get(...) default.
+    if catalog.contacts_sig is not None:
+        data["contacts_sig"] = list(catalog.contacts_sig)
     # Backfill progress (cam.12): persisted only while pending/underway,
     # so an indexer-built catalog's file shape is unchanged. The periodic
     # mid-backfill saves ride the same atomic write-temp-rename, so a
@@ -2013,6 +2110,29 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig,
             db3_contacts = []
         db3_contacts = {str(c) for c in db3_contacts}
 
+        # v14 ini/contacts freshness signals (fauxcasa-cam.14 step 4):
+        # absent on any pre-v14 file (the v11 compat path never carries
+        # these keys either) -> {} / None, same as a fresh catalog that
+        # simply has no signal yet. Nested by the actual root_id (see
+        # save_catalog) — no folder-key inversion needed, unlike
+        # "folders"/"hidden_folders".
+        ini_sigs: dict[tuple[str, str], tuple[int, int]] = {}
+        ini_sigs_raw = data.get("ini_sigs", {})
+        if isinstance(ini_sigs_raw, dict):
+            for rid, per_folder in ini_sigs_raw.items():
+                if not isinstance(per_folder, dict):
+                    continue
+                for frel, sig in per_folder.items():
+                    if isinstance(sig, list) and len(sig) == 2:
+                        ini_sigs[(str(rid), str(frel))] = \
+                            (int(sig[0]), int(sig[1]))
+
+        contacts_sig: tuple[int, int] | None = None
+        contacts_sig_raw = data.get("contacts_sig")
+        if isinstance(contacts_sig_raw, list) and len(contacts_sig_raw) == 2:
+            contacts_sig = (int(contacts_sig_raw[0]),
+                            int(contacts_sig_raw[1]))
+
         # Backfill progress (cam.12): an absent key means complete (the
         # indexer-built shape — save_catalog omits it then). A non-dict
         # value raises here (AttributeError -> the defensive net); an
@@ -2040,6 +2160,7 @@ def load_catalog(path: Path, cfg: Path | LibraryConfig,
                       db3_contacts=db3_contacts,
                       backfill_state=backfill_state,
                       backfill_cursor=backfill_cursor,
+                      ini_sigs=ini_sigs, contacts_sig=contacts_sig,
                       roots=list(cfg.roots), library_id=cfg.library_id)
     # "populated when the catalog is opened" (design §8, bead .e) — a warm
     # load is exactly an open, so check every root's reachability now
@@ -2057,10 +2178,20 @@ class Drift:
     added: int = 0
     removed: int = 0
     modified: int = 0
+    # An externally added/removed/modified .picasa.ini sidecar somewhere
+    # under this root (fauxcasa-cam.14 step 4 — set by reconcile_walk from
+    # Catalog.ini_sigs), OR — folded in by main._reconcile_online_roots,
+    # which does this check ONCE for the whole library rather than once
+    # per root, since contacts.xml is a single machine-local file — a
+    # changed contacts.xml. Either would otherwise bake stale names/
+    # metadata into a warm start indefinitely, since neither touches any
+    # photo file's own size/mtime.
+    ini_changed: bool = False
 
     @property
     def changed(self) -> bool:
-        return bool(self.added or self.removed or self.modified)
+        return bool(self.added or self.removed or self.modified
+                    or self.ini_changed)
 
     def summary(self) -> str:
         return (f"+{self.added} added, -{self.removed} removed, "
@@ -2089,10 +2220,21 @@ def reconcile_walk(catalog: Catalog, root: Path,
     the catalog subset for THIS root_id only means a photo with the same
     `rel` on a different root never counts as added/removed/modified here
     — callers walk each root independently (design §9; looping over all
-    online roots is bead .e's job, out of this function's scope)."""
+    online roots is bead .e's job, out of this function's scope).
+
+    Drift.ini_changed (fauxcasa-cam.14 step 4) checks only THIS root's
+    ini_sigs slice — every folder_rel `catalog.ini_sigs` already tracks
+    for this root_id, unioned with every folder_rel the fresh walk just
+    visited (so a brand-new ini in a previously ini-less but now
+    photo-bearing folder is caught too), each re-stat'd via
+    _folder_ini_sig and compared against the stored signal. The
+    contacts.xml check is NOT here — it's a single machine-local file, not
+    a per-root artifact, so it's done ONCE by the multiroot reconcile
+    helper (main._reconcile_online_roots), not per root."""
     root = root.resolve()
     files = walk_library(root, scan_filter, exts)
     fresh: dict[tuple[str, str], tuple[int, int]] = {}
+    folder_rels: set[str] = set()
     for i, (p, rel) in enumerate(zip(files, rel_paths(root, files))):
         if cancel is not None and i % 512 == 0 and cancel.is_set():
             return None
@@ -2101,6 +2243,7 @@ def reconcile_walk(catalog: Catalog, root: Path,
             fresh[(root_id, rel)] = (st.st_size, int(st.st_mtime))
         except OSError:
             fresh[(root_id, rel)] = (-1, -1)
+        folder_rels.add(rel.rpartition("/")[0])
     old = {(p.root_id, p.rel): (p.size, p.mtime)
            for p in catalog.photos if p.root_id == root_id}
     drift = Drift()
@@ -2112,4 +2255,12 @@ def reconcile_walk(catalog: Catalog, root: Path,
     for key in old:
         if key not in fresh:
             drift.removed += 1
+
+    old_ini_slice = {frel: sig for (rid, frel), sig in catalog.ini_sigs.items()
+                     if rid == root_id}
+    for frel in folder_rels | set(old_ini_slice):
+        fresh_ini_sig = _folder_ini_sig(root / frel if frel else root)
+        if old_ini_slice.get(frel) != fresh_ini_sig:
+            drift.ini_changed = True
+            break
     return drift

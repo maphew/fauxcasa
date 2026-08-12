@@ -11775,11 +11775,12 @@ def test_multiroot_two_root_save_load_roundtrip_v13(tmp_path: Path) -> None:
     explicit "R" (fauxcasa-ed5.5: now at the GROUP level, since grouping
     is by (root_id, folder) — see _group_photo_rows), and
     Catalog.roots/library_id survive the reload.
-    (== 13: the newest version-gate test pins the exact value.)"""
+    (== 14: the newest version-gate test pins the exact value — bumped
+    from 13 by fauxcasa-cam.14 step 4's ini_sigs/contacts_sig fields.)"""
     import catalog as catmod
     from catalog import Catalog, Folder, Photo
 
-    assert catmod.CATALOG_VERSION == 13
+    assert catmod.CATALOG_VERSION == 14
     root_a, root_b = tmp_path / "a", tmp_path / "b"
     root_a.mkdir()
     root_b.mkdir()
