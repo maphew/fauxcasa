@@ -97,4 +97,4 @@ baseline: 'after 036-edit-tilt-straighten-unsaved' (2026-06-20T23:06:49+00:00)
    changed: db3/wordhash.dat — binary; 66920 -> 66928 bytes; first difference at offset 0x1038c
 ```
 
-**CORRECTION (2026-08-12 salvage review, fauxcasa-nu9): this diff's imagedata_* delta mixes two edits — imagedata_filters[7] ''->'tilt=...' and edited[7] 0->1 are fixture 036's carry-over flush, while imagedata_filters[8] ''->'finetune2=...' IS this fixture's own filters flush, captured after all (contradicting 'flush not waited'). Partial flush: edited[8] had NOT yet flushed at snapshot time — filters and edited flush independently.**
+**CORRECTION (2026-08-12 salvage review, fauxcasa-nu9): this diff's imagedata_* delta mixes two edits — rows [7] (filters ''->'tilt=...', edited 0->1, backuphash 0->53094) are fixture 036's carry-over flush, while rows [8] (filters ''->'finetune2=...', edited 0->1, backuphash 0->49282) are this fixture's own edit FULLY flushed within the snapshot, contradicting the 'flush not waited' claim — so this capture is ini+db3, not ini-only.**
