@@ -14,11 +14,15 @@ on:
     paths:
       - "apps/desktop-python/**"
       - "scripts/picasa_db.py"
+      - "scripts/make-synthetic-dng.py"
+      - "fixtures/raw-smoke/**"
       - ".github/workflows/bundle.yml"
   pull_request:
     paths:
       - "apps/desktop-python/**"
       - "scripts/picasa_db.py"
+      - "scripts/make-synthetic-dng.py"
+      - "fixtures/raw-smoke/**"
       - ".github/workflows/bundle.yml"
 
 jobs:
@@ -98,7 +102,7 @@ jobs:
           fi
           "$EXE" --bundle-self-check
 
-      - name: Generate a smoke library (JPEG fixtures)
+      - name: Generate a smoke library (JPEG fixtures + synthetic DNG)
         shell: bash
         run: |
           uv run --with "${{ env.PYSIDE6 }}" python - <<'EOF'
@@ -118,6 +122,11 @@ jobs:
               "[photo01.jpg]\r\nstar=yes\r\ncaption=summit\r\n")
           print("ci-library ready")
           EOF
+          # Add the pre-committed synthetic DNG (fauxcasa-v46.5): gates the
+          # RAW decode path (rawpy hidden-import) in the frozen artifact.
+          # Blue JPEG preview matches the existing blue-dominant palette;
+          # a dedicated assertion step below checks the tile is non-blank.
+          cp fixtures/raw-smoke/synthetic.dng "ci-library/2019-03-02 Hike/"
 
       - name: Smoke-run the FROZEN artifact headless (the whole point)
         shell: bash
@@ -156,6 +165,59 @@ jobs:
           if blue < 50:
               sys.exit("BLANK grid — JPEG tiles did not decode (qjpeg missing?)")
           print("OK: frozen artifact decodes JPEG thumbnails")
+          EOF
+
+      - name: Assert DNG thumbnail decoded in frozen artifact (rawpy gated)
+        # Mirrors the JPEG tile assertion above but keys on the fcache directly
+        # rather than the screenshot: checks that the synthetic.dng entry has a
+        # nonzero tile length, proving rawpy is bundled (fauxcasa-v46.5, #45).
+        shell: bash
+        run: |
+          uv run --with "${{ env.PYSIDE6 }}" python - <<'EOF'
+          import json, struct, sys
+          from pathlib import Path
+
+          cache_root = Path("ci-cache")
+          if not cache_root.exists():
+              sys.exit("ci-cache not found — smoke run may have failed")
+
+          dng_found = False
+          for d in sorted(cache_root.iterdir()):
+              if not d.is_dir():
+                  continue
+              fc = d / "thumbs.fcache"
+              fj = d / "thumbs.fcache.json"
+              if not fc.exists() or not fj.exists():
+                  continue
+              meta = json.loads(fj.read_text())
+              files = meta.get("files", [])
+              dng_files = [f for f in files if f.lower().endswith(".dng")]
+              if not dng_files:
+                  continue
+              idx = files.index(dng_files[0])
+              raw_data = fc.read_bytes()
+              # v1 fcache: 16-byte header (FCTC + version + count + reserved),
+              # then count*16 index entries (offset:Q, length:I, w:H, h:H).
+              if raw_data[:4] != b"FCTC":
+                  sys.exit(f"Bad fcache magic: {raw_data[:4]!r}")
+              version = struct.unpack_from("<I", raw_data, 4)[0]
+              if version != 1:
+                  sys.exit(f"Unexpected fcache version {version}")
+              entry_off = 16 + idx * 16
+              offset, length, w, h = struct.unpack_from("<QIHH", raw_data,
+                                                        entry_off)
+              if length == 0:
+                  sys.exit(
+                      "DNG decoded to error tile (rawpy/hiddenimport missing?)"
+                      f" — {dng_files[0]}"
+                  )
+              print(f"OK: DNG thumb decoded ({w}x{h}, {length} bytes) "
+                    "— rawpy bundled correctly")
+              dng_found = True
+              break
+
+          if not dng_found:
+              sys.exit("DNG not found in ci-cache — was it indexed?")
           EOF
 
       - name: Frozen no-arg launch fails GRACEFULLY (shipping double-click UX)

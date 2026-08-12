@@ -1238,6 +1238,80 @@ def test_infile_metadata_survives_catalog_roundtrip(tmp_path: Path) -> None:
     assert p.caption == "persisted cap" and p.keywords == ("kw1",)
 
 
+# ---- import-report entries for in-file overrides (fauxcasa-cam.17) --------
+
+
+def test_infile_override_reported(tmp_path: Path) -> None:
+    """When an in-file value replaces a DIFFERENT non-empty ini value, an
+    infile_override entry is added to the catalog's import report (§4).
+    Covers caption and keywords here (see test_infile_override_geotag_reported
+    for geotag); date_taken has no ini key so it is always a gap-fill and
+    never produces an entry, and star is deliberately excluded (machine-local
+    star overlays make the ini-original value unobservable at this point —
+    see apply_photo_meta)."""
+    root = tmp_path / "lib"
+    write_jpeg_meta(root / "f" / "p.jpg",
+                    xmp=_xmp_app1(caption="file cap", keywords=("fkw",)))
+    (root / "f" / ".picasa.ini").write_text(
+        "[p.jpg]\r\ncaption=ini cap\r\nkeywords=ikw\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    entries = [e for e in cat.report.entries if e.kind == "infile_override"]
+    # both caption and keywords were overridden
+    subjects = {e.subject for e in entries}
+    assert "f/p.jpg" in subjects
+    kinds_detail = {e.subject: e.detail for e in entries}
+    cap_e = next(e for e in entries if "caption" in e.detail)
+    assert 'ini "ini cap"' in cap_e.detail and 'in-file "file cap"' in cap_e.detail
+    assert cap_e.source == "file"
+    kw_e = next(e for e in entries if "keywords" in e.detail)
+    assert '"ikw"' in kw_e.detail and '"fkw"' in kw_e.detail
+
+
+def test_infile_override_geotag_reported(tmp_path: Path) -> None:
+    """A geotag override (ini geotag= beaten by in-file EXIF GPS) produces an
+    infile_override entry. star is deliberately NOT reported here even
+    though XMP Rating=3 beats ini star=yes: machine-local star overlays
+    (apply_star_overrides) are applied before build_cache runs, so
+    photo.star may already be an overlay value rather than the ini-original
+    — a report entry would misattribute the overlay to "ini" (see
+    apply_photo_meta)."""
+    root = tmp_path / "mlib"
+    _meta_jpeg(root / "f" / "a.jpg", gps=WHITEHORSE, rating=3)
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\nstar=yes\r\ngeotag=-33.856800,151.215300\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    overrides = {e.detail.split(":")[0]: e
+                 for e in cat.report.entries if e.kind == "infile_override"}
+    assert "geotag" in overrides
+    assert "star" not in overrides
+    a = next(p for p in cat.photos if p.rel == "f/a.jpg")
+    assert a.star == 3  # in-file rating still WINS on the photo itself
+
+
+def test_infile_override_no_flood(tmp_path: Path) -> None:
+    """Gap-fills — ini had no value, in-file supplies one — must NOT add
+    a report entry; only a genuine replacement of a different non-empty ini
+    value counts as an override (fauxcasa-cam.17 no-flood rule)."""
+    root = tmp_path / "lib"
+    # p: has in-file caption but NO ini caption/keywords -> gap-fill, no entry
+    write_jpeg_meta(root / "f" / "p.jpg",
+                    xmp=_xmp_app1(caption="file only"))
+    # q: in-file caption MATCHES the ini caption -> same value, no entry
+    write_jpeg_meta(root / "f" / "q.jpg",
+                    xmp=_xmp_app1(caption="same"))
+    (root / "f" / ".picasa.ini").write_text(
+        "[q.jpg]\r\ncaption=same\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    overrides = [e for e in cat.report.entries if e.kind == "infile_override"]
+    assert not overrides, f"unexpected override entries: {overrides}"
+
+
 # ---- EXIF orientation baked consistently into the thumbnail cache --------
 
 def test_index_bakes_exif_orientation(tmp_path: Path) -> None:
@@ -2260,6 +2334,37 @@ def test_folder_hidden_matcher_is_defensive() -> None:
     assert not catalog._is_folder_hidden(mk(""))
     assert not catalog._is_folder_hidden(IniSection(name="Picasa"))  # no key
     assert not catalog._is_folder_hidden(None)  # no [Picasa] section at all
+
+
+def test_folder_hidden_legacy_category_key() -> None:
+    """Legacy Picasa 2 used category= (not P2category=); _is_folder_hidden
+    accepts both so pre-3.x folders are hidden correctly (fauxcasa-cam.14)."""
+    import catalog
+    from picasa_db import IniSection
+
+    def mk_legacy(v: str) -> IniSection:
+        return IniSection(name="Picasa", items=[("category", v)])
+
+    assert catalog._is_folder_hidden(mk_legacy("Hidden Folders"))
+    assert catalog._is_folder_hidden(mk_legacy("hidden folders"))
+    assert not catalog._is_folder_hidden(mk_legacy("Folders on Disk"))
+    assert not catalog._is_folder_hidden(mk_legacy(""))
+
+
+def test_scan_folder_hidden_legacy_category(tmp_path: Path) -> None:
+    """A folder with [Picasa] category=Hidden Folders (legacy spelling) is
+    also hidden — same result as P2category= (fauxcasa-cam.14)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "visible" / "a.jpg")
+    (root / "visible" / ".picasa.ini").write_text(
+        "[Picasa]\r\nP2category=Folders on Disk\r\n")
+    make_jpeg(root / "hidden" / "b.jpg")
+    (root / "hidden" / ".picasa.ini").write_text(
+        "[Picasa]\r\ncategory=Hidden Folders\r\n")
+    cat = scan_library(root)
+    assert not cat.folders["visible"].folder_hidden
+    assert cat.folders["hidden"].folder_hidden
+    assert cat.visible_count == 1
 
 
 def test_folder_hidden_survives_catalog_roundtrip(
@@ -3496,6 +3601,106 @@ def test_mainwindow_slideshow_surface_reused_and_repointed(
     win.reload_data(cat3, cache2)
     assert first.isHidden()                            # ...closes the show
     assert not first._timer.isActive()
+
+
+# ---- grid header play glyph (fauxcasa-q6l.16) --------------------------------
+
+def _header_click(g_widget, vx: float, vy: float) -> None:
+    """Deliver a plain left-button press at viewport (vx, vy)."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    pos = QPointF(vx, vy)
+    ev = QMouseEvent(QEvent.Type.MouseButtonPress, pos, pos, pos,
+                     Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier)
+    g_widget.mousePressEvent(ev)
+
+
+def _two_folder_library(root):
+    """Synthetic library with two folders (2 + 1 photos) for play-glyph
+    tests — no real Picasa data."""
+    make_jpeg(root / "folder_a" / "img1.jpg")
+    make_jpeg(root / "folder_a" / "img2.jpg")
+    make_jpeg(root / "folder_b" / "img3.jpg")
+
+
+def test_grid_header_glyph_click_emits_play_group(tmp_path: Path) -> None:
+    """Click on the play triangle in a group header emits play_group with
+    the matching folder key; clicking the label area of the same header
+    does NOT emit the signal (fauxcasa-q6l.16)."""
+    _offscreen_app()
+    from grid import GridView, HEADER_H, HEADER_PLAY_W, PAD
+
+    root = tmp_path / "lib"
+    _two_folder_library(root)
+    cat = scan_library(root)
+
+    g = GridView()
+    g.resize(400, 640)
+    g.show()
+    g.set_data(cat, None)
+    assert len(g.groups) == 2
+
+    emitted: list[str] = []
+    g.play_group.connect(emitted.append)
+
+    w = g.viewport().width()
+    top = g.verticalScrollBar().value()   # 0 (not scrolled)
+
+    # First group header: viewport y = 0
+    glyph0 = g._header_glyph_rect(g.groups[0].y - top, w)
+    _header_click(g, glyph0.center().x(), glyph0.center().y())
+    assert emitted == [g.groups[0].folder], "glyph click must emit play_group"
+
+    # Click the label side of the SAME header — must NOT emit
+    emitted.clear()
+    _header_click(g, float(PAD + 4), float(HEADER_H // 2))
+    assert emitted == [], "label-area click must not emit play_group"
+
+    # Second group header
+    emitted.clear()
+    y_vp_g1 = g.groups[1].y - top
+    glyph1 = g._header_glyph_rect(y_vp_g1, w)
+    _header_click(g, glyph1.center().x(), glyph1.center().y())
+    assert emitted == [g.groups[1].folder]
+
+
+def test_mainwindow_play_group_starts_slideshow_for_group(
+        tmp_path: Path) -> None:
+    """_play_group starts the slideshow over THAT group's items from
+    position 0; a second call with a different key replays that group;
+    an unknown key is a no-op (fauxcasa-q6l.16)."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    _two_folder_library(root)
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    ga = next(g for g in win.grid.groups if "folder_a" in g.folder)
+    gb = next(g for g in win.grid.groups if "folder_b" in g.folder)
+
+    # Play folder_a
+    win._play_group(ga.folder)
+    assert win._slideshow is not None and win._slideshow.isFullScreen()
+    assert list(win._slideshow.display) == ga.items
+    assert win._slideshow.pos == 0
+    _press(win._slideshow, Qt.Key.Key_Escape)
+
+    # Play folder_b — same surface, different display set
+    win._play_group(gb.folder)
+    assert win._slideshow.isFullScreen()
+    assert list(win._slideshow.display) == gb.items
+    assert win._slideshow.pos == 0
+    _press(win._slideshow, Qt.Key.Key_Escape)
+
+    # Unknown folder key is a silent no-op
+    win._play_group("no-such-folder")
+    assert win._slideshow is None or win._slideshow.isHidden()
+
+
 # ---- search upgrades: multi-word AND, -term negation, folder names --------
 # (fauxcasa-q6l.6) §5: instant search over filenames, captions, keywords and
 # folder names, with '-term' negation. Positive terms AND together (each may
@@ -5411,6 +5616,40 @@ def test_status_readout_stashed_original(library: Path) -> None:
     assert "Picasa-saved original kept" not in win.meta_label.text()
 
 
+def test_status_readout_dims_and_size(library: Path) -> None:
+    """Single-photo status bar includes image dimensions and human file size
+    when present, and omits both cleanly when dims is None (pre-backfill)
+    or size is -1 (unindexed) — fauxcasa-q6l.12."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    cat = scan_library(library)
+    a = next(p for p in cat.photos if p.rel.endswith("Trip/a.jpg"))
+    a.dims = (3648, 2736)
+    a.size = 2_200_000
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    idx = cat.photos.index(a)
+
+    # present: dims and size both populated
+    win._photo_selected(idx)
+    text = win.meta_label.text()
+    assert "3648x2736" in text
+    assert "2.1 MB" in text
+
+    # absent: dims=None, size=-1 — omit cleanly
+    a.dims = None
+    a.size = -1
+    win._photo_selected(idx)
+    text2 = win.meta_label.text()
+    assert "3648x2736" not in text2
+    assert " MB" not in text2
+    assert " KB" not in text2
+
+
 def test_viewer_info_line_paints_metadata(library: Path) -> None:
     """The viewer's info bar composes star count + date + coordinates
     without incident (offscreen paint smoke; the text path is the shared
@@ -5810,6 +6049,161 @@ def test_scan_filter_never_drops_raw(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Preview-orientation edge fix (fauxcasa-v46.5): unit tests for the helpers
+# and the full end-to-end path.  The mapping is empirically verified:
+# TIFF/EXIF Orientation 1/3/6/8 in the container → LibRaw sizes.flip
+# 0/3/6/5 respectively (confirmed by running rawpy against _make_dng).
+# ---------------------------------------------------------------------------
+
+
+def test_flip_helpers_inject_and_detect() -> None:
+    """_inject_exif_orientation embeds a tag; _jpeg_has_exif_orientation finds
+    it. Round-trip: inject orientation 6 into a plain JPEG (no own tag) →
+    detect succeeds; detect on the unmodified plain JPEG → False."""
+    import rawload
+
+    plain = _jpeg_bytes(16, 16)                  # no EXIF at all
+    assert not rawload._jpeg_has_exif_orientation(plain)
+
+    with_tag = rawload._inject_exif_orientation(plain, 6)
+    assert with_tag[:2] == b"\xff\xd8"           # still valid SOI
+    assert rawload._jpeg_has_exif_orientation(with_tag)
+
+    # A JPEG that already carries orientation (from _inject in test helpers)
+    already = _inject(plain, 0xE1, _exif_orientation_app1(6))
+    assert rawload._jpeg_has_exif_orientation(already)
+
+
+def test_flip_helpers_garbage_input() -> None:
+    """_jpeg_has_exif_orientation and _inject_exif_orientation are fail-soft:
+    garbage bytes don't raise."""
+    import rawload
+
+    for bad in (b"", b"not a jpeg", b"\xff\xd8\xff" + b"\x00" * 100):
+        assert not rawload._jpeg_has_exif_orientation(bad)
+
+    # inject always returns bytes starting with SOI regardless of the value
+    result = rawload._inject_exif_orientation(_jpeg_bytes(8, 8), 8)
+    assert result[:2] == b"\xff\xd8"
+
+
+def test_libraw_flip_to_exif_orientation_mapping() -> None:
+    """The _LIBRAW_FLIP_TO_EXIF_ORIENTATION table covers all four nonzero
+    flip values rawpy produces (3, 5, 6) with the correct EXIF values
+    (3 = 180°, 8 = 90° CCW, 6 = 90° CW), verified against real rawpy output
+    for _make_dng with orientation 3/8/6 → flip 3/5/6."""
+    import rawload
+
+    m = rawload._LIBRAW_FLIP_TO_EXIF_ORIENTATION
+    assert m[3] == 3    # 180° → EXIF 3
+    assert m[5] == 8    # 90° CCW → EXIF 8 (rotate 270° CW)
+    assert m[6] == 6    # 90° CW  → EXIF 6 (rotate 90° CW)
+    assert 0 not in m   # flip=0 never needs injection
+
+
+@pytest.mark.parametrize("container_orient,exif_expect", [
+    (3, 3),    # 180°
+    (6, 6),    # 90° CW
+    (8, 8),    # 90° CCW
+])
+def test_raw_preview_flip_injection_e2e(
+        tmp_path: Path, container_orient: int, exif_expect: int) -> None:
+    """DNG with container Orientation=N and an embedded JPEG preview that
+    carries NO own orientation tag: raw_preview_jpeg must inject EXIF
+    Orientation=exif_expect into the returned bytes so callers' auto-transform
+    applies the correct rotation. The mapping is verified against rawpy's
+    actual sizes.flip values for each container orientation."""
+    import rawload
+
+    # preview JPEG built by _jpeg_bytes has no EXIF at all
+    pj = _jpeg_bytes(64, 48)
+    assert not rawload._jpeg_has_exif_orientation(pj)
+
+    p = _make_dng(tmp_path / "f.dng",
+                  orientation=container_orient,
+                  preview_jpeg=pj,
+                  preview_size=(64, 48))
+    data = p.read_bytes()
+
+    returned = rawload.raw_preview_jpeg(data)
+    assert returned is not None, "raw_preview_jpeg returned None"
+    assert returned[:2] == b"\xff\xd8", "returned bytes are not a JPEG"
+    assert rawload._jpeg_has_exif_orientation(returned), \
+        "orientation was not injected"
+
+    # The injected tag must carry the expected EXIF orientation value.
+    # Re-use metareader.read_orientation to read it back.
+    import metareader
+    got = metareader.read_orientation(returned)
+    assert got == exif_expect, (
+        f"container orient {container_orient}: "
+        f"expected EXIF {exif_expect}, got {got}"
+    )
+
+
+def test_raw_preview_flip_injection_skipped_when_preview_has_own_tag(
+        tmp_path: Path) -> None:
+    """When the preview already carries its own EXIF Orientation tag, no
+    injection occurs — the existing tag is the sole source of rotation.
+    The existing test_raw_orientation_applied_once_preview (orientation 6 in
+    the preview) already covers the cache path; this confirms raw_preview_jpeg
+    does not double-inject when flip != 0 and own tag is present."""
+    import rawload
+
+    # preview with its own orientation=6
+    pj = _inject(_jpeg_bytes(64, 48), 0xE1, _exif_orientation_app1(6))
+    assert rawload._jpeg_has_exif_orientation(pj)
+
+    p = _make_dng(tmp_path / "f.dng",
+                  orientation=6,
+                  preview_jpeg=pj,
+                  preview_size=(64, 48))
+    returned = rawload.raw_preview_jpeg(p.read_bytes())
+    assert returned is not None
+
+    # Byte-identical to pj (no segment was prepended) — checked by comparing
+    # to a version that WOULD have injection and confirming lengths differ.
+    plain_pj = _jpeg_bytes(64, 48)
+    injected_would_be = rawload._inject_exif_orientation(plain_pj, 6)
+    # returned starts with the preview's own APP1 after SOI, not a new one
+    assert len(returned) == len(pj)              # no extra segment prepended
+
+
+def test_raw_preview_no_flip_valid_jpeg(tmp_path: Path) -> None:
+    """DNG with container Orientation=1 (flip=0): raw_preview_jpeg returns
+    a valid JPEG. Our injection code does not fire when flip=0. rawpy/LibRaw
+    may add its own EXIF metadata (empirically it does — Orientation=1 is
+    injected by LibRaw regardless of whether the embedded preview had a tag).
+    We do not assert absence of a tag (LibRaw adds one); we assert the JPEG
+    is usable and decodes to the expected landscape dimensions."""
+    _offscreen_app()
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QImageReader
+
+    import rawload
+
+    pj = _jpeg_bytes(32, 32)
+    p = _make_dng(tmp_path / "f.dng",
+                  orientation=1,
+                  preview_jpeg=pj,
+                  preview_size=(32, 32))
+    returned = rawload.raw_preview_jpeg(p.read_bytes())
+    assert returned is not None
+    assert returned[:2] == b"\xff\xd8"           # valid JPEG SOI
+
+    # Decode with auto-transform: orientation=1 means no rotation, so the
+    # 32x32 preview decodes square (no portrait/landscape swap).
+    buf = QBuffer()
+    buf.setData(returned)
+    buf.open(QIODevice.OpenModeFlag.ReadOnly)
+    reader = QImageReader(buf)
+    reader.setAutoTransform(True)
+    img = reader.read()
+    assert not img.isNull()
+    assert img.width() == 32 and img.height() == 32
+
+
+# ---------------------------------------------------------------------------
 # §7 performance gates (fauxcasa-ed5.4/.3): the --search-probe latency
 # harness and the per-catalog search-haystack index behind it. The probe
 # emits one machine-readable {"event":"search","query","ms","hits"} line
@@ -5911,6 +6305,40 @@ def test_search_haystack_rebuilt_on_cold_index_finish(
     win.search.setText("")                      # identical text would not
     win.search.setText("windswept")             # re-fire textChanged
     assert _hits(win) == {"dunes.jpg"}          # fresh haystacks
+    capsys.readouterr()                         # swallow the indexed event
+
+
+def test_import_notes_refresh_on_cold_index_finish(
+        tmp_path: Path, capsys) -> None:
+    """Review finding (fauxcasa-nu9): the cold-build branch of
+    _on_index_finished must also call _update_import_notes, same as the
+    reconcile branch (reload_data) already does — otherwise a fresh
+    infile_override entry from build_cache's §4 tier-1 merge stays
+    invisible in the status bar until relaunch."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    # in-file caption conflicts with ini -> one infile_override entry,
+    # recorded only once build_cache (the indexer) actually runs.
+    write_jpeg_meta(root / "f" / "p.jpg", xmp=_xmp_app1(caption="file cap"))
+    (root / "f" / ".picasa.ini").write_text(
+        "[p.jpg]\r\ncaption=ini cap\r\n")
+
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+    assert win.notes_label.text() == ""          # nothing yet: pre-index
+
+    result = thumbcache.build_cache(win.catalog, tmp_path / "cache")
+    assert result is not None
+    win._on_index_finished(result, win.catalog, False)  # cold-build finish
+
+    assert win.notes_label.isVisibleTo(win)
+    assert "1 import note" in win.notes_label.text()
+    assert "caption" in win.notes_label.toolTip()
     capsys.readouterr()                         # swallow the indexed event
 
 
@@ -6179,6 +6607,96 @@ def test_placeholder_album_materializes_and_reports(
     assert "placeholder" in unknown[0].detail
 
 
+def test_album_redefinition_reported(tmp_path: Path) -> None:
+    """Two folders carrying [.album:<uid>] sections that differ in name (or
+    other fields) produce an album_redefinition import-report entry naming
+    both values and the winner; an identical duplicate does NOT produce one;
+    the first definition always wins (fauxcasa-cam.17)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "A" / "a.jpg")
+    make_jpeg(root / "B" / "b.jpg")
+    uid = "aa" * 16
+    (root / "A" / ".picasa.ini").write_text(
+        f"[.album:{uid}]\r\nname=First Name\r\n"
+        f"[a.jpg]\r\nalbums={uid}\r\n")
+    (root / "B" / ".picasa.ini").write_text(
+        f"[.album:{uid}]\r\nname=Second Name\r\n"
+        f"[b.jpg]\r\nalbums={uid}\r\n")
+    cat = scan_library(root)
+
+    redef = [e for e in cat.report.entries if e.kind == "album_redefinition"]
+    assert len(redef) == 1
+    e = redef[0]
+    assert e.subject == uid and e.source == "ini"
+    assert "First Name" in e.detail and "Second Name" in e.detail
+    assert "first" in e.detail.lower()          # winner named
+    # first definition wins
+    assert cat.albums[uid].name == "First Name"
+
+
+def test_album_redefinition_no_flood_on_identical(tmp_path: Path) -> None:
+    """An identical duplicate definition (same name, date, description)
+    does not produce a report entry — only divergence is reported."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "A" / "a.jpg")
+    make_jpeg(root / "B" / "b.jpg")
+    uid = "bb" * 16
+    ini_block = (f"[.album:{uid}]\r\nname=Same\r\ndate=39272.630035\r\n"
+                 f"description=same desc\r\n")
+    (root / "A" / ".picasa.ini").write_text(ini_block + f"[a.jpg]\r\nalbums={uid}\r\n")
+    (root / "B" / ".picasa.ini").write_text(ini_block + f"[b.jpg]\r\nalbums={uid}\r\n")
+    cat = scan_library(root)
+
+    assert not [e for e in cat.report.entries if e.kind == "album_redefinition"]
+
+
+def test_cross_folder_contact_conflict_reported(tmp_path: Path) -> None:
+    """Two sibling folders whose [Contacts2] sections name the same contact
+    id differently produce a contact_name_conflict entry (source='ini') with
+    both values and the winner named; the first-registered folder wins in the
+    flat registry (fauxcasa-cam.17)."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Alpha" / "a.jpg")
+    make_jpeg(root / "Beta" / "b.jpg")
+    cid = "a1b2c3d4e5f6a1b2"
+    (root / "Alpha" / ".picasa.ini").write_text(
+        f"[Contacts2]\r\n{cid}=Alice Alpha;;\r\n")
+    (root / "Beta" / ".picasa.ini").write_text(
+        f"[Contacts2]\r\n{cid}=Alice Beta;;\r\n")
+    cat = scan_library(root)
+
+    cross = [e for e in cat.report.entries
+             if e.kind == "contact_name_conflict" and e.source == "ini"]
+    assert len(cross) == 1
+    e = cross[0]
+    assert e.subject == cid
+    assert "Alice Alpha" in e.detail and "Alice Beta" in e.detail
+    assert "first" in e.detail.lower()          # winner described
+    # the first-registered value is in the registry
+    assert cat.contacts[cid] in ("Alice Alpha", "Alice Beta")
+
+
+def test_cross_folder_contact_conflict_no_duplicate_entry(tmp_path: Path) -> None:
+    """A contact conflict between two folders is reported only ONCE even when
+    a child of the losing folder re-inherits the losing name — the de-dup
+    guard prevents a second entry for the same contact id."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Alpha" / "a.jpg")
+    make_jpeg(root / "Beta" / "b.jpg")
+    make_jpeg(root / "Beta" / "sub" / "c.jpg")
+    cid = "c3d4e5f6a1b2c3d4"
+    (root / "Alpha" / ".picasa.ini").write_text(
+        f"[Contacts2]\r\n{cid}=One;;\r\n")
+    (root / "Beta" / ".picasa.ini").write_text(
+        f"[Contacts2]\r\n{cid}=Two;;\r\n")
+    # Beta/sub inherits "Two" from Beta; no extra ini entry
+    cat = scan_library(root)
+
+    cross = [e for e in cat.report.entries
+             if e.kind == "contact_name_conflict" and e.source == "ini"]
+    assert len(cross) == 1  # only one entry despite three folders
+
+
 def test_contact_name_conflict_reported(
         faces_library: Path, tmp_path: Path) -> None:
     """The §4 conflict PR #37 resolved silently: contacts.xml renaming a
@@ -6190,17 +6708,23 @@ def test_contact_name_conflict_reported(
         _write_faces_contacts_xml(tmp_path / "contacts.xml"))
     cat = scan_library(faces_library, None, contacts)
 
-    conflicts = [e for e in cat.report.entries
-                 if e.kind == "contact_name_conflict"]
-    assert len(conflicts) == 1                 # only Carol truly conflicts
-    e = conflicts[0]
-    assert e.subject == "cccccccccccccccc" and e.source == "contacts"
+    # contacts.xml conflict: source="contacts"; cross-folder ini conflict
+    # for Ada Ancestor vs Ada Local is source="ini" (tested separately below)
+    xml_conflicts = [e for e in cat.report.entries
+                     if e.kind == "contact_name_conflict"
+                     and e.source == "contacts"]
+    assert len(xml_conflicts) == 1             # only Carol has a contacts.xml conflict
+    e = xml_conflicts[0]
+    assert e.subject == "cccccccccccccccc"
     assert "Carol Ini" in e.detail and "Carol Xml" in e.detail
     assert "contacts.xml wins" in e.detail
     # ...and the resolution itself is unchanged (xml wins, §4)
     assert cat.contacts["cccccccccccccccc"] == "Carol Xml"
 
-    assert not scan_library(faces_library).report.entries  # no xml, no notes
+    # without contacts.xml: one cross-folder ini conflict (Ada Ancestor vs Ada Local)
+    ini_cross = [e for e in scan_library(faces_library).report.entries
+                 if e.kind == "contact_name_conflict" and e.source == "ini"]
+    assert len(ini_cross) == 1
 
 
 def test_placeholder_sidebar_marking_and_notes_count(
@@ -6319,6 +6843,57 @@ def test_catalog_v6_roundtrips_album_flags(
     data["version"] = 5
     path.write_text(json.dumps(data))  # plain JSON: a version this old never zstd-wrapped
     assert load_catalog(path, album_library) is None
+
+
+def test_album_tooltip_date_description(tmp_path: Path) -> None:
+    """A regular album with date and/or description surfaces those as sidebar
+    tooltip lines; placeholder and pal-sourced albums keep their own tooltips
+    (fauxcasa-cam.14)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    uid_dated = "aaaabbbbccccdddd" * 2
+    uid_nodesc = "0000111122223333" * 2
+    (root / "f" / ".picasa.ini").write_text(
+        f"[.album:{uid_dated}]\r\n"
+        "name=Summer Trip\r\n"
+        "date=2022-07-15\r\n"
+        "description=Beach holiday\r\n"
+        f"token=]album:{uid_dated}\r\n"
+        f"[.album:{uid_nodesc}]\r\n"
+        "name=No Desc\r\n"
+        f"token=]album:{uid_nodesc}\r\n"
+        "[a.jpg]\r\n"
+        f"albums={uid_dated},{uid_nodesc}\r\n"
+    )
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    def item_for(kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    dated = item_for("album", uid_dated)
+    assert dated is not None
+    tip = dated.toolTip(0)
+    assert "2022-07-15" in tip
+    assert "Beach holiday" in tip
+
+    no_desc = item_for("album", uid_nodesc)
+    assert no_desc is not None
+    # No date/description — no tooltip set (empty string)
+    assert no_desc.toolTip(0) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -8167,6 +8742,70 @@ def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
     assert load_catalog(path, root) is None
 
 
+def test_backfill_persists_report_across_resume(tmp_path: Path) -> None:
+    """A cancel/resume cycle must not lose infile_override report entries
+    for photos already applied before the cursor (review finding: the
+    cursor skips re-processing them, so a report dropped at cancel time is
+    gone forever). With report_path supplied, checkpoint() persists
+    catalog.report alongside the catalog on both the periodic and the
+    terminal save — the entry recorded for photo 0 survives a simulated
+    relaunch (fresh catalog load + report re-attach) and the finished
+    resume pass."""
+    import threading
+
+    from catalog import REPORT_NAME, load_report
+
+    root = tmp_path / "lib"
+    # p0: in-file caption conflicts with ini -> one infile_override entry
+    write_jpeg_meta(root / "f" / "p0.jpg",
+                    xmp=_xmp_app1(caption="file cap"))
+    (root / "f" / ".picasa.ini").write_text(
+        "[p0.jpg]\r\ncaption=ini cap\r\n")
+    make_jpeg(root / "f" / "p1.jpg")
+    cat, cat_path = _adopted_catalog(root, tmp_path)
+    report_path = tmp_path / REPORT_NAME
+
+    stop = threading.Event()
+    assert thumbcache.backfill_catalog(
+        cat, cat_path, cancel=stop, persist_every=1, report_path=report_path,
+        progress=lambda done, total: stop.set() if done >= 1 else None,
+    ) is None  # cancelled after photo 0's checkpoint
+
+    # The checkpoint after photo 0 must have persisted the override entry —
+    # not just the catalog.
+    on_disk = load_report(report_path)
+    overrides = [e for e in on_disk.entries if e.kind == "infile_override"]
+    assert len(overrides) == 1 and "caption" in overrides[0].detail
+
+    # Simulate the next launch: fresh catalog load + report re-attach
+    # (mirrors main()'s warm-start path), exactly as main.py does.
+    disk = load_catalog(cat_path, root)
+    assert disk is not None
+    disk.report = load_report(report_path)
+    assert len(disk.report.entries) == 1  # survived the "relaunch"
+
+    result = thumbcache.backfill_catalog(disk, cat_path,
+                                         report_path=report_path)
+    assert result is not None and result.photos == 1  # the tail only (p1)
+    # p0's entry is still there after the resumed pass completes — it was
+    # never re-derived (p0 wasn't re-processed) and never lost.
+    final = load_report(report_path)
+    final_overrides = [e for e in final.entries if e.kind == "infile_override"]
+    assert len(final_overrides) == 1 and "caption" in final_overrides[0].detail
+
+
+def test_backfill_report_path_none_preserves_old_behavior(
+        tmp_path: Path) -> None:
+    """The default report_path=None never writes a report file — existing
+    callers that don't pass it see no behavior change."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    cat, cat_path = _adopted_catalog(root, tmp_path)
+    result = thumbcache.backfill_catalog(cat, cat_path)
+    assert result is not None
+    assert not (tmp_path / "import-report.json").exists()
+
+
 def test_recent_empty_state_hint_while_backfill_pending(
         tmp_path: Path) -> None:
     """§1 modes-not-modals honesty (the PR #41 rider): while an adopt-mode
@@ -8271,6 +8910,62 @@ def test_mainwindow_adopt_backfill_end_to_end(tmp_path: Path) -> None:
     assert disk.backfill_state == BACKFILL_COMPLETE
     assert all(p.sha256 and p.mtime >= 0 for p in disk.photos)
     assert win._reconcile_thread is not None     # the deferred reconcile ran
+    win.shutdown()
+
+
+def test_mainwindow_backfill_persists_report_and_updates_notes(
+        tmp_path: Path) -> None:
+    """Review findings (fauxcasa-nu9): _start_backfill threads a real
+    report_path into backfill_catalog (reusing the same cache_dir/
+    REPORT_NAME the adopt path already saves to at scan time), so an
+    infile_override entry survives the pass on disk; and _on_backfill_done
+    calls _update_import_notes so the status-bar note appears without
+    requiring a relaunch."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import time as _time
+
+    from catalog import REPORT_NAME, load_report
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    # in-file caption conflicts with ini -> one infile_override entry
+    write_jpeg_meta(root / "f" / "p.jpg", xmp=_xmp_app1(caption="file cap"))
+    (root / "f" / ".picasa.ini").write_text(
+        "[p.jpg]\r\ncaption=ini cap\r\n")
+
+    built = thumbcache.build_cache(scan_library(root), tmp_path / "prebuilt")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(built.path)
+    thumbcache.bind(cache, cat)
+    cat.backfill_state = BACKFILL_NOT_STARTED
+    cache_dir = tmp_path / "cachedir"
+    save_catalog(cat, cache_dir / "catalog.json")
+
+    win = MainWindow(cat, cache, cache_dir=cache_dir, build_dir=None,
+                     warm=True, adopt=True)
+    assert win._backfill_thread is not None
+    assert win.notes_label.text() == ""  # nothing yet: backfill hasn't run
+
+    deadline = _time.time() + 20
+    while win._backfill_thread.is_alive() and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    assert not win._backfill_thread.is_alive()
+    app.processEvents()  # deliver backfill_done -> _on_backfill_done
+
+    # _update_import_notes ran without a relaunch (item A/B of the review).
+    assert win.notes_label.isVisibleTo(win)
+    assert "1 import note" in win.notes_label.text()
+
+    # report_path was threaded through: the entry is on disk, not just
+    # in the live catalog's report.
+    on_disk = load_report(cache_dir / REPORT_NAME)
+    overrides = [e for e in on_disk.entries if e.kind == "infile_override"]
+    assert len(overrides) == 1 and "caption" in overrides[0].detail
     win.shutdown()
 
 

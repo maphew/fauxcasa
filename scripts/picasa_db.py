@@ -625,6 +625,21 @@ class PicasaIni:
         return None
 
 
+def _has_utf8_marker(raw: bytes) -> bool:
+    """Return True if the bytes contain an [encoding] section with utf8=1.
+    Uses an ASCII-safe scan; the marker itself is always pure ASCII."""
+    in_encoding = False
+    for line in raw.decode("ascii", "replace").splitlines():
+        stripped = line.strip()
+        if stripped.lower() == "[encoding]":
+            in_encoding = True
+        elif stripped.startswith("["):
+            in_encoding = False
+        elif in_encoding and stripped.lower() == "utf8=1":
+            return True
+    return False
+
+
 def read_picasa_ini(path: Path | str) -> PicasaIni:
     """Parse a .picasa.ini (or legacy Picasa.ini / picasa.ini) file.
 
@@ -643,14 +658,47 @@ def read_picasa_ini(path: Path | str) -> PicasaIni:
     Encoding: Picasa 3.x writes UTF-8 and marks it with an `[encoding]`
     section (`utf8=1`, may appear anywhere); older versions wrote the
     system codepage, and mixed-encoding files exist in the wild (sections
-    appended by different Picasa versions). We decode UTF-8 with
-    surrogateescape so every byte survives a round trip either way.
+    appended by different Picasa versions).
+
+    Priority:
+    - Bytes that ARE valid strict UTF-8: surrogateescape (round-trip safe).
+    - Bytes with [encoding] utf8=1 marker but not valid strict UTF-8
+      (mixed-encoding file): surrogateescape keeps every byte intact.
+    - Bytes that are NOT valid strict UTF-8 AND have no utf8=1 marker:
+      decode as cp1252 (Picasa was Windows-only, so cp1252 — not the
+      *running* machine's locale codepage, which would make ingest
+      platform-dependent and a no-op on UTF-8 locales like Linux/macOS —
+      is the codepage pre-UTF8 Picasa actually wrote), fail-soft back to
+      surrogateescape for the handful of cp1252 code points with no
+      mapping.
+
+    The byte-exact round-trip guarantee (every byte survives a decode +
+    re-encode cycle) holds for utf8=1-marked files and strictly-valid-UTF-8
+    files, both of which go through surrogateescape. Unmarked legacy
+    (cp1252) files round-trip only where cp1252's mapping is total — a
+    cp1252-undefined byte falls through to surrogateescape same as the
+    other paths.
     """
     path = Path(path)
     raw = path.read_bytes()
     if raw.startswith(b"\xef\xbb\xbf"):
         raw = raw[3:]
-    text = raw.decode("utf-8", "surrogateescape")
+    try:
+        # Fast path: strict decode succeeds -> no invalid byte to escape,
+        # so plain "utf-8" and "utf-8"+surrogateescape agree; no need to
+        # decode twice.
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        if _has_utf8_marker(raw):
+            # UTF-8 marked but bytes contain non-UTF-8 sequences (mixed-
+            # encoding file); surrogateescape preserves every byte.
+            text = raw.decode("utf-8", "surrogateescape")
+        else:
+            # Pre-UTF8 Picasa: Windows-only app, so cp1252.
+            try:
+                text = raw.decode("cp1252")
+            except UnicodeDecodeError:
+                text = raw.decode("utf-8", "surrogateescape")
 
     sections: list[IniSection] = []
     anomalies: list[str] = []
@@ -1284,12 +1332,54 @@ _INI_EDIT_KEYS = frozenset(
 )
 
 
-def _survey_ini_tree(root: Path) -> dict[str, Any]:
+def _count_pal_files(albums_dir: Path) -> int:
+    """Count *.pal files in a Picasa2Albums directory; 0 if absent.
+
+    Counts only — the file names are internal UIDs (32 hex), not personal
+    data, but we count without reading them so the output is always safe.
+    """
+    if not albums_dir.is_dir():
+        return 0
+    return sum(1 for _ in albums_dir.glob("*.pal"))
+
+
+def _count_contacts_xml(xml_path: Path) -> int:
+    """Count <contact> elements in a Picasa contacts.xml file; 0 if absent.
+
+    Uses a tag-scan rather than an XML parser so the file path never
+    appears in any error path (privacy-safe like the survey functions).
+    """
+    if not xml_path.is_file():
+        return 0
+    try:
+        text = xml_path.read_text("utf-8")
+        return len(re.findall(r"<contact\b", text))
+    except (OSError, UnicodeDecodeError):
+        return 0
+
+
+def _survey_ini_tree(root: Path, *,
+                     image_exts: frozenset[str] | None = None,
+                     video_exts: frozenset[str] | None = None) -> dict[str, Any]:
     """Aggregate .picasa.ini usage across a library tree.
 
     Counts only — no paths, section names, key names outside the known
     vocabulary, or values appear in the output, so this is safe to run on
     a private library by construction.
+
+    When ``image_exts`` is provided (a frozenset of lower-case dot-suffixes
+    such as ``{".jpg", ".avi"}``), the result also contains a ``media``
+    sub-dict with survey-owned counts so callers do not need their own
+    filesystem walks:
+
+    - ``files``   — total media files matching ``image_exts``
+    - ``folders`` — directories containing at least one media file
+    - ``videos``  — subset matching ``video_exts`` (None when not provided)
+
+    These three fields are the reference side of the ingest-parity gate
+    (fauxcasa-ed5.11): promoting them here means the gate's entire
+    reference side is survey-owned and the generator's manifest.json is
+    the only other source of truth.
     """
     n_files = 0
     n_dirs = 0
@@ -1298,11 +1388,24 @@ def _survey_ini_tree(root: Path) -> dict[str, Any]:
     sections: Counter[str] = Counter()
     keys: Counter[str] = Counter()
     feats: Counter[str] = Counter()
+    # media-counting state — only populated when image_exts is provided
+    n_media = 0
+    n_video = 0
+    media_folders: set[Path] = set()
     for p in sorted(root.rglob("*")):
         if p.is_dir():
             n_dirs += 1
             continue
-        if p.name.lower() not in (".picasa.ini", "picasa.ini") or not p.is_file():
+        if not p.is_file():
+            continue
+        if image_exts is not None:
+            ext = p.suffix.lower()
+            if ext in image_exts:
+                n_media += 1
+                media_folders.add(p.parent)
+                if video_exts is not None and ext in video_exts:
+                    n_video += 1
+        if p.name.lower() not in (".picasa.ini", "picasa.ini"):
             continue
         n_files += 1
         try:
@@ -1344,7 +1447,7 @@ def _survey_ini_tree(root: Path) -> dict[str, Any]:
                     )
                 if kl in _INI_EDIT_KEYS:
                     feats["edit_keys"] += 1
-    return {
+    result: dict[str, Any] = {
         "ini_files": n_files,
         # distinguishes "library has no ini files" from a near-empty walk
         "dirs_walked": n_dirs,
@@ -1354,6 +1457,13 @@ def _survey_ini_tree(root: Path) -> dict[str, Any]:
         "keys": dict(sorted(keys.items())),
         "features": dict(sorted(feats.items())),
     }
+    if image_exts is not None:
+        result["media"] = {
+            "files": n_media,
+            "videos": n_video if video_exts is not None else None,
+            "folders": len(media_folders),
+        }
+    return result
 
 
 def cmd_survey(args: argparse.Namespace) -> int:

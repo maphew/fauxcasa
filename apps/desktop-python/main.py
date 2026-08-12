@@ -84,6 +84,7 @@ from catalog import (  # noqa: E402
     default_contacts_xml,
     default_pal_dir,
     format_date_taken,
+    format_file_size,
     format_geotag,
     load_catalog,
     load_contacts_xml,
@@ -1271,6 +1272,8 @@ class MainWindow(QMainWindow):
             lambda _sel: self._refresh_tray_readout())
         self.search.textChanged.connect(
             lambda _t: self._refresh_tray_readout())
+        # Per-group play button (fauxcasa-q6l.16)
+        self.grid.play_group.connect(self._play_group)
 
         self.grid.set_data(catalog, thumbs)
         self._refresh_tray_readout()
@@ -1493,6 +1496,7 @@ class MainWindow(QMainWindow):
         values photo by photo as the pass reaches them (§4 tier-1)."""
         bridge, catalog = self._bridge, self.catalog
         cat_path = self.cache_dir / "catalog.json"
+        report_path = self.cache_dir / REPORT_NAME
 
         def cb(done: int, total: int) -> None:
             if done % 100 == 0 or done == total:
@@ -1503,7 +1507,8 @@ class MainWindow(QMainWindow):
             try:
                 result = backfill_catalog(catalog, cat_path, progress=cb,
                                           cancel=self.build_cancel,
-                                          pause=self.backfill_pause)
+                                          pause=self.backfill_pause,
+                                          report_path=report_path)
             except Exception as e:  # report, never crash the UI
                 log.error("metadata backfill failed: %s", e)
                 _emit(bridge.backfill_done, False)
@@ -1535,6 +1540,7 @@ class MainWindow(QMainWindow):
         if kind == "recent" and not self.search.text().strip():
             self._apply_view(kind, key)   # the collection just populated
         self.grid.viewport().update()     # star badges may have changed
+        self._update_import_notes()       # infile_override entries landed
         self.statusBar().showMessage("metadata backfill complete", 8000)
         if self._reconcile_after_backfill:
             self._reconcile_after_backfill = False
@@ -1603,6 +1609,7 @@ class MainWindow(QMainWindow):
             # build_cache merged in-file captions/keywords into these SAME
             # Photo objects in place — the prebuilt haystacks are stale.
             self._rebuild_search_index()
+            self._update_import_notes()  # the cold build collected a fresh report
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
         self.statusBar().showMessage(
@@ -1956,6 +1963,15 @@ class MainWindow(QMainWindow):
                 elif album.pal_sourced:
                     item.setToolTip(
                         0, "Album definition from a Picasa2Albums .pal file")
+                else:
+                    # Regular album: show date and/or description if present.
+                    tip_parts = []
+                    if album.date:
+                        tip_parts.append(album.date)
+                    if album.description:
+                        tip_parts.append(album.description)
+                    if tip_parts:
+                        item.setToolTip(0, "\n".join(tip_parts))
             albums_root.setExpanded(True)
 
         # People (read-only v1 slice, fauxcasa-cam.3): named people with
@@ -2440,10 +2456,13 @@ class MainWindow(QMainWindow):
         """Single-photo status readout (§5 dual mode): path, star count
         (★ repeated — one glyph per star, so a count > 1 reads at a
         glance), capture date, geotag coordinates (§3 geotag v1 display,
-        fauxcasa-cam.9/.10/.11), caption, keywords. Also feeds the
-        inspector panel (fauxcasa-q6l.25) when visible — this one method
-        already fires on grid selection, viewer navigation (photo_shown),
-        and after a star toggle, so the panel needs no new wiring."""
+        fauxcasa-cam.9/.10/.11), caption, keywords, a "Picasa-saved
+        original kept" chip when a stash copy exists (fauxcasa-cam.19),
+        and image dimensions + human-readable file size when known
+        (fauxcasa-q6l.12). Also feeds the inspector panel (fauxcasa-q6l.25)
+        when visible — this one method already fires on grid selection,
+        viewer navigation (photo_shown), and after a star toggle, so the
+        panel needs no new wiring."""
         if idx < 0:
             self.meta_label.setText("")
             if self.info_action.isChecked():
@@ -2465,6 +2484,10 @@ class MainWindow(QMainWindow):
             # baked edit with the untouched original still in the stash
             # (fauxcasa-cam.19); restore machinery is M3.
             parts.append("Picasa-saved original kept")
+        if p.dims is not None:
+            parts.append(f"{p.dims[0]}x{p.dims[1]}")
+        if p.size >= 0:
+            parts.append(format_file_size(p.size))
         self.meta_label.setText("   ".join(parts) + "  ")
         if self.info_action.isChecked():
             self._refresh_inspector(p)
@@ -2631,6 +2654,25 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         current = self.pages.currentWidget()
         (self.viewer if current is self.viewer else self.grid).setFocus()
+
+    def _play_group(self, folder_key: str) -> None:
+        """Start a slideshow over a specific folder group's items
+        (fauxcasa-q6l.16 — per-group play button in the grid header).
+        Looks up the group by folder key in the current grid and plays
+        its items from position 0; no-op if the group is missing or
+        empty (can happen when the grid view just changed)."""
+        group = next(
+            (g for g in self.grid.groups if g.folder == folder_key), None)
+        if group is None or not group.items:
+            return
+        display = list(group.items)
+        if self._slideshow is None:
+            self._slideshow = SlideshowPage(self.catalog, self.grid.thumbs)
+            self._slideshow.closed.connect(self._slideshow_closed)
+        else:
+            self._slideshow.catalog = self.catalog
+            self._slideshow.set_thumbs(self.grid.thumbs)
+        self._slideshow.start(display, 0)
 
     # ---------- hover peek (fauxcasa-q6l.5) ----------
 

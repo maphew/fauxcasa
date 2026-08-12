@@ -374,12 +374,27 @@ def test_ini_bom_and_unicode(tmp_path):
 
 
 def test_ini_undecodable_bytes_survive(tmp_path):
+    # A file with [encoding] utf8=1 but non-UTF-8 bytes (mixed-encoding
+    # file from different Picasa versions): surrogateescape keeps every byte
+    # intact — the UTF-8-path round-trip guarantee is untouched.
     p = tmp_path / ".picasa.ini"
-    p.write_bytes(b"[photo.jpg]\ncaption=caf\xe9 latin1\n")  # not valid UTF-8
+    p.write_bytes(b"[encoding]\nutf8=1\n[photo.jpg]\ncaption=caf\xe9 latin1\n")
     ini = pdb.read_picasa_ini(p)
-    cap = ini.sections[0].get("caption")
+    cap = ini.sections[1].get("caption")  # sections[0] = [encoding]
     assert cap is not None
     assert cap.encode("utf-8", "surrogateescape") == b"caf\xe9 latin1"
+
+
+def test_ini_cp1252_caption(tmp_path):
+    """Without [encoding] utf8=1 and with non-strict-UTF-8 bytes, decode
+    falls through to cp1252 (pre-UTF8 Picasa was Windows-only, so cp1252 —
+    not the running machine's locale — is always the fallback codepage;
+    no monkeypatch needed, the real path is portable by construction)."""
+    p = tmp_path / ".picasa.ini"
+    # "Straße" in cp1252: ß = 0xDF; no [encoding] utf8=1 marker
+    p.write_bytes(b"[photo.jpg]\ncaption=Stra\xdfe\n")
+    ini = pdb.read_picasa_ini(p)
+    assert ini.sections[0].get("caption") == "Straße"
 
 
 def test_ini_key_before_section(tmp_path):
@@ -970,6 +985,73 @@ def test_survey_ini_tree(tmp_path, capsys):
     assert feats["album_memberships"] == 1
     assert feats["edit_keys"] == 1  # rotate; faces/star/caption are not edits
     assert feats["contacts"] == 1
+
+
+# --------------------------------------------------------------------------
+# survey rollup helpers: media counts, .pal, contacts.xml (fauxcasa-ed5.11)
+# --------------------------------------------------------------------------
+
+
+def test_survey_ini_tree_media_counts(tmp_path):
+    """_survey_ini_tree with image_exts/video_exts returns survey-owned
+    media file, video, and folder counts; backward-compat: callers that
+    omit image_exts get no 'media' key."""
+    lib = tmp_path / "lib"
+    (lib / "f1").mkdir(parents=True)
+    (lib / "f1" / "photo00.jpg").write_bytes(b"\xff\xd8\xff\xe0")
+    (lib / "f1" / "clip00.avi").write_bytes(b"RIFF")
+    (lib / "f1" / "note.txt").write_bytes(b"not media")
+    (lib / "f2").mkdir()
+    (lib / "f2" / "photo00.jpg").write_bytes(b"\xff\xd8\xff\xe0")
+    # f3: dir with no media — must NOT count toward media_folders
+    (lib / "f3").mkdir()
+    (lib / "f3" / "readme.txt").write_bytes(b"x")
+    image_exts = frozenset({".jpg", ".jpeg", ".avi", ".mp4"})
+    video_exts = frozenset({".avi", ".mp4"})
+    result = pdb._survey_ini_tree(lib, image_exts=image_exts,
+                                  video_exts=video_exts)
+    assert result["media"]["files"] == 3   # photo00.jpg x2 + clip00.avi
+    assert result["media"]["videos"] == 1  # clip00.avi only
+    assert result["media"]["folders"] == 2  # f1 and f2 each have media
+    # backward-compat: no image_exts → no "media" key
+    result_basic = pdb._survey_ini_tree(lib)
+    assert "media" not in result_basic
+    # video_exts=None → videos count is None
+    result_no_vext = pdb._survey_ini_tree(lib, image_exts=image_exts)
+    assert result_no_vext["media"]["files"] == 3
+    assert result_no_vext["media"]["videos"] is None
+
+
+def test_count_pal_files(tmp_path):
+    """_count_pal_files: counts *.pal files in a directory; 0 for absent."""
+    albums = tmp_path / "albums"
+    albums.mkdir()
+    (albums / "uid1.pal").write_text("<picasa2album/>")
+    (albums / "uid2.pal").write_text("<picasa2album/>")
+    (albums / "readme.txt").write_text("not a pal")
+    assert pdb._count_pal_files(albums) == 2
+    assert pdb._count_pal_files(tmp_path / "nonexistent") == 0
+
+
+def test_count_contacts_xml(tmp_path):
+    """_count_contacts_xml: counts <contact> elements; 0 for absent file."""
+    xml = tmp_path / "contacts.xml"
+    xml.write_text(
+        "<contacts>\n"
+        ' <contact id="a" name="Alice"/>\n'
+        ' <contact id="b" name="Bob"/>\n'
+        "</contacts>\n",
+        encoding="utf-8",
+    )
+    assert pdb._count_contacts_xml(xml) == 2
+    assert pdb._count_contacts_xml(tmp_path / "nonexistent.xml") == 0
+
+
+def test_count_contacts_xml_empty_file(tmp_path):
+    """An empty contacts.xml (no <contact> elements) returns 0."""
+    xml = tmp_path / "contacts.xml"
+    xml.write_text("<contacts/>\n", encoding="utf-8")
+    assert pdb._count_contacts_xml(xml) == 0
 
 
 # --------------------------------------------------------------------------
