@@ -1056,6 +1056,11 @@ class _BuildBridge(QObject):
     status = Signal(str)                   # inline status text (reconcile)
     finished = Signal(object, object, bool)  # (IndexResult|None, Catalog, is_reconcile)
     backfill_done = Signal(bool)           # adopt-mode backfill: completed?
+    # Non-blocking first run (fauxcasa-q6l.13): the background library WALK
+    # landed a real Catalog (or None on failure) — see _start_cold_scan /
+    # _on_scan_done. Carries the whole Catalog, same object-payload idiom
+    # as `finished` above.
+    scan_done = Signal(object)
 
 
 class MainWindow(QMainWindow):
@@ -1069,7 +1074,9 @@ class MainWindow(QMainWindow):
                  excluded_exts: set[str] | None = None,
                  thumbs_path: Path | None = None,
                  db3_dir: Path | None = None,
-                 contacts_path: Path | None = None):
+                 contacts_path: Path | None = None,
+                 cfg: library.LibraryConfig | None = None,
+                 contacts_sig: tuple[int, int] | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
@@ -1098,6 +1105,19 @@ class MainWindow(QMainWindow):
         # contacts.xml was configured/found at startup, same as `catalog.
         # contacts_sig` in that case.
         self.contacts_path = contacts_path
+        # main()'s pre-scan stat_sig(contacts_path) (fauxcasa-cam.14 step
+        # 4), captured immediately before load_contacts_xml read it — kept
+        # so a deferred cold scan (fauxcasa-q6l.13, _start_cold_scan) can
+        # stamp the real catalog it builds with the SAME signature main()
+        # would have stamped had it scanned synchronously, never a fresh
+        # re-stat after the (possibly long) walk.
+        self.contacts_sig = contacts_sig
+        # LibraryConfig this window was opened from (fauxcasa-q6l.13):
+        # None for callers that never defer a scan (most tests); the cold
+        # non-adopt startup path in main() always supplies it so
+        # _start_cold_scan's worker can call _scan_library_config the same
+        # way main() would have, off the startup critical path.
+        self.cfg = cfg
         # Picasa2Albums .pal directory, kept for the same reason: a
         # reconcile rescan must merge albums the way the startup scan did
         self.pal_dir = pal_dir
@@ -1390,6 +1410,38 @@ class MainWindow(QMainWindow):
         self._build_thread: threading.Thread | None = None
         self._reconcile_thread: threading.Thread | None = None
         self._backfill_thread: threading.Thread | None = None
+        # Non-blocking first run (fauxcasa-q6l.13): the background library
+        # WALK thread, its target build dir (persisted for the chained
+        # _start_cold_build once the walk lands), and its start time (for
+        # the cold-scan-ms duration event). _cold_scan_pending is set the
+        # instant _start_cold_scan is called — before the thread itself
+        # starts — and cleared at the top of _on_scan_done; it is folded
+        # into index_busy() below so a scripted --finish-build run never
+        # quits mid-walk, only mid-build (the pre-existing guarantee).
+        self._scan_thread: threading.Thread | None = None
+        self._scan_build_dir: Path | None = None
+        self._scan_t0: float | None = None
+        self._cold_scan_pending = False
+        # Set by _on_scan_done when the background walk raised (Codex
+        # cross-vendor review finding 2): the synchronous cold path let
+        # that exception propagate out of main() and crash the process —
+        # never a fake READY. This flag is how main()'s check_ready tells
+        # a failed deferred walk apart from a genuinely empty, successful
+        # one (both leave the placeholder catalog in place).
+        self._scan_failed = False
+        # Set by shutdown() (Codex cross-vendor review round 3): a cold
+        # scan that outlives both a scripted --timeout and shutdown()'s own
+        # 5 s join leaves _scan_thread alive after main() has already
+        # returned. If a later in-process run reuses the same
+        # QApplication (main() supports this — see
+        # test_ready_poll_timer_dies_with_the_run) and restarts the event
+        # loop, the orphaned worker's queued scan_done can fire into this
+        # now-stale window and reload/rebuild against deleted Qt objects.
+        # _on_scan_done checks this FIRST and returns immediately once set;
+        # shutdown() also disconnects the signal itself as a second,
+        # belt-and-braces line of defense for an emit already queued
+        # before the disconnect runs.
+        self._shut_down = False
         # Parks the backfill's readers between photos while set — the
         # low-priority hook (a future consumer can pause on heavy scroll);
         # tests drive it directly.
@@ -1400,6 +1452,7 @@ class MainWindow(QMainWindow):
         self._bridge.status.connect(self._on_status)
         self._bridge.finished.connect(self._on_index_finished)
         self._bridge.backfill_done.connect(self._on_backfill_done)
+        self._bridge.scan_done.connect(self._on_scan_done)
 
         if build_dir is not None:
             self._start_cold_build(build_dir)
@@ -1418,6 +1471,121 @@ class MainWindow(QMainWindow):
             self._start_reconcile()
 
     # ---------- background index jobs ----------
+
+    def _start_cold_scan(self, cache_dir: Path) -> None:
+        """Non-blocking first run (fauxcasa-q6l.13): move the library WALK
+        off the startup critical path so a NAS-scale first run paints
+        instantly instead of reading as a hung app. main()'s cold non-adopt
+        branch constructs this window around an EMPTY placeholder catalog
+        (composed FROM cfg — same roots/library_id/root shape
+        _scan_library_config itself would produce — so sidebar/abs()/
+        photos_for_root see a coherent multiroot shape from the very first
+        paint) and calls this right after win.show(). The walk runs here,
+        on a background thread; _on_scan_done reloads the real catalog it
+        returns and chains straight into the existing cold BUILD
+        (_start_cold_build) — the same scan -> reload -> build order a
+        synchronous cold start always had, just off the critical path."""
+        self._cold_scan_pending = True
+        self._scan_build_dir = cache_dir
+        self._scan_t0 = time.perf_counter()
+        self._show_activity(f"Scanning {self.catalog.root.name}…")
+        bridge = self._bridge
+        cfg, scan_filter = self.cfg, self.scan_filter
+        contacts, pal_dir, exts, db3_dir = (
+            self.contacts, self.pal_dir, self.exts, self.db3_dir)
+        contacts_sig = self.contacts_sig
+
+        def work() -> None:
+            try:
+                catalog = _scan_library_config(
+                    cfg, scan_filter, contacts, pal_dir, exts, db3_dir)
+                # Same stat-before-read invariant as main()'s synchronous
+                # cold path (fauxcasa-cam.14 step 4): contacts_sig was
+                # captured in main() BEFORE load_contacts_xml read the
+                # file, well before this walk even started — stamp that
+                # SAME value, never a fresh re-stat after a walk that may
+                # have taken a long time.
+                catalog.contacts_sig = contacts_sig
+                _emit(bridge.scan_done, catalog)
+            except Exception as e:  # report, never crash the UI
+                log.error("library scan failed: %s", e)
+                _emit(bridge.scan_done, None)
+
+        self._scan_thread = threading.Thread(target=work, daemon=True)
+        self._scan_thread.start()
+
+    def _on_scan_done(self, catalog) -> None:
+        """The background walk started by _start_cold_scan landed (or
+        failed). Clears _cold_scan_pending FIRST (fauxcasa-q6l.13) so
+        index_busy() reflects reality for the rest of this handler and any
+        --finish-build poll racing it; on success, swaps the real catalog
+        in via reload_data (mirrors _on_index_finished's reconcile-swap
+        branch) and immediately chains into the cold BUILD, exactly the
+        scan -> reload -> build order a synchronous cold start always had.
+
+        Checked FIRST, before anything else (Codex cross-vendor review
+        round 3): a scan that outlives shutdown()'s join leaves the worker
+        thread alive after main() has already returned this window to the
+        caller. main() supports reusing the same QApplication across an
+        in-process run (test_ready_poll_timer_dies_with_the_run) — if a
+        later run restarts the event loop, the orphaned worker's queued
+        scan_done can fire into this now-stale window. shutdown() sets
+        _shut_down and disconnects this slot, but an emit already queued
+        before that disconnect runs still needs this guard: reload_data/
+        _start_cold_build must never touch a window past its shutdown."""
+        if self._shut_down:
+            return
+        self._cold_scan_pending = False
+        build_dir, self._scan_build_dir = self._scan_build_dir, None
+        cold_ms = (time.perf_counter() - self._scan_t0) * 1000.0 \
+            if self._scan_t0 is not None else 0.0
+        if catalog is None:
+            # Codex cross-vendor review finding 2: the synchronous cold
+            # path let a scan exception propagate out of main() and crash
+            # the process (never a fake READY, always a nonzero exit for
+            # scripted runs). _scan_failed is how main()'s check_ready
+            # tells this apart from a genuinely empty, successful walk —
+            # both leave the placeholder catalog in win.catalog. An
+            # interactive run isn't killed outright (the window already
+            # exists and is otherwise usable) — the failure surfaces via
+            # the activity row/status bar/log instead, closer to old
+            # behavior than a hard crash would be for THIS entry point.
+            self._scan_failed = True
+            self._hide_activity()
+            self.build_failed = True
+            self.statusBar().showMessage(
+                "library scan failed — see stderr", 10000)
+            return
+        # User star choices are overlays in Fauxcasa's machine-local cache
+        # (self.star_overrides, loaded once in __init__ from cache_dir) —
+        # the ctor's own apply_star_overrides call only ever touched the
+        # EMPTY placeholder catalog on this path, so the just-scanned REAL
+        # catalog needs the same reapply here, BEFORE reload_data builds
+        # the Starred count/filter and before the cold build starts
+        # (Codex cross-vendor review finding 1: a --rebuild/invalidated-
+        # cache cold run must not silently drop existing star choices).
+        apply_star_overrides(catalog, self.star_overrides)
+        log.info("cold-scan: %d photos, %d folders, %d albums in %.0f ms",
+                 len(catalog.photos), len(catalog.folders),
+                 len(catalog.albums), cold_ms)
+        if catalog.report.entries:
+            # §4 conflicts surfaced, never silent — main()'s own "import
+            # report" log only ever covers the EMPTY placeholder on this
+            # path (always report-free, so it's a silent no-op there, not
+            # a duplicate of this one) — the real summary is only known
+            # once the walk lands here (Codex cross-vendor review finding
+            # 3).
+            log.info("import report: %s", catalog.report.summary())
+        # Distinct from the "indexed" event _on_index_finished emits for
+        # the BUILD below — prep_ms in the READY line no longer measures
+        # this walk (fauxcasa-q6l.13), so it gets its own duration event.
+        print(json.dumps({
+            "event": "cold-scan", "cold_scan_ms": round(cold_ms),
+            "photos": len(catalog.photos),
+        }), flush=True)
+        self.reload_data(catalog, None)
+        if build_dir is not None:
+            self._start_cold_build(build_dir)
 
     def _start_cold_build(self, build_dir: Path) -> None:
         bridge, catalog = self._bridge, self.catalog
@@ -1778,8 +1946,14 @@ class MainWindow(QMainWindow):
             self._toggle_inspector(True)
 
     def index_busy(self) -> bool:
-        return any(t is not None and t.is_alive()
-                   for t in (self._build_thread, self._reconcile_thread))
+        # _cold_scan_pending covers the gap between _start_cold_scan
+        # setting it and the walk thread actually landing (fauxcasa-q6l.13)
+        # — including the moment before _scan_thread.start() runs — so a
+        # scripted --finish-build run never quits while a cold scan is
+        # still in flight, only once the chained build finishes too.
+        return self._cold_scan_pending or any(
+            t is not None and t.is_alive()
+            for t in (self._build_thread, self._reconcile_thread))
 
     def shutdown(self) -> None:
         """Stop and reap the index threads so none is mid-write (or
@@ -1789,10 +1963,29 @@ class MainWindow(QMainWindow):
         same join, not a bare daemon abandon)."""
         self.build_cancel.set()
         self.backfill_pause.clear()  # a paused backfill must see the cancel
+        # _scan_thread (fauxcasa-q6l.13) has no cancel token — scan_library/
+        # _scan_library_config walk to completion — so this join is a bounded
+        # wait, not a real interrupt; the thread is a daemon and the process
+        # exiting reaps it regardless. Joined anyway so a quit mid-scan in
+        # tests doesn't race a still-running walk against interpreter teardown.
         for t in (self._build_thread, self._reconcile_thread,
-                  self._backfill_thread):
+                  self._backfill_thread, self._scan_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=5.0)
+        # Codex cross-vendor review round 3: set unconditionally, whether
+        # the join above reaped _scan_thread or gave up on a walk that
+        # outlived it — either way this window must never react to a
+        # scan_done that fires after this point (see the docstring on
+        # _shut_down in __init__). Disconnecting the signal here is a
+        # second line of defense for an emit already queued before this
+        # runs; swallow the RuntimeError a torn-down C++ bridge or an
+        # already-disconnected slot would raise (shutdown() itself may
+        # run more than once in some call sequences — never fatal here).
+        self._shut_down = True
+        try:
+            self._bridge.scan_done.disconnect(self._on_scan_done)
+        except (RuntimeError, TypeError):
+            pass
 
     def _change_library(self) -> None:
         root = _choose_library_from_dialog(
@@ -3217,6 +3410,10 @@ def main() -> int:
     thumbs: object | None = None
     build_dir: Path | None = None
     warm = False
+    # Non-blocking first run (fauxcasa-q6l.13): set True only by the cold
+    # non-adopt branch below — main() then defers to win._start_cold_scan
+    # after win.show() instead of walking here on the startup critical path.
+    cold_scan_needed = False
 
     t_prep = time.perf_counter()
     if not args.rebuild:
@@ -3254,19 +3451,23 @@ def main() -> int:
             build_dir = cache_dir
 
     if catalog is None:  # cold path
-        catalog = _scan_library_config(
-            cfg, scan_filter, contacts, pal_dir, exts, db3_dir)
-        # scan_library/_scan_library_config only see the already-parsed
-        # `contacts` name map, never the contacts.xml PATH — stamp the
-        # freshness signal captured BEFORE load_contacts_xml ran (above),
-        # not a fresh re-stat here (Codex review round-2 finding 2): the
-        # scan this cold path just ran can take a long time, and
-        # re-statting only now would risk pairing a mid-scan external
-        # edit's NEW content with a signature that already looks current.
-        # Covers both the legacy and composed multi-root shapes and both
-        # the adopt and normal cold paths below (fauxcasa-cam.14 step 4).
-        catalog.contacts_sig = contacts_sig
         if adopt:
+            # Adopt keeps the SYNCHRONOUS walk (fauxcasa-q6l.13 spec item
+            # 3): an adopted --thumbs cache is bound to catalog INDICES the
+            # scan just produced, so there is no sound empty-placeholder
+            # shape to show first here the way the non-adopt branch below
+            # can.
+            catalog = _scan_library_config(
+                cfg, scan_filter, contacts, pal_dir, exts, db3_dir)
+            # scan_library/_scan_library_config only see the already-parsed
+            # `contacts` name map, never the contacts.xml PATH — stamp the
+            # freshness signal captured BEFORE load_contacts_xml ran
+            # (above), not a fresh re-stat here (Codex review round-2
+            # finding 2): the scan this cold path just ran can take a long
+            # time, and re-statting only now would risk pairing a
+            # mid-scan external edit's NEW content with a signature that
+            # already looks current (fauxcasa-cam.14 step 4).
+            catalog.contacts_sig = contacts_sig
             try:
                 thumbs = load_cache(args.thumbs)
                 bind(thumbs, catalog)
@@ -3282,7 +3483,19 @@ def main() -> int:
             save_catalog_retrying(catalog, cat_path)  # warm-start next time
             save_report(catalog.report, cache_dir / REPORT_NAME)
         else:
-            build_dir = cache_dir  # the build thread persists the catalog
+            # Non-blocking first run (fauxcasa-q6l.13): don't walk here —
+            # an unbounded-size NAS library would block first paint and
+            # read as a hung app. Build an EMPTY catalog straight FROM cfg
+            # (same roots/library_id/root shape _scan_library_config
+            # itself would produce) so the window, sidebar, abs() and
+            # photos_for_root all see a coherent multiroot shape from the
+            # very first paint; the real walk runs on MainWindow's
+            # background thread (_start_cold_scan), started right after
+            # win.show() below.
+            catalog = Catalog(
+                root=cfg.roots[0].path, photos=[], folders={}, albums={},
+                roots=list(cfg.roots), library_id=cfg.library_id)
+            cold_scan_needed = True
 
     if adopt and isinstance(thumbs, ThumbCache) and thumbs.library \
             and Path(thumbs.library).resolve() != root:
@@ -3293,7 +3506,18 @@ def main() -> int:
                     thumbs.library, str(root))
 
     prep_ms = (time.perf_counter() - t_prep) * 1000.0
-    mode = "warm-load" if warm else ("adopt" if adopt else "cold-walk")
+    if warm:
+        mode = "warm-load"
+    elif adopt:
+        mode = "adopt"
+    elif cold_scan_needed:
+        # fauxcasa-q6l.13: prep_ms here only measures the EMPTY placeholder
+        # catalog's construction, not the walk — the walk runs later on
+        # MainWindow's background thread and gets its own "cold-scan" event
+        # (see _on_scan_done) since prep_ms no longer covers it.
+        mode = "cold-scan-deferred"
+    else:
+        mode = "cold-walk"
     log.info("%s: %d photos, %d folders, %d albums in %.0f ms",
              mode, len(catalog.photos), len(catalog.folders),
              len(catalog.albums), prep_ms)
@@ -3301,6 +3525,11 @@ def main() -> int:
         # §4: conflicts are surfaced, never silent — the applog line plus
         # the status-bar count are the minimal v1 surface (full inspector
         # is N7/M2). Details live in the persisted import-report.json.
+        # On the cold_scan_needed path `catalog` here is the EMPTY
+        # placeholder — its report is always entry-free, so this is
+        # naturally a no-op, never a duplicate of _on_scan_done's own
+        # "import report" log for the real, just-scanned catalog
+        # (fauxcasa-q6l.13, Codex cross-vendor review finding 3).
         log.info("import report: %s", catalog.report.summary())
 
     # A frozen first-run picker may already have created the app.
@@ -3311,16 +3540,29 @@ def main() -> int:
                      contacts=contacts, pal_dir=pal_dir,
                      excluded_exts=excluded_exts,
                      thumbs_path=args.thumbs, db3_dir=db3_dir,
-                     contacts_path=contacts_path)
+                     contacts_path=contacts_path, cfg=cfg,
+                     contacts_sig=contacts_sig)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
     win.show()
+    if cold_scan_needed:
+        # Non-blocking first run (fauxcasa-q6l.13): the window is already
+        # painted (empty) — start the deferred walk now, off the startup
+        # critical path. index_busy() (via _cold_scan_pending) is what
+        # keeps a scripted --finish-build run from quitting before it (and
+        # the build it chains into) land.
+        win._start_cold_scan(cache_dir)
 
     # READY instrumentation (§7 cold start): poll until every visible
     # tile is decoded, then report cold start + RSS on stdout.
     state = {"scrolled": False, "shot": False, "opened": False,
-             "probed": False}
+             "probed": False, "scan_failure_handled": False}
+    # A scripted probe (any of the three) implies quit — same set the hard
+    # timeout below arms on; reused by check_ready's scan-failure gate
+    # (fauxcasa-q6l.13, Codex cross-vendor review finding 2).
+    scripted_run = (args.screenshot is not None or args.quit_after_ready
+                    or args.search_probe is not None)
 
     def may_quit() -> bool:
         if not args.finish_build:
@@ -3336,7 +3578,32 @@ def main() -> int:
         return True
 
     def check_ready() -> None:
-        if not win.grid.all_visible_decoded():
+        if win._scan_failed:
+            # Codex cross-vendor review finding 2: never let a failed
+            # deferred walk report a fake READY against the still-empty
+            # placeholder catalog — _on_scan_done already surfaced the
+            # failure via the activity row/status bar/log. A scripted
+            # probe gets an immediate nonzero exit here (mirrors the crash
+            # an unhandled scan exception caused on the old synchronous
+            # path, just without waiting out the full --timeout); a plain
+            # interactive run simply stays open with the window it already
+            # has — not killed outright, since unlike the old path the
+            # window exists and is otherwise usable.
+            if scripted_run and not state["scan_failure_handled"]:
+                state["scan_failure_handled"] = True
+                log.error("cold scan failed — exiting nonzero, no READY")
+                app.exit(1)
+            return
+        # fauxcasa-q6l.13: while the deferred cold scan is still in flight
+        # the grid is genuinely empty (0 items), so all_visible_decoded()
+        # would trivially read True and fire READY against the EMPTY
+        # placeholder catalog — never once the real one lands. Hold READY
+        # until the walk lands (this does NOT block the event loop; the
+        # walk runs on its own thread and the window is already painted
+        # and responsive), same as the pre-existing "wait for visible
+        # tiles to decode" gate this joins for the async BUILD that
+        # follows.
+        if win._cold_scan_pending or not win.grid.all_visible_decoded():
             return
         if not win.ready_reported:
             win.ready_reported = True
@@ -3356,18 +3623,27 @@ def main() -> int:
             except OSError:
                 cat_bytes = 0
             print("READY", flush=True)
+            # fauxcasa-q6l.13: win.catalog, not the outer `catalog` closed
+            # over above — on the non-blocking cold-scan path that outer
+            # binding is the EMPTY placeholder forever, while win.catalog
+            # is swapped in place by reload_data once the deferred walk
+            # lands (_on_scan_done). Reading win.catalog means READY
+            # reports whatever is actually live at the moment first paint
+            # settled — 0 on a still-scanning NAS-scale library (honest:
+            # the walk isn't done yet), the real counts when the walk
+            # already landed by then (small/warm-adjacent libraries).
             print(json.dumps({
                 "event": "ready",
                 "cold_start_ms": round(cold_ms),
                 "prep_ms": round(prep_ms),
                 "warm": warm,
-                "photos": len(catalog.photos),
-                "visible_photos": catalog.visible_count,
-                "folders": len(catalog.folders),
-                "albums": len(catalog.albums),
+                "photos": len(win.catalog.photos),
+                "visible_photos": win.catalog.visible_count,
+                "folders": len(win.catalog.folders),
+                "albums": len(win.catalog.albums),
                 "catalog_bytes": cat_bytes,
                 "catalog_bytes_per_photo": round(
-                    cat_bytes / max(1, len(catalog.photos)), 1),
+                    cat_bytes / max(1, len(win.catalog.photos)), 1),
                 "vm_rss_mb": round(rss, 1),
                 "vm_hwm_mb": round(hwm, 1),
             }), flush=True)
@@ -3423,8 +3699,7 @@ def main() -> int:
     poll.start()
     # Hard stop for scripted runs: a stuck decode must fail loudly, not
     # hang CI or masquerade as success.
-    if args.screenshot is not None or args.quit_after_ready \
-            or args.search_probe is not None:
+    if scripted_run:
         def on_timeout() -> None:
             log.error("TIMEOUT after %ss — ready=%s state=%s",
                       args.timeout, win.ready_reported, state)

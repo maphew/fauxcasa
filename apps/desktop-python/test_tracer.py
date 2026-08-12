@@ -9128,6 +9128,249 @@ def test_mainwindow_adopt_backfill_end_to_end(tmp_path: Path) -> None:
     win.shutdown()
 
 
+def test_cold_scan_nonblocking(tmp_path: Path, monkeypatch) -> None:
+    """Non-blocking first run (fauxcasa-q6l.13): main()'s cold non-adopt
+    branch hands MainWindow an EMPTY cfg-shaped catalog and calls
+    _start_cold_scan after show() — the window must stay responsive/
+    paintable while the walk is in flight, index_busy() must read True for
+    the whole time _cold_scan_pending is set (this is what keeps a
+    scripted --finish-build run from quitting mid-walk), and landing the
+    walk (_on_scan_done) must populate the real catalog via reload_data and
+    chain straight into the cold BUILD — the scan -> reload -> build gate
+    design."""
+    app = _offscreen_app()
+    import threading
+    import time as _time
+
+    import main
+    from catalog import Catalog
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    make_jpeg(root / "b.jpg")
+    cfg = libmod.legacy_config(root)
+
+    real_catalog = scan_library(root)
+    release = threading.Event()
+    calls = []
+
+    def fake_scan_library_config(cfg_, scan_filter, contacts, pal_dir,
+                                 exts, db3_dir):
+        calls.append(cfg_)
+        assert release.wait(5.0), "test never released the fake scan"
+        return real_catalog
+
+    monkeypatch.setattr(main, "_scan_library_config",
+                        fake_scan_library_config)
+
+    empty = Catalog(root=cfg.roots[0].path, photos=[], folders={},
+                    albums={}, roots=list(cfg.roots),
+                    library_id=cfg.library_id)
+    cache_dir = tmp_path / "cachedir"
+    win = main.MainWindow(empty, None, cache_dir=cache_dir, build_dir=None,
+                          cfg=cfg)
+    win.show()
+
+    # Constructing/showing the window must NOT itself have started a scan
+    # or build — main() calls _start_cold_scan explicitly, after show().
+    assert not win.index_busy()
+    assert win._scan_thread is None
+
+    win._start_cold_scan(cache_dir)
+    assert win._cold_scan_pending
+    assert win.index_busy()          # folded into index_busy from the start
+    assert win.catalog is empty      # not yet swapped — the walk is blocked
+
+    # The window stays responsive while the walk (blocked on `release`) is
+    # in flight: the event loop keeps pumping and the window is still the
+    # empty placeholder's — nothing here waits on the walk thread.
+    for _ in range(5):
+        app.processEvents()
+    assert win.isVisible()
+    assert win._cold_scan_pending     # still pending — release() not yet set
+    assert win.catalog is empty
+
+    release.set()
+    deadline = _time.time() + 5.0
+    while win._cold_scan_pending and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    app.processEvents()  # deliver the queued bridge.scan_done signal
+
+    assert not win._cold_scan_pending
+    assert win.catalog is real_catalog          # reload_data swapped it in
+    assert len(win.catalog.photos) == 2
+    assert win._build_thread is not None        # the cold BUILD was chained
+    assert calls == [cfg]                       # _scan_library_config args
+
+    win.shutdown()
+
+
+def test_cold_scan_reapplies_star_overrides(tmp_path: Path,
+                                            monkeypatch) -> None:
+    """Codex cross-vendor review finding 1: the ctor's own
+    apply_star_overrides call only ever touches the EMPTY placeholder
+    catalog on the deferred cold path — a stars.json from an earlier run
+    (e.g. --rebuild, or an invalidated cache) must still land on the REAL
+    catalog once _on_scan_done gets it, same as the old synchronous cold
+    path applied it in __init__ directly against the just-scanned catalog."""
+    app = _offscreen_app()
+    import time as _time
+
+    import starstore
+    import main
+    from catalog import Catalog
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    make_jpeg(root / "b.jpg")
+    cfg = libmod.legacy_config(root)
+
+    # A prior run's Fauxcasa-local star choice, persisted beside the cache
+    # (main()'s cold non-adopt branch never re-walks this on --rebuild —
+    # only the photos change, the overlay file survives).
+    pre_scan = scan_library(root)
+    key = starstore.photo_key(pre_scan.photos[0])
+    cache_dir = tmp_path / "cachedir"
+    starstore.save_star_overrides(cache_dir, {key: 4})
+
+    real_catalog = scan_library(root)
+    assert all(p.star == 0 for p in real_catalog.photos)  # no ini stars
+
+    def fake_scan_library_config(cfg_, scan_filter, contacts, pal_dir,
+                                 exts, db3_dir):
+        return real_catalog
+
+    monkeypatch.setattr(main, "_scan_library_config",
+                        fake_scan_library_config)
+
+    empty = Catalog(root=cfg.roots[0].path, photos=[], folders={},
+                    albums={}, roots=list(cfg.roots),
+                    library_id=cfg.library_id)
+    win = main.MainWindow(empty, None, cache_dir=cache_dir, build_dir=None,
+                          cfg=cfg)
+    assert win.star_overrides == {key: 4}    # loaded in __init__ as usual
+    win.show()
+    win._start_cold_scan(cache_dir)
+
+    deadline = _time.time() + 5.0
+    while win._cold_scan_pending and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    app.processEvents()
+
+    assert win.catalog is real_catalog
+    starred = {starstore.photo_key(p): p.star for p in win.catalog.photos
+              if p.star}
+    assert starred == {key: 4}               # reapplied onto the REAL scan
+    win.shutdown()
+
+
+def test_cold_scan_failure_scripted_run_exits_nonzero(
+        tmp_path: Path, monkeypatch, capsys) -> None:
+    """Codex cross-vendor review finding 2: the old synchronous cold path
+    let a scan exception propagate out of main() and crash the process —
+    never a fake READY, always a nonzero exit. A background-thread scan
+    failure on the deferred path must reproduce that contract for a
+    scripted run: no READY line, nonzero exit — driven in-process the same
+    way test_main_reuses_existing_qapplication drives main() (a real
+    subprocess can't monkeypatch _scan_library_config to force a
+    deterministic, portable failure)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+
+    def fake_scan_library_config(cfg_, scan_filter, contacts, pal_dir,
+                                 exts, db3_dir):
+        raise RuntimeError("synthetic scan failure (test)")
+
+    monkeypatch.setattr(main, "_scan_library_config",
+                        fake_scan_library_config)
+
+    cache_root = tmp_path / "cr"
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(root), "--cache-root", str(cache_root),
+        "--quit-after-ready", "--timeout", "10"])
+    rc = main.main()
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "READY" not in out
+    assert '"event": "ready"' not in out
+
+
+def test_cold_scan_orphan_ignored_after_shutdown(
+        tmp_path: Path, monkeypatch) -> None:
+    """Codex cross-vendor review round 3, working repro: a cold scan that
+    outlives both a scripted --timeout and shutdown()'s own 5 s join
+    leaves _scan_thread alive after main() has already returned this
+    window. main() supports reusing the same QApplication across an
+    in-process run (test_ready_poll_timer_dies_with_the_run) — if a later
+    run restarts the event loop, the orphaned worker's queued scan_done
+    can fire into this now-stale window and reload/rebuild against
+    deleted Qt objects. shutdown() must set _shut_down (whether its join
+    reaped the thread or gave up on it — this test exercises the giving-up
+    shape without paying the real 5 s wait, since a monkeypatched join
+    timeout would diverge from the actual code path being fixed) and
+    _on_scan_done must check it FIRST and be a strict no-op once set —
+    this is exactly the guard a signal delivered after shutdown() would
+    hit, whether or not the belt-and-braces disconnect also won its race."""
+    app = _offscreen_app()
+    import main
+    from catalog import Catalog
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cfg = libmod.legacy_config(root)
+
+    def fake_scan_library_config(cfg_, scan_filter, contacts, pal_dir,
+                                 exts, db3_dir):
+        raise AssertionError("must never run once shut down")
+
+    monkeypatch.setattr(main, "_scan_library_config",
+                        fake_scan_library_config)
+
+    empty = Catalog(root=cfg.roots[0].path, photos=[], folders={},
+                    albums={}, roots=list(cfg.roots),
+                    library_id=cfg.library_id)
+    cache_dir = tmp_path / "cachedir"
+    win = main.MainWindow(empty, None, cache_dir=cache_dir, build_dir=None,
+                          cfg=cfg)
+    win.show()
+    assert not win._shut_down
+
+    win.shutdown()          # no scan ever started here: the join is instant,
+    assert win._shut_down   # same as the "gave up on a stuck join" outcome —
+                             # shutdown() sets the flag unconditionally either way
+
+    # Belt and braces: the signal itself is disconnected too, so a SECOND
+    # disconnect attempt returns False (PySide6's signal for "not
+    # connected", a RuntimeWarning rather than a raise) — proving
+    # shutdown() actually severed it, not just set the flag.
+    assert win._bridge.scan_done.disconnect(win._on_scan_done) is False
+
+    # Simulate the orphaned worker's queued scan_done landing AFTER
+    # shutdown (the exact race the flag exists for, independent of
+    # whether Qt's queued delivery would even still reach a disconnected
+    # slot): a real, non-empty catalog arrives — _on_scan_done must still
+    # be a strict no-op.
+    real_catalog = scan_library(root)
+    win._on_scan_done(real_catalog)
+
+    assert win.catalog is empty          # never reloaded
+    assert not win._cold_scan_pending    # untouched by the no-op guard's
+                                          # early return (shutdown() itself
+                                          # never toggled it — no scan ran)
+    app.processEvents()                  # nothing queued; must not raise
+    win.deleteLater()
+
+
 def test_mainwindow_backfill_persists_report_and_updates_notes(
         tmp_path: Path) -> None:
     """Review findings (fauxcasa-nu9): _start_backfill threads a real
