@@ -293,6 +293,33 @@ def _library_config_path(cache_dir: Path) -> Path:
     return cache_dir / "config.json"
 
 
+def _read_library_config(cache_dir: Path) -> dict:
+    """Read the raw per-library config dict, or {} on any failure.
+    View prefs are a convenience, never a gate."""
+    try:
+        data = json.loads(_library_config_path(cache_dir).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_library_config(cache_dir: Path, data: dict) -> None:
+    """Persist the per-library config atomically via temp-sibling + os.replace.
+    Best-effort: a write failure never breaks the session."""
+    cfg = _library_config_path(cache_dir)
+    tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, cfg)
+    except OSError as e:
+        log.warning("could not persist library config: %s", e)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def load_sort_modes(cache_dir: Path | None) -> dict[str, str]:
     """The persisted per-folder sort modes (folder rel-path -> mode), or {}.
     Tolerates a missing/garbage file, a non-object document, and unknown
@@ -300,13 +327,7 @@ def load_sort_modes(cache_dir: Path | None) -> dict[str, str]:
     Default-mode entries are dropped too: absent == DEFAULT_SORT_MODE."""
     if cache_dir is None:
         return {}
-    try:
-        data = json.loads(_library_config_path(cache_dir).read_text())
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    modes = data.get("sort_modes")
+    modes = _read_library_config(cache_dir).get("sort_modes")
     if not isinstance(modes, dict):
         return {}
     return {rel: mode for rel, mode in modes.items()
@@ -315,27 +336,40 @@ def load_sort_modes(cache_dir: Path | None) -> dict[str, str]:
 
 
 def save_sort_modes(cache_dir: Path | None, modes: dict[str, str]) -> None:
-    """Persist the non-default per-folder sort modes. Best-effort (a write
-    failure never breaks the session — the in-memory modes still apply) and
-    torn-proof via the same temp-sibling + os.replace dance as
-    _remember_library. Rewrites the whole document: sort_modes is its only
-    key today; a future second view pref must merge, not clobber."""
+    """Persist the non-default per-folder sort modes. Best-effort and
+    torn-proof via temp-sibling + os.replace. Merges into the existing config
+    doc so other view prefs (folder_view_flat) survive the write."""
     if cache_dir is None:
         return  # no cache dir (tests, degraded runs): session-only modes
     keep = {rel: mode for rel, mode in sorted(modes.items())
             if mode in SORT_MODES and mode != DEFAULT_SORT_MODE}
-    cfg = _library_config_path(cache_dir)
-    tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
-    try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps({"sort_modes": keep}))
-        os.replace(tmp, cfg)
-    except OSError as e:
-        log.warning("could not persist sort modes: %s", e)
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+    doc = _read_library_config(cache_dir)
+    doc["sort_modes"] = keep
+    _write_library_config(cache_dir, doc)
+
+
+def load_folder_view(cache_dir: Path | None) -> bool:
+    """Whether the folder sidebar should use flat (True) or tree (False) mode.
+    Default False (tree). Tolerates missing/garbage config — view prefs are
+    a convenience, never a gate. Absent key == tree (False)."""
+    if cache_dir is None:
+        return False
+    v = _read_library_config(cache_dir).get("folder_view_flat")
+    return bool(v) if isinstance(v, bool) else False
+
+
+def save_folder_view(cache_dir: Path | None, flat: bool) -> None:
+    """Persist the flat/tree folder sidebar choice. Best-effort and
+    torn-proof. Merges into the existing config so sort_modes survives.
+    The default (tree/False) is stored as absent, not False."""
+    if cache_dir is None:
+        return
+    doc = _read_library_config(cache_dir)
+    if flat:
+        doc["folder_view_flat"] = True
+    else:
+        doc.pop("folder_view_flat", None)
+    _write_library_config(cache_dir, doc)
 
 
 def _gui_unavailable() -> bool:
@@ -1064,8 +1098,20 @@ class MainWindow(QMainWindow):
         self._peek_page: PeekPage | None = None
 
         # --- sidebar: All / Starred / Folders / Albums ---
+        # Flat/tree toggle (fauxcasa-q6l.10): small checkbox above the tree;
+        # load the persisted choice before _build_sidebar reads it.
         self.tree = self._new_sidebar_tree()
+        self._flat_check = QCheckBox("Flat")
+        self._flat_check.setToolTip(
+            "List folders alphabetically instead of as a tree")
+        # Block signals while setting initial state — _toggle_folder_view
+        # calls _rebuild_sidebar, which is not safe before __init__ completes.
+        self._flat_check.blockSignals(True)
+        self._flat_check.setChecked(load_folder_view(cache_dir))
+        self._flat_check.blockSignals(False)
         self._build_sidebar()
+        # Wire AFTER _build_sidebar so init doesn't trigger a spurious rebuild.
+        self._flat_check.toggled.connect(self._toggle_folder_view)
 
         # --- menu bar: Tools (fauxcasa-v46.4) ---
         # The File Types panel is the first menu item the tracer grows; a
@@ -1156,7 +1202,15 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(browser)
         lay.setContentsMargins(0, 0, 0, 0)
         split = QSplitter()
-        split.addWidget(self.tree)
+        # Sidebar panel: flat/tree toggle above the tree widget so both
+        # travel together in the splitter (fauxcasa-q6l.10).
+        self._sidebar_panel = QWidget()
+        _spanel_lay = QVBoxLayout(self._sidebar_panel)
+        _spanel_lay.setContentsMargins(0, 2, 0, 0)
+        _spanel_lay.setSpacing(2)
+        _spanel_lay.addWidget(self._flat_check)
+        _spanel_lay.addWidget(self.tree)
+        split.addWidget(self._sidebar_panel)
         split.addWidget(self.grid)
         split.setSizes([240, 1040])
         split.setCollapsible(1, False)
@@ -1789,6 +1843,14 @@ class MainWindow(QMainWindow):
                 return
             it += 1
 
+    def _toggle_folder_view(self, flat: bool) -> None:
+        """Switch the folder sidebar between flat and tree layouts, persist the
+        choice, and rebuild the sidebar while preserving the current selection."""
+        save_folder_view(self.cache_dir, flat)
+        kind, key = self._selected_view()
+        self._rebuild_sidebar()
+        self._reselect_view(kind, key)
+
     # ---------- sidebar ----------
 
     def _new_sidebar_tree(self) -> QTreeWidget:
@@ -1821,11 +1883,11 @@ class MainWindow(QMainWindow):
         Building a new tree and letting the event loop free the old one at a
         safe point sidesteps that teardown path entirely."""
         old = self.tree
-        split = old.parentWidget()
         new = self._new_sidebar_tree()
-        idx = split.indexOf(old)
         self.tree = new
-        split.replaceWidget(idx, new)
+        # Replace the tree inside the sidebar panel (not the splitter) so the
+        # flat/tree toggle above it stays in place (fauxcasa-q6l.10).
+        self._sidebar_panel.layout().replaceWidget(old, new)
         self._build_sidebar()
         old.deleteLater()
 
@@ -1853,6 +1915,10 @@ class MainWindow(QMainWindow):
         folders_root = QTreeWidgetItem(t, ["Folders"])
         folders_root.setFlags(
             folders_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        # Flat/tree toggle (fauxcasa-q6l.10): both branches below grow a flat
+        # mode alongside their existing tree mode, and both modes now carry
+        # a full on-disk-path tooltip (path on demand) on every folder item.
+        flat = self._flat_check.isChecked()
         if len(cat.roots) <= 1:
             # Exact one-root passthrough: keep the historical tree shape,
             # labels, item data, and offline badge behavior unchanged.
@@ -1863,76 +1929,143 @@ class MainWindow(QMainWindow):
                 bf = badge.font(0)
                 bf.setItalic(True)
                 badge.setFont(0, bf)
-            nodes: dict[str, QTreeWidgetItem] = {"": folders_root}
+            # cat.roots is populated for every load_catalog()/scan_library()
+            # call (single-root gets the implicit LEGACY_ROOT_ID entry); the
+            # cat.root fallback only matters for a bare test fixture that
+            # never went through either.
+            root_path = cat.roots[0].path if cat.roots else cat.root
+            if flat:
+                # Flat mode: alphabetical by leaf name, tooltip carries the
+                # full on-disk path (path on demand).
+                ordered = sorted(
+                    ((rel, folder) for rel, folder in cat.folders.items()
+                     if fcount(folder) > 0),
+                    key=lambda rf: rf[0].rsplit("/", 1)[-1].lower(),
+                )
+                for rel, folder in ordered:
+                    leaf = rel.split("/")[-1]
+                    item = QTreeWidgetItem(
+                        folders_root, [f"{leaf}  ({fcount(folder)})"])
+                    item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
+                    item.setToolTip(0, str(root_path / rel))
+            else:
+                # Tree mode (default): hierarchical, with full-path tooltips.
+                nodes: dict[str, QTreeWidgetItem] = {"": folders_root}
 
-            def node_for(rel: str) -> QTreeWidgetItem:
-                if rel in nodes:
-                    return nodes[rel]
-                parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
-                parent = node_for(parent_rel)
-                item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
-                item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
-                nodes[rel] = item
-                return item
+                def node_for(rel: str) -> QTreeWidgetItem:
+                    if rel in nodes:
+                        return nodes[rel]
+                    parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
+                    parent = node_for(parent_rel)
+                    item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
+                    item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
+                    item.setToolTip(0, str(root_path / rel))
+                    nodes[rel] = item
+                    return item
 
-            for rel, folder in cat.folders.items():
-                if fcount(folder) == 0:
-                    continue
-                item = node_for(rel)
-                item.setText(0, f"{folder.title}  ({fcount(folder)})")
-        else:
-            # Genuine multiroot: durable manifest order is display order.
-            # Root labels are the top-level folder nodes; child identities
-            # use the catalog's root-qualified convention so duplicate rels
-            # never merge. Offline roots remain browseable from cached thumbs.
-            root_nodes: dict[str, QTreeWidgetItem] = {}
-            nodes2: dict[tuple[str, str], QTreeWidgetItem] = {}
-            for root in cat.roots:
-                label = root.label or root.path.name or str(root.path)
-                if root.id in cat.offline_ids:
-                    label += " (offline)"
-                item = QTreeWidgetItem(folders_root, [label])
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-                if root.id in cat.offline_ids:
-                    font = item.font(0)
-                    font.setItalic(True)
-                    item.setFont(0, font)
-                    item.setForeground(0, t.palette().brush(
-                        QPalette.ColorGroup.Disabled,
-                        QPalette.ColorRole.Text))
-                root_nodes[root.id] = item
-                nodes2[(root.id, "")] = item
-
-            def node_for_root(root_id: str, rel: str) -> QTreeWidgetItem:
-                ident = (root_id, rel)
-                if ident in nodes2:
-                    return nodes2[ident]
-                parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
-                parent = node_for_root(root_id, parent_rel)
-                item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
-                key = folder_key(cat, root_id, rel)
-                item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
-                nodes2[ident] = item
-                return item
-
-            for key, folder in cat.folders.items():
-                if fcount(folder) == 0 or folder.root_id not in root_nodes:
-                    continue
-                item = node_for_root(folder.root_id, folder.rel)
-                if folder.rel:
+                for rel, folder in cat.folders.items():
+                    if fcount(folder) == 0:
+                        continue
+                    item = node_for(rel)
                     item.setText(0, f"{folder.title}  ({fcount(folder)})")
-                else:
-                    label = (next(r for r in cat.roots
-                                  if r.id == folder.root_id).label
-                             or next(r for r in cat.roots
-                                     if r.id == folder.root_id).path.name)
-                    if folder.root_id in cat.offline_ids:
-                        label += " (offline)"
-                    item.setText(0, f"{label}  ({fcount(folder)})")
-                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsSelectable)
+        else:
+            # Genuine multiroot: durable manifest order is display order in
+            # tree mode; flat mode is alphabetical across every root. Child
+            # identities use the catalog's root-qualified convention
+            # (folder_key) so duplicate rels across roots never merge.
+            roots_by_id = {r.id: r for r in cat.roots}
+            if flat:
+                # Flat mode: alphabetical by leaf name across all roots.
+                # Offline roots remain browseable from cached thumbs (not
+                # skipped) — styled with the same italic/dim cue tree mode
+                # gives the offline root header, since a flat list has no
+                # header row to carry that cue instead.
+                def leaf_label(item: tuple[str, object]) -> str:
+                    folder = item[1]
+                    if folder.rel:
+                        return folder.rel.split("/")[-1]
+                    root = roots_by_id[folder.root_id]
+                    return root.label or root.path.name
+
+                ordered = sorted(
+                    ((key, folder) for key, folder in cat.folders.items()
+                     if fcount(folder) > 0
+                     and folder.root_id in roots_by_id),
+                    key=lambda kf: leaf_label(kf).lower(),
+                )
+                for key, folder in ordered:
+                    root = roots_by_id[folder.root_id]
+                    if folder.rel:
+                        leaf = folder.rel.split("/")[-1]
+                        text = f"{leaf}  ({fcount(folder)})"
+                    else:
+                        label = root.label or root.path.name
+                        if folder.root_id in cat.offline_ids:
+                            label += " (offline)"
+                        text = f"{label}  ({fcount(folder)})"
+                    item = QTreeWidgetItem(folders_root, [text])
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
-            for item in root_nodes.values():
-                item.setExpanded(True)
+                    item.setToolTip(0, str(root.path / folder.rel))
+                    if folder.root_id in cat.offline_ids:
+                        font = item.font(0)
+                        font.setItalic(True)
+                        item.setFont(0, font)
+                        item.setForeground(0, t.palette().brush(
+                            QPalette.ColorGroup.Disabled,
+                            QPalette.ColorRole.Text))
+            else:
+                # Tree mode (default): root labels are the top-level folder
+                # nodes; child items carry full-path tooltips too.
+                root_nodes: dict[str, QTreeWidgetItem] = {}
+                nodes2: dict[tuple[str, str], QTreeWidgetItem] = {}
+                for root in cat.roots:
+                    label = root.label or root.path.name or str(root.path)
+                    if root.id in cat.offline_ids:
+                        label += " (offline)"
+                    item = QTreeWidgetItem(folders_root, [label])
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                    item.setToolTip(0, str(root.path))
+                    if root.id in cat.offline_ids:
+                        font = item.font(0)
+                        font.setItalic(True)
+                        item.setFont(0, font)
+                        item.setForeground(0, t.palette().brush(
+                            QPalette.ColorGroup.Disabled,
+                            QPalette.ColorRole.Text))
+                    root_nodes[root.id] = item
+                    nodes2[(root.id, "")] = item
+
+                def node_for_root(root_id: str, rel: str) -> QTreeWidgetItem:
+                    ident = (root_id, rel)
+                    if ident in nodes2:
+                        return nodes2[ident]
+                    parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
+                    parent = node_for_root(root_id, parent_rel)
+                    item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
+                    key = folder_key(cat, root_id, rel)
+                    item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
+                    item.setToolTip(0, str(roots_by_id[root_id].path / rel))
+                    nodes2[ident] = item
+                    return item
+
+                for key, folder in cat.folders.items():
+                    if fcount(folder) == 0 or folder.root_id not in root_nodes:
+                        continue
+                    item = node_for_root(folder.root_id, folder.rel)
+                    if folder.rel:
+                        item.setText(0, f"{folder.title}  ({fcount(folder)})")
+                    else:
+                        label = (next(r for r in cat.roots
+                                      if r.id == folder.root_id).label
+                                 or next(r for r in cat.roots
+                                         if r.id == folder.root_id).path.name)
+                        if folder.root_id in cat.offline_ids:
+                            label += " (offline)"
+                        item.setText(0, f"{label}  ({fcount(folder)})")
+                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsSelectable)
+                        item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
+                for item in root_nodes.values():
+                    item.setExpanded(True)
         folders_root.setExpanded(True)
 
         if cat.albums:
