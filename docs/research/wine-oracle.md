@@ -89,6 +89,11 @@ mouse+keyboard work natively (exact 1:1 px).
       exec wine "C:\\Program Files (x86)\\Google\\Picasa3\\Picasa3.exe"'
    ```
 
+   `scripts/launch-oracle-picasa.sh` wraps this exact invocation
+   (display via `ORACLE_DISPLAY`, default `:2`); run it detached so Picasa
+   survives across agent tool calls:
+   `tmux new-session -d -s oracle scripts/launch-oracle-picasa.sh`.
+
 3. **See + drive** (all on `:3`, 1:1 device px, no HiDPI scaling):
 
    ```sh
