@@ -20,14 +20,19 @@ HONESTY CONTRACT — read before tightening a threshold:
   that added this file (2026-07-02: warm cold start ~0.57 s; search
   5.6-30 ms across 0..100k-hit queries).
 
-- Catalog size: the §7 row says ~50 B/photo core catalog (oracle-measured)
-  and there is a KNOWN TENSION, tracked as fauxcasa-1jb: the tracer's JSON
-  catalog rows carry rel + sha256 (64 hex chars) once the indexer has run,
-  which cannot meet ~50 B/photo. This job REPORTS bytes/photo so the number
-  is visible in every CI run, and fails only past a generous ceiling that
-  flags runaway growth (a new per-photo blob landing in the catalog), not
-  the known tension. Do not "fix" a ceiling failure by raising the ceiling
-  silently — file it against fauxcasa-1jb.
+- Catalog size: spec §10 item 20 re-baselines the budget to <=100 B/photo
+  fully indexed, hash included (fauxcasa-1jb, CLOSED — the original ~50
+  B/photo row demoted to a historical baseline, never the green bar).
+  fauxcasa-ed5.5 met that honestly: catalog.json is now zstd level 3 over
+  folder-grouped compact JSON (docs/research/catalog-size-analysis.md),
+  and this field is main.py's `cat_path.stat().st_size` — the real on-disk
+  bytes of that compressed file, divided by photo count — so it already
+  reflects compression, not a claim about it. This job REPORTS bytes/photo
+  so the number is visible in every CI run, and fails only past a generous
+  ceiling that flags runaway growth (a new per-photo blob landing in the
+  catalog, or compression regressing back to plain JSON), not the exact
+  budget number. Do not "fix" a ceiling failure by raising the ceiling
+  silently — file a new bead.
 
 Flow (all subprocesses run offscreen, timeout-armed):
   1. generate the default 24-photo synthetic library if absent
@@ -70,8 +75,11 @@ COLD_CANARY_MS = 10_000
 # Search over 24 photos is sub-millisecond; 500 ms only fires on a
 # pathology (per-keystroke IO / quadratic scan). §7 budget: 50 ms at 100k.
 SEARCH_CANARY_MS = 500
-# ~50 B/photo is the §7 row; the sha256-bearing JSON rows measure ~150-250.
-# The ceiling flags runaway growth only (fauxcasa-1jb owns the tension).
+# <=100 B/photo fully indexed is the re-baselined budget (spec §10 item
+# 20); fauxcasa-ed5.5's zstd-over-grouped-JSON catalog measures ~40-60 on
+# a synthetic 1000-photo catalog (see docs/research/catalog-size-analysis.md
+# and the fauxcasa-ed5.5 close-out). The ceiling below stays generous —
+# it flags runaway growth only, not the exact budget number.
 CATALOG_CEILING_B_PER_PHOTO = 2_048
 
 PROBE = "beach,winter,-beach,garden photo,zzznope"

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "PySide6", "pillow", "exiv2", "rawpy", "av"]
+# dependencies = ["pytest", "PySide6", "pillow", "exiv2", "rawpy", "av", "zstandard"]
 # ///
 """Tests for the tracer's non-GUI layers: catalog scan + metadata,
 thumbnail-cache build/load/bind, and walk-rule parity with
@@ -81,6 +81,46 @@ def _isolate_qt_per_test():
         w.deleteLater()
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # actually free them
     app.processEvents()
+
+
+def _raw_catalog(path: Path) -> dict:
+    """Read a save_catalog-produced file back into its raw dict form for
+    tests that inspect the serialized shape directly (fauxcasa-ed5.5: the
+    file is zstd-compressed from CATALOG_VERSION 13 on, so a plain
+    path.read_text()/json.loads() no longer works on it)."""
+    import zstandard
+
+    raw = path.read_bytes()
+    if raw[:4] == b"\x28\xb5\x2f\xfd":
+        raw = zstandard.ZstdDecompressor().decompress(raw)
+    return json.loads(raw)
+
+
+def _write_raw_catalog(path: Path, data: dict) -> None:
+    """The inverse of _raw_catalog: write a (possibly hand-mutated) raw
+    catalog dict back out as a v13 zstd-compressed file, so a test that
+    pokes at the parsed structure still exercises load_catalog's real
+    on-disk format."""
+    import zstandard
+
+    payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(zstandard.ZstdCompressor(level=3).compress(payload))
+
+
+def _raw_photo_rows(data: dict) -> list[dict]:
+    """Flatten a raw catalog dict's "photos" into the pre-ed5.5 flat-row
+    shape ("r" rel path, hex "x", absent-means-roots[0] "R") that many
+    tests are written against — transparently ungrouping the v13
+    folder-grouped shape when present, and passing an already-flat legacy
+    "photos" (a hand-built v11 fixture) through untouched."""
+    import catalog as catmod
+
+    roots_hdr = data.get("roots")
+    first_root_id = roots_hdr[0]["id"] if roots_hdr else ""
+    photos = data.get("photos", [])
+    if photos and isinstance(photos[0], dict) and "ph" in photos[0]:
+        return catmod._ungroup_photo_rows(photos, first_root_id)
+    return photos
 
 
 def make_jpeg(path: Path, w: int = 64, h: int = 48) -> None:
@@ -408,7 +448,7 @@ def test_stashed_original_survives_catalog_roundtrip(
     assert loaded.photos[a.stashed_original].rel == \
         "2020-01-01 Trip/.picasaoriginals/a.jpg"
     # derived, not stored — the JSON must contain no stashed_original key
-    assert '"stashed_original"' not in path.read_text()
+    assert '"stashed_original"' not in json.dumps(_raw_catalog(path))
 
 
 def test_build_fills_signals_and_binds(library: Path, tmp_path: Path) -> None:
@@ -477,6 +517,148 @@ def test_load_catalog_rejects_foreign_format(tmp_path: Path) -> None:
     p.write_text("{ not json")
     assert load_catalog(p, tmp_path) is None
     assert load_catalog(tmp_path / "missing.json", tmp_path) is None
+
+
+# ---- on-disk size budget (fauxcasa-ed5.5, spec §10 item 20 re-baseline):
+# zstd level 3 over folder-grouped compact JSON — see
+# docs/research/catalog-size-analysis.md and catalog.save_catalog. --------
+
+
+def test_catalog_v13_is_zstd_compressed_and_smaller_than_plain(
+        library: Path, tmp_path: Path) -> None:
+    """save_catalog's on-disk file starts with the zstd frame magic and is
+    smaller than an uncompressed dump of the exact same (grouped) JSON —
+    the size-budget mechanism actually engages, not just parses back."""
+    import catalog as catmod
+
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")  # fills z/m/x so rows aren't tiny
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    raw = path.read_bytes()
+    assert raw[:4] == catmod.ZSTD_MAGIC
+    uncompressed = json.dumps(_raw_catalog(path),
+                              separators=(",", ":")).encode("utf-8")
+    assert len(raw) < len(uncompressed)
+
+
+def test_load_catalog_accepts_legacy_v11_plain_json(tmp_path: Path) -> None:
+    """A hand-built pre-multiroot (v11) plain-JSON catalog — flat rows, no
+    "R", no zstd wrapping — still loads for a single-root library (design
+    §5's compat carve-out), unaffected by the ed5.5 v13 zstd/grouped bump:
+    a v11 file was never grouped or compressed to begin with."""
+    import catalog as catmod
+
+    p = tmp_path / "catalog.json"
+    digest_hex = "ab" * 32  # 64-char hex, this format's native shape
+    data = {
+        "version": catmod.PRE_MULTIROOT_VERSION,
+        "library": str(tmp_path),
+        "photos": [{"r": "a.jpg", "z": 10, "m": 100, "x": digest_hex}],
+        "folders": {}, "hidden_folders": [], "contacts": {},
+        "db3_contacts": [], "albums": [],
+    }
+    p.write_text(json.dumps(data))
+    loaded = load_catalog(p, tmp_path)
+    assert loaded is not None
+    assert loaded.photos[0].rel == "a.jpg"
+    assert loaded.photos[0].sha256 == digest_hex
+
+
+def test_load_catalog_rejects_plain_v12_json(tmp_path: Path) -> None:
+    """A plain (uncompressed) v12 file — the format this catalog shipped
+    right before the ed5.5 zstd bump — now simply fails the version gate:
+    there is no migration path for it, only a cold rebuild (the catalog
+    is a regenerable cache, not a document worth migrating)."""
+    p = tmp_path / "catalog.json"
+    data = {"version": 12, "library": str(tmp_path), "photos": [],
+            "folders": {}, "hidden_folders": [], "contacts": {},
+            "db3_contacts": [], "albums": []}
+    p.write_text(json.dumps(data))
+    assert load_catalog(p, tmp_path) is None
+
+
+def test_load_catalog_rejects_corrupt_or_truncated_zstd(
+        library: Path, tmp_path: Path) -> None:
+    """A truncated zstd frame, and a file whose first 4 bytes lie about
+    being a valid one, both degrade to None (-> cold walk) — never an
+    uncaught exception reaching main()."""
+    cat = scan_library(library)
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    good = path.read_bytes()
+    path.write_bytes(good[:len(good) // 2])       # truncated mid-frame
+    assert load_catalog(path, library) is None
+
+    path.write_bytes(good[:4] + b"not a real zstd payload at all, just junk")
+    assert load_catalog(path, library) is None
+
+    path.write_bytes(b"")                          # empty file
+    assert load_catalog(path, library) is None
+
+
+def test_catalog_sha256_b85_roundtrips_to_same_hex(tmp_path: Path) -> None:
+    """"x" is stored as base85 of the raw 32 bytes on disk (shorter than
+    64 hex chars) but load_catalog decodes it straight back to the exact
+    same hex string Photo.sha256 has always carried — every other
+    consumer of that field is unaffected by the encoding change."""
+    import hashlib
+
+    from catalog import Catalog, Folder, Photo
+
+    digest_hex = hashlib.sha256(b"hello world").hexdigest()
+    photos = [Photo(rel="a.jpg", folder="", name="a.jpg", sha256=digest_hex,
+                    size=10, mtime=100)]
+    folders = {"": Folder(rel="", title="x", photo_count=1, total_count=1)}
+    cat = Catalog(root=tmp_path, photos=photos, folders=folders, albums={})
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    loaded = load_catalog(path, tmp_path)
+    assert loaded is not None
+    assert loaded.photos[0].sha256 == digest_hex
+
+    # On disk it's genuinely base85, not hex: shorter, and not the hex text.
+    group_row = _raw_catalog(path)["photos"][0]["ph"][0]
+    assert group_row["x"] != digest_hex
+    assert len(group_row["x"]) < len(digest_hex)
+    # ...but the ungrouping helper (what load_catalog itself uses) restores
+    # the exact hex string.
+    assert _raw_photo_rows(_raw_catalog(path))[0]["x"] == digest_hex
+
+
+def test_catalog_multiroot_two_roots_round_trip_root_id(tmp_path: Path) -> None:
+    """A minimal two-root case alongside the size-budget tests above:
+    photos on two different roots each keep their own root_id across a
+    save/load cycle, via the group-level "R" (fauxcasa-ed5.5) — the fuller
+    header/folder-key coverage lives in
+    test_multiroot_two_root_save_load_roundtrip_v13."""
+    from catalog import Catalog, Photo
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    id_a, id_b = "aaaaaaaa", "bbbbbbbb"
+    cat = Catalog(
+        root=root_a,
+        photos=[Photo(rel="x.jpg", folder="", name="x.jpg", root_id=id_a),
+                Photo(rel="x.jpg", folder="", name="x.jpg", root_id=id_b)],
+        folders={}, albums={},
+        roots=[libmod.LibraryRoot(id=id_a, path=root_a),
+               libmod.LibraryRoot(id=id_b, path=root_b)],
+        library_id=libmod.mint_library_id(),
+    )
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    cfg = libmod.LibraryConfig(library_id=cat.library_id, name="",
+                               roots=cat.roots, home=tmp_path)
+    loaded = load_catalog(path, cfg)
+    assert loaded is not None
+    assert {p.root_id for p in loaded.photos} == {id_a, id_b}
+    assert [p.root_id for p in loaded.photos] == [id_a, id_b]  # order preserved
 
 
 def test_save_catalog_retrying_succeeds_after_transient_errors(
@@ -717,9 +899,12 @@ def test_load_catalog_survives_malformed_rows(library: Path,
     thumbcache.build_cache(cat, tmp_path / "c")
     path = tmp_path / "catalog.json"
     save_catalog(cat, path)
-    data = json.loads(path.read_text())
-    data["photos"][0] = {"no_rel_key": 1}  # version 1, but a broken row
-    path.write_text(json.dumps(data))
+    data = _raw_catalog(path)
+    # A structurally broken FIRST GROUP (not even a dict) — ungrouping it
+    # must raise (AttributeError), which load_catalog degrades to None,
+    # exactly like a broken flat row did pre-ed5.5.
+    data["photos"][0] = "not_a_group"
+    _write_raw_catalog(path, data)
     assert load_catalog(path, library) is None  # -> caller cold-walks
 
 
@@ -4966,9 +5151,9 @@ def test_metadata_catalog_roundtrip_and_version_gate(
 
     # the version gate: a v4 (pre-metadata) catalog cold-rebuilds
     assert catmod.CATALOG_VERSION >= 5   # exact value pinned by the v7 test
-    data = json.loads(path.read_text())
+    data = _raw_catalog(path)
     data["version"] = 4
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data))  # plain JSON: a version this old never zstd-wrapped
     assert load_catalog(path, metadata_library) is None
 
 
@@ -5975,9 +6160,9 @@ def test_catalog_v6_roundtrips_album_flags(
     assert loaded.albums[UID_GHOST].placeholder
     assert loaded.albums[UID_PAL].pal_sourced
 
-    data = json.loads(path.read_text())
+    data = _raw_catalog(path)
     data["version"] = 5
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data))  # plain JSON: a version this old never zstd-wrapped
     assert load_catalog(path, album_library) is None
 
 
@@ -6596,7 +6781,7 @@ def test_db3_catalog_roundtrip_v11(db3_library: Path,
     catalog (scanned before the rescue existed) is rejected so a warm
     start cold-rebuilds instead of silently un-naming rescued people.
     (>= 11: the exact current value is pinned by the newest version-gate
-    test, test_multiroot_two_root_save_load_roundtrip_v12.)"""
+    test, test_multiroot_two_root_save_load_roundtrip_v13.)"""
     import catalog as catmod
 
     assert catmod.CATALOG_VERSION >= 11
@@ -6613,9 +6798,9 @@ def test_db3_catalog_roundtrip_v11(db3_library: Path,
     assert [p.faces for p in loaded.photos] == [p.faces for p in cat.photos]
     assert loaded.contacts == cat.contacts
 
-    data = json.loads(path.read_text())
+    data = _raw_catalog(path)
     data["version"] = 10                   # pre-db3-rescue format
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data))  # plain JSON: a version this old never zstd-wrapped
     assert load_catalog(path, db3_library) is None
 
 
@@ -7365,16 +7550,20 @@ def test_video_catalog_roundtrip_media_and_dims(tmp_path: Path) -> None:
                             if p.rel == "c.mp4").sha256
     s = next(p for p in loaded.photos if p.rel == "p.jpg")
     assert s.media == "image" and s.dims is None
-    rows = json.loads(path.read_text())["photos"]
+    data = _raw_catalog(path)
+    rows = _raw_photo_rows(data)
     assert all("media" not in r for r in rows)  # derived, never persisted
 
-    data = json.loads(path.read_text())
-    # -2, not -1: CATALOG_VERSION - 1 is now the multiroot-compat boundary
-    # (fauxcasa-ed5.7.2 — a single-root library still loads it, see
-    # test_multiroot_old_version_single_root_still_loads), so genuinely
-    # stale/incompatible formats start two versions back.
-    data["version"] = catmod.CATALOG_VERSION - 2
-    path.write_text(json.dumps(data))
+    # A hard-coded pre-v6 (pre-video) version, not "CATALOG_VERSION - N":
+    # CATALOG_VERSION - 1 is the multiroot-compat boundary (fauxcasa-
+    # ed5.7.2 — a single-root library still loads it, see
+    # test_multiroot_old_version_single_root_still_loads) and
+    # CATALOG_VERSION - 2 is now PRE_MULTIROOT_VERSION itself (also
+    # single-root-accepted) since the ed5.5 zstd bump — any relative
+    # offset risks silently landing on a future compat carve-out again.
+    assert 4 not in (catmod.CATALOG_VERSION, catmod.PRE_MULTIROOT_VERSION)
+    data["version"] = 4
+    path.write_text(json.dumps(data))  # plain JSON: an old format never zstd-wrapped
     assert load_catalog(path, root) is None     # pre-video: cold-rebuild
 
 
@@ -7572,7 +7761,7 @@ def test_backfill_matches_indexer_read_side(tmp_path: Path) -> None:
     assert next(p for p in loaded.photos
                 if p.name == "a.jpg").caption == "in-file cap"
     # ...and a complete catalog's file shape carries no backfill key
-    assert "backfill" not in json.loads(cat_path.read_text())
+    assert "backfill" not in _raw_catalog(cat_path)
 
 
 def test_backfill_interrupt_resume_and_periodic_persist(
@@ -7787,35 +7976,35 @@ def test_backfill_state_roundtrip_and_version_gate(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.backfill_state == BACKFILL_IN_PROGRESS
     assert loaded.backfill_cursor == 1
-    data = json.loads(path.read_text())
+    data = _raw_catalog(path)
     data["backfill"]["cursor"] = 99              # hand-edited overshoot
-    path.write_text(json.dumps(data))
+    _write_raw_catalog(path, data)
     assert load_catalog(path, root).backfill_cursor == 2   # clamped to count
 
     cat.backfill_state = BACKFILL_COMPLETE
     save_catalog(cat, path)
-    assert "backfill" not in json.loads(path.read_text())
+    assert "backfill" not in _raw_catalog(path)
     loaded = load_catalog(path, root)
     assert loaded is not None
     assert loaded.backfill_state == BACKFILL_COMPLETE
 
-    data = json.loads(path.read_text())
+    data = _raw_catalog(path)
     data["backfill"] = {"state": "banana"}       # unknown state string
-    path.write_text(json.dumps(data))
+    _write_raw_catalog(path, data)
     assert load_catalog(path, root) is None
     data["backfill"] = "not-an-object"
-    path.write_text(json.dumps(data))
+    _write_raw_catalog(path, data)
     assert load_catalog(path, root) is None
 
     # v9 (TGA/PSD stills, fauxcasa-v46.4) through v10 (edit recipes,
     # fauxcasa-cam.15): the exact current value is pinned by the newest
-    # version-gate test (test_multiroot_two_root_save_load_roundtrip_v12).
+    # version-gate test (test_multiroot_two_root_save_load_roundtrip_v13).
     assert catmod.CATALOG_VERSION >= 9
     cat.backfill_state = BACKFILL_COMPLETE
     save_catalog(cat, path)
-    data = json.loads(path.read_text())
+    data = _raw_catalog(path)
     data["version"] = 6                          # pre-backfill-state format
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data))  # plain JSON: a version this old never zstd-wrapped
     assert load_catalog(path, root) is None
 
 
@@ -9449,7 +9638,7 @@ def test_catalog_v10_crop_roundtrip_and_version_gate(tmp_path: Path) -> None:
     check could notice an ini-only interpretation change)."""
     from catalog import CATALOG_VERSION
 
-    assert CATALOG_VERSION >= 10  # exact value pinned by the v12 test
+    assert CATALOG_VERSION >= 10  # exact value pinned by the v13 test
     root = tmp_path / "lib"
     make_jpeg(root / "f" / "a.jpg")
     make_jpeg(root / "f" / "b.jpg")
@@ -9468,9 +9657,9 @@ def test_catalog_v10_crop_roundtrip_and_version_gate(tmp_path: Path) -> None:
     assert a.edits == cat.photos[0].edits
     assert a.has_edits and not b.has_edits
     assert b.crop is None and b.edits == ()
-    data = json.loads(path.read_text())
+    data = _raw_catalog(path)
     data["version"] = 9                          # pre-edit-recipe format
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data))  # plain JSON: a version this old never zstd-wrapped
     assert load_catalog(path, root) is None
 
 
@@ -10235,16 +10424,18 @@ def test_walk_roots_tags_and_orders_by_root(tmp_path: Path) -> None:
     assert [p.name for rid, p in hits if rid == id_b] == ["m.jpg"]
 
 
-def test_multiroot_two_root_save_load_roundtrip_v12(tmp_path: Path) -> None:
+def test_multiroot_two_root_save_load_roundtrip_v13(tmp_path: Path) -> None:
     """A 2-root explicit-library catalog round-trips (design §5/§6): the
     header carries library_id + a roots snapshot, roots[0]'s photo needs
     no "R" (absent means roots[0]), the second root's photo carries an
-    explicit "R", and Catalog.roots/library_id survive the reload.
-    (== 12: the newest version-gate test pins the exact value.)"""
+    explicit "R" (fauxcasa-ed5.5: now at the GROUP level, since grouping
+    is by (root_id, folder) — see _group_photo_rows), and
+    Catalog.roots/library_id survive the reload.
+    (== 13: the newest version-gate test pins the exact value.)"""
     import catalog as catmod
     from catalog import Catalog, Folder, Photo
 
-    assert catmod.CATALOG_VERSION == 12
+    assert catmod.CATALOG_VERSION == 13
     root_a, root_b = tmp_path / "a", tmp_path / "b"
     root_a.mkdir()
     root_b.mkdir()
@@ -10271,14 +10462,20 @@ def test_multiroot_two_root_save_load_roundtrip_v12(tmp_path: Path) -> None:
     path = tmp_path / "catalog.json"
     save_catalog(cat, path)
 
-    raw = json.loads(path.read_text())
+    raw = _raw_catalog(path)
     assert raw["library_id"] == lib_id
     assert raw["roots"] == [{"id": id_a, "path": str(root_a)},
                             {"id": id_b, "path": str(root_b)}]
     assert "library" not in raw
-    rows = {r["r"]: r for r in raw["photos"]}
+    rows = {r["r"]: r for r in _raw_photo_rows(raw)}
     assert "R" not in rows["1.jpg"]            # roots[0]: absent means first
     assert rows["2.jpg"]["R"] == id_b
+    # the "R" convention is now hoisted to the GROUP, not the row: each
+    # photo is alone in its own root's "" folder, so there are 2 groups,
+    # and only the second root's group carries "R".
+    groups = raw["photos"]
+    assert sum("R" in g for g in groups) == 1
+    assert next(g for g in groups if "R" in g)["R"] == id_b
 
     cfg = libmod.LibraryConfig(library_id=lib_id, name="",
                                roots=cat.roots, home=tmp_path)
@@ -10320,8 +10517,9 @@ def test_photo_rows_byte_identical_with_and_without_roots_header(
     # BYTES, not parsed dicts: dict equality would pass a key-order change
     # that still breaks the promotion invariant's byte-identity claim.
     assert p1.read_bytes() == p2.read_bytes()
-    raw1 = json.loads(p1.read_text())
-    assert "R" not in raw1["photos"][0]
+    raw1 = _raw_catalog(p1)
+    assert "R" not in raw1["photos"][0]         # group level, not per-row
+    assert "R" not in _raw_photo_rows(raw1)[0]
     assert raw1["library"] == str(tmp_path)
     # And the row serialization itself: a roots[0] photo in an EXPLICIT
     # multi-root catalog must emit the same row bytes as the legacy row,
@@ -10433,7 +10631,7 @@ def test_folder_key_prefix_convention_roundtrip(tmp_path: Path) -> None:
                   library_id=libmod.mint_library_id())
     path = tmp_path / "catalog.json"
     save_catalog(cat, path)
-    raw = json.loads(path.read_text())
+    raw = _raw_catalog(path)
     assert raw["folders"] == {"2019": "root A 2019",
                               f"{id_b}/2019": "root B 2019"}
     assert raw["hidden_folders"] == [f"{id_b}/2019"]
@@ -10465,10 +10663,14 @@ def test_old_version_compat_single_root_vs_multi_root(
     path = tmp_path / "catalog.json"
     save_catalog(cat, path)
 
-    data = json.loads(path.read_text())
+    data = _raw_catalog(path)
     assert data["version"] == catmod.CATALOG_VERSION
+    # A genuine v11 fixture needs FLAT rows (ungroup the v13 shape back) —
+    # v11 predates grouping entirely, same as it predates "R" (single root
+    # here, so no "R" survives either way).
+    data["photos"] = _raw_photo_rows(data)
     data["version"] = catmod.PRE_MULTIROOT_VERSION
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data))  # plain JSON: v11 never zstd-wrapped
 
     single_root_cfg = libmod.legacy_config(library)
     loaded = load_catalog(path, single_root_cfg)
@@ -11470,7 +11672,7 @@ def test_promote_happy_path(tmp_path: Path) -> None:
     assert not (new_dir / "thumbs.fcache").exists()
     assert not (new_dir / "thumbs.fcache.json").exists()
 
-    cat_data = json.loads((new_dir / "catalog.json").read_text())
+    cat_data = _raw_catalog(new_dir / "catalog.json")
     assert cat_data["version"] == catmod.CATALOG_VERSION
     assert cat_data["library_id"] == cfg.library_id
     assert cat_data["roots"] == [{"id": root_id, "path": str(root.resolve())}]
@@ -11507,14 +11709,65 @@ def test_promoted_rows_equal_old_rows(tmp_path: Path) -> None:
     cat.photos[0].keywords = ("x", "y")
     save_catalog(cat, old_dir / "catalog.json")
 
-    before = json.loads((old_dir / "catalog.json").read_text())["photos"]
-    assert all(p["x"] for p in before), "sha256 backfill must be present pre-promotion"
+    before_raw = _raw_catalog(old_dir / "catalog.json")
+    before = before_raw["photos"]
+    assert all(p["x"] for row in before for p in row["ph"]), \
+        "sha256 backfill must be present pre-promotion"
 
     cfg = libmod.promote_library(root, cache_root=cache_root)
     new_dir = thumbcache.cache_dir_for(cfg.library_id, cache_root)
-    after = json.loads((new_dir / "catalog.json").read_text())["photos"]
+    after = _raw_catalog(new_dir / "catalog.json")["photos"]
 
-    assert after == before
+    assert after == before  # the grouped "photos" array itself, untouched
+
+
+def test_promote_upgrades_legacy_plain_json_catalog(tmp_path: Path) -> None:
+    """_promote_upgrade_catalog's other input shape (fauxcasa-ed5.5): an
+    on-disk catalog.json from BEFORE the zstd/grouped bump — plain JSON,
+    flat rows, no "R" — is not just header-rewritten but fully regrouped
+    and compressed into the current v13 format; the promoted file loads
+    cleanly and its rows carry the exact same content as the pre-upgrade
+    flat rows, just reshaped."""
+    import catalog as catmod
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "2020" / "a.jpg")
+    make_jpeg(root / "b.jpg")
+    cache_root = tmp_path / "cache"
+    old_dir = thumbcache.cache_dir_for(str(root.resolve()), cache_root)
+    old_dir.mkdir(parents=True)
+
+    flat_rows = [
+        {"r": "2020/a.jpg", "s": 2, "c": "hi", "z": 10, "m": 100,
+         "x": "ab" * 32},
+        {"r": "b.jpg", "z": 20, "m": 200, "x": "cd" * 32},
+    ]
+    legacy_data = {
+        "version": catmod.PRE_MULTIROOT_VERSION,
+        "library": str(root.resolve()),
+        "photos": flat_rows,
+        "folders": {}, "hidden_folders": [], "contacts": {},
+        "db3_contacts": [], "albums": [],
+    }
+    (old_dir / "catalog.json").write_text(json.dumps(legacy_data))
+
+    cfg = libmod.promote_library(root, cache_root=cache_root)
+    new_dir = thumbcache.cache_dir_for(cfg.library_id, cache_root)
+    cat_path = new_dir / "catalog.json"
+
+    raw = cat_path.read_bytes()
+    assert raw[:4] == catmod.ZSTD_MAGIC        # now compressed, not plain
+    data = _raw_catalog(cat_path)
+    assert data["version"] == catmod.CATALOG_VERSION
+    assert data["library_id"] == cfg.library_id
+    # regrouped, not left flat: every group carries "ph", never a bare "r"
+    assert all("ph" in g for g in data["photos"])
+    assert _raw_photo_rows(data) == flat_rows   # same content, reshaped only
+
+    loaded = load_catalog(cat_path, cfg)
+    assert loaded is not None
+    a = next(p for p in loaded.photos if p.rel == "2020/a.jpg")
+    assert a.star == 2 and a.caption == "hi" and a.sha256 == "ab" * 32
 
 
 def test_promote_rollback_on_injected_failure(tmp_path: Path,
@@ -12114,8 +12367,8 @@ def test_main_missing_cache_keeps_offline_root_slice(tmp_path: Path) -> None:
     assert again["photos"] == 2 and not again["warm"]   # slice preserved
     assert a_cache.is_file()                            # A re-indexed
     assert b_cache.read_bytes() == b_bytes              # B never rewritten
-    cat = json.loads((cache_dir / "catalog.json").read_text("utf-8"))
-    assert len(cat["photos"]) == 2
+    cat = _raw_catalog(cache_dir / "catalog.json")
+    assert len(_raw_photo_rows(cat)) == 2
 
     # Same open with B's cache also gone: the composite serves an
     # all-error placeholder for B — the catalog still keeps B's photos
@@ -12125,8 +12378,8 @@ def test_main_missing_cache_keeps_offline_root_slice(tmp_path: Path) -> None:
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert third["photos"] == 2 and not third["warm"]
     assert not b_cache.exists()
-    cat = json.loads((cache_dir / "catalog.json").read_text("utf-8"))
-    assert len(cat["photos"]) == 2
+    cat = _raw_catalog(cache_dir / "catalog.json")
+    assert len(_raw_photo_rows(cat)) == 2
 
 
 # ---------------------------------------------------------------------------

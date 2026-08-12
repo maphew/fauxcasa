@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["PySide6", "rawpy", "exiv2", "pillow", "av"]
+# dependencies = ["PySide6", "rawpy", "exiv2", "pillow", "av", "zstandard"]
 # ///
 """Tracer bullet app (fauxcasa-pzx): a thin but real end-to-end slice of
 the product on the proposed Python + Qt stack.
@@ -3035,10 +3035,12 @@ def main() -> int:
             # §7 catalog-size row (fauxcasa-ed5.3): the persisted
             # catalog.json's on-disk bytes, normalized per photo. 0 = not
             # yet persisted (a cold build writes it when the index lands).
-            # KNOWN TENSION (fauxcasa-1jb): the ~50 B/photo budget is
-            # oracle-derived, and the tracer's JSON rows (rel + sha256
-            # alone are ~100 chars) do not meet it — this field MEASURES
-            # the row honestly; it does not claim the budget.
+            # fauxcasa-ed5.5 re-baselined the budget to <=100 B/photo fully
+            # indexed (spec §10 item 20) and met it honestly: catalog.json
+            # is now zstd level 3 over folder-grouped compact JSON (see
+            # catalog.save_catalog and docs/research/catalog-size-analysis.md)
+            # — st_size already reflects that compression, so this field
+            # continues to measure the file honestly, just a smaller one.
             try:
                 cat_bytes = cat_path.stat().st_size
             except OSError:
