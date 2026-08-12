@@ -114,8 +114,10 @@ mismatch and rebuilds via the existing path.
   (42) with the 512-px source level (native edge 256×1.25 = 320 → 512).
   Mechanism: the scaled-paint cache only pays on *re*-paints; during a
   2.5-screens/s flick nearly every tile is a first paint doing a smooth
-  scale off a 4× source, plus in-paint decode-pump. Default zoom stays
-  healthy (dpr 2.5 p99 11 ms / 100 % deadline; dpr 1.25 p99 26 ms).
+  scale off a 4× source, plus in-paint decode-pump. Default zoom: dpr 2.5
+  passes clean (p99 11 ms, 100 % deadline, zero blanks, max 14.5 ms);
+  dpr 1.25 is in budget on p99 (26 ms) but fails the §7 max ≤ 100 ms and
+  zero-blank gates (max 247 ms, 3 blank frames).
   Remaining work (first-paint scale amortization / paint batching) is
   tracked as `fauxcasa-q6l.27`.
 
