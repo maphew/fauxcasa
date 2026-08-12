@@ -1943,7 +1943,10 @@ class MainWindow(QMainWindow):
                     key=lambda rf: rf[0].rsplit("/", 1)[-1].lower(),
                 )
                 for rel, folder in ordered:
-                    leaf = rel.split("/")[-1]
+                    # rel == "" is the library root itself (photos directly
+                    # in the root folder) — label it by on-disk folder name,
+                    # matching what multiroot flat does for a root leaf.
+                    leaf = rel.split("/")[-1] if rel else root_path.name
                     item = QTreeWidgetItem(
                         folders_root, [f"{leaf}  ({fcount(folder)})"])
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
@@ -1967,6 +1970,12 @@ class MainWindow(QMainWindow):
                     if fcount(folder) == 0:
                         continue
                     item = node_for(rel)
+                    if not rel:
+                        # node_for("") is the preseeded "Folders" header
+                        # standing in for the root folder — it skips the
+                        # tooltip assignment above, so keep the path-on-
+                        # demand promise here.
+                        item.setToolTip(0, str(root_path))
                     item.setText(0, f"{folder.title}  ({fcount(folder)})")
         else:
             # Genuine multiroot: durable manifest order is display order in

@@ -9777,6 +9777,52 @@ def test_folder_view_flat_listing(tmp_path: Path) -> None:
         it2 += 1
 
 
+def test_folder_view_flat_root_rel_photos(tmp_path: Path) -> None:
+    """Photos directly in the library root (rel == "") must not render an
+    unlabeled flat item: the leaf label falls back to the root's on-disk
+    folder name, and tree mode's stand-in root node carries the path
+    tooltip (codex cross-review finding, fauxcasa-q6l.10)."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+    from main import MainWindow
+    from catalog import scan_library
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "rootpic.jpg")          # photo directly in the root
+    make_jpeg(root / "Animals" / "cat.jpg")
+
+    cat = scan_library(root)
+    assert "" in cat.folders  # precondition: root folder is a real entry
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._flat_check.setChecked(True)
+
+    def folder_items():
+        found = {}
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            d = it.value().data(0, Qt.ItemDataRole.UserRole)
+            if d is not None and d[0] == "folder":
+                found[d[1]] = it.value()
+            it += 1
+        return found
+
+    flat = folder_items()
+    root_item = flat[""]
+    assert root_item.text(0).startswith("lib  ("), root_item.text(0)
+    assert root_item.toolTip(0) == str(cat.root)
+
+    # Tree mode: the stand-in root node (the "Folders" header, which carries
+    # no ("folder", rel) item data) keeps the path-on-demand tooltip.
+    win._flat_check.setChecked(False)
+    headers = [win.tree.topLevelItem(i)
+               for i in range(win.tree.topLevelItemCount())]
+    folders_header = [h for h in headers
+                      if h.data(0, Qt.ItemDataRole.UserRole) is None]
+    assert folders_header, "Folders header not found"
+    assert folders_header[0].toolTip(0) == str(cat.root)
+
+
 def test_multiroot_flat_folder_listing(tmp_path: Path) -> None:
     """Flat mode across a genuine (>1-root) multiroot library (fauxcasa-
     q6l.10): items are alphabetical by leaf name across ALL roots, keyed by
