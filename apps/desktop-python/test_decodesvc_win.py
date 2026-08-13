@@ -86,6 +86,20 @@ def synthetic_png(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def synthetic_wide_png(tmp_path: Path) -> Path:
+    """A 32769x1 synthetic PNG -- under MAX_PIXELS (32769 px total) but
+    over the per-axis MAX_EDGE cap of 32768 (design doc sec 2.4 checklist
+    item 1). Exercises FIX 5's worker-side per-axis guard. Built at test
+    time with PySide6.QtGui, not committed as a fixture file."""
+    from PySide6.QtGui import QImage
+    img = QImage(32_769, 1, QImage.Format_RGB32)
+    img.fill(0xFFFF0000)
+    p = tmp_path / "synthetic_wide.png"
+    assert img.save(str(p), "PNG"), "failed to write synthetic wide PNG fixture"
+    return p
+
+
+@pytest.fixture
 def probe_secret_file():
     """A real file inside the user's profile the worker must NOT be able
     to read -- the filesystem-containment probe target (gotcha 4: probe
@@ -244,6 +258,18 @@ def test_real_decode(shared_worker, synthetic_png):
         result.pixels.len)
     assert result.pixels_bytes == before
     assert shared_worker.read_arena(result.pixels.off, result.pixels.len) != before
+
+
+def test_decode_too_large_per_axis(shared_worker, synthetic_wide_png):
+    """FIX 5 (P2): an image over MAX_EDGE per-axis but under MAX_PIXELS
+    must come back as the worker's own honest TOO_LARGE error, not a
+    silent 'ok' -- an ok response here would make the broker's own
+    PixelBuffer.validate() reject the buffer as a PROTOCOL violation,
+    killing a legitimately-behaving worker over an honestly-oversized
+    file."""
+    with pytest.raises(DecodeServiceError) as exc_info:
+        shared_worker.decode(synthetic_wide_png)
+    assert exc_info.value.code == ErrorCode.TOO_LARGE
 
 
 def test_unknown_op_no_crash(shared_worker):

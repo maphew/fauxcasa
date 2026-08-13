@@ -48,6 +48,7 @@ from ctypes import wintypes
 PROTO = 1  # decodesvc.PROTO, mirrored here to avoid importing decodesvc.py
 MAX_CONTROL_MSG = 64 * 2**10  # decodesvc.MAX_CONTROL_MSG, mirrored
 MAX_PIXELS = 64 * 2**20  # decodesvc.MAX_PIXELS, mirrored
+MAX_EDGE = 32_768  # decodesvc.MAX_EDGE, mirrored -- per-axis cap
 
 ARENA_BYTES = int(os.environ.get("FAUXCASA_DECODESVC_ARENA_BYTES", str(256 * 2**20)))
 PROBE_ENABLED = os.environ.get("FAUXCASA_DECODESVC_PROBE") == "1"
@@ -170,6 +171,19 @@ def _handle_decode(req: dict, out_file, arena_addr: int, qt) -> dict:
 
         if not source_w or not source_h:
             source_w, source_h = img.width(), img.height()
+
+        # FIX 5 (P2, review fix pass): per-axis MAX_EDGE check, ahead of the
+        # convertToFormat/constBits work below. An image like 32769x1 is
+        # under MAX_PIXELS and under the arena but over MAX_EDGE per-axis
+        # (design doc sec 2.4 checklist item 1); reporting it as ok here
+        # would make the broker's PixelBuffer.validate() reject it as a
+        # PROTOCOL violation -- killing a legitimately-behaving worker for
+        # an honestly-oversized file. Report the documented TOO_LARGE file
+        # error instead.
+        if img.width() > MAX_EDGE or img.height() > MAX_EDGE:
+            return {"id": rid, "ok": False, "error": "TOO_LARGE",
+                     "detail": f"{img.width()}x{img.height()} exceeds per-axis "
+                               f"MAX_EDGE {MAX_EDGE}"}
 
         img = img.convertToFormat(qt.QImage.Format_RGBA8888)
         pixel_bytes = bytes(img.constBits())
