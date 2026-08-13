@@ -55,6 +55,7 @@ if sys.platform != "win32":
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import decodesvc_win as dw  # noqa: E402
+import decodesvc_worker_win as dw_worker  # noqa: E402  -- FIX 9: unit-test its pure _write_frame directly (no sandbox/live process needed)
 from decodesvc import (  # noqa: E402
     DecodeServiceError,
     ErrorCode,
@@ -673,6 +674,15 @@ def test_fuzz_oversized_outgoing_control_frame():
     huge = {"id": 1, "ok": True, "pad": "x" * (MAX_CONTROL_MSG + 100)}
     with pytest.raises(ProtocolViolation):
         dw._write_frame(io.BytesIO(), huge)
+
+
+def test_worker_write_frame_oversized_outgoing_control_frame():
+    """FIX 9 (nit): the worker's own _write_frame (decodesvc_worker_win.py,
+    inlined/separate from the broker's) must reject an outgoing frame past
+    MAX_CONTROL_MSG too -- symmetric to the broker's guard above."""
+    huge = {"id": 1, "ok": True, "pad": "x" * (dw_worker.MAX_CONTROL_MSG + 100)}
+    with pytest.raises(ValueError, match="MAX_CONTROL_MSG"):
+        dw_worker._write_frame(io.BytesIO(), huge)
 
 
 def test_fuzz_oversized_incoming_control_frame():

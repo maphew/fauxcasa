@@ -83,6 +83,15 @@ def _read_frame(fh):
 
 def _write_frame(fh, obj) -> None:
     data = json.dumps(obj).encode("utf-8")
+    if len(data) > MAX_CONTROL_MSG:
+        # FIX 9 (nit, review fix pass): symmetric to the broker's own
+        # _write_frame guard (decodesvc_win.py) -- never even attempt to
+        # put an outgoing frame past the wire cap on the pipe. Raising
+        # (rather than truncating or silently sending it anyway) lets the
+        # job loop's own exception handling fall back to a small,
+        # in-cap error response instead.
+        raise ValueError(
+            f"outgoing control frame {len(data)} bytes exceeds MAX_CONTROL_MSG {MAX_CONTROL_MSG}")
     fh.write(struct.pack("<I", len(data)))
     fh.write(data)
     fh.flush()
