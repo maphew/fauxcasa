@@ -455,6 +455,86 @@ def _probe_tcp_connect_nonloopback(req):
         return False, repr(e)
 
 
+def _probe_raw_dns_roundtrip(req):
+    """DECISIVE egress test: build a real DNS A-query, sendto 8.8.8.8:53,
+    and recvfrom a reply. Returns allowed=True ONLY if a well-formed DNS
+    response with the matching transaction id and >=1 answer comes back --
+    i.e. a datagram actually left the machine AND a reply returned. A bare
+    sendto() success is inert if WFP silently drops the packet; this proves
+    round-trip reachability or nothing."""
+    try:
+        import socket, struct
+        txid = 0x4A21
+        # DNS header: id, flags(RD=0x0100), qd=1, an/ns/ar=0
+        header = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0)
+        # QNAME example.com, QTYPE A(1), QCLASS IN(1)
+        qname = b"".join(bytes([len(p)]) + p for p in (b"example", b"com")) + b"\x00"
+        query = header + qname + struct.pack(">HH", 1, 1)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(3.0)
+        try:
+            s.sendto(query, ("8.8.8.8", 53))
+            data, _ = s.recvfrom(512)
+            if len(data) >= 12:
+                rid, _flags, _qd, an = struct.unpack(">HHHH", data[:8])
+                if rid == txid and an >= 1:
+                    return True, f"DNS reply received: {an} answer(s), {len(data)} bytes"
+                return True, f"reply received but unexpected (id={rid:#x} an={an})"
+            return True, f"short reply {len(data)} bytes"
+        finally:
+            s.close()
+    except Exception as e:
+        return False, repr(e)
+
+
+def _probe_udp_to_broker(req):
+    """DECISIVE local-egress test: sendto a broker-controlled UDP listener
+    (address+port+nonce passed in req). The broker checks whether the
+    datagram arrived. sendto() here just fires; the verdict is the broker's
+    (it reports back). Returns whether sendto raised."""
+    try:
+        import socket
+        host = req.get("bhost"); port = int(req.get("bport"))
+        nonce = req.get("nonce", "x").encode()
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1.5)
+        try:
+            s.sendto(nonce, (host, port))
+            return True, f"sendto {host}:{port} ok"
+        finally:
+            s.close()
+    except Exception as e:
+        return False, repr(e)
+
+
+def _probe_bind_accept_wait(req):
+    """DECISIVE inbound test: bind a broker-chosen port, listen, and BLOCK
+    in accept() for up to `wait_s`. Returns allowed=True only if a peer
+    actually connected (a completed inbound handshake). The broker attempts
+    to connect concurrently; if WFP blocks inbound to the container, accept
+    times out and this returns False."""
+    try:
+        import socket
+        port = int(req.get("bport"))
+        wait_s = float(req.get("wait_s", 4.0))
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", port))
+            s.listen(1)
+            s.settimeout(wait_s)
+            try:
+                conn, addr = s.accept()
+                conn.close()
+                return True, f"inbound connection accepted from {addr}"
+            except TimeoutError:
+                return False, "bind+listen ok but no inbound connection completed"
+        finally:
+            s.close()
+    except Exception as e:
+        return False, repr(e)
+
+
 def _probe_memory_limit_exceeded(req):
     """Attempt an allocation past the 2 GiB job ProcessMemoryLimit
     (design doc sec 4) -- must never succeed. Either Python raises
@@ -544,6 +624,9 @@ _PROBES = {
     "udp_sendto": _probe_udp_sendto,
     "socket_bind_listen": _probe_socket_bind_listen,
     "tcp_connect_nonloopback": _probe_tcp_connect_nonloopback,
+    "raw_dns_roundtrip": _probe_raw_dns_roundtrip,
+    "udp_to_broker": _probe_udp_to_broker,
+    "bind_accept_wait": _probe_bind_accept_wait,
     "memory_limit_exceeded": _probe_memory_limit_exceeded,
     # arena_write handled specially (needs arena_addr) -- see _handle_probe
 }
