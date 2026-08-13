@@ -1267,9 +1267,13 @@ class WinSandboxWorker:
             raise
         source, buf = self._validate_response(resp, expect_id=req_id)
         # Checklist item 6: copy the bytes out of the arena now, before any
-        # later job can overwrite this worker's single-slot arena.
-        self.read_arena(buf.off, buf.len)
-        return DecodeResult(pixels=buf, source_w=source["w"], source_h=source["h"])
+        # later job can overwrite this worker's single-slot arena, and KEEP
+        # the copy -- no trusted consumer may re-read arena memory the
+        # worker can still write (TOCTOU). The (off, len) descriptor in
+        # `buf` stays for shape only; `pixels_bytes` is the real payload.
+        pixels_bytes = self.read_arena(buf.off, buf.len)
+        return DecodeResult(pixels=buf, source_w=source["w"], source_h=source["h"],
+                             pixels_bytes=pixels_bytes)
 
     def probe(self, name: str, target: str | None = None, handle: int | None = None) -> dict:
         """Send a probe job (test-only; the worker only honors it when

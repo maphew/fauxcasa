@@ -261,11 +261,20 @@ class MetaFields:
 
 @dataclass(frozen=True)
 class DecodeResult:
-    """decode/poster response: one validated buffer + source dimensions."""
+    """decode/poster response: one validated buffer + source dimensions.
+
+    `pixels_bytes` is the broker's own COPY of the arena bytes described by
+    `pixels` (checklist item 6) -- the actual private-memory payload a
+    trusted caller should read. It defaults to None so the skeleton stays
+    back-compatible with any code constructing a DecodeResult without it;
+    every real transport populates it. `pixels` (the off/len descriptor)
+    stays for shape/validation, not as a live pointer into worker-writable
+    memory."""
 
     pixels: PixelBuffer
     source_w: int
     source_h: int
+    pixels_bytes: bytes | None = None
 
 
 @dataclass(frozen=True)

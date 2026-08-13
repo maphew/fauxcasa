@@ -33,6 +33,7 @@ is a 2x2 red PNG built from a literal byte string, not any real image.
 from __future__ import annotations
 
 import base64
+import ctypes
 import io
 import struct
 import subprocess
@@ -219,6 +220,22 @@ def test_real_decode(shared_worker, synthetic_png):
     assert result.pixels.w == 2
     assert result.pixels.h == 2
     result.pixels.validate(arena_bytes=shared_worker.arena_bytes)  # no raise
+    # FIX 1: pixels_bytes is a KEPT, private copy of the arena bytes -- not
+    # a live view into memory the worker can still write.
+    assert result.pixels_bytes is not None
+    assert len(result.pixels_bytes) == result.pixels.len
+    # Must match what's still sitting in the arena right now...
+    assert result.pixels_bytes == shared_worker.read_arena(
+        result.pixels.off, result.pixels.len)
+    # ...and mutating the live arena afterward must NOT change the copy
+    # already returned to the caller (the TOCTOU guarantee FIX 1 closes).
+    before = bytes(result.pixels_bytes)
+    ctypes.memmove(
+        shared_worker._arena_addr + result.pixels.off,
+        (ctypes.c_ubyte * result.pixels.len)(*b"\xff" * result.pixels.len),
+        result.pixels.len)
+    assert result.pixels_bytes == before
+    assert shared_worker.read_arena(result.pixels.off, result.pixels.len) != before
 
 
 def test_unknown_op_no_crash(shared_worker):
