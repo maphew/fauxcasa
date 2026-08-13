@@ -353,6 +353,35 @@ def test_hello_wrong_proto_refused_loudly():
         proc.wait(timeout=5)
 
 
+def test_framed_non_hello_first_message_raises_promptly():
+    """FIX 4 (P2): a valid framed JSON object that is NOT a hello must
+    raise ProtocolViolation immediately -- not fall through to the
+    newline-resync path (reserved for truly unframeable noise) and hang
+    waiting for a '\\n' that will never arrive, blocking spawn() forever.
+    Bounded-time assertion: this must fail fast, not time out."""
+    stub_code = (
+        "import sys, json, struct\n"
+        "msg = json.dumps({'op': 'not_a_hello', 'x': 1}).encode('utf-8')\n"
+        "sys.stdout.buffer.write(struct.pack('<I', len(msg)) + msg)\n"
+        "sys.stdout.buffer.flush()\n"
+        "import time\n"
+        "time.sleep(30)\n"  # if the broker hangs, this keeps the pipe open
+    )
+    proc = subprocess.Popen([sys.executable, "-c", stub_code], stdout=subprocess.PIPE)
+    try:
+        t0 = time.perf_counter()
+        with pytest.raises(ProtocolViolation, match="not a hello handshake"):
+            dw._read_hello_frame_tolerant(proc.stdout)
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 2.0, (
+            f"_read_hello_frame_tolerant took {elapsed:.2f}s on a framed "
+            f"non-hello first message, expected < 2s (must raise promptly, "
+            f"not hang resyncing on a newline that will never arrive)")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 def test_lockdown_sequencing_guard_no_job_before_locked():
     """Design doc sec 7 gate 5: assert no job is dispatched before
     'locked'. No sandbox needed -- a worker that never completed the

@@ -203,6 +203,16 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
             obj = None
         if isinstance(obj, dict) and obj.get("hello") == 1:
             return obj, 0
+        # FIX 4 (P2): a SUCCESSFULLY framed JSON object that is not a hello
+        # is not noise -- it is a real (if wrong) message from a worker
+        # that is now past its hello and possibly blocked waiting for
+        # attach_arena. Falling through to newline-resync here would
+        # discard real protocol bytes looking for a '\n' that may never
+        # arrive, hanging spawn() forever. Raise immediately instead;
+        # only an UNFRAMEABLE prefix (obj is None/not-a-dict) is noise.
+        if isinstance(obj, dict):
+            raise ProtocolViolation(
+                f"first framed control message was not a hello handshake: {obj!r}")
 
     noise = bytes(consumed)
     if b"\n" not in noise:
