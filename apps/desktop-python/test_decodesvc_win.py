@@ -176,6 +176,14 @@ def test_registry_hklm_read_documented_not_asserted(shared_worker):
           f"detail={result.get('detail')!r} (documented, not asserted)")
 
 
+def test_bogus_probe_name_errors(shared_worker):
+    """FIX 2 (P1): an unknown/misspelled probe attempt must ERROR, not
+    silently 'pass' as a denial -- that would let the containment gate
+    suite green-pass a probe that never actually ran."""
+    with pytest.raises(ProtocolViolation, match="did not run to completion"):
+        shared_worker.probe("this_probe_does_not_exist")
+
+
 def test_socket_create_documented_not_asserted(shared_worker):
     """Found during Stage B bring-up on this box (not in the spike or the
     bd memory's 6 gotchas -- a 7th, network-flavored analogue of gotcha 4):

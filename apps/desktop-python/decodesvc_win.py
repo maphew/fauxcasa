@@ -1278,7 +1278,19 @@ class WinSandboxWorker:
     def probe(self, name: str, target: str | None = None, handle: int | None = None) -> dict:
         """Send a probe job (test-only; the worker only honors it when
         spawned with probe=True, i.e. FAUXCASA_DECODESVC_PROBE=1 in its
-        environment). Returns {attempt, allowed, detail}."""
+        environment). Returns {attempt, allowed, detail}.
+
+        FIX 2 (P1, review fix pass): fail-closed. A denial (`allowed:
+        False`) is accepted ONLY when the worker's response is well-formed
+        proof that the requested probe actually ran: `ok` is True,
+        `attempt` echoes the requested name, and `allowed` is a real bool.
+        Anything else -- an unknown attempt, PROBE_ENABLED=0, a worker-side
+        error, a missing/malformed field -- must NOT be silently treated
+        as a denial; that would let a misspelled or removed probe
+        silently "pass" the containment gate without ever having run.
+        Raise ProtocolViolation instead, loudly, so the calling test
+        ERRORS rather than green-passing. This is the integrity of the
+        whole gate suite (design doc sec 7 gate 1)."""
         self._require_ready()
         if not self._probe_enabled:
             raise RuntimeError(
@@ -1293,9 +1305,19 @@ class WinSandboxWorker:
         resp = self.recv_response()
         if not isinstance(resp, dict) or resp.get("id") != req_id:
             raise ProtocolViolation(f"probe response id mismatch: {resp!r}")
-        if resp.get("ok") is False:
-            return {"attempt": name, "allowed": False, "detail": resp.get("detail", resp.get("error"))}
-        return {"attempt": resp.get("attempt", name), "allowed": bool(resp.get("allowed")),
+        if resp.get("ok") is not True:
+            raise ProtocolViolation(
+                f"probe {name!r} did not run to completion (ok={resp.get('ok')!r}, "
+                f"error={resp.get('error')!r}, detail={resp.get('detail')!r}) -- "
+                f"a broken or unknown probe must never be treated as a denial")
+        if resp.get("attempt") != name:
+            raise ProtocolViolation(
+                f"probe response attempt {resp.get('attempt')!r} != requested {name!r}")
+        allowed = resp.get("allowed")
+        if not isinstance(allowed, bool):
+            raise ProtocolViolation(
+                f"probe {name!r} response missing/non-bool 'allowed': {allowed!r}")
+        return {"attempt": name, "allowed": allowed,
                 "detail": resp.get("detail"), "data_b64": resp.get("data_b64")}
 
     def probe_file(self, name: str, path: Path) -> dict:
