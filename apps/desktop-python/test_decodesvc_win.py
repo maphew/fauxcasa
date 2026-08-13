@@ -100,6 +100,16 @@ def synthetic_wide_png(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def unrecognized_format_file(tmp_path: Path) -> Path:
+    """Bytes with no recognizable image magic at all -- no bundled Qt
+    image plugin claims this format, exercising FIX 6's UNSUPPORTED path
+    (as opposed to CORRUPT: a format a decoder engaged with and failed)."""
+    p = tmp_path / "not_an_image.bin"
+    p.write_bytes(b"this is definitely not an image file format\x00\x01\x02" * 8)
+    return p
+
+
+@pytest.fixture
 def probe_secret_file():
     """A real file inside the user's profile the worker must NOT be able
     to read -- the filesystem-containment probe target (gotcha 4: probe
@@ -270,6 +280,15 @@ def test_decode_too_large_per_axis(shared_worker, synthetic_wide_png):
     with pytest.raises(DecodeServiceError) as exc_info:
         shared_worker.decode(synthetic_wide_png)
     assert exc_info.value.code == ErrorCode.TOO_LARGE
+
+
+def test_decode_unsupported_format(shared_worker, unrecognized_format_file):
+    """FIX 6 (P2): a file no bundled decoder claims must come back as
+    UNSUPPORTED, not CORRUPT (design doc sec 2.5 taxonomy; matters for
+    the per-extension maintenance surface)."""
+    with pytest.raises(DecodeServiceError) as exc_info:
+        shared_worker.decode(unrecognized_format_file)
+    assert exc_info.value.code == ErrorCode.UNSUPPORTED
 
 
 def test_unknown_op_no_crash(shared_worker):

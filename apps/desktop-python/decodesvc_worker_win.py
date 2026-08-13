@@ -153,6 +153,15 @@ def _handle_decode(req: dict, out_file, arena_addr: int, qt) -> dict:
         reader = qt.QImageReader(buf)
         reader.setAutoTransform(True)  # EXIF orientation -> display-upright
 
+        # FIX 6 (P2, review fix pass): UNSUPPORTED vs CORRUPT taxonomy
+        # (design doc sec 2.5). canRead() is Qt's own "does any bundled
+        # decoder plugin claim this format" check -- false here means no
+        # decoder engaged at all, which is UNSUPPORTED, not a decode
+        # failure.
+        if not reader.canRead():
+            return {"id": rid, "ok": False, "error": "UNSUPPORTED",
+                     "detail": f"no bundled decoder claims this format: {reader.errorString()}"}
+
         src_size = reader.size()
         source_w = source_h = 0
         if src_size.isValid() and src_size.width() > 0 and src_size.height() > 0:
@@ -167,6 +176,13 @@ def _handle_decode(req: dict, out_file, arena_addr: int, qt) -> dict:
 
         img = reader.read()
         if img.isNull():
+            # canRead() passed (a plugin claimed the format) but the actual
+            # read still failed -- engaged-but-failed is CORRUPT, EXCEPT
+            # Qt can still report UnsupportedFormatError post-hoc for some
+            # plugins/codepaths (e.g. an unsupported sub-variant sniffed
+            # only once decoding starts); honor that the same way.
+            if reader.error() == qt.QImageReader.UnsupportedFormatError:
+                return {"id": rid, "ok": False, "error": "UNSUPPORTED", "detail": reader.errorString()}
             return {"id": rid, "ok": False, "error": "CORRUPT", "detail": reader.errorString()}
 
         if not source_w or not source_h:
