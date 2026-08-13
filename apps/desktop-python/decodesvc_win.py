@@ -122,8 +122,14 @@ def _read_frame(fh: Any) -> dict:
             ErrorCode.WORKER_CRASHED, "control pipe closed mid-frame")
     try:
         obj = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise ProtocolViolation(f"malformed JSON control frame: {e}") from e
+    except (UnicodeDecodeError, ValueError, RecursionError) as e:
+        # ValueError covers json.JSONDecodeError (a subclass) AND the
+        # int-string conversion cap (a >4300-digit integer literal raises
+        # bare ValueError, not JSONDecodeError); RecursionError covers a
+        # deeply-nested object. A hostile worker can fit any of these in a
+        # sub-64 KiB frame, so all must take the protocol-violation path
+        # (kill + counter), not escape as an unexpected exception.
+        raise ProtocolViolation(f"malformed JSON control frame: {e!r}") from e
     if not isinstance(obj, dict):
         raise ProtocolViolation(f"control frame is not a JSON object: {type(obj).__name__}")
     return obj

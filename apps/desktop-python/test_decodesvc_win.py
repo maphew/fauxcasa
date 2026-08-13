@@ -477,6 +477,59 @@ def test_decode_too_large_per_axis(shared_worker, synthetic_wide_png):
     assert exc_info.value.code == ErrorCode.TOO_LARGE
 
 
+def test_decode_edge_never_upscales(shared_worker, synthetic_png):
+    """Cross-vendor review (P2): `edge` is a MAX long-edge, not an upscale
+    target. A 2x2 source requested at edge=512 must stay 2x2 (the thumbnail
+    contract never enlarges), not balloon to 512x512 (~1 MiB)."""
+    result = shared_worker.decode(synthetic_png, edge=512)
+    assert result.pixels.w == 2 and result.pixels.h == 2, (
+        f"edge=512 upscaled a 2x2 source to {result.pixels.w}x{result.pixels.h}")
+
+
+def _write_ihdr_png(path: Path, w: int, h: int) -> None:
+    """Take the valid 2x2 PNG and patch only its IHDR width/height to w x h
+    (fixing the IHDR CRC). QImageReader.size() then reports the huge declared
+    dimensions from IHDR alone -- no pixel buffer that large is ever
+    allocated -- so the worker's pre-decode size guard can reject it before
+    reader.read(). (An IHDR-only stub does NOT work: libpng refuses to report
+    size() without a readable image body, so size() comes back invalid.)"""
+    import struct as _struct, zlib as _zlib
+    png = bytearray(SYNTHETIC_PNG_2X2_RED)
+    _struct.pack_into(">II", png, 16, w, h)  # IHDR w,h at offset 16
+    crc = _zlib.crc32(bytes(png[12:16 + 13])) & 0xFFFFFFFF  # 'IHDR' + 13 data
+    _struct.pack_into(">I", png, 16 + 13, crc)
+    path.write_bytes(bytes(png))
+
+
+@_WINDOWS_ONLY
+def test_decode_oversized_header_too_large_before_decode(tmp_path):
+    """Cross-vendor review (P2): at edge=0, a header declaring dimensions
+    past the caps must return TOO_LARGE from the pre-decode size check --
+    NOT be handed to reader.read(), where Qt's allocation limit / the job
+    memory cap would trip first and misreport it as CORRUPT/WORKER_CRASHED.
+
+    Dedicated worker (not shared_worker): a decode that stresses the native
+    codec could in principle kill the process; isolating it keeps every
+    other test's shared worker clean regardless of the outcome here."""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES, probe=True)
+    worker.spawn()
+    try:
+        p = tmp_path / "huge_header.png"
+        _write_ihdr_png(p, 40_000, 40_000)  # > MAX_EDGE and > MAX_PIXELS
+        with pytest.raises(DecodeServiceError) as exc_info:
+            worker.decode(p)  # edge=0
+        assert exc_info.value.code == ErrorCode.TOO_LARGE
+        # The worker must survive an oversized-header decode (native libpng
+        # "Read Error" chatter must not desync the control protocol).
+        assert worker._child.is_alive()
+        # And it must still serve a normal job afterward.
+        good = tmp_path / "ok.png"
+        good.write_bytes(SYNTHETIC_PNG_2X2_RED)
+        assert worker.decode(good).source_w == 2
+    finally:
+        worker.close()
+
+
 def test_decode_unsupported_format(shared_worker, unrecognized_format_file):
     """FIX 6 (P2): a file no bundled decoder claims must come back as
     UNSUPPORTED, not CORRUPT (design doc sec 2.5 taxonomy; matters for
@@ -810,6 +863,32 @@ def test_fuzz_garbage_json():
 
 def test_fuzz_frame_not_a_json_object():
     payload = b"[1, 2, 3]"  # valid JSON, but not an object
+    buf = io.BytesIO(struct.pack("<I", len(payload)) + payload)
+    with pytest.raises(ProtocolViolation):
+        dw._read_frame(buf)
+
+
+def test_fuzz_huge_integer_literal_is_protocol_violation():
+    """Cross-vendor review (P1): a JSON integer literal past CPython's
+    4300-digit int-string cap makes json.loads raise a BARE ValueError,
+    not JSONDecodeError. It fits in a sub-64 KiB frame, so a hostile
+    worker could send it to escape the ProtocolViolation path (leaving the
+    worker alive and the violation counter unmoved). _read_frame must
+    normalize it to ProtocolViolation."""
+    payload = b'{"id": ' + b"9" * 5000 + b"}"  # 5000-digit int > 4300 cap
+    assert len(payload) < MAX_CONTROL_MSG  # a worker really can send this
+    buf = io.BytesIO(struct.pack("<I", len(payload)) + payload)
+    with pytest.raises(ProtocolViolation):
+        dw._read_frame(buf)
+
+
+def test_fuzz_deeply_nested_json_is_protocol_violation():
+    """Cross-vendor review (P1): deeply-nested JSON makes json.loads raise
+    RecursionError, which likewise must take the protocol-violation path
+    rather than escaping as an unexpected exception."""
+    depth = 20_000
+    payload = (b"[" * depth) + (b"]" * depth)
+    assert len(payload) < MAX_CONTROL_MSG
     buf = io.BytesIO(struct.pack("<I", len(payload)) + payload)
     with pytest.raises(ProtocolViolation):
         dw._read_frame(buf)

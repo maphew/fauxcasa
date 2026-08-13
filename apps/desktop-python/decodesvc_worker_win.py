@@ -175,13 +175,30 @@ def _handle_decode(req: dict, out_file, arena_addr: int, qt) -> dict:
         source_w = source_h = 0
         if src_size.isValid() and src_size.width() > 0 and src_size.height() > 0:
             source_w, source_h = src_size.width(), src_size.height()
+            # Reject oversized sources from the HEADER, BEFORE reader.read()
+            # allocates the full frame. At edge=0 (full resolution) a header
+            # declaring huge dimensions would otherwise trip Qt's allocation
+            # limit or the job memory cap first, misreporting an honestly-
+            # oversized file as CORRUPT / WORKER_CRASHED instead of the
+            # documented TOO_LARGE. (When edge>0 the scaled decode caps the
+            # allocation, so only the full-res path needs this pre-check.)
+            if edge == 0 and (source_w > MAX_EDGE or source_h > MAX_EDGE
+                              or source_w * source_h > MAX_PIXELS):
+                return {"id": rid, "ok": False, "error": "TOO_LARGE",
+                         "detail": f"source {source_w}x{source_h} exceeds caps "
+                                   f"(MAX_EDGE {MAX_EDGE}, MAX_PIXELS {MAX_PIXELS})"}
             if edge > 0:
                 w0, h0 = source_w, source_h
-                if w0 >= h0:
-                    new_w, new_h = edge, max(1, round(h0 * edge / w0))
-                else:
-                    new_h, new_w = edge, max(1, round(w0 * edge / h0))
-                reader.setScaledSize(qt.QSize(new_w, new_h))
+                # `edge` is a MAXIMUM long-edge, never an upscale target:
+                # a 2x2 source requested at edge=512 stays 2x2, matching the
+                # thumbnail contract (never enlarge). Only scale down when
+                # the source's long edge actually exceeds edge.
+                if max(w0, h0) > edge:
+                    if w0 >= h0:
+                        new_w, new_h = edge, max(1, round(h0 * edge / w0))
+                    else:
+                        new_h, new_w = edge, max(1, round(w0 * edge / h0))
+                    reader.setScaledSize(qt.QSize(new_w, new_h))
 
         img = reader.read()
         if img.isNull():
@@ -661,8 +678,23 @@ def _handle_probe(req: dict, arena_addr: int) -> dict:
 # Main
 
 def main() -> None:
+    # Isolate the JSON control channel from native-library noise BEFORE any
+    # decoder is imported or run. The broker merged this process's stdout and
+    # stderr onto one pipe; libpng/Qt (and any C code) write diagnostics to
+    # fd 2 -- e.g. "libpng error: Read Error" on a truncated/hostile image --
+    # and a stray write to fd 1/2 would land in the middle of a length-
+    # prefixed frame and desync the protocol for every later job (a hostile
+    # file could weaponize this). So: dup the pipe to a PRIVATE fd for the
+    # protocol, then point fd 1 and fd 2 at NUL. Structured decode errors
+    # still carry reader.errorString() inside the JSON, so nothing useful is
+    # lost -- only the raw native chatter that must never touch the wire.
     stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
+    _ctrl_fd = os.dup(1)
+    _nul = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_nul, 1)
+    os.dup2(_nul, 2)
+    os.close(_nul)
+    stdout = os.fdopen(_ctrl_fd, "wb", buffering=0)
 
     # PHASE 1: import everything up front (design doc sec 4 -- Python's lazy
     # imports would otherwise fail post-lockdown).
