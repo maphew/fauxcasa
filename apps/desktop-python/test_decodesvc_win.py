@@ -290,6 +290,47 @@ def test_job_handle_close_kills_worker():
     dw.kernel32.CloseHandle(proc_handle)
 
 
+def test_env_block_is_an_allowlist_not_a_copy_of_os_environ(monkeypatch):
+    """FIX 3 (P1): _build_env_block must never leak host env vars it
+    doesn't explicitly allowlist -- a hijacked decoder must not be able
+    to read host tokens/keys/secrets that happen to live in os.environ.
+    Regression guard against reverting to `dict(os.environ)`."""
+    monkeypatch.setenv("FAUXCASA_TEST_SECRET_TOKEN", "sh-not-in-the-child")
+    block = dw._build_env_block(pythonpath=r"C:\some\site-packages", extra_env={})
+    # The block is a double-null-terminated sequence of null-terminated
+    # strings; wstring_at() alone stops at the FIRST null, so read the
+    # full buffer length explicitly and split on embedded nulls.
+    text = ctypes.wstring_at(ctypes.addressof(block), len(block))
+    entries = [e for e in text.split("\x00") if e]
+    keys = {e.split("=", 1)[0] for e in entries}
+    assert "FAUXCASA_TEST_SECRET_TOKEN" not in keys, (
+        "host-only env var leaked into the worker's environment block -- "
+        "the allowlist regressed to copying os.environ")
+    allowed = {"SystemRoot", "SystemDrive", "windir", "USERPROFILE",
+               "LOCALAPPDATA", "APPDATA", "PATH", "QT_QPA_PLATFORM",
+               "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "PYTHONUTF8",
+               "PYTHONPATH"}
+    assert keys <= allowed, f"unexpected keys in env block: {keys - allowed}"
+    assert "PATH" in keys  # empty-string PATH is required (see comment)
+
+
+def test_trimmed_env_worker_spawns_and_decodes(synthetic_png):
+    """FIX 3 (P1): the trimmed allowlist env is not just theoretically
+    sufficient -- confirm a fresh worker spawned under it reaches
+    'locked' and decodes a real (synthetic) file end to end. A separate
+    worker from `shared_worker` on purpose: this test's entire point is
+    to exercise spawn() itself under the trimmed env, not reuse an
+    already-proven-working instance."""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    worker.spawn()
+    try:
+        result = worker.decode(synthetic_png)
+        assert result.source_w == 2
+        assert result.source_h == 2
+    finally:
+        worker.close()
+
+
 def test_hello_wrong_proto_refused_loudly():
     """A stub worker that speaks proto=PROTO+1 is refused loudly. No
     sandbox needed -- exercises decodesvc_win's own hello-verification

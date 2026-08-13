@@ -776,15 +776,58 @@ if sys.platform == "win32":
         kernel32.SetHandleInformation(stdout_r, HANDLE_FLAG_INHERIT, 0)
         return stdin_r, stdin_w, stdout_r, stdout_w
 
+    # FIX 3 (P1, review fix pass): the worker environment is an explicit
+    # allowlist, not a copy of the broker's own os.environ -- a hijacked
+    # decoder must not be able to read host tokens/keys/secrets that
+    # happen to live in the broker's environment. Every name kept here is
+    # empirically load-bearing -- verified by trimming to exactly this set
+    # and spawning a real AppContainer worker end to end (hello -> attach_arena
+    # -> locked -> decode all succeed; see the module's containment/decode
+    # tests, which all run under this trimmed env). What each key is for:
+    #   SystemRoot, SystemDrive, windir -- Windows DLL/loader path
+    #     resolution AND (confirmed by direct testing) the AppContainer
+    #     machinery itself: CreateProcessW with a SECURITY_CAPABILITIES
+    #     attribute fails outright (WinError 203,
+    #     ERROR_ENVVAR_NOT_FOUND) if these are missing -- the OS needs
+    #     them to set up the container's virtualized profile paths.
+    #   USERPROFILE, LOCALAPPDATA, APPDATA -- same AppContainer-profile-
+    #     setup requirement as above (confirmed by the same WinError 203
+    #     reproduction/fix); dropping any of the six above breaks spawn
+    #     itself, before the worker ever runs a line of Python.
+    #   PATH -- deliberately forced to the EMPTY string, not copied from
+    #     the host: PySide6/__init__.py unconditionally does
+    #     `os.environ['PATH']` at import time (a KeyError, not a graceful
+    #     default, if PATH is absent) and then appends its own package dir
+    #     to it. An empty string satisfies that without handing the worker
+    #     the host's real PATH (which could name arbitrary host tool
+    #     directories) -- Windows' default DLL search order already checks
+    #     the application directory and System32 before consulting PATH,
+    #     so this costs nothing for the worker's own DLL resolution.
+    # PATHEXT and TEMP/TMP were tested and are NOT needed: the worker never
+    # execs anything by extension lookup (no child processes -- design doc
+    # sec 4) and never writes to a temp dir (arena + control pipe only), so
+    # both are deliberately omitted (see design doc sec 4 filesystem row).
+    _ENV_PASSTHROUGH_KEYS = ("SystemRoot", "SystemDrive", "windir",
+                              "USERPROFILE", "LOCALAPPDATA", "APPDATA")
+
     def _build_env_block(pythonpath: str | None, extra_env: dict[str, str]) -> ctypes.Array:
-        env = dict(os.environ)
+        env: dict[str, str] = {}
+        for key in _ENV_PASSTHROUGH_KEYS:
+            val = os.environ.get(key)
+            if val:
+                env[key] = val
+        env["PATH"] = ""  # see comment above -- required key, empty value
         env["QT_QPA_PLATFORM"] = "offscreen"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONUTF8"] = "1"
         if pythonpath:
             env["PYTHONPATH"] = pythonpath
-        env.update(extra_env)
+        # The worker's own test-only/config flags (FAUXCASA_DECODESVC_*)
+        # only -- nothing else from the caller passes through.
+        for k, v in extra_env.items():
+            if k.startswith("FAUXCASA_DECODESVC_"):
+                env[k] = v
         parts = [f"{k}={v}" for k, v in env.items()]
         block = "\x00".join(parts) + "\x00\x00"
         return ctypes.create_unicode_buffer(block)
