@@ -373,6 +373,101 @@ def _probe_dns_lookup(req):
         return False, repr(e)
 
 
+# FIX 8 (should-fix, review fix pass): network-probe coverage backing the
+# socket_create "document, don't assert" decision (see
+# test_socket_create_documented_not_asserted) -- socket_create's inertness
+# is only meaningful evidence of containment if actual I/O is separately
+# proven denied. These three cover UDP send, listen/accept, and a
+# non-loopback TCP connect distinct from the existing loopback:445 gate.
+
+def _probe_udp_sendto(req):
+    """UDP to a routable non-loopback address (8.8.8.8:53) -- must
+    fail/timeout at the socket layer (no AppContainer network
+    capability). Distinct from TCP: UDP is connectionless, so a bare
+    sendto() succeeding is not by itself proof of exfiltration, but the
+    zero-capability AppContainer's WFP filters are documented (design doc
+    sec 4) to block ALL outbound I/O, TCP or UDP alike, at the socket
+    layer -- so a raised error here is the expected signal."""
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1.5)
+        try:
+            s.sendto(b"fauxcasa-decodesvc-probe", ("8.8.8.8", 53))
+            return True, "sendto() succeeded"
+        finally:
+            s.close()
+    except Exception as e:
+        return False, repr(e)
+
+
+def _probe_socket_bind_listen(req):
+    """Bind a TCP listener + accept -- must fail. Without any
+    AppContainer network capability (internetClientServer /
+    privateNetworkClientServer), the process must not be able to open a
+    listening socket at all."""
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("0.0.0.0", 0))
+            s.listen(1)
+            s.settimeout(1.0)
+            try:
+                conn, _addr = s.accept()
+                conn.close()
+                return True, "bind+listen+accept succeeded (a client connected)"
+            except TimeoutError:
+                # bind()/listen() themselves did not raise -- that alone is
+                # the containment question this probe asks (nothing
+                # connecting within the timeout is not itself a denial).
+                return True, "bind()+listen() succeeded (no client connected within timeout)"
+        finally:
+            s.close()
+    except Exception as e:
+        return False, repr(e)
+
+
+def _probe_tcp_connect_nonloopback(req):
+    """TCP connect to a routable non-loopback address:443 -- must
+    fail/timeout, distinct from the existing loopback:445
+    (socket_tcp_connect) gate: containment must hold for reachable
+    external hosts, not just prove loopback is denied."""
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        try:
+            s.connect(("8.8.8.8", 443))
+            return True, "connect succeeded"
+        finally:
+            s.close()
+    except Exception as e:
+        return False, repr(e)
+
+
+def _probe_memory_limit_exceeded(req):
+    """Attempt an allocation past the 2 GiB job ProcessMemoryLimit
+    (design doc sec 4) -- must never succeed. Either Python raises
+    MemoryError here (a graceful commit failure) or the job object kills
+    the process outright before this function can return at all (the
+    caller must handle that as WORKER_CRASHED, not as this function's
+    return value)."""
+    try:
+        target_bytes = 3 * 1024 * 1024 * 1024  # 3 GiB, past the 2 GiB job limit
+        chunk = bytearray(target_bytes)
+        # Touch pages to force actual commit, not just a reserved range.
+        touched = 0
+        for i in range(0, len(chunk), 4096):
+            chunk[i] = 1
+            touched += 1
+        return True, f"allocated+touched {touched} pages ({len(chunk)} bytes) without hitting the job memory limit"
+    except MemoryError as e:
+        return False, f"MemoryError as expected: {e!r}"
+    except Exception as e:
+        return False, repr(e)
+
+
 def _probe_subprocess_spawn(req):
     try:
         import subprocess
@@ -435,6 +530,12 @@ _PROBES = {
     "subprocess_spawn": _probe_subprocess_spawn,
     "open_clipboard": _probe_open_clipboard,
     "handed_fd_read": _probe_handed_fd_read,
+    # FIX 8 (should-fix): network-I/O-denial coverage backing the
+    # socket_create "document, don't assert" decision.
+    "udp_sendto": _probe_udp_sendto,
+    "socket_bind_listen": _probe_socket_bind_listen,
+    "tcp_connect_nonloopback": _probe_tcp_connect_nonloopback,
+    "memory_limit_exceeded": _probe_memory_limit_exceeded,
     # arena_write handled specially (needs arena_addr) -- see _handle_probe
 }
 

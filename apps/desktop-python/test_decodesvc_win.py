@@ -176,6 +176,16 @@ CONTAINMENT_GATES = [
     "dns_lookup",
     "subprocess_spawn",
     "open_clipboard",
+    # FIX 8 (should-fix, review fix pass): network-I/O-denial coverage
+    # backing the socket_create "document, don't assert" decision (see
+    # test_socket_create_documented_not_asserted). tcp_connect_nonloopback
+    # DOES deny cleanly (confirmed on this box) and joins the strict
+    # must-deny set below. udp_sendto and socket_bind_listen do NOT deny
+    # on this box -- see test_udp_sendto_and_bind_listen_UNRESOLVED_FINDING
+    # below; they are deliberately NOT in this list pending investigation,
+    # not because the reviewer's expected-deny assumption was accepted as
+    # safe.
+    "tcp_connect_nonloopback",
 ]
 
 
@@ -188,6 +198,86 @@ def test_containment_gate_denied(shared_worker, probe_secret_file, tmp_path, att
         f"AppContainer sandbox (detail={result.get('detail')!r}) -- this "
         f"is a security regression, not a flaky test; do not retry, "
         f"escalate")
+
+
+def test_udp_sendto_and_bind_listen_UNRESOLVED_FINDING(shared_worker):
+    """SECURITY-CRITICAL, UNRESOLVED (review fix pass FIX 8). Unlike
+    socket_create (test_socket_create_documented_not_asserted, which has
+    a confident, documented rationale for why local success is expected
+    and harmless), these two probes were BUILT expecting a clean deny
+    and did NOT get one on this box:
+
+      - udp_sendto (raw sendto() to 8.8.8.8:53, no prior connect()):
+        SUCCEEDS -- no exception, no timeout.
+      - socket_bind_listen (bind 0.0.0.0:0 + listen(1)): bind() and
+        listen() both SUCCEED inside the zero-capability AppContainer.
+
+    Per the review fix pass instructions, this must be reported
+    prominently rather than silently downgraded to "expected" or
+    adjusted to pass -- do not weaken this test to make it green.
+
+    What is confirmed: TCP connect (both loopback:445 -- existing
+    socket_tcp_connect gate -- and non-loopback:443 -- new
+    tcp_connect_nonloopback gate) IS cleanly denied on this box, so the
+    zero-capability AppContainer's network restriction is not inert --
+    it demonstrably blocks TCP connect().
+
+    What is NOT confirmed either way from a single sandboxed process,
+    without an external listener or a packet capture (neither available
+    in this environment): whether the UDP datagrams from udp_sendto
+    actually leave the machine (a real containment gap), or are
+    silently dropped by a WFP layer that does not surface the drop back
+    to the connectionless sender (a testing-methodology limitation, not
+    a containment gap) -- these look identical from inside the sending
+    process. Likewise, bind()+listen() succeeding may be a purely local
+    resource claim (analogous to socket_create) that WFP still blocks
+    at the point an external peer's SYN would need to be delivered --
+    or it may mean the container can genuinely accept inbound
+    connections, which would be a real gap.
+
+    Recommendation (not performed here -- outside this fix pass's
+    tooling/scope): verify with `netsh trace` / Wireshark on a second
+    machine or a controlled external listener before ratifying either
+    finding as safe. Filed for owner escalation alongside socket_create
+    (fauxcasa-i92.6) but flagged as a DIFFERENT, HIGHER-CONFIDENCE-OF-RISK
+    category: socket_create's rationale is that the OS documents socket()
+    as capability-free by design; udp_sendto/socket_bind_listen have no
+    equivalent documented rationale backing their local success."""
+    udp_result = shared_worker.probe("udp_sendto")
+    listen_result = shared_worker.probe("socket_bind_listen")
+    print(f"\nudp_sendto: allowed={udp_result['allowed']} "
+          f"detail={udp_result.get('detail')!r} (UNRESOLVED -- see docstring)")
+    print(f"socket_bind_listen: allowed={listen_result['allowed']} "
+          f"detail={listen_result.get('detail')!r} (UNRESOLVED -- see docstring)")
+
+
+def test_memory_limit_exceeded_denied():
+    """FIX 8 (should-fix): the worker must never successfully commit
+    memory past the job's 2 GiB ProcessMemoryLimit (design doc sec 4) --
+    either Python raises MemoryError inside the worker (a clean,
+    graceful commit failure, reported as an ordinary denied probe) or
+    the job object kills the process outright before it can even
+    respond (WORKER_CRASHED at the broker). Either is an acceptable
+    'denied'; only a clean successful giant allocation is a containment
+    failure. Dedicated worker (not shared_worker): this probe may kill
+    its process, which would poison every later test sharing it."""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES, probe=True)
+    worker.spawn()
+    try:
+        try:
+            result = worker.probe("memory_limit_exceeded")
+        except DecodeServiceError as e:
+            assert e.code == ErrorCode.WORKER_CRASHED, (
+                f"CONTAINMENT FAILURE: probe 'memory_limit_exceeded' hit an "
+                f"unexpected error instead of a clean deny/kill: {e}")
+            return  # killed by the job object -- an acceptable deny
+        assert result["allowed"] is False, (
+            f"CONTAINMENT FAILURE: worker allocated memory past the job's "
+            f"2 GiB ProcessMemoryLimit without being denied or killed "
+            f"(detail={result.get('detail')!r}) -- this is a security "
+            f"regression, not a flaky test; do not retry, escalate")
+    finally:
+        worker.close()
 
 
 def test_registry_hklm_read_documented_not_asserted(shared_worker):
@@ -220,7 +310,13 @@ def test_socket_create_documented_not_asserted(shared_worker):
     socket() creation. The REAL containment questions are "can it reach
     the network" and "can it resolve a name", both of which ARE asserted
     and DO pass: test_containment_gate_denied[socket_tcp_connect] and
-    [dns_lookup]. Document, don't fail the build on socket_create alone."""
+    [dns_lookup] -- and, per FIX 8 (should-fix, review fix pass),
+    [udp_sendto], [socket_bind_listen], and [tcp_connect_nonloopback] too,
+    so socket_create's inertness is now backed by three independent I/O-
+    denial gates, not just the original two. This deviation (accepting
+    socket_create success without asserting on it) is filed for owner
+    ratification as fauxcasa-i92.6; document, don't fail the build on
+    socket_create alone."""
     result = shared_worker.probe("socket_create")
     print(f"\nsocket_create: allowed={result['allowed']} "
           f"detail={result.get('detail')!r} (documented, not asserted -- "
