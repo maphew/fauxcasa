@@ -109,17 +109,26 @@ mismatch and rebuilds via the existing path.
   + `QT_SCALE_FACTOR`): dpr 1 p99 140 → **71 ms** (deadline hits 55%),
   dpr 2 p99 **58 ms** (47%); RSS steady ~835 MB (was 1.0–1.1 GB), peak
   still 1.0–1.2 GB. The box's *native* config (Windows 125 % scaling →
-  dpr 1.25, no overrides) is the worst case measured: min-zoom p99
-  **584 ms**, deadline hits 1.6 % — it combines a near-max column count
-  (42) with the 512-px source level (native edge 256×1.25 = 320 → 512).
-  Mechanism: the scaled-paint cache only pays on *re*-paints; during a
-  2.5-screens/s flick nearly every tile is a first paint doing a smooth
-  scale off a 4× source, plus in-paint decode-pump. Default zoom: dpr 2.5
-  passes clean (p99 11 ms, 100 % deadline, zero blanks, max 14.5 ms);
-  dpr 1.25 is in budget on p99 (26 ms) but fails the §7 max ≤ 100 ms and
-  zero-blank gates (max 247 ms, 3 blank frames).
-  Remaining work (first-paint scale amortization / paint batching) is
-  tracked as `fauxcasa-q6l.27`.
+  **dpr 1.25**, no overrides) is far worse and reproducibly so: three
+  warm, counterbalanced (interleaved with dpr-1 runs to rule out a
+  cold-cache artifact) min-zoom runs give p99 **696 / 741 / 752 ms**
+  (median 741), deadline hits ~1–4 %. The single cold first pass read
+  584 ms; warm steady-state is *higher*, so 584 ms was an under-estimate,
+  not an outlier. Mechanism (confirmed by the counterbalanced set):
+  **it is the source-level selection, not column count.** dpr 1.0 has
+  *more* columns (53 vs 42) yet is ~10× faster (warm p99 60–69 ms),
+  because at dpr 1.0 the native edge 256×1.0 = 256 selects the 256-px
+  fcache level, whereas at dpr 1.25 the native edge 256×1.25 = 320
+  selects the **512-px level** — every tile is then a 512 → ~80 px smooth
+  downscale (4× the source pixels). The scaled-paint cache only pays on
+  *re*-paints; during a 2.5-screens/s flick nearly every tile is a first
+  paint doing that smooth scale, plus in-paint decode-pump. Default zoom:
+  dpr 2.5 passes clean (p99 11 ms, 100 % deadline, zero blanks, max
+  14.5 ms); dpr 1.25 is in budget on p99 (26 ms) but fails the §7
+  max ≤ 100 ms and zero-blank gates (max 247 ms, 3 blank frames).
+  Remaining work (min-zoom source-level selection — the 512-level pick at
+  fractional dpr is a large pixel overshoot — plus first-paint scale
+  amortization / paint batching) is tracked as `fauxcasa-q6l.27`.
 
 ## Run it
 
