@@ -440,6 +440,36 @@ def test_lockdown_sequencing_guard_no_job_before_locked():
         w.probe("anything")
 
 
+def test_protocol_violation_kills_live_worker_and_counts(synthetic_png):
+    """FIX 7 (should-fix): a ProtocolViolation during decode() on a LIVE
+    worker kills it outright (no retry -- the worker is now suspect) and
+    increments protocol_violations. Uses a real spawned worker with
+    recv_response monkeypatched to return a deliberately malformed
+    response, exercising decode()'s actual kill path end to end -- the
+    pure-trusted-side fuzz below (_fresh_validator) never has a live
+    process to kill, so it only asserts the counter half of this."""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    worker.spawn()
+    try:
+        assert worker.protocol_violations == 0
+        assert worker.is_alive() is True
+
+        def _lying_recv_response():
+            return {"id": worker._id_counter, "ok": True,
+                    "source": {"w": 2, "h": 2},
+                    "pixels": {"w": 2, "h": 2, "stride": 8, "pixfmt": "RGBA8",
+                               "off": 0, "len": 10_000_000}}  # oversized len
+
+        worker.recv_response = _lying_recv_response
+        with pytest.raises(ProtocolViolation):
+            worker.decode(synthetic_png)
+
+        assert worker.protocol_violations == 1
+        assert worker.is_alive() is False
+    finally:
+        worker.close()
+
+
 # ---------------------------------------------------------------------------
 # 3. Trusted-side protocol fuzz (design doc sec 7 gate 3). No sandbox.
 
@@ -456,14 +486,19 @@ def _decode_resp(**pixels_overrides) -> dict:
 
 
 def test_fuzz_oversized_len():
+    v = _fresh_validator()
     with pytest.raises(ProtocolViolation):
-        _fresh_validator()._validate_response(_decode_resp(len=10_000_000), expect_id=1)
+        v._validate_response(_decode_resp(len=10_000_000), expect_id=1)
+    # FIX 7 (should-fix): _validate_response is the counting seam pure-
+    # trusted-side fuzz can exercise without a live worker to kill.
+    assert v.protocol_violations == 1
 
 
 def test_fuzz_off_past_arena():
+    v = _fresh_validator()
     with pytest.raises(ProtocolViolation):
-        _fresh_validator()._validate_response(
-            _decode_resp(off=SMALL_ARENA_BYTES), expect_id=1)
+        v._validate_response(_decode_resp(off=SMALL_ARENA_BYTES), expect_id=1)
+    assert v.protocol_violations == 1
 
 
 def test_fuzz_overlapping_buffers():
@@ -480,46 +515,62 @@ def test_fuzz_overlapping_buffers():
 
 @pytest.mark.parametrize("bad_w", [-5, 10**9, -1, 0])
 def test_fuzz_negative_huge_dims(bad_w):
+    v = _fresh_validator()
     with pytest.raises(ProtocolViolation):
-        _fresh_validator()._validate_response(_decode_resp(w=bad_w), expect_id=1)
+        v._validate_response(_decode_resp(w=bad_w), expect_id=1)
+    assert v.protocol_violations == 1
 
 
 def test_fuzz_non_hex_sha():
     resp = _decode_resp()
     resp["sha256"] = "not-hex!" * 8  # 64 chars, not hex
+    v = _fresh_validator()
     with pytest.raises(ProtocolViolation):
-        _fresh_validator()._validate_response(resp, expect_id=1)
+        v._validate_response(resp, expect_id=1)
+    assert v.protocol_violations == 1
 
 
 def test_fuzz_unknown_pixfmt():
+    v = _fresh_validator()
     with pytest.raises(ProtocolViolation):
-        _fresh_validator()._validate_response(_decode_resp(pixfmt="NOPE"), expect_id=1)
+        v._validate_response(_decode_resp(pixfmt="NOPE"), expect_id=1)
+    assert v.protocol_violations == 1
 
 
 def test_fuzz_id_mismatch():
+    v = _fresh_validator()
     with pytest.raises(ProtocolViolation):
-        _fresh_validator()._validate_response(_decode_resp(), expect_id=999)
+        v._validate_response(_decode_resp(), expect_id=999)
+    assert v.protocol_violations == 1
 
 
 def test_fuzz_bad_stride():
+    v = _fresh_validator()
     with pytest.raises(ProtocolViolation):
-        _fresh_validator()._validate_response(_decode_resp(stride=3), expect_id=1)
+        v._validate_response(_decode_resp(stride=3), expect_id=1)
+    assert v.protocol_violations == 1
 
 
 def test_fuzz_len_mismatch():
+    v = _fresh_validator()
     with pytest.raises(ProtocolViolation):
-        _fresh_validator()._validate_response(_decode_resp(len=15), expect_id=1)
+        v._validate_response(_decode_resp(len=15), expect_id=1)
+    assert v.protocol_violations == 1
 
 
 def test_fuzz_unknown_error_code():
     resp = {"id": 1, "ok": False, "error": "TOTALLY_MADE_UP", "detail": "x"}
+    v = _fresh_validator()
     with pytest.raises(ProtocolViolation):
-        _fresh_validator()._validate_response(resp, expect_id=1)
+        v._validate_response(resp, expect_id=1)
+    assert v.protocol_violations == 1
 
 
 def test_fuzz_response_not_a_dict():
+    v = _fresh_validator()
     with pytest.raises(ProtocolViolation):
-        _fresh_validator()._validate_response("not a dict", expect_id=1)  # type: ignore[arg-type]
+        v._validate_response("not a dict", expect_id=1)  # type: ignore[arg-type]
+    assert v.protocol_violations == 1
 
 
 def test_fuzz_oversized_outgoing_control_frame():

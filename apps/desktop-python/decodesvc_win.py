@@ -1078,6 +1078,12 @@ class WinSandboxWorker:
         self._arena_handle = None
         self._arena_addr: int | None = None
         self._winsta_grant: dict | None = None
+        # FIX 7 (should-fix, review fix pass): per-session protocol-
+        # violation counter (design doc sec 1/sec 7 gate 3). Full
+        # counter-assertion contract is fauxcasa-i92.3.2; this is just the
+        # cheap, correct minimum -- increment it, kill the worker, no
+        # retry (the pool, not this transport, owns retry/respawn).
+        self.protocol_violations = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1191,6 +1197,11 @@ class WinSandboxWorker:
         except Exception:
             pass
 
+    def is_alive(self) -> bool:
+        """True iff a child process is spawned and still running. False
+        after close()/kill(), or if spawn() was never called."""
+        return self._child is not None and self._child.is_alive()
+
     # -- arena ---------------------------------------------------------------
 
     def _create_arena(self):
@@ -1253,7 +1264,22 @@ class WinSandboxWorker:
         response, BEFORE any arena memory is touched. Raises
         ProtocolViolation or DecodeServiceError; never needs a live
         worker, arena mapping, or Windows -- the seam the trusted-side
-        protocol-fuzz tests call directly with hand-built dicts."""
+        protocol-fuzz tests call directly with hand-built dicts.
+
+        FIX 7 (should-fix, review fix pass): any ProtocolViolation raised
+        below increments self.protocol_violations (design doc sec 7 gate
+        3) before propagating -- this is the seam pure-trusted-side fuzz
+        tests call WITHOUT a live worker, so counting here (rather than
+        only in decode()'s kill path, which needs a real child to kill)
+        is what lets those tests assert the counter directly. decode()
+        additionally kills the worker on catching this from a live job."""
+        try:
+            return self._validate_response_checks(resp, expect_id)
+        except ProtocolViolation:
+            self.protocol_violations += 1
+            raise
+
+    def _validate_response_checks(self, resp: dict, expect_id: int | None = None) -> tuple[dict, PixelBuffer]:
         if not isinstance(resp, dict):
             raise ProtocolViolation(f"response is not a JSON object: {type(resp).__name__}")
         if expect_id is not None and resp.get("id") != expect_id:
@@ -1316,9 +1342,25 @@ class WinSandboxWorker:
         try:
             self.send_request(request)
             resp = self.recv_response()
-        except DecodeServiceError:
+        except ProtocolViolation:
+            # FIX 7 (should-fix, review fix pass): a malformed/oversized
+            # incoming frame is evidence of compromise (design doc sec 1)
+            # detected below _validate_response's seam (framing, not
+            # shape), so it isn't counted there -- count it here.
+            self.protocol_violations += 1
+            self.kill()
             raise
-        source, buf = self._validate_response(resp, expect_id=req_id)
+        try:
+            source, buf = self._validate_response(resp, expect_id=req_id)
+        except ProtocolViolation:
+            # _validate_response already incremented protocol_violations
+            # (its own seam, shared with the trusted-side fuzz tests);
+            # here we just do the kill -- no retry, the worker is suspect.
+            # (An honest CORRUPT/UNSUPPORTED/TOO_LARGE result is a plain
+            # DecodeServiceError, not ProtocolViolation, and does not land
+            # here -- the worker behaved correctly.)
+            self.kill()
+            raise
         # Checklist item 6: copy the bytes out of the arena now, before any
         # later job can overwrite this worker's single-slot arena, and KEEP
         # the copy -- no trusted consumer may re-read arena memory the
