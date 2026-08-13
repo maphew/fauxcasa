@@ -6,25 +6,37 @@
 """Tests for the Windows sandboxed decode transport (fauxcasa-i92.3, Stage B).
 
 Run: `QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q`
-(matches how test_tracer.py is invoked). The whole module skips on
-non-Windows -- this is the Windows half of i92.3; the Linux half is a
-separate module.
+(matches how test_tracer.py is invoked).
+
+FIX 10 (should-fix, review fix pass): this module used to skip wholesale
+on non-Windows, which meant the gate-3 trusted-side protocol fuzz below
+-- pure Python, no sandbox, no Windows API -- ran in NO Linux CI, despite
+decodesvc_win.py and decodesvc_worker_win.py both being importable on any
+platform by design (their Windows-only pieces are internally guarded by
+`if sys.platform == "win32":`). Only the tests that actually spawn a real
+sandboxed worker (or touch a win32-guarded symbol like `dw.kernel32` or
+`dw._build_env_block`) are marked `_WINDOWS_ONLY` below (the `shared_worker`
+fixture self-skips too, so every containment/boundary test depending on
+it skips cleanly rather than erroring); everything else -- including the
+hello/lockdown-sequencing unit tests, which touch only the module's
+platform-independent parsing functions -- now runs everywhere.
 
 Three kinds of test here:
 
 1. Containment gates (design doc sec 7 gate 1) -- each spawns a REAL
    sandboxed worker with the probe flag and asserts the hostile attempt
    was DENIED. A failing containment gate is a security finding, not a
-   flaky test; see the assertion messages.
+   flaky test; see the assertion messages. Windows-only.
 2. Positive/boundary tests -- handed_fd_read (the one attempt that must
    succeed), an arena round trip, a real decode of a synthetic fixture,
-   lifetime/kill semantics, and the hello/proto refusal path.
+   lifetime/kill semantics, and the hello/proto refusal path. Mostly
+   Windows-only (spawns real workers); a few pure-parsing tests run
+   everywhere -- see their own docstrings.
 3. Trusted-side protocol fuzz (design doc sec 7 gate 3) -- feeds
    decodesvc_win's response validator (`WinSandboxWorker._validate_response`)
    and its framing (`_read_frame`/`_write_frame`) hand-built lying-worker
-   data. No sandbox needed; these exercise ONLY the broker's own
-   validation code and run on every platform (they just happen to live in
-   a module that otherwise skips on non-Windows, per the Stage B spec).
+   data. No sandbox needed; these exercise ONLY the trusted side's own
+   validation code and run on every platform.
 
 Synthetic-only fixtures throughout (privacy rule): the "photo" used here
 is a 2x2 red PNG built from a literal byte string, not any real image.
@@ -43,15 +55,6 @@ from pathlib import Path
 
 import pytest
 
-if sys.platform != "win32":
-    pytest.skip(
-        "Windows-only sandbox (fauxcasa-i92.3 Stage B); the trusted-side "
-        "fuzz tests below are individually platform-independent by design "
-        "(no Windows API touched) but this module skips wholesale here per "
-        "the Stage B spec -- a Linux module owns the Linux half.",
-        allow_module_level=True,
-    )
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import decodesvc_win as dw  # noqa: E402
@@ -64,6 +67,14 @@ from decodesvc import (  # noqa: E402
     PixelFormat,
     PROTO,
     ProtocolViolation,
+)
+
+# FIX 10: applied individually to tests that spawn a real sandboxed worker
+# or touch a win32-guarded symbol -- NOT at module level, so the
+# platform-independent tests (chiefly section 3) run on every platform.
+_WINDOWS_ONLY = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="requires spawning a real Windows AppContainer sandbox worker",
 )
 
 # A 2x2 solid-red PNG, valid CRCs, built from a literal byte string --
@@ -132,7 +143,13 @@ def shared_worker():
     """One spawned+locked AppContainer worker (probe=True), reused across
     every containment/boundary test in this module -- spawn is ~0.5s, and
     re-spawning per test would dominate the suite's wall clock for no
-    isolation benefit (each probe attempt is a fresh, independent job)."""
+    isolation benefit (each probe attempt is a fresh, independent job).
+
+    FIX 10: self-skips on non-Windows (rather than letting spawn() raise)
+    so every test depending on this fixture shows as skipped, not
+    errored, when the module runs on Linux CI."""
+    if sys.platform != "win32":
+        pytest.skip("requires spawning a real Windows AppContainer sandbox worker")
     worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES, probe=True)
     worker.spawn()
     try:
@@ -252,6 +269,7 @@ def test_udp_sendto_and_bind_listen_UNRESOLVED_FINDING(shared_worker):
           f"detail={listen_result.get('detail')!r} (UNRESOLVED -- see docstring)")
 
 
+@_WINDOWS_ONLY
 def test_memory_limit_exceeded_denied():
     """FIX 8 (should-fix): the worker must never successfully commit
     memory past the job's 2 GiB ProcessMemoryLimit (design doc sec 4) --
@@ -400,6 +418,7 @@ def test_unknown_op_no_crash(shared_worker):
     assert shared_worker._child.is_alive()
 
 
+@_WINDOWS_ONLY
 def test_lifetime_close_kills_worker_within_2s():
     worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
     worker.spawn()
@@ -409,6 +428,7 @@ def test_lifetime_close_kills_worker_within_2s():
     assert elapsed < 2.0, f"close() took {elapsed:.2f}s, expected < 2s (gotcha 5 backstop)"
 
 
+@_WINDOWS_ONLY
 def test_job_handle_close_kills_worker():
     """KILL_ON_JOB_CLOSE backstop: closing ONLY the job handle (no
     TerminateProcess) must still kill the child within 2s."""
@@ -432,6 +452,7 @@ def test_job_handle_close_kills_worker():
     dw.kernel32.CloseHandle(proc_handle)
 
 
+@_WINDOWS_ONLY
 def test_env_block_is_an_allowlist_not_a_copy_of_os_environ(monkeypatch):
     """FIX 3 (P1): _build_env_block must never leak host env vars it
     doesn't explicitly allowlist -- a hijacked decoder must not be able
@@ -456,6 +477,7 @@ def test_env_block_is_an_allowlist_not_a_copy_of_os_environ(monkeypatch):
     assert "PATH" in keys  # empty-string PATH is required (see comment)
 
 
+@_WINDOWS_ONLY
 def test_trimmed_env_worker_spawns_and_decodes(synthetic_png):
     """FIX 3 (P1): the trimmed allowlist env is not just theoretically
     sufficient -- confirm a fresh worker spawned under it reaches
@@ -537,6 +559,7 @@ def test_lockdown_sequencing_guard_no_job_before_locked():
         w.probe("anything")
 
 
+@_WINDOWS_ONLY
 def test_protocol_violation_kills_live_worker_and_counts(synthetic_png):
     """FIX 7 (should-fix): a ProtocolViolation during decode() on a LIVE
     worker kills it outright (no retry -- the worker is now suspect) and
