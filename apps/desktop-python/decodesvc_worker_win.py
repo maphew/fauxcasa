@@ -690,30 +690,33 @@ def main() -> None:
     # lost -- only the raw native chatter that must never touch the wire.
     stdin = sys.stdin.buffer
     _ctrl_fd = os.dup(1)
-    _nul = os.open(os.devnull, os.O_WRONLY)
+    # Gotcha 8: opening the NUL device from INSIDE the AppContainer is
+    # denied on some hosts (GHA windows-latest / Server 2025 runners; fine
+    # on Win11) -- and the resulting PermissionError used to vanish into
+    # the old silent exit-1 entry point, costing a multi-round CI bisect.
+    # Production brokers therefore open NUL themselves and hand us an
+    # inheritable write-only handle; the env fallback keeps manual/dev
+    # spawns (and non-broker harnesses) working where NUL is openable.
+    nul_handle = os.environ.get("FAUXCASA_DECODESVC_NUL_HANDLE")
+    if nul_handle:
+        import msvcrt
+        _nul = msvcrt.open_osfhandle(int(nul_handle), os.O_WRONLY)
+    else:
+        _nul = os.open(os.devnull, os.O_WRONLY)
     os.dup2(_nul, 1)
     os.dup2(_nul, 2)
     os.close(_nul)
     stdout = os.fdopen(_ctrl_fd, "wb", buffering=0)
+    global _CTRL
+    _CTRL = stdout
 
     # PHASE 1: import everything up front (design doc sec 4 -- Python's lazy
-    # imports would otherwise fail post-lockdown). Failures here happen
-    # AFTER fd 2 was pointed at NUL, so an uncaught exception dies as a
-    # silent exit-1 with zero bytes on the pipe -- undebuggable from the
-    # broker (seen on the GHA windows-latest runner). Report it as a
-    # structured frame instead: the broker's strict hello path raises
-    # ProtocolViolation with this payload repr'd, surfacing the traceback.
-    try:
-        from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize
-        from PySide6.QtGui import QImage, QImageReader
-        import PySide6
-    except BaseException as e:
-        import traceback
-        _write_frame(stdout, {
-            "fatal": "phase1-import", "error": repr(e),
-            "traceback": traceback.format_exc()[-4000:],
-            "sys_path": [str(p) for p in sys.path][:20]})
-        return
+    # imports would otherwise fail post-lockdown). A failure here (or
+    # anywhere in main()) is reported as a framed fatal dict by the entry
+    # point below -- never a silent exit.
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize
+    from PySide6.QtGui import QImage, QImageReader
+    import PySide6
 
     class _Qt:
         pass
@@ -775,11 +778,40 @@ def main() -> None:
                 return
 
 
+_CTRL = None  # the private control-fd file object; set by main() post-redirect
+
+
+def _report_fatal(obj: dict) -> None:
+    """Best-effort framed fatal report; never raises. Pre-redirect, fd 1 IS
+    the control pipe; post-redirect the dup'd private fd is in _CTRL. A raw
+    traceback must never touch the pipe (it would desync the framing), but
+    a FRAMED dict is protocol-safe: every broker read path surfaces
+    unexpected frame content verbatim in the error it raises."""
+    try:
+        data = json.dumps(obj).encode("utf-8")
+        if len(data) > MAX_CONTROL_MSG:
+            data = json.dumps({"fatal": obj.get("fatal"),
+                                "error": str(obj.get("error"))[:1000]}).encode("utf-8")
+        frame = struct.pack("<I", len(data)) + data
+        if _CTRL is not None:
+            _CTRL.write(frame)
+        else:
+            os.write(1, frame)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        # Never let an uncaught exception print a traceback to a pipe the
-        # broker is reading as JSON frames; just exit non-zero. The broker
-        # sees this as EOF -> WORKER_CRASHED, which is the correct signal.
+    except Exception as e:
+        # The old handler here exited silently "to protect the pipe from a
+        # traceback" -- which turned every startup failure into an
+        # evidence-free WORKER_CRASHED EOF and cost a multi-round CI bisect
+        # to find gotcha 8 (NUL open denied in the AppContainer on GHA's
+        # Server 2025 runners). Report a framed fatal dict instead: loud at
+        # the broker, still nothing unframed on the wire.
+        import traceback
+        _report_fatal({"fatal": "worker-main", "error": repr(e),
+                       "traceback": traceback.format_exc()[-4000:]})
         sys.exit(1)

@@ -104,16 +104,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 \
             libfontconfig1 libdbus-1-3
-      # TEMPORARY (remove once the GHA windows spawn failure is diagnosed):
-      # the Stage A spike (full parent env passed through) is viable on
-      # this runner while the production allowlist env block dies exit-1
-      # pre-Python. Bisect which env variable is load-bearing here.
-      - name: DEBUG env-block bisect (windows only, temporary)
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        run: uv run docs/research/spikes/gha-envblock-bisect.py
-        env:
-          QT_QPA_PLATFORM: offscreen
       - name: i92.3 sandbox escape gates (win) + trusted-side fuzz (all)
         run: uv run apps/desktop-python/test_decodesvc_win.py -q
         env:

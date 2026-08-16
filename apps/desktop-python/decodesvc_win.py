@@ -381,6 +381,8 @@ if sys.platform == "win32":
     PAGE_READWRITE = 0x04
     FILE_MAP_ALL_ACCESS = 0x000F001F
     FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    GENERIC_WRITE = 0x40000000
     OPEN_EXISTING = 3
     FILE_ATTRIBUTE_NORMAL = 0x80
     INVALID_HANDLE_VALUE = wintypes.HANDLE(-1)
@@ -990,6 +992,29 @@ if sys.platform == "win32":
         (gotcha 2 -- the latter spawns a forbidden conhost.exe child
         under child-process-restricted policy)."""
         stdin_r, stdin_w, stdout_r, stdout_w = make_pipe_pair()
+
+        # Gotcha 8 (found via GHA CI bisect, 2026-08-16): opening the NUL
+        # device from INSIDE the AppContainer is denied on some hosts
+        # (GitHub's windows-latest / Server 2025 runners; allowed on this
+        # Win11 dev box), and the worker needs a NUL fd to point fd 1/2
+        # away from the control pipe before any hostile decode runs. The
+        # broker is unsandboxed, so it opens NUL and hands the worker an
+        # inheritable write-only handle (value passed in the env). The only
+        # capability this grants the sandbox is writing to nowhere.
+        nul_sa = SECURITY_ATTRIBUTES()
+        nul_sa.nLength = ctypes.sizeof(nul_sa)
+        nul_sa.lpSecurityDescriptor = None
+        nul_sa.bInheritHandle = True
+        nul_h = kernel32.CreateFileW(
+            "NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ctypes.byref(nul_sa), OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+        if not nul_h or nul_h == INVALID_HANDLE_VALUE.value:
+            err = ctypes.get_last_error()
+            for h in (stdin_r, stdin_w, stdout_r, stdout_w):
+                kernel32.CloseHandle(h)
+            raise OSError(f"CreateFileW(NUL) failed err={err}")
+
+        extra_env = {**extra_env, "FAUXCASA_DECODESVC_NUL_HANDLE": str(int(nul_h))}
         env_block = _build_env_block(pythonpath, extra_env)
         cmdline = f'"{worker_python}" "{worker_script}"'
         cmd_buf = ctypes.create_unicode_buffer(cmdline)
@@ -1003,7 +1028,7 @@ if sys.platform == "win32":
         sec_cap.Reserved = 0
 
         child_policy = ctypes.c_uint32(PROCESS_CREATION_CHILD_PROCESS_RESTRICTED)
-        handle_arr = (wintypes.HANDLE * 2)(stdin_r, stdout_w)
+        handle_arr = (wintypes.HANDLE * 3)(stdin_r, stdout_w, nul_h)
         mitigation = ctypes.c_uint64(MITIGATION_FULL)
 
         attrs = [
@@ -1022,6 +1047,7 @@ if sys.platform == "win32":
             kernel32.CloseHandle(stdin_w)
             kernel32.CloseHandle(stdout_r)
             kernel32.CloseHandle(stdout_w)
+            kernel32.CloseHandle(nul_h)
             kernel32.CloseHandle(job)
             raise ctypes.WinError(ctypes.get_last_error())
 
@@ -1050,6 +1076,7 @@ if sys.platform == "win32":
 
         kernel32.CloseHandle(stdin_r)
         kernel32.CloseHandle(stdout_w)
+        kernel32.CloseHandle(nul_h)  # child holds its own inherited copy
 
         if not ok:
             kernel32.CloseHandle(stdin_w)

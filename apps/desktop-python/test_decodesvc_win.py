@@ -672,6 +672,25 @@ def test_worker_python_override_resolves_to_base_interpreter(monkeypatch):
         f"environment's PySide6 site-packages")
 
 
+def test_worker_report_fatal_is_framed_and_parseable():
+    """Gotcha 8 regression (companion): a worker-side fatal (e.g. a
+    prologue failure like the NUL-open denial on GHA's Server 2025
+    runners) must reach the broker as a VALID length-prefixed frame that
+    the broker's own _read_frame parses -- never a raw traceback on the
+    wire, and never the old silent exit-1 that leaves zero evidence."""
+    buf = io.BytesIO()
+    old = dw_worker._CTRL
+    dw_worker._CTRL = buf
+    try:
+        dw_worker._report_fatal({"fatal": "worker-main", "error": "boom",
+                                  "traceback": "tb"})
+    finally:
+        dw_worker._CTRL = old
+    buf.seek(0)
+    msg = dw._read_frame(buf)
+    assert msg == {"fatal": "worker-main", "error": "boom", "traceback": "tb"}
+
+
 def test_hello_wrong_proto_refused_loudly():
     """A stub worker that speaks proto=PROTO+1 is refused loudly. No
     sandbox needed -- exercises decodesvc_win's own hello-verification
