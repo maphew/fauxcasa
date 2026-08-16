@@ -105,36 +105,13 @@ jobs:
           sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 \
             libfontconfig1 libdbus-1-3
       # TEMPORARY (remove once the GHA windows spawn failure is diagnosed):
-      # spike says full lockdown is viable on this runner, so the delta is
-      # location-shaped. Bisect the broker CWD (D:\a checkout, runner-only
-      # ACLs, inherited by the child) vs a world-readable C: temp cwd, and
-      # dump the ACLs the spawn-time grants actually produced.
-      - name: DEBUG spawn cwd bisect (windows only, temporary)
+      # the Stage A spike (full parent env passed through) is viable on
+      # this runner while the production allowlist env block dies exit-1
+      # pre-Python. Bisect which env variable is load-bearing here.
+      - name: DEBUG env-block bisect (windows only, temporary)
         if: runner.os == 'Windows'
         continue-on-error: true
-        shell: bash
-        run: |
-          uv run --with PySide6 python - <<'PYEOF'
-          import os, subprocess, sys, tempfile
-          repo = os.getcwd()
-          sys.path.insert(0, os.path.join(repo, "apps", "desktop-python"))
-          import decodesvc_win as dw
-          for label, cwd in [("cwd-repo-D", repo), ("cwd-temp-C", tempfile.gettempdir())]:
-              os.chdir(cwd)
-              try:
-                  w = dw.WinSandboxWorker(arena_bytes=8 * 1024 * 1024, probe=True)
-                  w.spawn()
-                  print(label, "SPAWN-OK", flush=True)
-                  w.close()
-              except Exception as e:
-                  print(label, "SPAWN-FAIL", repr(e)[:400], flush=True)
-          os.chdir(repo)
-          wp, site = dw.resolve_worker_python()
-          for p in (repo, os.path.join(repo, "apps", "desktop-python"),
-                    site, os.path.dirname(wp)):
-              print("== icacls", p, flush=True)
-              subprocess.run(["icacls", p], check=False)
-          PYEOF
+        run: uv run docs/research/spikes/gha-envblock-bisect.py
         env:
           QT_QPA_PLATFORM: offscreen
       - name: i92.3 sandbox escape gates (win) + trusted-side fuzz (all)
