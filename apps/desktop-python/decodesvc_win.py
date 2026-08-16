@@ -1172,7 +1172,21 @@ class WinSandboxWorker:
         try:
             dup_arena = _duplicate_into_child(arena_handle, child.pi.hProcess)
 
-            hello_msg, noise = _read_hello_frame_tolerant(child.out_file)
+            try:
+                hello_msg, noise = _read_hello_frame_tolerant(child.out_file)
+            except DecodeServiceError as e:
+                # A worker that dies before hello almost always died in
+                # loader/startup; the NTSTATUS exit code (0xC0000142 user32
+                # init, 0xC0000135 DLL not found, 0xC0000022 access denied,
+                # ...) plus the exe we actually spawned is the difference
+                # between a debuggable CI failure and a shrug.
+                kernel32.WaitForSingleObject(child.pi.hProcess, 2000)
+                exit_code = wintypes.DWORD(0)
+                kernel32.GetExitCodeProcess(child.pi.hProcess, ctypes.byref(exit_code))
+                raise DecodeServiceError(
+                    e.code,
+                    f"{e} [worker exit code {exit_code.value:#010x}; "
+                    f"exe {worker_python!r}; pythonpath {worker_pythonpath!r}]") from e
             self.hello_noise_bytes = noise
             self.hello = parse_hello(hello_msg, self.arena_bytes)
 
