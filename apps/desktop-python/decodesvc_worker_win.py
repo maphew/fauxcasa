@@ -697,10 +697,23 @@ def main() -> None:
     stdout = os.fdopen(_ctrl_fd, "wb", buffering=0)
 
     # PHASE 1: import everything up front (design doc sec 4 -- Python's lazy
-    # imports would otherwise fail post-lockdown).
-    from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize
-    from PySide6.QtGui import QImage, QImageReader
-    import PySide6
+    # imports would otherwise fail post-lockdown). Failures here happen
+    # AFTER fd 2 was pointed at NUL, so an uncaught exception dies as a
+    # silent exit-1 with zero bytes on the pipe -- undebuggable from the
+    # broker (seen on the GHA windows-latest runner). Report it as a
+    # structured frame instead: the broker's strict hello path raises
+    # ProtocolViolation with this payload repr'd, surfacing the traceback.
+    try:
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize
+        from PySide6.QtGui import QImage, QImageReader
+        import PySide6
+    except BaseException as e:
+        import traceback
+        _write_frame(stdout, {
+            "fatal": "phase1-import", "error": repr(e),
+            "traceback": traceback.format_exc()[-4000:],
+            "sys_path": [str(p) for p in sys.path][:20]})
+        return
 
     class _Qt:
         pass
