@@ -47,6 +47,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import io
+import os
 import socket
 import struct
 import subprocess
@@ -300,11 +301,24 @@ def test_udp_sendto_and_bind_listen_are_inert_not_a_gap(shared_worker):
     t = threading.Thread(target=_listen, daemon=True)
     t.start()
     try:
-        rid = shared_worker._next_id()
-        shared_worker.send_request({"id": rid, "op": "probe",
-                                    "attempt": "udp_to_broker",
-                                    "bhost": ip, "bport": lport, "nonce": "probe"})
-        shared_worker.recv_response()
+        # Codex review PR110 (P1): go through probe()'s fail-closed
+        # validation (ok/attempt echo/bool allowed) AND require that the
+        # sendto itself completed inside the sandbox -- if the probe were
+        # renamed, removed, or its sendto raised, the "datagram never
+        # arrived" assertion below would be vacuously green without any
+        # I/O ever being attempted. allowed=True (inert syscall success)
+        # is the documented Windows behavior this gate is built on; if
+        # Windows ever starts denying the sendto at the syscall layer,
+        # this fails loudly so the documented-not-asserted classification
+        # gets re-examined rather than silently shifting.
+        udp_sent = shared_worker.probe(
+            "udp_to_broker",
+            extra={"bhost": ip, "bport": lport, "nonce": "probe"})
+        assert udp_sent["allowed"] is True, (
+            f"udp_to_broker's sendto did not complete inside the sandbox "
+            f"({udp_sent['detail']!r}) -- the non-arrival evidence below "
+            f"would be vacuous; re-examine the probe (or a syscall-layer "
+            f"behavior change) before trusting this gate")
         t.join(timeout=4.0)
     finally:
         lsock.close()
@@ -319,11 +333,14 @@ def test_udp_sendto_and_bind_listen_are_inert_not_a_gap(shared_worker):
     accepted = {}
 
     def _run_accept():
-        rid2 = shared_worker._next_id()
-        shared_worker.send_request({"id": rid2, "op": "probe",
-                                    "attempt": "bind_accept_wait",
-                                    "bport": port, "wait_s": 5.0})
-        accepted["resp"] = shared_worker.recv_response()
+        # Same fail-closed path as udp_to_broker above (Codex review
+        # PR110 P1): a renamed/broken probe raises in probe() instead of
+        # yielding an error response that could be misread as a denial.
+        try:
+            accepted["resp"] = shared_worker.probe(
+                "bind_accept_wait", extra={"bport": port, "wait_s": 5.0})
+        except Exception as e:  # surfaced by the assert below, not lost
+            accepted["err"] = e
 
     at = threading.Thread(target=_run_accept, daemon=True)
     at.start()
@@ -339,6 +356,8 @@ def test_udp_sendto_and_bind_listen_are_inert_not_a_gap(shared_worker):
         except Exception as e:
             outcomes[label] = type(e).__name__
     at.join(timeout=8.0)
+    assert "err" not in accepted, (
+        f"bind_accept_wait probe did not run to completion: {accepted['err']!r}")
     resp = accepted.get("resp", {})
     assert resp.get("allowed") is False, (
         f"CONTAINMENT FAILURE: the sandboxed worker accepted an inbound "
@@ -628,6 +647,31 @@ def test_trimmed_env_worker_spawns_and_decodes(synthetic_png):
         worker.close()
 
 
+@_WINDOWS_ONLY
+def test_worker_python_override_resolves_to_base_interpreter(monkeypatch):
+    """Codex review PR110 (P2): FAUXCASA_WORKER_PYTHON selects the probe
+    ENVIRONMENT, but resolve_worker_python must still spawn that
+    environment's BASE interpreter -- a uv/venv python.exe is a trampoline
+    that re-launches the base interpreter as a child process, which the
+    job's no-child rule kills before the hello handshake (gotcha 1).
+    Under `uv run` this test's own sys.executable IS such a trampoline
+    (sys.prefix != sys.base_prefix), which makes it exactly the trap
+    input; on a bare base interpreter the identity still holds."""
+    monkeypatch.setenv("FAUXCASA_WORKER_PYTHON", sys.executable)
+    exe, site = dw.resolve_worker_python()
+    expected = os.path.join(sys.base_prefix, "python.exe")
+    assert os.path.normcase(exe) == os.path.normcase(expected), (
+        f"override resolved to {exe!r}, expected the probe environment's "
+        f"base interpreter {expected!r}")
+    if os.path.normcase(sys.prefix) != os.path.normcase(sys.base_prefix):
+        assert os.path.normcase(exe) != os.path.normcase(sys.executable), (
+            "override returned the venv trampoline itself -- it would be "
+            "killed by the job's no-child-process rule before hello")
+    assert (Path(site) / "PySide6").is_dir(), (
+        f"worker PYTHONPATH {site!r} does not contain the override "
+        f"environment's PySide6 site-packages")
+
+
 def test_hello_wrong_proto_refused_loudly():
     """A stub worker that speaks proto=PROTO+1 is refused loudly. No
     sandbox needed -- exercises decodesvc_win's own hello-verification
@@ -674,6 +718,43 @@ def test_framed_non_hello_first_message_raises_promptly():
             f"_read_hello_frame_tolerant took {elapsed:.2f}s on a framed "
             f"non-hello first message, expected < 2s (must raise promptly, "
             f"not hang resyncing on a newline that will never arrive)")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.parametrize("payload_expr, match", [
+    ("b'{this is not json'", "not valid JSON"),
+    ("b'\\xff\\xfe\\xfd\\xfc\\xfb'", "not valid JSON"),      # invalid UTF-8
+    ("json.dumps([1, 2, 3]).encode()", "not a JSON object"),  # valid JSON, not a dict
+])
+def test_framed_malformed_first_message_raises_promptly(payload_expr, match):
+    """Codex review PR110 (P2), completing FIX 4: a first message whose
+    4-byte length prefix frames correctly but whose PAYLOAD is malformed
+    (bad JSON, bad UTF-8, or a JSON non-object) must also raise
+    ProtocolViolation immediately. It cannot be the gotcha-7 ASCII
+    diagnostic -- printable ASCII can never produce an in-cap length
+    prefix -- so it is worker protocol bytes gone wrong; the old
+    fall-through to newline-resync would block in read(1) forever against
+    a worker holding the pipe open while waiting for the broker."""
+    stub_code = (
+        "import sys, json, struct\n"
+        f"msg = {payload_expr}\n"
+        "sys.stdout.buffer.write(struct.pack('<I', len(msg)) + msg)\n"
+        "sys.stdout.buffer.flush()\n"
+        "import time\n"
+        "time.sleep(30)\n"  # if the broker resyncs, this keeps the pipe open
+    )
+    proc = subprocess.Popen([sys.executable, "-c", stub_code], stdout=subprocess.PIPE)
+    try:
+        t0 = time.perf_counter()
+        with pytest.raises(ProtocolViolation, match=match):
+            dw._read_hello_frame_tolerant(proc.stdout)
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 2.0, (
+            f"_read_hello_frame_tolerant took {elapsed:.2f}s on a framed "
+            f"malformed first message, expected < 2s (must raise promptly, "
+            f"not block resyncing on a newline that will never arrive)")
     finally:
         proc.terminate()
         proc.wait(timeout=5)

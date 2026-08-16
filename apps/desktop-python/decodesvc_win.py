@@ -184,8 +184,11 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
     try the strict framing exactly once (which can only be fooled by
     noise if the very first 4 bytes happen to already be a valid frame,
     impossible for ASCII diagnostic text -- see inline comment below);
-    on failure, discard through the next newline (bounded) and retry the
-    strict framing exactly once more. Two bounded attempts, no scanning."""
+    on failure to frame at all (length prefix over the cap -- the only
+    way ASCII noise presents), discard through the next newline (bounded)
+    and retry the strict framing exactly once more. Two bounded attempts,
+    no scanning; a payload that FRAMES but doesn't parse as a hello is a
+    protocol violation, never noise (see inline comment)."""
     header = _read_exact(fh, 4)
     if header is None:
         raise DecodeServiceError(
@@ -203,22 +206,31 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
             raise DecodeServiceError(
                 ErrorCode.WORKER_CRASHED, "control pipe closed mid-frame while reading the first frame")
         consumed += payload
+        # FIX 4 (P2) + Codex review PR110 (P2): ANYTHING that framed
+        # successfully is worker protocol bytes, never gotcha-7 noise --
+        # the ASCII diagnostic can't produce an in-cap length prefix (see
+        # comment above this branch). A framed payload that is malformed
+        # JSON, a non-object, or a non-hello object is a real (if wrong)
+        # first message from a worker that has already consumed our
+        # attention and may now be blocked waiting for attach_arena.
+        # Falling through to newline-resync here would discard real
+        # protocol bytes and then block in fh.read(1) waiting for a '\n'
+        # that may never arrive, hanging spawn() forever. Raise promptly
+        # instead; the resync below is reserved for the known unframeable
+        # ASCII interpreter diagnostic.
         try:
             obj = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            obj = None
-        if isinstance(obj, dict) and obj.get("hello") == 1:
-            return obj, 0
-        # FIX 4 (P2): a SUCCESSFULLY framed JSON object that is not a hello
-        # is not noise -- it is a real (if wrong) message from a worker
-        # that is now past its hello and possibly blocked waiting for
-        # attach_arena. Falling through to newline-resync here would
-        # discard real protocol bytes looking for a '\n' that may never
-        # arrive, hanging spawn() forever. Raise immediately instead;
-        # only an UNFRAMEABLE prefix (obj is None/not-a-dict) is noise.
-        if isinstance(obj, dict):
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise ProtocolViolation(
+                f"first framed control message was not valid JSON: {e!r}") from e
+        if not isinstance(obj, dict):
+            raise ProtocolViolation(
+                f"first framed control message was not a JSON object: "
+                f"{type(obj).__name__}")
+        if obj.get("hello") != 1:
             raise ProtocolViolation(
                 f"first framed control message was not a hello handshake: {obj!r}")
+        return obj, 0
 
     noise = bytes(consumed)
     if b"\n" not in noise:
@@ -864,7 +876,15 @@ if sys.platform == "win32":
         declared as a PEP 723 dependency of the caller's uv env): its
         sys.base_prefix, NEVER sys.executable itself (gotcha 1 -- a uv
         venv python.exe is a trampoline that re-launches the base
-        interpreter as a forbidden child process)."""
+        interpreter as a forbidden child process).
+
+        FAUXCASA_WORKER_PYTHON overrides which ENVIRONMENT is probed (its
+        PySide6 site-packages become the worker's PYTHONPATH), but the
+        spawned exe is still always that environment's base interpreter:
+        gotcha 1 applies to an override venv/uv interpreter exactly as it
+        does to sys.executable (Codex review PR110 P2 -- returning the
+        trampoline directly would die under the job's no-child rule
+        before ever reaching the hello handshake)."""
         env_py = os.environ.get("FAUXCASA_WORKER_PYTHON")
         probe_interp = env_py or sys.executable
         code = (
@@ -883,7 +903,7 @@ if sys.platform == "win32":
         dirs = json.loads(out.stdout.strip().splitlines()[-1])
         if "site" not in dirs:
             raise RuntimeError(f"PySide6 not importable from {probe_interp}: {dirs.get('err')}")
-        worker_python = env_py or os.path.join(dirs["base_prefix"], "python.exe")
+        worker_python = os.path.join(dirs["base_prefix"], "python.exe")
         return worker_python, dirs["site"]
 
     def is_appcontainer(token_handle=None) -> bool | str:
@@ -1376,10 +1396,16 @@ class WinSandboxWorker:
         return DecodeResult(pixels=buf, source_w=source["w"], source_h=source["h"],
                              pixels_bytes=pixels_bytes)
 
-    def probe(self, name: str, target: str | None = None, handle: int | None = None) -> dict:
+    def probe(self, name: str, target: str | None = None, handle: int | None = None,
+              extra: dict | None = None) -> dict:
         """Send a probe job (test-only; the worker only honors it when
         spawned with probe=True, i.e. FAUXCASA_DECODESVC_PROBE=1 in its
-        environment). Returns {attempt, allowed, detail}.
+        environment). Returns {attempt, allowed, detail}. `extra` carries
+        probe-specific request fields (e.g. udp_to_broker's bhost/bport/
+        nonce, bind_accept_wait's bport/wait_s) so those completed-I/O
+        gates go through this same fail-closed validation instead of raw
+        send_request/recv_response (Codex review PR110 P1); the fixed
+        id/op/attempt keys always win over `extra`.
 
         FIX 2 (P1, review fix pass): fail-closed. A denial (`allowed:
         False`) is accepted ONLY when the worker's response is well-formed
@@ -1397,7 +1423,8 @@ class WinSandboxWorker:
             raise RuntimeError(
                 "worker was not spawned with probe=True; probe() is test-only")
         req_id = self._next_id()
-        request: dict[str, Any] = {"id": req_id, "op": "probe", "attempt": name}
+        request: dict[str, Any] = {**(extra or {}),
+                                   "id": req_id, "op": "probe", "attempt": name}
         if target is not None:
             request["target"] = target
         if handle is not None:

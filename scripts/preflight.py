@@ -17,6 +17,10 @@ Checks (derived from .github/workflows/tests.yml and tracer.yml):
   - uv run scripts/test_picasa_db.py -q
   - uv run scripts/check-ingest-parity.py
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q   (skipped with --fast)
+  - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q
+    (skipped with --fast; on Windows this spawns real AppContainer sandbox
+    workers -- the i92.3 escape gates; elsewhere only the trusted-side
+    protocol fuzz runs)
   - git ls-files --error-unmatch -- .beads/issues.jsonl must FAIL            (the one bd preflight
     check that still applies here: no beads-jsonl pollution — the file is
     pollution iff git tracks it, whether staged or committed; a plain
@@ -80,6 +84,12 @@ def checks(root: Path, fast: bool) -> list[dict]:
         result.append({
             "name": "tracer tests",
             "command": ["uv", "run", "apps/desktop-python/test_tracer.py", "-q"],
+            "cwd": root,
+            "env": {"QT_QPA_PLATFORM": "offscreen"},
+        })
+        result.append({
+            "name": "decode-sandbox suite",
+            "command": ["uv", "run", "apps/desktop-python/test_decodesvc_win.py", "-q"],
             "cwd": root,
             "env": {"QT_QPA_PLATFORM": "offscreen"},
         })
