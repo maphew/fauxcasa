@@ -5,13 +5,13 @@
 # ///
 """TEMPORARY (fauxcasa-i92.3): bisect the GHA windows-latest worker death.
 
-Round 3. Round 2 proved the production spawn machinery boots plain-python
-stubs from every location on the runner; only the real worker dies -- and
-the real worker is the only one that imports PySide6. A native-level
-death during the Qt DLL load (ExitProcess-style, no Python exception)
-would explain the silent exit-1 that the phase-1 reporter cannot catch.
-These stubs import PySide6 WITHOUT redirecting stderr first, so whatever
-the loader prints arrives on the control pipe for us to read.
+Round 4. Round 3 proved site-packages reads and the QtGui import all work
+under the production sandbox on the runner. The real worker's entry point
+swallows every main() exception into a silent sys.exit(1) -- the exact
+observed signature -- so the death is an ordinary exception in main()'s
+prologue, before the phase-1 import reporter. Beacon every prologue step
+(sys.stdin.buffer, os.dup(1), os.open(NUL) -- the one syscall no stub has
+exercised -- the dup2s, fdopen) to see exactly which one raises.
 
 Delete this file once the culprit is identified and fixed.
 """
@@ -34,52 +34,51 @@ if sys.platform != "win32":
     print("windows only")
     sys.exit(0)
 
-STUB_QTCORE = (
-    "import sys\n"
-    "sys.stdout.write('PRE-IMPORT\\n')\n"
-    "sys.stdout.flush()\n"
-    "from PySide6.QtCore import QSize\n"
-    "sys.stdout.write('QTCORE-OK\\n')\n"
-    "sys.stdout.flush()\n"
-    "from PySide6.QtGui import QImage\n"
-    "sys.stdout.write('QTGUI-OK\\n')\n"
-    "sys.stdout.flush()\n"
-    "sys.stdin.buffer.read(1)\n"
-)
-
-STUB_LISTDIR = (
+STUB_BEACONS = (
     "import sys, os\n"
-    "site = os.environ.get('PYTHONPATH', '')\n"
-    "p = os.path.join(site, 'PySide6')\n"
+    "os.write(1, b'[A:fd1-raw-write]')\n"
+    "stdin = sys.stdin.buffer\n"
+    "os.write(1, b'[B:stdin-buffer]')\n"
     "try:\n"
-    "    names = os.listdir(p)\n"
-    "    sys.stdout.write('LISTDIR-OK %d entries\\n' % len(names))\n"
-    "    ok = err = 0\n"
-    "    first_err = ''\n"
-    "    for n in names:\n"
-    "        f = os.path.join(p, n)\n"
-    "        if not os.path.isfile(f):\n"
-    "            continue\n"
-    "        try:\n"
-    "            with open(f, 'rb') as fh:\n"
-    "                fh.read(16)\n"
-    "            ok += 1\n"
-    "        except OSError as e:\n"
-    "            err += 1\n"
-    "            if not first_err:\n"
-    "                first_err = '%s: %r' % (n, e)\n"
-    "    sys.stdout.write('READ ok=%d err=%d first_err=%s\\n' % (ok, err, first_err))\n"
-    "except OSError as e:\n"
-    "    sys.stdout.write('LISTDIR-FAIL %r\\n' % (e,))\n"
-    "sys.stdout.flush()\n"
-    "sys.stdin.buffer.read(1)\n"
+    "    _ctrl_fd = os.dup(1)\n"
+    "    os.write(_ctrl_fd, b'[C:dup1]')\n"
+    "    _nul = os.open(os.devnull, os.O_WRONLY)\n"
+    "    os.write(_ctrl_fd, b'[D:open-nul]')\n"
+    "    os.dup2(_nul, 1)\n"
+    "    os.write(_ctrl_fd, b'[E:dup2-1]')\n"
+    "    os.dup2(_nul, 2)\n"
+    "    os.write(_ctrl_fd, b'[F:dup2-2]')\n"
+    "    os.close(_nul)\n"
+    "    os.write(_ctrl_fd, b'[G:close-nul]')\n"
+    "    f = os.fdopen(_ctrl_fd, 'wb', buffering=0)\n"
+    "    f.write(b'[H:fdopen]')\n"
+    "    import base64, json, struct\n"
+    "    import ctypes\n"
+    "    from ctypes import wintypes\n"
+    "    f.write(b'[I:stdlib-imports]')\n"
+    "    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')\n"
+    "    from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize\n"
+    "    f.write(b'[J:qtcore]')\n"
+    "    from PySide6.QtGui import QImage, QImageReader\n"
+    "    f.write(b'[K:qtgui]')\n"
+    "    import PySide6\n"
+    "    f.write(b'[L:pyside6-root]')\n"
+    "except BaseException as e:\n"
+    "    import traceback\n"
+    "    msg = ('[EXC:%r]' % (e,)) + traceback.format_exc()[-800:]\n"
+    "    try:\n"
+    "        os.write(_ctrl_fd, msg.encode())\n"
+    "    except Exception:\n"
+    "        os.write(1, msg.encode())\n"
+    "stdin.read(1)\n"
 )
 
 
-def try_spawn(label: str, worker_python: str, script: str, pythonpath, sid) -> None:
+def try_spawn(label: str, worker_python: str, script: str, pythonpath, sid, extra_env) -> None:
     try:
         child = dw._spawn_appcontainer(
-            worker_python, script, sid, pythonpath, {}, 2 * 1024 * 1024 * 1024)
+            worker_python, script, sid, pythonpath, extra_env,
+            2 * 1024 * 1024 * 1024)
     except Exception as e:
         print(f"VERDICT {label}: SPAWN-RAISED {repr(e)[:200]}", flush=True)
         return
@@ -95,12 +94,12 @@ def try_spawn(label: str, worker_python: str, script: str, pythonpath, sid) -> N
     t = threading.Thread(target=_read, daemon=True)
     t.start()
     deadline = time.monotonic() + 20.0
-    while time.monotonic() < deadline and t.is_alive() and len(buf) < 3900:
+    while time.monotonic() < deadline and t.is_alive() and len(buf) < 3000:
         time.sleep(0.25)
     code = ctypes.wintypes.DWORD(0)
     dw.kernel32.GetExitCodeProcess(child.pi.hProcess, ctypes.byref(code))
     print(f"VERDICT {label}: exit={code.value:#010x} bytes={len(buf)}", flush=True)
-    print(f"OUTPUT {label}: {bytes(buf[:3900])!r}", flush=True)
+    print(f"OUTPUT {label}: {bytes(buf[:3000])!r}", flush=True)
     child.close()
 
 
@@ -109,18 +108,17 @@ def main() -> None:
     base_dir = os.path.dirname(worker_python)
 
     tmp_c = Path(tempfile.mkdtemp(prefix="fauxcasa-bisect-"))
-    qt_stub = tmp_c / "qt_stub.py"
-    qt_stub.write_text(STUB_QTCORE)
-    ls_stub = tmp_c / "ls_stub.py"
-    ls_stub.write_text(STUB_LISTDIR)
+    stub = tmp_c / "beacon_stub.py"
+    stub.write_text(STUB_BEACONS)
 
     sid = dw.create_or_derive_profile("fauxcasa.decode.bisect")
     for d in (base_dir, site, str(APPDIR), str(tmp_c)):
         dw.grant_read_execute(d, sid)
     print("winsta:", dw.grant_winsta_desktop(sid), flush=True)
 
-    try_spawn("listdir-site", worker_python, str(ls_stub), site, sid)
-    try_spawn("qt-import-noredirect", worker_python, str(qt_stub), site, sid)
+    prod_env = {"FAUXCASA_DECODESVC_ARENA_BYTES": str(8 * 1024 * 1024),
+                "FAUXCASA_DECODESVC_PROBE": "1"}
+    try_spawn("beacons-prodenv", worker_python, str(stub), site, sid, prod_env)
 
 
 if __name__ == "__main__":
