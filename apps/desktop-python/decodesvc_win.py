@@ -200,7 +200,10 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
     # with its top byte in [0x20, 0x7E] -- always > MAX_CONTROL_MSG. So this
     # branch is only ever taken for a genuine (small) frame OR a coincidence
     # too improbable to design around; either way we validate the parse.
-    if 0 < length <= MAX_CONTROL_MSG:
+    # length == 0 is a successfully framed (empty) message, not ASCII noise:
+    # it must take the strict branch below and fail parse as a protocol
+    # violation, never fall through to newline-resync (which would block).
+    if length <= MAX_CONTROL_MSG:
         payload = _read_exact(fh, length)
         if payload is None:
             raise DecodeServiceError(
@@ -220,7 +223,9 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
         # ASCII interpreter diagnostic.
         try:
             obj = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        except (UnicodeDecodeError, ValueError, RecursionError) as e:
+            # Same tuple as _read_frame: hostile capped JSON can raise bare
+            # ValueError (huge int literal) or RecursionError (deep nesting).
             raise ProtocolViolation(
                 f"first framed control message was not valid JSON: {e!r}") from e
         if not isinstance(obj, dict):
@@ -1250,6 +1255,13 @@ class WinSandboxWorker:
         if self._arena_handle:
             kernel32.CloseHandle(self._arena_handle)
             self._arena_handle = None
+        # The SID from create_or_derive_profile is a per-spawn native
+        # allocation (MSDN: caller must FreeSid); the reusable AppContainer
+        # *profile* is untouched. Only ever set inside spawn() (Windows-only),
+        # so the advapi32 call is unreachable off-Windows.
+        if self._sid is not None:
+            advapi32.FreeSid(self._sid)
+            self._sid = None
 
     def kill(self) -> None:
         """Hard-stop path (design doc sec 1: 'never a polite request to

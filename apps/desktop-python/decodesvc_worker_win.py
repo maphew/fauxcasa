@@ -690,6 +690,14 @@ def main() -> None:
     # lost -- only the raw native chatter that must never touch the wire.
     stdin = sys.stdin.buffer
     _ctrl_fd = os.dup(1)
+    # Publish the control stream BEFORE any redirect below can fail: once
+    # fd 1 points at NUL, _report_fatal's os.write(1, ...) fallback is a
+    # silent discard — the exact zero-byte startup failure this exists to
+    # eliminate. If this fdopen itself fails, fd 1 is still the pipe and
+    # the fallback still reaches the broker.
+    stdout = os.fdopen(_ctrl_fd, "wb", buffering=0)
+    global _CTRL
+    _CTRL = stdout
     # Gotcha 8: opening the NUL device from INSIDE the AppContainer is
     # denied on some hosts (GHA windows-latest / Server 2025 runners; fine
     # on Win11) -- and the resulting PermissionError used to vanish into
@@ -706,9 +714,6 @@ def main() -> None:
     os.dup2(_nul, 1)
     os.dup2(_nul, 2)
     os.close(_nul)
-    stdout = os.fdopen(_ctrl_fd, "wb", buffering=0)
-    global _CTRL
-    _CTRL = stdout
 
     # PHASE 1: import everything up front (design doc sec 4 -- Python's lazy
     # imports would otherwise fail post-lockdown). A failure here (or

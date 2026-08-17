@@ -33,7 +33,7 @@ regressions, not a local dev-loop check, so it's left to CI.
 
 Usage:
   uv run scripts/preflight.py            # run all checks
-  uv run scripts/preflight.py --fast     # skip the slow tracer suite
+  uv run scripts/preflight.py --fast     # skip the slow suites (tracer + decode-sandbox)
   uv run scripts/preflight.py --json     # machine-readable output
 
 Exits nonzero if any check fails (mirrors `bd preflight --check`).
@@ -149,7 +149,7 @@ def run_check(check: dict) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fast", action="store_true",
-                         help="skip the tracer suite (the slow gate)")
+                         help="skip the slow suites (tracer + decode-sandbox)")
     parser.add_argument("--json", action="store_true",
                          help="machine-readable output (name/passed/command/output)")
     args = parser.parse_args()

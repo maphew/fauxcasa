@@ -578,6 +578,9 @@ def test_lifetime_close_kills_worker_within_2s():
     worker.close()
     elapsed = time.perf_counter() - t0
     assert elapsed < 2.0, f"close() took {elapsed:.2f}s, expected < 2s (gotcha 5 backstop)"
+    # Codex review PR110 round 3: close() must FreeSid + clear, or every
+    # respawn leaks one native SID allocation
+    assert worker._sid is None, "close() must free and clear the AppContainer SID"
 
 
 @_WINDOWS_ONLY
@@ -746,6 +749,14 @@ def test_framed_non_hello_first_message_raises_promptly():
     ("b'{this is not json'", "not valid JSON"),
     ("b'\\xff\\xfe\\xfd\\xfc\\xfb'", "not valid JSON"),      # invalid UTF-8
     ("json.dumps([1, 2, 3]).encode()", "not a JSON object"),  # valid JSON, not a dict
+    # Codex review PR110 round 3: a zero-length frame is a successfully
+    # framed (empty) malformed message, not resyncable noise
+    ("b''", "not valid JSON"),
+    # ... and hostile capped JSON that raises bare ValueError (>4300-digit
+    # int literal) or RecursionError (deep nesting) must be normalized to
+    # ProtocolViolation, same tuple as _read_frame
+    ("b'1' * 5000", "not valid JSON"),
+    ("b'[' * 3000 + b']' * 3000", "not valid JSON"),
 ])
 def test_framed_malformed_first_message_raises_promptly(payload_expr, match):
     """Codex review PR110 (P2), completing FIX 4: a first message whose

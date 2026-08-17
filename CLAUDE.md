@@ -177,7 +177,7 @@ QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q
 git ls-files --error-unmatch -- .beads/issues.jsonl
 
 # one-liner mirroring all of the above locally (fauxcasa-op6):
-uv run scripts/preflight.py            # add --fast to skip the tracer suite
+uv run scripts/preflight.py            # add --fast to skip the slow suites (tracer + decode-sandbox)
 ```
 
 ## Architecture Overview
