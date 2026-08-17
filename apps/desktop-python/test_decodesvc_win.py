@@ -65,7 +65,12 @@ import decodesvc_worker_win as dw_worker  # noqa: E402  -- FIX 9: unit-test its 
 from decodesvc import (  # noqa: E402
     DecodeServiceError,
     ErrorCode,
+    FaceRegion,
+    MAX_CAPTION_BYTES,
     MAX_CONTROL_MSG,
+    MAX_FACES,
+    MAX_KEYWORDS,
+    MetaFields,
     PixelBuffer,
     PixelFormat,
     PROTO,
@@ -1286,6 +1291,190 @@ def test_frame_round_trip_still_works():
     dw._write_frame(buf, {"hello": 1, "x": 2})
     buf.seek(0)
     assert dw._read_frame(buf) == {"hello": 1, "x": 2}
+
+
+# ---------------------------------------------------------------------------
+# 4. Broker-side metadata clamps (design doc sec 2.4 checklist item 5,
+# fauxcasa-i92.3.3). `dw.parse_meta_fields` is a pure dict validator, same
+# shape as section 3 above -- no sandbox, no live worker.
+
+def test_meta_none_is_defaults():
+    assert dw.parse_meta_fields(None) == MetaFields()
+
+
+def test_meta_empty_dict_is_defaults():
+    assert dw.parse_meta_fields({}) == MetaFields()
+
+
+def test_meta_unknown_top_level_keys_ignored():
+    meta = dw.parse_meta_fields({"caption": "hi", "bogus": "ignored", "another": 123})
+    assert meta.caption == "hi"
+
+
+def test_meta_not_a_dict_is_violation():
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields("not a dict")  # type: ignore[arg-type]
+
+
+def test_meta_caption_exactly_max_kept():
+    caption = "a" * MAX_CAPTION_BYTES
+    meta = dw.parse_meta_fields({"caption": caption})
+    assert meta.caption == caption
+    assert len(meta.caption.encode("utf-8")) == MAX_CAPTION_BYTES
+
+
+def test_meta_caption_oversize_ascii_clamped():
+    caption = "a" * 9000
+    meta = dw.parse_meta_fields({"caption": caption})
+    assert len(meta.caption.encode("utf-8")) == MAX_CAPTION_BYTES
+    assert meta.caption == "a" * MAX_CAPTION_BYTES
+
+
+def test_meta_caption_multibyte_boundary_split_drops_cleanly():
+    """8191 ASCII bytes + a run of 4-byte emoji straddles the
+    MAX_CAPTION_BYTES clamp boundary -- the codepoint split by the
+    truncation must be dropped whole, never emitted as mojibake/
+    replacement chars (U+FFFD)."""
+    caption = "a" * 8191 + ("\U0001F600" * 10)  # each emoji is 4 utf-8 bytes
+    assert len(caption.encode("utf-8")) > MAX_CAPTION_BYTES
+    meta = dw.parse_meta_fields({"caption": caption})
+    encoded = meta.caption.encode("utf-8")
+    assert len(encoded) <= MAX_CAPTION_BYTES
+    assert "�" not in meta.caption
+    assert encoded.decode("utf-8") == meta.caption  # round-trips cleanly
+
+
+def test_meta_caption_wrong_type_is_violation():
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"caption": 12345})
+
+
+def test_meta_keywords_at_max_kept():
+    kws = [f"k{i}" for i in range(MAX_KEYWORDS)]
+    meta = dw.parse_meta_fields({"keywords": kws})
+    assert meta.keywords == tuple(kws)
+
+
+def test_meta_keywords_over_max_clamped():
+    kws = [f"k{i}" for i in range(MAX_KEYWORDS + 1)]
+    meta = dw.parse_meta_fields({"keywords": kws})
+    assert meta.keywords == tuple(kws[:MAX_KEYWORDS])
+
+
+def test_meta_keywords_wrong_element_type_is_violation():
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"keywords": ["ok", 5, "also-ok"]})
+
+
+def test_meta_keywords_not_a_list_is_violation():
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"keywords": "not-a-list"})
+
+
+def test_meta_taken_absent_defaults_empty():
+    assert dw.parse_meta_fields({}).taken == ""
+
+
+def test_meta_taken_wrong_type_is_violation():
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"taken": 20260101})
+
+
+def test_meta_faces_at_max_kept():
+    faces = [{"name": f"f{i}", "x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1} for i in range(MAX_FACES)]
+    meta = dw.parse_meta_fields({"faces": faces})
+    assert len(meta.faces) == MAX_FACES
+    assert all(isinstance(f, FaceRegion) for f in meta.faces)
+
+
+def test_meta_faces_over_max_clamped():
+    faces = [{"name": f"f{i}", "x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}
+             for i in range(MAX_FACES + 1)]
+    meta = dw.parse_meta_fields({"faces": faces})
+    assert len(meta.faces) == MAX_FACES
+    assert meta.faces[-1].name == f"f{MAX_FACES - 1}"
+
+
+def test_meta_faces_unknown_keys_ignored():
+    meta = dw.parse_meta_fields(
+        {"faces": [{"name": "a", "x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1, "bogus": True}]})
+    assert meta.faces == (FaceRegion(name="a", x=0.1, y=0.1, w=0.1, h=0.1),)
+
+
+@pytest.mark.parametrize("bad_face", [
+    {"name": "a", "x": float("nan"), "y": 0.1, "w": 0.1, "h": 0.1},
+    {"name": "a", "x": 0.1, "y": 0.1, "w": float("inf"), "h": 0.1},
+    {"name": "a", "x": 0.1, "y": -0.001, "w": 0.1, "h": 0.1},
+    {"name": "a", "x": 0.1, "y": 0.1, "w": 0.1, "h": 1.001},
+    {"name": 5, "x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1},
+    "not-a-dict",
+], ids=["nan-x", "inf-w", "y-below-0", "h-above-1", "name-not-str", "face-not-dict"])
+def test_meta_faces_bad_entry_is_violation(bad_face):
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"faces": [bad_face]})
+
+
+def test_meta_faces_not_a_list_is_violation():
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"faces": {"name": "a"}})
+
+
+def test_meta_gps_valid_pair_kept_as_floats():
+    meta = dw.parse_meta_fields({"gps": [49, -123]})
+    assert meta.gps == (49.0, -123.0)
+    assert all(isinstance(v, float) for v in meta.gps)
+
+
+@pytest.mark.parametrize("bad_gps", [
+    [1], ["a", "b"], [float("nan"), 0], True,
+], ids=["too-short", "non-numeric", "nan", "bool"])
+def test_meta_gps_bad_value_is_violation(bad_gps):
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"gps": bad_gps})
+
+
+def test_meta_gps_absent_is_none():
+    assert dw.parse_meta_fields({}).gps is None
+
+
+def test_meta_gps_explicit_none_is_none():
+    assert dw.parse_meta_fields({"gps": None}).gps is None
+
+
+def test_meta_rating_over_max_clamped():
+    assert dw.parse_meta_fields({"rating": 7}).rating == 5
+
+
+def test_meta_rating_below_min_clamped():
+    assert dw.parse_meta_fields({"rating": -1}).rating == 0
+
+
+def test_meta_rating_wrong_type_is_violation():
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"rating": "3"})
+
+
+def test_meta_rating_bool_is_violation():
+    """rating is an int subclass footgun: bool must be rejected even
+    though isinstance(True, int) is True."""
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"rating": True})
+
+
+def test_validate_meta_violation_increments_counter():
+    v = _fresh_validator()
+    with pytest.raises(ProtocolViolation):
+        v.validate_meta({"caption": 12345})
+    assert v.protocol_violations == 1
+
+
+def test_validate_meta_clamp_does_not_increment_counter():
+    v = _fresh_validator()
+    meta = v.validate_meta(
+        {"caption": "a" * 9000, "keywords": [f"k{i}" for i in range(MAX_KEYWORDS + 1)]})
+    assert len(meta.caption.encode("utf-8")) == MAX_CAPTION_BYTES
+    assert len(meta.keywords) == MAX_KEYWORDS
+    assert v.protocol_violations == 0
 
 
 if __name__ == "__main__":

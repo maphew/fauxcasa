@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import struct
 import subprocess
@@ -71,8 +72,13 @@ from decodesvc import (
     DecodeResult,
     DecodeServiceError,
     ErrorCode,
+    FaceRegion,
     Hello,
+    MAX_CAPTION_BYTES,
     MAX_CONTROL_MSG,
+    MAX_FACES,
+    MAX_KEYWORDS,
+    MetaFields,
     PixelBuffer,
     PixelFormat,
     PROTO,
@@ -334,6 +340,96 @@ def parse_locked(msg: dict) -> bool:
     if not isinstance(is_appc, bool):
         raise ProtocolViolation(f"locked message missing is_appcontainer bool: {msg!r}")
     return is_appc
+
+
+# ---------------------------------------------------------------------------
+# In-file metadata parsing (design doc sec 2.4 checklist item 5,
+# fauxcasa-i92.3.3), landed ahead of the index/poster ops that will carry
+# MetaFields in a real response. Pure dict validator -- cross-platform, no
+# live worker needed, same shape as parse_hello/parse_locked above.
+
+def parse_meta_fields(meta: object, *,
+                       max_caption_bytes: int = MAX_CAPTION_BYTES,
+                       max_keywords: int = MAX_KEYWORDS,
+                       max_faces: int = MAX_FACES) -> MetaFields:
+    """The clamp-vs-reject rule: a claim about SIZE (caption bytes, keyword/
+    face count) is CLAMPED, because a worker can legitimately produce too
+    much of a real thing, but a claim about TYPE, SHAPE, or FINITENESS is
+    REJECTED as a ProtocolViolation, because that can only be a lie --
+    unknown top-level keys (and unknown keys inside a face dict) are
+    ignored for additive evolution. This is the seam the future index/
+    poster response validation MUST route through, exactly as
+    `_validate_response_checks` is for PixelBuffer today."""
+    if meta is None:
+        return MetaFields()
+    if not isinstance(meta, dict):
+        raise ProtocolViolation(f"meta is not a JSON object: {type(meta).__name__}")
+
+    caption = meta.get("caption", "")
+    if not isinstance(caption, str):
+        raise ProtocolViolation(f"meta.caption is not a string: {caption!r}")
+    encoded = caption.encode("utf-8")
+    if len(encoded) > max_caption_bytes:
+        # Truncate the ENCODED bytes first, then decode with errors=
+        # 'ignore' -- a multibyte codepoint split at the boundary is
+        # dropped whole, never emitted as mojibake/replacement chars.
+        caption = encoded[:max_caption_bytes].decode("utf-8", errors="ignore")
+
+    keywords_raw = meta.get("keywords", [])
+    if not isinstance(keywords_raw, list) or not all(isinstance(k, str) for k in keywords_raw):
+        raise ProtocolViolation(f"meta.keywords is not a list of strings: {keywords_raw!r}")
+    keywords = tuple(keywords_raw[:max_keywords])
+
+    taken = meta.get("taken", "")
+    if not isinstance(taken, str):
+        raise ProtocolViolation(f"meta.taken is not a string: {taken!r}")
+
+    gps_raw = meta.get("gps")
+    gps: tuple[float, float] | None = None
+    if gps_raw is not None:
+        if not isinstance(gps_raw, (list, tuple)) or len(gps_raw) != 2:
+            raise ProtocolViolation(f"meta.gps is not a 2-element list/tuple: {gps_raw!r}")
+        lat, lon = gps_raw
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (lat, lon)):
+            raise ProtocolViolation(f"meta.gps element is not a real number: {gps_raw!r}")
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            raise ProtocolViolation(f"meta.gps element is not finite: {gps_raw!r}")
+        gps = (float(lat), float(lon))
+
+    rating_raw = meta.get("rating", 0)
+    if not isinstance(rating_raw, int) or isinstance(rating_raw, bool):
+        raise ProtocolViolation(f"meta.rating is not an int: {rating_raw!r}")
+    rating = max(0, min(5, rating_raw))
+
+    faces_raw = meta.get("faces", [])
+    if not isinstance(faces_raw, list):
+        raise ProtocolViolation(f"meta.faces is not a list: {faces_raw!r}")
+    # Validate EVERY entry (even ones a count clamp below will drop) --
+    # geometry claims are shape claims, same severity as PixelBuffer dims
+    # (design doc sec 2.4 item 4/6); clamping a lie away rather than
+    # rejecting it would silently let a hostile worker hide bad data past
+    # the visible cutoff.
+    faces: list[FaceRegion] = []
+    for f in faces_raw:
+        if not isinstance(f, dict):
+            raise ProtocolViolation(f"meta.faces entry is not an object: {f!r}")
+        name = f.get("name")
+        if not isinstance(name, str):
+            raise ProtocolViolation(f"face.name is not a string: {name!r}")
+        coords: dict[str, float] = {}
+        for key in ("x", "y", "w", "h"):
+            v = f.get(key)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ProtocolViolation(f"face.{key} is not a real number: {v!r}")
+            if not math.isfinite(v) or not (0.0 <= v <= 1.0):
+                raise ProtocolViolation(f"face.{key} not finite/in [0,1]: {v!r}")
+            coords[key] = float(v)
+        faces.append(FaceRegion(name=name, x=coords["x"], y=coords["y"],
+                                 w=coords["w"], h=coords["h"]))
+    faces_clamped = tuple(faces[:max_faces])
+
+    return MetaFields(caption=caption, keywords=keywords, taken=taken,
+                       gps=gps, rating=rating, faces=faces_clamped)
 
 
 # ---------------------------------------------------------------------------
@@ -1489,6 +1585,21 @@ class WinSandboxWorker:
         buf.validate(arena_bytes=self.arena_bytes)
         PixelBuffer.validate_disjoint([buf])
         return source, buf
+
+    def validate_meta(self, meta: object) -> MetaFields:
+        """fauxcasa-i92.3.3: broker-side entry point for the checklist item
+        5 metadata clamps (design doc sec 2.4), landed ahead of the index/
+        poster ops that will actually carry MetaFields in a response.
+        Mirrors _validate_response's counting seam exactly -- a
+        ProtocolViolation from parse_meta_fields increments
+        self.protocol_violations before propagating (the i92.3.2 counter
+        contract), so this keeps working the day a real index() job calls
+        it; the caller still owns the kill, same as _validate_response."""
+        try:
+            return parse_meta_fields(meta)
+        except ProtocolViolation:
+            self.protocol_violations += 1
+            raise
 
     # -- jobs ------------------------------------------------------------
 
