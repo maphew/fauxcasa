@@ -43,6 +43,7 @@ import ctypes
 import json
 import struct
 import sys
+import time
 from ctypes import wintypes
 
 PROTO = 1  # decodesvc.PROTO, mirrored here to avoid importing decodesvc.py
@@ -614,6 +615,19 @@ def _probe_handed_fd_read(req):
         return False, repr(e)
 
 
+def _probe_stall(req):
+    """Test-only: accept the job but never respond within the caller's
+    lifetime (capped at 300s so a runaway test/broker bug can't hang this
+    process forever even if the broker-side deadline kill never fires).
+    A live, entirely non-hostile worker that just sits there is exactly
+    what exercises the broker's per-job deadline path end to end
+    (fauxcasa-i92.3.1, design doc sec 1) -- distinct from the hostile-
+    attempt probes above, which are denied/allowed, not timed."""
+    seconds = min(float(req.get("seconds", 30)), 300)
+    time.sleep(seconds)
+    return True, f"stalled {seconds}s"
+
+
 def _probe_arena_write(req, arena_addr: int):
     if arena_addr is None:
         return False, "arena not mapped"
@@ -648,6 +662,7 @@ _PROBES = {
     "udp_to_broker": _probe_udp_to_broker,
     "bind_accept_wait": _probe_bind_accept_wait,
     "memory_limit_exceeded": _probe_memory_limit_exceeded,
+    "stall": _probe_stall,
     # arena_write handled specially (needs arena_addr) -- see _handle_probe
 }
 
