@@ -490,7 +490,16 @@ def parse_meta_fields(meta: object, *,
             raise ProtocolViolation(f"meta.faces entry is not an object: {f!r}")
         # FIX 1: routes through the same surrogate-safe check as caption/
         # taken/keywords, clamped to MAX_META_ITEM_BYTES.
-        name = _checked_str(f.get("name"), "face.name", max_bytes=MAX_META_ITEM_BYTES)
+        # An unnamed face region (name omitted or explicit JSON null) is
+        # the honest common case -- detected-but-unidentified faces in
+        # Picasa's own model and MWG/exiv2 region records carry geometry
+        # with no name, and design sec 2.4 item 5 imposes no name
+        # requirement. FIX 4's null->omitted normalization above only
+        # covers the six top-level keys, so mirror it here: None -> ""
+        # exactly, keeping any non-None non-str (0, [], ...) a type lie.
+        name_raw = f.get("name")
+        name = ("" if name_raw is None else
+                _checked_str(name_raw, "face.name", max_bytes=MAX_META_ITEM_BYTES))
         coords: dict[str, float] = {}
         for key in ("x", "y", "w", "h"):
             v = f.get(key)

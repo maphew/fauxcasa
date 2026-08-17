@@ -1915,5 +1915,24 @@ def test_meta_null_field_normalizes_to_default(field, default):
     assert v.protocol_violations == 0
 
 
+# An unnamed face region (name omitted or explicit null) is the honest
+# common case -- detected-but-unidentified faces carry geometry with no
+# name (Picasa's own model, MWG/exiv2 region records), and design sec 2.4
+# item 5 imposes no name requirement. FIX 4's top-level null->omitted
+# normalization does not reach inside a face dict, so the face loop
+# normalizes None -> "" itself; any other non-str name stays a type lie
+# (the name-not-str case in test_meta_faces_bad_entry_is_violation).
+
+@pytest.mark.parametrize("face", [
+    {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1},
+    {"name": None, "x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1},
+], ids=["name-omitted", "name-null"])
+def test_meta_unnamed_face_is_honest(face):
+    v = _fresh_validator()
+    meta = v.validate_meta({"faces": [face]})
+    assert meta.faces == (FaceRegion(name="", x=0.1, y=0.1, w=0.1, h=0.1),)
+    assert v.protocol_violations == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__] + (sys.argv[1:] or ["-v"])))
