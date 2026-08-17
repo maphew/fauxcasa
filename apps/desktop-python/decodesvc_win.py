@@ -1379,14 +1379,33 @@ class WinSandboxWorker:
     def _validate_response_checks(self, resp: dict, expect_id: int | None = None) -> tuple[dict, PixelBuffer]:
         if not isinstance(resp, dict):
             raise ProtocolViolation(f"response is not a JSON object: {type(resp).__name__}")
-        if expect_id is not None and resp.get("id") != expect_id:
-            raise ProtocolViolation(f"response id {resp.get('id')!r} != request id {expect_id}")
+        if expect_id is not None:
+            # Codex review PR110 round 5 deferral (fauxcasa-i92.3.2): plain
+            # `!=` accepts JSON true for 1 and 1.0 for an int expect_id
+            # (Python numeric-tower equality) -- require an exact int type
+            # first. `type(rid) is not int` deliberately rejects bool too
+            # (bool is an int subclass) since a JSON `true`/`false` id is
+            # not a legitimate response id.
+            rid = resp.get("id")
+            if type(rid) is not int or rid != expect_id:
+                raise ProtocolViolation(f"response id {rid!r} != request id {expect_id}")
         if "sha256" in resp:
             sha = resp["sha256"]
             if not (isinstance(sha, str) and len(sha) == 64
                     and all(c in "0123456789abcdef" for c in sha)):
                 raise ProtocolViolation(f"sha256 not 64 lowercase hex chars: {sha!r}")
-        if resp.get("ok") is not True:
+        # Codex review PR110 round 5 deferral (fauxcasa-i92.3.2): `is not
+        # True` alone lets ANY non-True value ("yes", 1, null, ...) fall
+        # through into the honest-error branch below, where e.g.
+        # {"ok": "yes", "error": "CORRUPT"} would raise a plain
+        # DecodeServiceError with no counter increment/kill -- a worker
+        # returning a non-boolean "ok" is protocol-malformed, not an
+        # honest error. Require a real JSON boolean before deferring to
+        # the honest-error branch.
+        ok = resp.get("ok")
+        if type(ok) is not bool:
+            raise ProtocolViolation(f"'ok' field is not a JSON boolean: {ok!r}")
+        if ok is not True:
             code_name = resp.get("error")
             try:
                 code = ErrorCode(code_name)

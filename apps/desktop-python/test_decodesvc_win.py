@@ -923,6 +923,21 @@ def test_fuzz_id_mismatch():
     assert v.protocol_violations == 1
 
 
+@pytest.mark.parametrize("bad_id", [True, 1.0])
+def test_fuzz_non_int_id_matching_value_is_violation(bad_id):
+    """Codex review PR110 round 5 deferral (fauxcasa-i92.3.2): plain `!=`
+    treats JSON true and 1.0 as equal to the int request id 1 (Python's
+    numeric-tower equality), so a worker could echo a non-int id and slip
+    past the id check unnoticed. `type(rid) is not int` rejects both --
+    bool (an int subclass) and float -- even when numerically equal."""
+    resp = _decode_resp()
+    resp["id"] = bad_id
+    v = _fresh_validator()
+    with pytest.raises(ProtocolViolation, match="!= request id"):
+        v._validate_response(resp, expect_id=1)
+    assert v.protocol_violations == 1
+
+
 @pytest.mark.parametrize("code", ["PROTOCOL", "TIMEOUT", "WORKER_CRASHED", "CANCELLED"])
 def test_fuzz_broker_only_error_code_is_violation(code):
     """Codex review PR110 round 4 (P2): TIMEOUT/WORKER_CRASHED/PROTOCOL/
@@ -947,6 +962,22 @@ def test_fuzz_honest_worker_error_code_not_violation():
         v._validate_response(resp, expect_id=1)
     assert not isinstance(ei.value, ProtocolViolation)
     assert v.protocol_violations == 0
+
+
+@pytest.mark.parametrize("bad_ok", ["yes", 1, 0, None, []])
+def test_fuzz_non_bool_ok_is_violation(bad_ok):
+    """Codex review PR110 round 5 deferral (fauxcasa-i92.3.2): 'ok' must be
+    a real JSON boolean -- a non-bool value (e.g. "yes", 1, 0, null, [])
+    previously fell through `is not True` into the honest-error branch,
+    so e.g. {"ok": "yes", "error": "CORRUPT"} would raise a plain
+    DecodeServiceError with no counter increment/kill. Require a real
+    bool before deferring to that branch."""
+    resp = _decode_resp()
+    resp["ok"] = bad_ok
+    v = _fresh_validator()
+    with pytest.raises(ProtocolViolation, match="not a JSON boolean"):
+        v._validate_response(resp, expect_id=1)
+    assert v.protocol_violations == 1
 
 
 @pytest.mark.parametrize("components", [["bad"], ["ab"], "ab", 7])
