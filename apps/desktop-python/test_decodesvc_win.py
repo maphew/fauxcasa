@@ -756,7 +756,11 @@ def test_framed_non_hello_first_message_raises_promptly():
     # int literal) or RecursionError (deep nesting) must be normalized to
     # ProtocolViolation, same tuple as _read_frame
     ("b'1' * 5000", "not valid JSON"),
-    ("b'[' * 3000 + b']' * 3000", "not valid JSON"),
+    # Whether deep nesting trips RecursionError is platform/version
+    # dependent (GHA ubuntu's CPython parses 3000 deep fine and lands in
+    # the not-a-dict branch; Windows raises). Either way the contract
+    # holds: prompt ProtocolViolation, never a hang or a leaked exception.
+    ("b'[' * 3000 + b']' * 3000", "not valid JSON|not a JSON object"),
 ])
 def test_framed_malformed_first_message_raises_promptly(payload_expr, match):
     """Codex review PR110 (P2), completing FIX 4: a first message whose
@@ -906,6 +910,45 @@ def test_fuzz_id_mismatch():
     with pytest.raises(ProtocolViolation):
         v._validate_response(_decode_resp(), expect_id=999)
     assert v.protocol_violations == 1
+
+
+@pytest.mark.parametrize("code", ["PROTOCOL", "TIMEOUT", "WORKER_CRASHED", "CANCELLED"])
+def test_fuzz_broker_only_error_code_is_violation(code):
+    """Codex review PR110 round 4 (P2): TIMEOUT/WORKER_CRASHED/PROTOCOL/
+    CANCELLED are broker-side judgments; a worker claiming one in its own
+    response is lying about broker state and must get the kill/no-retry
+    PROTOCOL treatment (counter + ProtocolViolation), not a plain
+    DecodeServiceError that leaves the suspect worker alive."""
+    v = _fresh_validator()
+    resp = {"id": 1, "ok": False, "error": code, "detail": "sure, boss"}
+    with pytest.raises(ProtocolViolation, match="broker-only error code"):
+        v._validate_response(resp, expect_id=1)
+    assert v.protocol_violations == 1
+
+
+def test_fuzz_honest_worker_error_code_not_violation():
+    """The flip side: UNSUPPORTED/CORRUPT/TOO_LARGE are the codes an honest
+    worker reports about its own work; they surface as DecodeServiceError
+    with the violation counter untouched."""
+    v = _fresh_validator()
+    resp = {"id": 1, "ok": False, "error": "CORRUPT", "detail": "bad stream"}
+    with pytest.raises(DecodeServiceError) as ei:
+        v._validate_response(resp, expect_id=1)
+    assert not isinstance(ei.value, ProtocolViolation)
+    assert v.protocol_violations == 0
+
+
+@pytest.mark.parametrize("components", [["bad"], ["ab"], "ab", 7])
+def test_hello_malformed_components_is_violation(components):
+    """Codex review PR110 round 4: a valid-JSON hello whose bundle
+    components is not an object must raise ProtocolViolation -- dict()
+    coercion of e.g. ['bad'] raises bare ValueError (previously leaked),
+    and ['ab'] would silently fabricate {'a': 'b'}."""
+    msg = {"hello": 1, "proto": PROTO, "arena_bytes": SMALL_ARENA_BYTES,
+           "bundle": {"id": "x", "version": "y", "components": components},
+           "ops": ["decode"], "max_pixels": 1}
+    with pytest.raises(ProtocolViolation, match="components"):
+        dw.parse_hello(msg, expected_arena_bytes=SMALL_ARENA_BYTES)
 
 
 def test_fuzz_bad_stride():

@@ -78,6 +78,14 @@ PROFILE_NAME = "fauxcasa.decode.worker"
 ARENA_DEFAULT_BYTES = ARENA_BYTES
 DEFAULT_MEM_LIMIT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB, design doc sec 4
 
+# The only error codes an honest worker ever reports about ITS OWN work
+# (decodesvc_worker_win.py emits exactly these). The rest -- TIMEOUT,
+# WORKER_CRASHED, PROTOCOL, CANCELLED -- are broker-side judgments about
+# the worker; a worker claiming one in a response is lying about the
+# broker's own state and gets the kill/no-retry PROTOCOL treatment.
+WORKER_ERROR_CODES = frozenset(
+    {ErrorCode.UNSUPPORTED, ErrorCode.CORRUPT, ErrorCode.TOO_LARGE})
+
 # A fixed, independently-recomputable byte pattern used by the
 # `arena_write` probe attempt (decodesvc_worker_win.py recomputes the
 # identical formula rather than importing this module, to keep the
@@ -287,11 +295,18 @@ def parse_hello(msg: dict, expected_arena_bytes: int) -> Hello:
     bundle = msg.get("bundle")
     if not isinstance(bundle, dict):
         raise ProtocolViolation(f"missing/invalid bundle in hello: {bundle!r}")
+    components = bundle.get("components", {})
+    if not isinstance(components, dict):
+        # dict() coercion of a hostile non-dict either raises bare
+        # ValueError (e.g. ["bad"]) or silently fabricates a mapping
+        # (e.g. ["ab"] -> {"a": "b"}); require a JSON object outright.
+        raise ProtocolViolation(
+            f"malformed bundle components in hello: {components!r}")
     try:
         bundle_info = BundleInfo(
             id=bundle["id"], version=bundle["version"],
-            components=dict(bundle.get("components", {})))
-    except (KeyError, TypeError) as e:
+            components=dict(components))
+    except (KeyError, TypeError, ValueError) as e:
         raise ProtocolViolation(f"malformed bundle in hello: {e}") from e
     ops = msg.get("ops")
     if not isinstance(ops, list) or not all(isinstance(o, str) for o in ops):
@@ -1194,10 +1209,10 @@ class WinSandboxWorker:
             child = _spawn_appcontainer(worker_python, worker_script, sid,
                                          worker_pythonpath, extra_env, self.mem_limit_bytes)
         except OSError:
-            kernel32.UnmapViewOfFile(ctypes.c_void_p(self._arena_addr))
-            kernel32.CloseHandle(arena_handle)
-            self._arena_addr = None
-            self._arena_handle = None
+            # close() is idempotent and _child is still None: this unmaps/
+            # closes the arena AND frees the per-spawn SID (which the old
+            # manual teardown leaked on every failed spawn attempt).
+            self.close()
             raise
         self._child = child
 
@@ -1374,6 +1389,9 @@ class WinSandboxWorker:
                 code = ErrorCode(code_name)
             except (ValueError, TypeError) as e:
                 raise ProtocolViolation(f"unknown/missing error code: {code_name!r}") from e
+            if code not in WORKER_ERROR_CODES:
+                raise ProtocolViolation(
+                    f"broker-only error code in worker response: {code_name!r}")
             raise DecodeServiceError(code, str(resp.get("detail", "")))
         source = resp.get("source")
         if not isinstance(source, dict):
