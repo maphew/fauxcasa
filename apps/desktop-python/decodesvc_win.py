@@ -382,6 +382,32 @@ def _checked_str(value: object, field: str, *, max_bytes: int | None = None) -> 
     return value
 
 
+def _checked_finite(value: object, field: str) -> float:
+    """Codex review (feat/i92.3-pool-hardening): OverflowError companion to
+    _checked_str's surrogate fix above, for the two numeric-shaped meta
+    fields (gps coordinates, face x/y/w/h). A JSON-valid huge integer
+    literal (e.g. 10**400) passes the isinstance(v, (int, float)) check,
+    then float(value) -- or math.isfinite(value) directly -- raises
+    OverflowError ("int too large to convert to float"), which used to
+    escape parse_meta_fields uncaught: an unexpected exception, not a
+    ProtocolViolation, defeating the counter/kill contract exactly like
+    the surrogate-string bug this module's FIX 1 closed. Same clamp-vs-
+    reject split as _checked_str: not a real number (a bool included) is a
+    TYPE claim (reject); a magnitude too large to represent as a float, or
+    a non-finite result, is a FINITENESS claim (reject -- there is no sane
+    clamp for an unbounded integer literal). Callers apply any additional
+    field-specific range check to the returned float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProtocolViolation(f"{field} is not a real number: {value!r}")
+    try:
+        result = float(value)
+    except OverflowError as e:
+        raise ProtocolViolation(f"{field} magnitude too large: {e}") from e
+    if not math.isfinite(result):
+        raise ProtocolViolation(f"{field} is not finite: {value!r}")
+    return result
+
+
 def parse_meta_fields(meta: object, *,
                        max_caption_bytes: int = MAX_CAPTION_BYTES,
                        max_keywords: int = MAX_KEYWORDS,
@@ -436,12 +462,14 @@ def parse_meta_fields(meta: object, *,
     if gps_raw is not None:
         if not isinstance(gps_raw, (list, tuple)) or len(gps_raw) != 2:
             raise ProtocolViolation(f"meta.gps is not a 2-element list/tuple: {gps_raw!r}")
-        lat, lon = gps_raw
-        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (lat, lon)):
-            raise ProtocolViolation(f"meta.gps element is not a real number: {gps_raw!r}")
-        if not (math.isfinite(lat) and math.isfinite(lon)):
-            raise ProtocolViolation(f"meta.gps element is not finite: {gps_raw!r}")
-        gps = (float(lat), float(lon))
+        lat_raw, lon_raw = gps_raw
+        # Codex review (feat/i92.3-pool-hardening): routes through
+        # _checked_finite so a huge integer literal (10**400) is a
+        # ProtocolViolation, not an uncaught OverflowError -- see that
+        # helper's docstring.
+        lat = _checked_finite(lat_raw, "meta.gps element")
+        lon = _checked_finite(lon_raw, "meta.gps element")
+        gps = (lat, lon)
 
     rating_raw = meta.get("rating", 0)
     if not isinstance(rating_raw, int) or isinstance(rating_raw, bool):
@@ -466,11 +494,15 @@ def parse_meta_fields(meta: object, *,
         coords: dict[str, float] = {}
         for key in ("x", "y", "w", "h"):
             v = f.get(key)
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
-                raise ProtocolViolation(f"face.{key} is not a real number: {v!r}")
-            if not math.isfinite(v) or not (0.0 <= v <= 1.0):
-                raise ProtocolViolation(f"face.{key} not finite/in [0,1]: {v!r}")
-            coords[key] = float(v)
+            # Codex review (feat/i92.3-pool-hardening): routes through
+            # _checked_finite so a huge integer literal (10**400) is a
+            # ProtocolViolation, not an uncaught OverflowError -- see that
+            # helper's docstring. The [0,1] range check applies to the
+            # already-finite float it returns.
+            fv = _checked_finite(v, f"face.{key}")
+            if not (0.0 <= fv <= 1.0):
+                raise ProtocolViolation(f"face.{key} out of range [0,1]: {v!r}")
+            coords[key] = fv
         faces.append(FaceRegion(name=name, x=coords["x"], y=coords["y"],
                                  w=coords["w"], h=coords["h"]))
     faces_clamped = tuple(faces[:max_faces])
@@ -1727,9 +1759,36 @@ class WinSandboxWorker:
             str(path), GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, None)
         if not h or h == INVALID_HANDLE_VALUE.value:
+            # A CreateFileW failure here is a caller/file problem (bad
+            # path, permissions, ...) -- it has nothing to do with the
+            # worker's health and must stay an ordinary OSError, never
+            # reclassified below (Codex review (feat/i92.3-pool-hardening),
+            # explicit caveat).
             raise OSError(f"CreateFileW({path}) failed err={ctypes.get_last_error()}")
         try:
-            return _duplicate_into_child(h, self._child.pi.hProcess)
+            try:
+                return _duplicate_into_child(h, self._child.pi.hProcess)
+            except OSError as e:
+                # Codex review (feat/i92.3-pool-hardening): DuplicateHandle
+                # targets the WORKER's process handle, not this file --
+                # a raw OSError here (not DecodeServiceError(WORKER_CRASHED))
+                # means the target process handle is dead, i.e. the worker's
+                # process died while idle (OOM-killed by the job object,
+                # crashed between jobs) and this is the first thing to touch
+                # it since. Before this fix that OSError escaped uncaught,
+                # outside the closed WORKER_CRASHED/TIMEOUT/PROTOCOL/
+                # CANCELLED taxonomy (module docstring), so the pool's
+                # retry-on-crash branch never triggered and the dead worker
+                # stayed cached. Only reclassify when the worker is
+                # confirmed not alive; any other DuplicateHandle failure
+                # (a genuinely unexpected OS error with a live worker)
+                # re-raises unchanged rather than being misdiagnosed as a
+                # worker crash it isn't.
+                if self.is_alive() is False:
+                    raise DecodeServiceError(
+                        ErrorCode.WORKER_CRASHED,
+                        f"worker died before job dispatch: {e}") from e
+                raise
         finally:
             kernel32.CloseHandle(h)
 
@@ -1895,7 +1954,21 @@ class WinDecodePool:
     protocol_violations counter resets to 0 every time a fresh worker is
     spawned, which is the wrong home for a session-wide tally (the full
     counter-assertion contract is fauxcasa-i92.3.2; this pool is where
-    that contract's counters actually need to live to survive a respawn)."""
+    that contract's counters actually need to live to survive a respawn).
+
+    Codex review (feat/i92.3-pool-hardening): this is a single-slot pool
+    -- one live worker, one control pipe -- so it is NOT safe for two
+    threads to call decode() concurrently without help: they would either
+    share one worker's pipe mid-job (one caller's response is consumed by
+    the other, producing a spurious id-mismatch ProtocolViolation that
+    kills a perfectly healthy worker) or both observe self._worker as
+    None and double-spawn, leaking a worker. `_job_lock` fixes this the
+    minimal way available to a single-slot pool: whole-job serialization,
+    the entire decode() retry loop as one critical section. Concurrency
+    LANES (e.g. an interactive job preempting a queued batch job) are
+    explicitly NOT this class's job -- that belongs to the future
+    multi-worker DecodeService this class is a stepping stone toward
+    (module docstring, design doc sec 2/4)."""
 
     def __init__(self, arena_bytes: int = ARENA_DEFAULT_BYTES, probe: bool = False,
                  profile_name: str = PROFILE_NAME,
@@ -1905,12 +1978,32 @@ class WinDecodePool:
         self.profile_name = profile_name
         self.mem_limit_bytes = mem_limit_bytes
         self._worker: WinSandboxWorker | None = None
+        # Codex review (feat/i92.3-pool-hardening): guards the ENTIRE
+        # decode() retry loop (and close(), which must not race a live
+        # job's respawn) -- see the class docstring's "not safe for
+        # concurrent decode()" paragraph.
+        self._job_lock = threading.Lock()
         # Per-SESSION counters (design doc sec 1/2.5) -- survive respawns.
         self.protocol_violations = 0
         self.timeouts = 0
         self.crashes = 0
 
     def _ensure_worker(self) -> WinSandboxWorker:
+        if (self._worker is not None and self._worker._child is not None
+                and not self._worker.is_alive()):
+            # Codex review (feat/i92.3-pool-hardening): the cached worker
+            # was spawned (it has a child process) but is no longer alive
+            # -- it died while idle, between jobs (OOM-killed by the job
+            # object, crashed on its own). Gated on `_child is not None` so
+            # a constructed-but-never-spawned worker (is_alive() is also
+            # False for that, but for an entirely different reason) is
+            # never mistaken for a dead one. Deliberately NOT counted in
+            # self.crashes: that counter counts failed JOBS per the
+            # taxonomy in this class's docstring, and this worker never
+            # failed a job -- it was found dead and silently replaced
+            # before ever being handed one, which costs the caller nothing.
+            self._worker.close()
+            self._worker = None
         if self._worker is None:
             worker = WinSandboxWorker(
                 arena_bytes=self.arena_bytes, probe=self.probe,
@@ -1920,63 +2013,71 @@ class WinDecodePool:
         return self._worker
 
     def decode(self, path: Path, edge: int = 0, deadline_ms: int = 20_000) -> DecodeResult:
-        for attempt in range(2):
-            worker = None
-            try:
-                # FIX 3 (P2, reviewer fix pass (fauxcasa-i92.3.x)): spawn
-                # now happens INSIDE the try. Previously `_ensure_worker()`
-                # sat outside it, so a DecodeServiceError raised from
-                # spawn() itself (e.g. the worker died in loader init,
-                # WORKER_CRASHED) propagated with no counter increment and
-                # no retry -- bypassing the exact taxonomy this method
-                # exists to enforce. Routing spawn failures through the
-                # same except clauses as decode failures gives them the
-                # same counting/retry/kill treatment.
-                worker = self._ensure_worker()
-                return worker.decode(path, edge=edge, deadline_ms=deadline_ms)
-            except ProtocolViolation:
-                # Evidence of compromise (design doc sec 1/2.5): NO retry.
-                # worker.decode() already killed the worker (and a
-                # ProtocolViolation from spawn() -- e.g. a hello violation
-                # -- already closed itself internally, leaving `worker`
-                # None here); FIX 5 closes it again defensively (close() is
-                # idempotent) rather than relying invisibly on the callee's
-                # own kill path, then drop our reference so the next call
-                # spawns fresh rather than reusing a dead one.
-                self.protocol_violations += 1
-                if worker is not None:
-                    worker.close()
-                self._worker = None
-                raise
-            except DecodeServiceError as e:
-                if e.code not in (ErrorCode.TIMEOUT, ErrorCode.WORKER_CRASHED):
-                    # Honest CORRUPT/UNSUPPORTED/TOO_LARGE: permanent for
-                    # this file; the worker behaved correctly and stays
-                    # alive and reusable.
+        # Codex review (feat/i92.3-pool-hardening): whole-job
+        # serialization -- see the class docstring. Every branch below
+        # (return, retry, raise) stays inside this lock for the entire
+        # method body.
+        with self._job_lock:
+            for attempt in range(2):
+                worker = None
+                try:
+                    # FIX 3 (P2, reviewer fix pass (fauxcasa-i92.3.x)): spawn
+                    # now happens INSIDE the try. Previously `_ensure_worker()`
+                    # sat outside it, so a DecodeServiceError raised from
+                    # spawn() itself (e.g. the worker died in loader init,
+                    # WORKER_CRASHED) propagated with no counter increment and
+                    # no retry -- bypassing the exact taxonomy this method
+                    # exists to enforce. Routing spawn failures through the
+                    # same except clauses as decode failures gives them the
+                    # same counting/retry/kill treatment.
+                    worker = self._ensure_worker()
+                    return worker.decode(path, edge=edge, deadline_ms=deadline_ms)
+                except ProtocolViolation:
+                    # Evidence of compromise (design doc sec 1/2.5): NO retry.
+                    # worker.decode() already killed the worker (and a
+                    # ProtocolViolation from spawn() -- e.g. a hello violation
+                    # -- already closed itself internally, leaving `worker`
+                    # None here); FIX 5 closes it again defensively (close() is
+                    # idempotent) rather than relying invisibly on the callee's
+                    # own kill path, then drop our reference so the next call
+                    # spawns fresh rather than reusing a dead one.
+                    self.protocol_violations += 1
+                    if worker is not None:
+                        worker.close()
+                    self._worker = None
                     raise
-                if e.code is ErrorCode.TIMEOUT:
-                    self.timeouts += 1
-                else:
-                    self.crashes += 1
-                # `worker` is None here when THIS DecodeServiceError came
-                # from _ensure_worker()/spawn() rather than worker.decode()
-                # -- spawn() already tore itself down on failure, so there
-                # is nothing left to close.
-                if worker is not None:
-                    worker.close()
-                self._worker = None
-                if attempt == 1:
-                    # Second TIMEOUT/WORKER_CRASHED in a row: permanent.
-                    raise
-                # else: loop around -- _ensure_worker() spawns a fresh
-                # worker for the one allowed retry (design doc sec 1/2.5).
-        raise AssertionError("unreachable: the loop above always returns or raises")
+                except DecodeServiceError as e:
+                    if e.code not in (ErrorCode.TIMEOUT, ErrorCode.WORKER_CRASHED):
+                        # Honest CORRUPT/UNSUPPORTED/TOO_LARGE: permanent for
+                        # this file; the worker behaved correctly and stays
+                        # alive and reusable.
+                        raise
+                    if e.code is ErrorCode.TIMEOUT:
+                        self.timeouts += 1
+                    else:
+                        self.crashes += 1
+                    # `worker` is None here when THIS DecodeServiceError came
+                    # from _ensure_worker()/spawn() rather than worker.decode()
+                    # -- spawn() already tore itself down on failure, so there
+                    # is nothing left to close.
+                    if worker is not None:
+                        worker.close()
+                    self._worker = None
+                    if attempt == 1:
+                        # Second TIMEOUT/WORKER_CRASHED in a row: permanent.
+                        raise
+                    # else: loop around -- _ensure_worker() spawns a fresh
+                    # worker for the one allowed retry (design doc sec 1/2.5).
+            raise AssertionError("unreachable: the loop above always returns or raises")
 
     def close(self) -> None:
-        """Safe to call twice."""
-        if self._worker is not None:
-            self._worker.close()
-            self._worker = None
+        """Safe to call twice. Codex review (feat/i92.3-pool-hardening):
+        takes _job_lock too -- an idempotent close() of the current worker
+        must not race a live job's respawn (see the class docstring)."""
+        with self._job_lock:
+            if self._worker is not None:
+                self._worker.close()
+                self._worker = None
 
 
 def spawn_worker(arena_bytes: int = ARENA_DEFAULT_BYTES, probe: bool = False,

@@ -1025,6 +1025,48 @@ def test_probe_stall_deadline_kills_worker():
         worker.close()
 
 
+@_WINDOWS_ONLY
+def test_open_and_duplicate_file_dead_worker_is_worker_crashed(tmp_path, monkeypatch):
+    """CODEX FIX 3(a) (P2, Codex review (feat/i92.3-pool-hardening)): if
+    the worker's process died while idle (OOM-killed by the job object,
+    crashed between jobs), _duplicate_into_child raises a raw OSError
+    (ctypes.WinError) because the target child process handle is dead --
+    NOT DecodeServiceError(WORKER_CRASHED). Before this fix that OSError
+    escaped _open_and_duplicate_file uncaught, so the pool's TIMEOUT/
+    WORKER_CRASHED retry branch never triggered and the dead worker
+    stayed cached. This constructs a worker with a fake dead child (no
+    real spawn needed) and monkeypatches the module-level
+    _duplicate_into_child to simulate the DuplicateHandle failure."""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+
+    class _FakePi:
+        hProcess = 0  # never dereferenced -- _duplicate_into_child is stubbed below
+
+    class _FakeDeadChild:
+        pi = _FakePi()
+
+        def is_alive(self) -> bool:
+            return False
+
+    worker._child = _FakeDeadChild()
+
+    # A real, existing file so the CreateFileW open itself succeeds --
+    # that failure path is a different, deliberately-untouched concern
+    # (see the comment in _open_and_duplicate_file: it must stay an
+    # ordinary OSError, never misclassified as a worker crash).
+    f = tmp_path / "probe.bin"
+    f.write_bytes(b"x")
+
+    def _raise_dead_handle(source_handle, child_process_handle):
+        raise OSError("DuplicateHandle failed: target process handle is dead")
+
+    monkeypatch.setattr(dw, "_duplicate_into_child", _raise_dead_handle)
+
+    with pytest.raises(DecodeServiceError) as exc_info:
+        worker._open_and_duplicate_file(f)
+    assert exc_info.value.code == ErrorCode.WORKER_CRASHED
+
+
 class _FakePoolWorker:
     """A fake WinSandboxWorker for WinDecodePool unit tests: `decode()`
     pops one scripted result (a value to return, or an exception
@@ -1196,6 +1238,151 @@ def test_pool_honest_error_leaves_worker_alive_and_reused():
     assert result == "decoded-ok-second-call"
     assert w1.decode_calls == 2
     assert pool._worker is w1
+
+
+class _SlowFakePoolWorker:
+    """Codex review (feat/i92.3-pool-hardening) fixture: a fake
+    WinSandboxWorker whose decode() sleeps briefly and records its own
+    (start, end) wall-clock window, so a concurrency test can assert two
+    calls never overlapped -- monkeypatch level, no real Windows worker,
+    same style as _FakePoolWorker above."""
+
+    def __init__(self, calls: list, sleep_s: float = 0.1):
+        self._calls = calls
+        self._sleep_s = sleep_s
+        self.closed = False
+
+    def decode(self, path, edge=0, deadline_ms=20_000):
+        start = time.perf_counter()
+        time.sleep(self._sleep_s)
+        end = time.perf_counter()
+        self._calls.append((start, end))
+        return f"decoded-{path}"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_pool_decode_serializes_concurrent_callers():
+    """CODEX FIX 2 (P1, Codex review (feat/i92.3-pool-hardening)): two
+    threads calling pool.decode() concurrently must not share one
+    worker's single control pipe mid-job (one caller's response consumed
+    by the other -> spurious id-mismatch ProtocolViolation kills a
+    healthy worker) or double-spawn/leak a worker when both observe
+    self._worker as None. The fix is whole-job serialization
+    (`_job_lock` around decode()'s entire retry loop) -- this test proves
+    that at the monkeypatch level: two concurrent decode() calls against
+    one shared fake worker must never overlap in wall-clock time, both
+    must succeed, and only one worker may ever be spawned."""
+    pool = dw.WinDecodePool()
+    calls: list = []
+    spawn_count = [0]
+
+    def _ensure_worker():
+        if pool._worker is None:
+            spawn_count[0] += 1
+            pool._worker = _SlowFakePoolWorker(calls, sleep_s=0.1)
+        return pool._worker
+
+    pool._ensure_worker = _ensure_worker
+
+    results: list = [None, None]
+    errors: list = [None, None]
+
+    def _call(i: int, path: str) -> None:
+        try:
+            results[i] = pool.decode(path)
+        except BaseException as e:  # pragma: no cover - surfaced via assert below
+            errors[i] = e
+
+    t1 = threading.Thread(target=_call, args=(0, "a.png"))
+    t2 = threading.Thread(target=_call, args=(1, "b.png"))
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert errors == [None, None], f"decode() raised unexpectedly: {errors}"
+    assert sorted(results) == ["decoded-a.png", "decoded-b.png"]
+    assert spawn_count[0] == 1, "only one worker should ever be spawned"
+    assert len(calls) == 2
+    calls.sort()
+    assert calls[0][1] <= calls[1][0], (
+        f"decode() calls overlapped: {calls} -- _job_lock should have "
+        f"serialized them")
+
+
+class _FakeDeadIdleWorker:
+    """Codex review (feat/i92.3-pool-hardening) fixture for CODEX FIX 3(b):
+    a fake worker that reports "spawned, but the process died while idle"
+    -- `_child is not None` (was spawned) and `is_alive()` False (dead).
+    Deliberately distinct from a worker that was merely constructed and
+    never spawned (which also has is_alive() False, but must NOT be
+    treated as dead by the same gate -- see _ensure_worker's comment)."""
+
+    def __init__(self):
+        self._child = object()
+        self.closed = False
+
+    def is_alive(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_pool_ensure_worker_replaces_dead_idle_worker(monkeypatch):
+    """CODEX FIX 3(b) (P2, Codex review (feat/i92.3-pool-hardening)): a
+    worker that died while idle (OOM-killed by the job object, crashed
+    between jobs) must not be handed back out by _ensure_worker for the
+    next job -- that would throw a job at a corpse. The next decode()
+    must get a FRESH worker, the dead one must be closed, and this must
+    NOT be counted in pool.crashes -- the crash counter counts failed
+    JOBS, and this worker never failed one."""
+    pool = dw.WinDecodePool()
+    dead = _FakeDeadIdleWorker()
+    pool._worker = dead
+
+    fresh = _FakePoolWorker(["decoded-ok"])
+
+    class _FakeWinSandboxWorker:
+        def __new__(cls, *args, **kwargs):
+            return fresh
+
+    monkeypatch.setattr(dw, "WinSandboxWorker", _FakeWinSandboxWorker)
+    fresh.spawn = lambda: None  # real _ensure_worker calls worker.spawn()
+
+    result = pool.decode("some.png")
+
+    assert result == "decoded-ok"
+    assert dead.closed is True
+    assert pool._worker is fresh
+    assert pool.crashes == 0, (
+        "a worker found dead between jobs and silently replaced costs "
+        "the caller nothing -- must not be counted as a crash")
+    assert pool.timeouts == 0
+    assert pool.protocol_violations == 0
+
+
+def test_pool_ensure_worker_does_not_treat_unspawned_worker_as_dead():
+    """CODEX FIX 3(b) caveat: a constructed-but-never-spawned worker (a
+    real WinSandboxWorker, `_child` still None) must not trip the
+    dead-idle-worker gate. `is_alive()` is False for BOTH "never spawned"
+    and "spawned then died"; the gate distinguishes them by additionally
+    requiring `_child is not None` (see _ensure_worker's comment) -- this
+    exercises the real _ensure_worker directly, not a stub, so the gate
+    condition itself is under test."""
+    pool = dw.WinDecodePool()
+    unspawned = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    assert unspawned._child is None
+    assert unspawned.is_alive() is False
+    pool._worker = unspawned
+
+    worker = pool._ensure_worker()
+
+    assert worker is unspawned, (
+        "the dead-idle gate must not close/replace a worker that was "
+        "simply never spawned")
 
 
 # ---------------------------------------------------------------------------
@@ -1563,7 +1750,14 @@ def test_meta_faces_unknown_keys_ignored():
     {"name": "a", "x": 0.1, "y": 0.1, "w": 0.1, "h": 1.001},
     {"name": 5, "x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1},
     "not-a-dict",
-], ids=["nan-x", "inf-w", "y-below-0", "h-above-1", "name-not-str", "face-not-dict"])
+    # Codex review (feat/i92.3-pool-hardening): a JSON-valid huge integer
+    # literal passes isinstance(v, (int, float)) but used to raise an
+    # uncaught OverflowError from math.isfinite/float() -- see
+    # _checked_finite's docstring.
+    {"name": "a", "x": 10 ** 400, "y": 0.1, "w": 0.1, "h": 0.1},
+    {"name": "a", "x": 0.1, "y": 0.1, "w": -(10 ** 400), "h": 0.1},
+], ids=["nan-x", "inf-w", "y-below-0", "h-above-1", "name-not-str",
+        "face-not-dict", "x-huge-int-overflow", "w-huge-negative-int-overflow"])
 def test_meta_faces_bad_entry_is_violation(bad_face):
     with pytest.raises(ProtocolViolation):
         dw.parse_meta_fields({"faces": [bad_face]})
@@ -1582,10 +1776,27 @@ def test_meta_gps_valid_pair_kept_as_floats():
 
 @pytest.mark.parametrize("bad_gps", [
     [1], ["a", "b"], [float("nan"), 0], True,
-], ids=["too-short", "non-numeric", "nan", "bool"])
+    # Codex review (feat/i92.3-pool-hardening): a JSON-valid huge integer
+    # literal passes isinstance(v, (int, float)) but used to raise an
+    # uncaught OverflowError from math.isfinite/float() -- see
+    # _checked_finite's docstring.
+    [10 ** 400, 0],
+], ids=["too-short", "non-numeric", "nan", "bool", "huge-int-overflow"])
 def test_meta_gps_bad_value_is_violation(bad_gps):
     with pytest.raises(ProtocolViolation):
         dw.parse_meta_fields({"gps": bad_gps})
+
+
+def test_meta_gps_huge_int_overflow_increments_counter():
+    """Codex review (feat/i92.3-pool-hardening): the huge-int-literal
+    OverflowError case must still route through validate_meta's counting
+    seam like any other ProtocolViolation (FIX 7's contract) -- confirms
+    _checked_finite doesn't escape as a bare OverflowError before the
+    ProtocolViolation is even raised."""
+    v = _fresh_validator()
+    with pytest.raises(ProtocolViolation):
+        v.validate_meta({"gps": [10 ** 400, 0]})
+    assert v.protocol_violations == 1
 
 
 def test_meta_gps_absent_is_none():
