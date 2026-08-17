@@ -175,30 +175,33 @@ def _handle_decode(req: dict, out_file, arena_addr: int, qt) -> dict:
         source_w = source_h = 0
         if src_size.isValid() and src_size.width() > 0 and src_size.height() > 0:
             source_w, source_h = src_size.width(), src_size.height()
-            # Reject oversized sources from the HEADER, BEFORE reader.read()
-            # allocates the full frame. At edge=0 (full resolution) a header
-            # declaring huge dimensions would otherwise trip Qt's allocation
-            # limit or the job memory cap first, misreporting an honestly-
-            # oversized file as CORRUPT / WORKER_CRASHED instead of the
-            # documented TOO_LARGE. (When edge>0 the scaled decode caps the
-            # allocation, so only the full-res path needs this pre-check.)
-            if edge == 0 and (source_w > MAX_EDGE or source_h > MAX_EDGE
-                              or source_w * source_h > MAX_PIXELS):
+            # Compute the EFFECTIVE output dims for any edge value, then
+            # reject oversized outputs from the HEADER, BEFORE reader.read()
+            # allocates the frame. A header declaring huge dimensions would
+            # otherwise trip Qt's allocation limit or the job memory cap
+            # first, misreporting an honestly-oversized file as CORRUPT /
+            # WORKER_CRASHED instead of the documented TOO_LARGE. (Codex
+            # review PR110 round 5: this must cover edge>0 too -- an edge
+            # above the source long-edge scales nothing, and even a legal
+            # edge can yield an over-MAX_PIXELS output on a huge source.)
+            w0, h0 = source_w, source_h
+            out_w, out_h = w0, h0
+            # `edge` is a MAXIMUM long-edge, never an upscale target:
+            # a 2x2 source requested at edge=512 stays 2x2, matching the
+            # thumbnail contract (never enlarge). Only scale down when
+            # the source's long edge actually exceeds edge.
+            if edge > 0 and max(w0, h0) > edge:
+                if w0 >= h0:
+                    out_w, out_h = edge, max(1, round(h0 * edge / w0))
+                else:
+                    out_h, out_w = edge, max(1, round(w0 * edge / h0))
+            if (out_w > MAX_EDGE or out_h > MAX_EDGE
+                    or out_w * out_h > MAX_PIXELS):
                 return {"id": rid, "ok": False, "error": "TOO_LARGE",
-                         "detail": f"source {source_w}x{source_h} exceeds caps "
+                         "detail": f"effective output {out_w}x{out_h} exceeds caps "
                                    f"(MAX_EDGE {MAX_EDGE}, MAX_PIXELS {MAX_PIXELS})"}
-            if edge > 0:
-                w0, h0 = source_w, source_h
-                # `edge` is a MAXIMUM long-edge, never an upscale target:
-                # a 2x2 source requested at edge=512 stays 2x2, matching the
-                # thumbnail contract (never enlarge). Only scale down when
-                # the source's long edge actually exceeds edge.
-                if max(w0, h0) > edge:
-                    if w0 >= h0:
-                        new_w, new_h = edge, max(1, round(h0 * edge / w0))
-                    else:
-                        new_h, new_w = edge, max(1, round(w0 * edge / h0))
-                    reader.setScaledSize(qt.QSize(new_w, new_h))
+            if (out_w, out_h) != (w0, h0):
+                reader.setScaledSize(qt.QSize(out_w, out_h))
 
         img = reader.read()
         if img.isNull():

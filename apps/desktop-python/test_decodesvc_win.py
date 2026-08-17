@@ -538,6 +538,17 @@ def test_decode_oversized_header_too_large_before_decode(tmp_path):
         with pytest.raises(DecodeServiceError) as exc_info:
             worker.decode(p)  # edge=0
         assert exc_info.value.code == ErrorCode.TOO_LARGE
+        # Codex review PR110 round 5: the pre-check must cover edge>0 too.
+        # An edge above the source long-edge scales nothing (never
+        # upscale), so the full 40k x 40k output must still be TOO_LARGE...
+        with pytest.raises(DecodeServiceError) as exc_info:
+            worker.decode(p, edge=50_000)
+        assert exc_info.value.code == ErrorCode.TOO_LARGE
+        # ...and even a legal edge yields a scaled 32768x32768 = 1 Gpx
+        # output on this source -- over MAX_PIXELS, also pre-checked.
+        with pytest.raises(DecodeServiceError) as exc_info:
+            worker.decode(p, edge=32_768)
+        assert exc_info.value.code == ErrorCode.TOO_LARGE
         # The worker must survive an oversized-header decode (native libpng
         # "Read Error" chatter must not desync the control protocol).
         assert worker._child.is_alive()

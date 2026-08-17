@@ -1177,41 +1177,44 @@ class WinSandboxWorker:
         sid = create_or_derive_profile(self.profile_name)
         self._sid = sid
 
-        grant_targets = []
-        for d in (base_dir, worker_pythonpath, worker_dir):
-            if d and d not in grant_targets:
-                grant_targets.append(d)
-        grant_errors = {}
-        for d in grant_targets:
-            try:
-                grant_read_execute(d, sid)
-            except OSError as e:
-                grant_errors[d] = str(e)
-        if grant_errors:
-            raise RuntimeError(
-                f"ACL grant(s) failed, refusing to spawn a worker that cannot "
-                f"read its own runtime (gotcha 3): {grant_errors}")
-
-        winsta_result = grant_winsta_desktop(sid)
-        self._winsta_grant = winsta_result
-        if winsta_result.get("window_station") != "granted" or winsta_result.get("desktop") != "granted":
-            raise RuntimeError(
-                "window station/desktop grant failed (gotcha 3, mandatory for "
-                f"AppContainer loader init): {winsta_result}")
-
-        arena_handle = self._create_arena()
-
-        extra_env = {"FAUXCASA_DECODESVC_ARENA_BYTES": str(self.arena_bytes)}
-        if self._probe_enabled:
-            extra_env["FAUXCASA_DECODESVC_PROBE"] = "1"
-
+        # Everything from here to a live child runs under one cleanup
+        # guard: close() is idempotent, _child is still None, and any
+        # failure (grant/winsta RuntimeError, arena WinError, spawn
+        # OSError) must free the per-spawn SID -- and the arena, once
+        # created -- or a retried spawn() overwrites and leaks them
+        # (Codex review PR110 rounds 4+5).
         try:
+            grant_targets = []
+            for d in (base_dir, worker_pythonpath, worker_dir):
+                if d and d not in grant_targets:
+                    grant_targets.append(d)
+            grant_errors = {}
+            for d in grant_targets:
+                try:
+                    grant_read_execute(d, sid)
+                except OSError as e:
+                    grant_errors[d] = str(e)
+            if grant_errors:
+                raise RuntimeError(
+                    f"ACL grant(s) failed, refusing to spawn a worker that cannot "
+                    f"read its own runtime (gotcha 3): {grant_errors}")
+
+            winsta_result = grant_winsta_desktop(sid)
+            self._winsta_grant = winsta_result
+            if winsta_result.get("window_station") != "granted" or winsta_result.get("desktop") != "granted":
+                raise RuntimeError(
+                    "window station/desktop grant failed (gotcha 3, mandatory for "
+                    f"AppContainer loader init): {winsta_result}")
+
+            arena_handle = self._create_arena()
+
+            extra_env = {"FAUXCASA_DECODESVC_ARENA_BYTES": str(self.arena_bytes)}
+            if self._probe_enabled:
+                extra_env["FAUXCASA_DECODESVC_PROBE"] = "1"
+
             child = _spawn_appcontainer(worker_python, worker_script, sid,
                                          worker_pythonpath, extra_env, self.mem_limit_bytes)
-        except OSError:
-            # close() is idempotent and _child is still None: this unmaps/
-            # closes the arena AND frees the per-spawn SID (which the old
-            # manual teardown leaked on every failed spawn attempt).
+        except Exception:
             self.close()
             raise
         self._child = child
