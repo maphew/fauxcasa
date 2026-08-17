@@ -927,6 +927,81 @@ def test_recv_response_prompt_reply_does_not_trigger_deadline():
         write_file.close()
 
 
+# ---------------------------------------------------------------------------
+# 2c. _DeadlineGuard (FIX 2, reviewer fix pass (fauxcasa-i92.3.x)): the
+# race-closing primitive behind recv_response's deadline handling. Pure,
+# lock-based, no timers -- deterministic on every platform.
+
+def test_deadline_guard_on_deadline_then_finish():
+    """The deadline wins: terminate_fn runs exactly once, and finish()
+    reports that it did."""
+    calls = []
+    guard = dw._DeadlineGuard(lambda: calls.append(1))
+    assert guard.on_deadline() is True
+    assert calls == [1]
+    assert guard.finish() is True
+    # A late/duplicate on_deadline() after finish() must be a no-op.
+    assert guard.on_deadline() is False
+    assert calls == [1]
+
+
+def test_deadline_guard_finish_then_on_deadline():
+    """The read wins: finish() runs first, so a subsequently-firing
+    on_deadline() must never call terminate_fn and must report it did
+    nothing."""
+    calls = []
+    guard = dw._DeadlineGuard(lambda: calls.append(1))
+    assert guard.finish() is False
+    assert guard.on_deadline() is False
+    assert calls == []
+
+
+def test_recv_response_race_kills_worker_even_though_frame_arrived(monkeypatch):
+    """FIX 2: deterministic reproduction of the timer-vs-read race,
+    without any real timer -- a fake threading.Timer fires its callback
+    SYNCHRONOUSLY from start(), before recv_response ever reaches the
+    blocking read, exactly the ordering that used to let a stale
+    timer.cancel() lose the race and let a killed worker's response
+    through. A valid frame is already sitting in the pipe (the read would
+    otherwise succeed instantly), so this isolates "deadline fired first"
+    as the only reason the read result must be discarded."""
+    r_fd, w_fd = os.pipe()
+    read_file = os.fdopen(r_fd, "rb", buffering=0)
+    write_file = os.fdopen(w_fd, "wb", buffering=0)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    worker._child = _FakeChild(read_file)
+    worker._locked = True
+    worker._terminate_child = lambda: None  # no real child to kill in this test
+    killed = {"called": False}
+    worker.kill = lambda: killed.__setitem__("called", True)
+
+    dw._write_frame(write_file, {"id": 1, "ok": True, "detail": "prompt"})
+
+    class _ImmediateTimer:
+        """Stand-in for threading.Timer: fires its callback synchronously
+        from start(), instead of after a real delay on a background
+        thread -- makes the race deterministic."""
+
+        def __init__(self, interval, function):
+            self._function = function
+
+        def start(self):
+            self._function()
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(dw.threading, "Timer", _ImmediateTimer)
+    try:
+        with pytest.raises(DecodeServiceError) as exc_info:
+            worker.recv_response(timeout_ms=5000)
+        assert exc_info.value.code == ErrorCode.TIMEOUT
+        assert killed["called"] is True
+    finally:
+        read_file.close()
+        write_file.close()
+
+
 @_WINDOWS_ONLY
 def test_probe_stall_deadline_kills_worker():
     """Live end-to-end version of the fake-child test above: a real,
@@ -971,15 +1046,28 @@ class _FakePoolWorker:
         self.closed = True
 
 
-def _stub_pool_ensure_worker(pool: "dw.WinDecodePool", spawned: list):
+def _stub_pool_ensure_worker(pool: "dw.WinDecodePool", spawned: list) -> list:
     """Installs a pool._ensure_worker stub that hands out `spawned`
     workers in order, one per (re)spawn -- mirroring the real
-    _ensure_worker's "spawn only when self._worker is None" contract."""
+    _ensure_worker's "spawn only when self._worker is None" contract.
+
+    Returns a one-element list [ensure_calls] the caller can inspect after
+    pool.decode() returns/raises (FIX 7, reviewer fix pass
+    (fauxcasa-i92.3.x)): a prior version of the never-retry PV test
+    asserted `spawned == []`, which was tautologically true regardless of
+    retry behavior -- `spawned` was already emptied by the FIRST
+    _ensure_worker call, so a bug that DID retry would leave the same
+    empty list. Counting actual invocations is the assertion that can
+    fail."""
+    calls = [0]
+
     def _ensure_worker():
+        calls[0] += 1
         if pool._worker is None:
             pool._worker = spawned.pop(0)
         return pool._worker
     pool._ensure_worker = _ensure_worker
+    return calls
 
 
 def test_pool_retries_once_on_timeout_then_succeeds():
@@ -1016,8 +1104,7 @@ def test_pool_retries_once_on_worker_crashed_then_succeeds():
 def test_pool_protocol_violation_never_retries():
     pool = dw.WinDecodePool()
     w1 = _FakePoolWorker([ProtocolViolation("lying worker")])
-    spawned = [w1]
-    _stub_pool_ensure_worker(pool, spawned)
+    ensure_calls = _stub_pool_ensure_worker(pool, [w1])
 
     with pytest.raises(ProtocolViolation):
         pool.decode("some.png")
@@ -1026,7 +1113,14 @@ def test_pool_protocol_violation_never_retries():
     assert pool.timeouts == 0
     assert pool.crashes == 0
     assert w1.decode_calls == 1
-    assert spawned == [], "a second worker must never be requested after a ProtocolViolation"
+    # FIX 7: count actual _ensure_worker invocations, not the leftover
+    # `spawned` list (which was already empty after the first call
+    # regardless of retry behavior -- see _stub_pool_ensure_worker).
+    assert ensure_calls[0] == 1, "a second worker must never be requested after a ProtocolViolation"
+    # FIX 5: the pool's PROTOCOL branch must close() the dropped worker
+    # itself rather than relying invisibly on worker.decode()'s own kill
+    # path having already done so.
+    assert w1.closed is True
 
 
 def test_pool_timeout_twice_is_permanent():
@@ -1041,6 +1135,67 @@ def test_pool_timeout_twice_is_permanent():
     assert exc_info.value.code == ErrorCode.TIMEOUT
     assert pool.timeouts == 2
     assert w1.closed is True and w2.closed is True
+
+
+def test_pool_spawn_failure_retries_and_counts_like_a_decode_failure():
+    """FIX 3 (P2, reviewer fix pass (fauxcasa-i92.3.x)): a
+    DecodeServiceError raised by spawn() itself (worker died in loader
+    init) used to escape `_ensure_worker()` from OUTSIDE the try in
+    WinDecodePool.decode -- no counter increment, no retry, unlike the
+    identical error raised from worker.decode(). _ensure_worker() is now
+    called INSIDE the try so spawn failures get the same taxonomy
+    treatment as job failures."""
+    pool = dw.WinDecodePool()
+    good_worker = _FakePoolWorker(["decoded-ok"])
+    ensure_calls = [0]
+
+    def _flaky_ensure_worker():
+        ensure_calls[0] += 1
+        if ensure_calls[0] == 1:
+            raise DecodeServiceError(ErrorCode.WORKER_CRASHED, "spawn died")
+        pool._worker = good_worker
+        return pool._worker
+
+    pool._ensure_worker = _flaky_ensure_worker
+
+    result = pool.decode("some.png")
+
+    assert result == "decoded-ok"
+    assert pool.crashes == 1
+    assert pool.timeouts == 0
+    assert pool.protocol_violations == 0
+    assert ensure_calls[0] == 2
+    assert good_worker.decode_calls == 1
+
+
+def test_pool_honest_error_leaves_worker_alive_and_reused():
+    """FIX 8 (P3, reviewer fix pass (fauxcasa-i92.3.x)): CORRUPT/
+    UNSUPPORTED/TOO_LARGE are honest, worker-reported outcomes (design doc
+    sec 2.5) -- the worker behaved correctly and must stay alive and
+    reusable, not be treated like a timeout/crash (no counter bump, no
+    close(), no respawn on the very next call)."""
+    pool = dw.WinDecodePool()
+    w1 = _FakePoolWorker([
+        DecodeServiceError(ErrorCode.CORRUPT, "bad jpeg"),
+        "decoded-ok-second-call",
+    ])
+    _stub_pool_ensure_worker(pool, [w1])
+
+    with pytest.raises(DecodeServiceError) as exc_info:
+        pool.decode("some.png")
+    assert exc_info.value.code == ErrorCode.CORRUPT
+
+    assert pool.timeouts == 0
+    assert pool.crashes == 0
+    assert pool.protocol_violations == 0
+    assert w1.closed is False
+    assert pool._worker is w1
+
+    result = pool.decode("some.png")
+
+    assert result == "decoded-ok-second-call"
+    assert w1.decode_calls == 2
+    assert pool._worker is w1
 
 
 # ---------------------------------------------------------------------------
@@ -1474,6 +1629,78 @@ def test_validate_meta_clamp_does_not_increment_counter():
         {"caption": "a" * 9000, "keywords": [f"k{i}" for i in range(MAX_KEYWORDS + 1)]})
     assert len(meta.caption.encode("utf-8")) == MAX_CAPTION_BYTES
     assert len(meta.keywords) == MAX_KEYWORDS
+    assert v.protocol_violations == 0
+
+
+# ---------------------------------------------------------------------------
+# 4a. FIX 1 (P1, reviewer fix pass (fauxcasa-i92.3.x)): a lone UTF-16
+# surrogate is legal JSON but illegal Unicode -- str.encode("utf-8") raises
+# UnicodeEncodeError on it, which used to escape parse_meta_fields
+# uncaught. `"\ud800bad"` below is built via the literal escape (a real
+# JSON payload containing a lone surrogate decodes to the same string).
+
+def test_meta_caption_lone_surrogate_is_violation():
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"caption": "\ud800bad"})
+
+
+def test_validate_meta_caption_lone_surrogate_increments_counter():
+    v = _fresh_validator()
+    with pytest.raises(ProtocolViolation):
+        v.validate_meta({"caption": "\ud800bad"})
+    assert v.protocol_violations == 1
+
+
+def test_meta_keyword_lone_surrogate_is_violation():
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields({"keywords": ["ok", "\ud800bad"]})
+
+
+def test_meta_face_name_lone_surrogate_is_violation():
+    with pytest.raises(ProtocolViolation):
+        dw.parse_meta_fields(
+            {"faces": [{"name": "\ud800bad", "x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}]})
+
+
+def test_meta_keyword_oversize_clamped_to_item_bound():
+    kw = "k" * 100_000
+    meta = dw.parse_meta_fields({"keywords": [kw]})
+    assert len(meta.keywords) == 1
+    assert len(meta.keywords[0].encode("utf-8")) <= dw.MAX_META_ITEM_BYTES
+
+
+def test_validate_meta_keyword_oversize_clamp_does_not_increment_counter():
+    v = _fresh_validator()
+    meta = v.validate_meta({"keywords": ["k" * 100_000]})
+    assert len(meta.keywords[0].encode("utf-8")) <= dw.MAX_META_ITEM_BYTES
+    assert v.protocol_violations == 0
+
+
+def test_meta_taken_oversize_clamped_to_item_bound():
+    taken = "2026-01-01T00:00:00" * 100_000
+    meta = dw.parse_meta_fields({"taken": taken})
+    assert len(meta.taken.encode("utf-8")) <= dw.MAX_META_ITEM_BYTES
+
+
+# ---------------------------------------------------------------------------
+# 4b. FIX 4 (P2, reviewer fix pass (fauxcasa-i92.3.x)): explicit JSON null
+# on any optional MetaFields field normalizes to that field's default,
+# same as the field being omitted entirely -- our own i92.4 exiv2 wrapper
+# emits nulls for missing metadata, and killing the worker for that would
+# be a false positive on the escape-gate counter.
+
+@pytest.mark.parametrize("field,default", [
+    ("caption", ""),
+    ("keywords", ()),
+    ("taken", ""),
+    ("gps", None),
+    ("rating", 0),
+    ("faces", ()),
+])
+def test_meta_null_field_normalizes_to_default(field, default):
+    v = _fresh_validator()
+    meta = v.validate_meta({field: None})
+    assert getattr(meta, field) == default
     assert v.protocol_violations == 0
 
 

@@ -348,6 +348,40 @@ def parse_locked(msg: dict) -> bool:
 # MetaFields in a real response. Pure dict validator -- cross-platform, no
 # live worker needed, same shape as parse_hello/parse_locked above.
 
+# FIX 1 (P1, reviewer fix pass (fauxcasa-i92.3.x)): a broker-chosen
+# per-item byte bound for taken/keywords/face names. Design doc sec 2.4
+# checklist item 5 only names the caption byte cap (MAX_CAPTION_BYTES) and
+# the keyword/face COUNT caps (MAX_KEYWORDS/MAX_FACES); it says nothing
+# about a per-item byte size for the smaller string fields. Rather than
+# lean on MAX_CONTROL_MSG incidentally bounding them (true today, but an
+# accident of the control-frame cap, not a designed clamp for this layer),
+# this keeps the clamp layer self-contained with its own explicit bound.
+MAX_META_ITEM_BYTES = 1024
+
+
+def _checked_str(value: object, field: str, *, max_bytes: int | None = None) -> str:
+    """FIX 1 (P1, reviewer fix pass (fauxcasa-i92.3.x)): closes an
+    exception surface in parse_meta_fields -- a lone UTF-16 surrogate
+    (e.g. JSON "\\ud800bad", legal JSON, illegal Unicode) passes the
+    isinstance(str) guard but makes .encode("utf-8") raise
+    UnicodeEncodeError, which used to escape parse_meta_fields uncaught,
+    defeating the ProtocolViolation counter/kill contract for that call
+    entirely. Same clamp-vs-reject split as the rest of this module: not a
+    string, or not UTF-8-encodable, is a TYPE claim (reject); too many
+    bytes is a SIZE claim (clamp -- truncate the ENCODED bytes first, then
+    decode with errors='ignore', same technique as the caption clamp, so a
+    codepoint split at the boundary is dropped whole, never mojibake)."""
+    if not isinstance(value, str):
+        raise ProtocolViolation(f"{field} not a string: {value!r}")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise ProtocolViolation(f"{field} not UTF-8-encodable: {e}") from e
+    if max_bytes is not None and len(encoded) > max_bytes:
+        value = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return value
+
+
 def parse_meta_fields(meta: object, *,
                        max_caption_bytes: int = MAX_CAPTION_BYTES,
                        max_keywords: int = MAX_KEYWORDS,
@@ -365,24 +399,37 @@ def parse_meta_fields(meta: object, *,
     if not isinstance(meta, dict):
         raise ProtocolViolation(f"meta is not a JSON object: {type(meta).__name__}")
 
-    caption = meta.get("caption", "")
-    if not isinstance(caption, str):
-        raise ProtocolViolation(f"meta.caption is not a string: {caption!r}")
-    encoded = caption.encode("utf-8")
-    if len(encoded) > max_caption_bytes:
-        # Truncate the ENCODED bytes first, then decode with errors=
-        # 'ignore' -- a multibyte codepoint split at the boundary is
-        # dropped whole, never emitted as mojibake/replacement chars.
-        caption = encoded[:max_caption_bytes].decode("utf-8", errors="ignore")
+    # FIX 4 (P2, reviewer fix pass (fauxcasa-i92.3.x)): MetaFields is an
+    # ALL-optional contract (see the dataclass docstring) -- our own i92.4
+    # exiv2 wrapper will naturally emit an explicit JSON null for a field
+    # it found no value for, not merely omit the key. Before this, only
+    # `gps` treated null the same as "field omitted"; every other field
+    # raised ProtocolViolation on an explicit null, which would make our
+    # own honest worker trip the compromise counter on ordinary,
+    # unremarkable files. Normalize null -> omitted for every optional
+    # field, once, up front: a false positive on that counter is worse
+    # than a clamp we could have applied to an omitted default instead.
+    meta = {k: v for k, v in meta.items()
+            if not (v is None and k in ("caption", "keywords", "taken",
+                                          "gps", "rating", "faces"))}
+
+    caption = _checked_str(meta.get("caption", ""), "meta.caption",
+                            max_bytes=max_caption_bytes)
 
     keywords_raw = meta.get("keywords", [])
-    if not isinstance(keywords_raw, list) or not all(isinstance(k, str) for k in keywords_raw):
+    if not isinstance(keywords_raw, list):
         raise ProtocolViolation(f"meta.keywords is not a list of strings: {keywords_raw!r}")
-    keywords = tuple(keywords_raw[:max_keywords])
+    # Validate/clamp EVERY keyword's type+bytes before the count clamp
+    # below -- same "validate everything, even entries a count clamp will
+    # drop" principle the faces loop documents further down.
+    checked_keywords = [
+        _checked_str(k, "meta.keyword", max_bytes=MAX_META_ITEM_BYTES)
+        for k in keywords_raw
+    ]
+    keywords = tuple(checked_keywords[:max_keywords])
 
-    taken = meta.get("taken", "")
-    if not isinstance(taken, str):
-        raise ProtocolViolation(f"meta.taken is not a string: {taken!r}")
+    taken = _checked_str(meta.get("taken", ""), "meta.taken",
+                          max_bytes=MAX_META_ITEM_BYTES)
 
     gps_raw = meta.get("gps")
     gps: tuple[float, float] | None = None
@@ -413,9 +460,9 @@ def parse_meta_fields(meta: object, *,
     for f in faces_raw:
         if not isinstance(f, dict):
             raise ProtocolViolation(f"meta.faces entry is not an object: {f!r}")
-        name = f.get("name")
-        if not isinstance(name, str):
-            raise ProtocolViolation(f"face.name is not a string: {name!r}")
+        # FIX 1: routes through the same surrogate-safe check as caption/
+        # taken/keywords, clamped to MAX_META_ITEM_BYTES.
+        name = _checked_str(f.get("name"), "face.name", max_bytes=MAX_META_ITEM_BYTES)
         coords: dict[str, float] = {}
         for key in ("x", "y", "w", "h"):
             v = f.get(key)
@@ -1228,6 +1275,53 @@ if sys.platform == "win32":
 
 
 # ---------------------------------------------------------------------------
+# FIX 2 (P2, reviewer fix pass (fauxcasa-i92.3.x)): closes a race between
+# recv_response's deadline timer and a successful read completing.
+# timer.cancel() in the old code was a no-op once the timer callback had
+# already started running, so a response that arrived right as the
+# deadline expired could still see the worker killed AFTER recv_response
+# had already decided to return that response -- handing a trusted caller
+# a "successful" result from a worker whose process was mid-TerminateProcess.
+# The old code also tracked "did the deadline fire" on an INSTANCE
+# attribute (self._deadline_hit), which persists across jobs: a timer left
+# running past its own recv_response call (already fixed by cancel(), but
+# only when cancel() actually beats the callback) could otherwise poison
+# the next job's read. This class is deliberately tiny and dependency-free
+# (just a lock) so it is unit-testable without any real threading.Timer.
+
+class _DeadlineGuard:
+    """Serializes "the deadline fired" against "the read finished" so
+    exactly one of them wins. `terminate_fn` is called AT MOST ONCE, and
+    only if on_deadline() reaches the lock before finish() does."""
+
+    def __init__(self, terminate_fn) -> None:
+        self._terminate_fn = terminate_fn
+        self._lock = threading.Lock()
+        self._hit = False
+        self._done = False
+
+    def on_deadline(self) -> bool:
+        """Timer callback. Returns True iff this call actually fired the
+        kill (i.e. finish() had not already run); False means the read
+        already completed and this callback is a harmless straggler."""
+        with self._lock:
+            if self._done:
+                return False
+            self._hit = True
+            self._terminate_fn()
+            return True
+
+    def finish(self) -> bool:
+        """Called once the read has returned (with a result OR an
+        exception). Returns whether the deadline had already fired by
+        then. After this returns, a late on_deadline() call is guaranteed
+        to be a no-op."""
+        with self._lock:
+            self._done = True
+            return self._hit
+
+
+# ---------------------------------------------------------------------------
 # WinSandboxWorker: importable on any platform (construction touches no
 # Windows API); spawn() is the one entry point that requires Windows.
 
@@ -1258,10 +1352,6 @@ class WinSandboxWorker:
         # cheap, correct minimum -- increment it, kill the worker, no
         # retry (the pool, not this transport, owns retry/respawn).
         self.protocol_violations = 0
-        # fauxcasa-i92.3.1: set by recv_response's deadline timer callback,
-        # read right after a WORKER_CRASHED escapes the read, to tell "the
-        # worker died on its own" apart from "we just killed it".
-        self._deadline_hit = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1453,6 +1543,14 @@ class WinSandboxWorker:
             raise RuntimeError("worker not spawned")
         _write_frame(self._child.in_file, msg)
 
+    def _deadline_guard(self, terminate_fn) -> "_DeadlineGuard":
+        """Factory seam (FIX 2, reviewer fix pass (fauxcasa-i92.3.x)): the
+        one place recv_response constructs its guard, so a test can wrap
+        or replace it (e.g. to invoke on_deadline() deterministically,
+        without a real timer) without reaching into recv_response's own
+        locals."""
+        return _DeadlineGuard(terminate_fn)
+
     def recv_response(self, timeout_ms: int | None = None) -> dict:
         """fauxcasa-i92.3.1: with timeout_ms=None, unchanged behavior --
         block on the read with no deadline. With timeout_ms set, arm a
@@ -1464,29 +1562,50 @@ class WinSandboxWorker:
         TIMEOUT here, since the crash was OUR kill, not the worker dying
         on its own. A ProtocolViolation (malformed/oversized frame)
         propagates unchanged even if the timer fired late -- it is
-        evidence of compromise, not a timing artifact."""
+        evidence of compromise, not a timing artifact.
+
+        FIX 2 (P2, reviewer fix pass (fauxcasa-i92.3.x)): a `_DeadlineGuard`
+        (see its class docstring) replaces the old instance-level
+        `_deadline_hit` flag and closes the race where the timer fires
+        just as the read completes successfully -- `guard.finish()` is the
+        single point that decides, atomically, whether the deadline or the
+        read "won"; if the deadline won even though the read returned a
+        well-formed response, that response is from a worker we are in the
+        middle of killing and must never be handed to a trusted caller."""
         if self._child is None:
             raise RuntimeError("worker not spawned")
         if timeout_ms is None:
             return _read_frame(self._child.out_file)
-        self._deadline_hit = False
 
-        def _on_deadline() -> None:
-            self._deadline_hit = True
-            self._terminate_child()
-
-        timer = threading.Timer(timeout_ms / 1000, _on_deadline)
+        guard = self._deadline_guard(self._terminate_child)
+        timer = threading.Timer(timeout_ms / 1000, guard.on_deadline)
         timer.daemon = True
         timer.start()
         try:
-            return _read_frame(self._child.out_file)
+            resp = _read_frame(self._child.out_file)
         except DecodeServiceError as e:
-            if e.code == ErrorCode.WORKER_CRASHED and self._deadline_hit:
+            hit = guard.finish()
+            if e.code == ErrorCode.WORKER_CRASHED and hit:
                 raise DecodeServiceError(
                     ErrorCode.TIMEOUT,
                     f"deadline exceeded (timeout_ms={timeout_ms}); worker killed") from e
             raise
+        else:
+            hit = guard.finish()
+            if hit:
+                # The read succeeded, but the deadline fired first (or
+                # concurrently) -- the worker is already killed or dying.
+                # Never return a result from a corpse.
+                self.kill()
+                raise DecodeServiceError(
+                    ErrorCode.TIMEOUT,
+                    "deadline expired as the response arrived; worker killed")
+            return resp
         finally:
+            # guard.finish() (above, in both branches) always runs BEFORE
+            # this cancel() -- once finish() has recorded "done", a timer
+            # callback that fires later is a guaranteed no-op, so a
+            # straggler thread here can never race a subsequent job.
             timer.cancel()
 
     def _require_ready(self) -> None:
@@ -1622,8 +1741,15 @@ class WinSandboxWorker:
         self._require_ready()
         req_id = self._next_id()
         dup_handle = self._open_and_duplicate_file(Path(path))
+        # FIX 9 (contract drift, reviewer fix pass (fauxcasa-i92.3.x)):
+        # design doc sec 2.2 lists deadline_ms as a common informational
+        # request field; the worker's decode handler already tolerates
+        # unknown/extra request keys (additive evolution), so this is a
+        # pure addition -- purely informational today (the broker, not the
+        # worker, enforces the deadline via recv_response's timer).
         request = {"id": req_id, "op": "decode", "edge": int(edge),
-                   "pixfmt": PixelFormat.RGBA8.value, "handle": dup_handle}
+                   "pixfmt": PixelFormat.RGBA8.value, "handle": dup_handle,
+                   "deadline_ms": int(deadline_ms)}
         try:
             self.send_request(request)
             resp = self.recv_response(timeout_ms=deadline_ms)
@@ -1713,8 +1839,19 @@ class WinSandboxWorker:
             if e.code == ErrorCode.TIMEOUT:
                 self.kill()
             raise
-        if not isinstance(resp, dict) or resp.get("id") != req_id:
-            raise ProtocolViolation(f"probe response id mismatch: {resp!r}")
+        if not isinstance(resp, dict):
+            raise ProtocolViolation(f"probe response is not a JSON object: {resp!r}")
+        # FIX 6 (P3, reviewer fix pass (fauxcasa-i92.3.x)): same type-strict
+        # id guard as _validate_response_checks -- plain `!=` accepts JSON
+        # true for 1 and 1.0 for an int req_id (Python numeric-tower
+        # equality). Deliberately no counter/kill semantics here (unlike
+        # _validate_response_checks): probe() PV raises also cover
+        # harness-side mistakes like an unknown probe name, so blanket
+        # counting would poison the escape-gate counter -- a follow-up
+        # bead will decide that policy.
+        rid = resp.get("id")
+        if type(rid) is not int or rid != req_id:
+            raise ProtocolViolation(f"probe response id {rid!r} != request id {req_id}")
         if resp.get("ok") is not True:
             raise ProtocolViolation(
                 f"probe {name!r} did not run to completion (ok={resp.get('ok')!r}, "
@@ -1784,15 +1921,31 @@ class WinDecodePool:
 
     def decode(self, path: Path, edge: int = 0, deadline_ms: int = 20_000) -> DecodeResult:
         for attempt in range(2):
-            worker = self._ensure_worker()
+            worker = None
             try:
+                # FIX 3 (P2, reviewer fix pass (fauxcasa-i92.3.x)): spawn
+                # now happens INSIDE the try. Previously `_ensure_worker()`
+                # sat outside it, so a DecodeServiceError raised from
+                # spawn() itself (e.g. the worker died in loader init,
+                # WORKER_CRASHED) propagated with no counter increment and
+                # no retry -- bypassing the exact taxonomy this method
+                # exists to enforce. Routing spawn failures through the
+                # same except clauses as decode failures gives them the
+                # same counting/retry/kill treatment.
+                worker = self._ensure_worker()
                 return worker.decode(path, edge=edge, deadline_ms=deadline_ms)
             except ProtocolViolation:
                 # Evidence of compromise (design doc sec 1/2.5): NO retry.
-                # worker.decode() already killed the worker; just drop our
-                # reference so the next call spawns fresh rather than
-                # reusing a dead one.
+                # worker.decode() already killed the worker (and a
+                # ProtocolViolation from spawn() -- e.g. a hello violation
+                # -- already closed itself internally, leaving `worker`
+                # None here); FIX 5 closes it again defensively (close() is
+                # idempotent) rather than relying invisibly on the callee's
+                # own kill path, then drop our reference so the next call
+                # spawns fresh rather than reusing a dead one.
                 self.protocol_violations += 1
+                if worker is not None:
+                    worker.close()
                 self._worker = None
                 raise
             except DecodeServiceError as e:
@@ -1805,7 +1958,12 @@ class WinDecodePool:
                     self.timeouts += 1
                 else:
                     self.crashes += 1
-                worker.close()
+                # `worker` is None here when THIS DecodeServiceError came
+                # from _ensure_worker()/spawn() rather than worker.decode()
+                # -- spawn() already tore itself down on failure, so there
+                # is nothing left to close.
+                if worker is not None:
+                    worker.close()
                 self._worker = None
                 if attempt == 1:
                     # Second TIMEOUT/WORKER_CRASHED in a row: permanent.
