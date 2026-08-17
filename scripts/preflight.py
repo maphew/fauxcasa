@@ -17,6 +17,10 @@ Checks (derived from .github/workflows/tests.yml and tracer.yml):
   - uv run scripts/test_picasa_db.py -q
   - uv run scripts/check-ingest-parity.py
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q   (skipped with --fast)
+  - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q
+    (skipped with --fast; on Windows this spawns real AppContainer sandbox
+    workers -- the i92.3 escape gates; elsewhere only the trusted-side
+    protocol fuzz runs)
   - git ls-files --error-unmatch -- .beads/issues.jsonl must FAIL            (the one bd preflight
     check that still applies here: no beads-jsonl pollution — the file is
     pollution iff git tracks it, whether staged or committed; a plain
@@ -29,7 +33,7 @@ regressions, not a local dev-loop check, so it's left to CI.
 
 Usage:
   uv run scripts/preflight.py            # run all checks
-  uv run scripts/preflight.py --fast     # skip the slow tracer suite
+  uv run scripts/preflight.py --fast     # skip the slow suites (tracer + decode-sandbox)
   uv run scripts/preflight.py --json     # machine-readable output
 
 Exits nonzero if any check fails (mirrors `bd preflight --check`).
@@ -80,6 +84,12 @@ def checks(root: Path, fast: bool) -> list[dict]:
         result.append({
             "name": "tracer tests",
             "command": ["uv", "run", "apps/desktop-python/test_tracer.py", "-q"],
+            "cwd": root,
+            "env": {"QT_QPA_PLATFORM": "offscreen"},
+        })
+        result.append({
+            "name": "decode-sandbox suite",
+            "command": ["uv", "run", "apps/desktop-python/test_decodesvc_win.py", "-q"],
             "cwd": root,
             "env": {"QT_QPA_PLATFORM": "offscreen"},
         })
@@ -139,7 +149,7 @@ def run_check(check: dict) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fast", action="store_true",
-                         help="skip the tracer suite (the slow gate)")
+                         help="skip the slow suites (tracer + decode-sandbox)")
     parser.add_argument("--json", action="store_true",
                          help="machine-readable output (name/passed/command/output)")
     args = parser.parse_args()
