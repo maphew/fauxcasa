@@ -833,7 +833,7 @@ def test_protocol_violation_kills_live_worker_and_counts(synthetic_png):
         assert worker.protocol_violations == 0
         assert worker.is_alive() is True
 
-        def _lying_recv_response():
+        def _lying_recv_response(timeout_ms=None):
             return {"id": worker._id_counter, "ok": True,
                     "source": {"w": 2, "h": 2},
                     "pixels": {"w": 2, "h": 2, "stride": 8, "pixfmt": "RGBA8",
@@ -847,6 +847,195 @@ def test_protocol_violation_kills_live_worker_and_counts(synthetic_png):
         assert worker.is_alive() is False
     finally:
         worker.close()
+
+
+# ---------------------------------------------------------------------------
+# 2b. Deadline enforcement, TIMEOUT taxonomy, retry pool (fauxcasa-i92.3.1;
+# design doc sec 1 "kill, timeout, crash" / sec 2.5 taxonomy).
+
+class _FakeChild:
+    """Stand-in for decodesvc_win._ChildProcess with NO real Windows
+    process at all -- just a real OS pipe standing in for the child's
+    stdout, so recv_response's blocking read has something real to block
+    on. `pi` is never touched by these tests: they monkeypatch
+    worker._terminate_child directly rather than exercising its real
+    TerminateProcess call, per WinSandboxWorker.decode's own doc that
+    _terminate_child only touches self._child through that one surface."""
+
+    def __init__(self, out_file):
+        self.pi = None
+        self.out_file = out_file
+        self.in_file = None
+
+
+def test_recv_response_deadline_kills_and_reports_timeout():
+    """No sandbox needed: a fake child whose read end never gets data
+    proves recv_response's timer fires, calls _terminate_child(), and
+    re-reports the resulting WORKER_CRASHED-from-EOF as TIMEOUT (design
+    doc sec 1) -- not as an honest crash."""
+    r_fd, w_fd = os.pipe()
+    read_file = os.fdopen(r_fd, "rb", buffering=0)
+    write_file = os.fdopen(w_fd, "wb", buffering=0)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    worker._child = _FakeChild(read_file)
+    worker._locked = True
+    terminated = {"called": False}
+
+    def _fake_terminate():
+        terminated["called"] = True
+        write_file.close()  # closes the "child"'s output -- read() sees EOF
+
+    worker._terminate_child = _fake_terminate
+    try:
+        with pytest.raises(DecodeServiceError) as exc_info:
+            worker.recv_response(timeout_ms=200)
+        assert exc_info.value.code == ErrorCode.TIMEOUT
+        assert terminated["called"] is True
+    finally:
+        read_file.close()
+        try:
+            write_file.close()
+        except OSError:
+            pass
+
+
+def test_recv_response_prompt_reply_does_not_trigger_deadline():
+    """Same fake child, but the write end delivers a valid frame promptly
+    -- recv_response must return it normally and never call
+    _terminate_child (a live, on-time worker must not be killed)."""
+    r_fd, w_fd = os.pipe()
+    read_file = os.fdopen(r_fd, "rb", buffering=0)
+    write_file = os.fdopen(w_fd, "wb", buffering=0)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    worker._child = _FakeChild(read_file)
+    worker._locked = True
+    terminated = {"called": False}
+    worker._terminate_child = lambda: terminated.__setitem__("called", True)
+
+    dw._write_frame(write_file, {"id": 1, "ok": True, "detail": "prompt"})
+    try:
+        resp = worker.recv_response(timeout_ms=5000)
+        assert resp == {"id": 1, "ok": True, "detail": "prompt"}
+        assert terminated["called"] is False
+    finally:
+        read_file.close()
+        write_file.close()
+
+
+@_WINDOWS_ONLY
+def test_probe_stall_deadline_kills_worker():
+    """Live end-to-end version of the fake-child test above: a real,
+    entirely non-hostile worker that accepts a probe job and just sits
+    there (the `stall` probe) must be killed by the broker's deadline,
+    not left hanging forever."""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES, probe=True)
+    worker.spawn()
+    try:
+        t0 = time.perf_counter()
+        with pytest.raises(DecodeServiceError) as exc_info:
+            worker.probe("stall", extra={"seconds": 30}, deadline_ms=1500)
+        elapsed = time.perf_counter() - t0
+        assert exc_info.value.code == ErrorCode.TIMEOUT, (
+            f"expected TIMEOUT, got {exc_info.value.code} ({exc_info.value})")
+        assert elapsed < 5.0, (
+            f"deadline kill took {elapsed:.2f}s, expected close to the "
+            f"1.5s deadline_ms")
+        assert worker.is_alive() is False
+    finally:
+        worker.close()
+
+
+class _FakePoolWorker:
+    """A fake WinSandboxWorker for WinDecodePool unit tests: `decode()`
+    pops one scripted result (a value to return, or an exception
+    instance/type to raise) per call. No Windows API, no real process."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.decode_calls = 0
+        self.closed = False
+
+    def decode(self, path, edge=0, deadline_ms=20_000):
+        self.decode_calls += 1
+        result = self._results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _stub_pool_ensure_worker(pool: "dw.WinDecodePool", spawned: list):
+    """Installs a pool._ensure_worker stub that hands out `spawned`
+    workers in order, one per (re)spawn -- mirroring the real
+    _ensure_worker's "spawn only when self._worker is None" contract."""
+    def _ensure_worker():
+        if pool._worker is None:
+            pool._worker = spawned.pop(0)
+        return pool._worker
+    pool._ensure_worker = _ensure_worker
+
+
+def test_pool_retries_once_on_timeout_then_succeeds():
+    pool = dw.WinDecodePool()
+    w1 = _FakePoolWorker([DecodeServiceError(ErrorCode.TIMEOUT, "slow")])
+    w2 = _FakePoolWorker(["decoded-ok"])
+    _stub_pool_ensure_worker(pool, [w1, w2])
+
+    result = pool.decode("some.png")
+
+    assert result == "decoded-ok"
+    assert pool.timeouts == 1
+    assert pool.crashes == 0
+    assert w1.closed is True
+    assert w2.closed is False
+    assert w1.decode_calls == 1 and w2.decode_calls == 1
+
+
+def test_pool_retries_once_on_worker_crashed_then_succeeds():
+    pool = dw.WinDecodePool()
+    w1 = _FakePoolWorker([DecodeServiceError(ErrorCode.WORKER_CRASHED, "died")])
+    w2 = _FakePoolWorker(["decoded-ok"])
+    _stub_pool_ensure_worker(pool, [w1, w2])
+
+    result = pool.decode("some.png")
+
+    assert result == "decoded-ok"
+    assert pool.crashes == 1
+    assert pool.timeouts == 0
+    assert w1.closed is True
+    assert w2.closed is False
+
+
+def test_pool_protocol_violation_never_retries():
+    pool = dw.WinDecodePool()
+    w1 = _FakePoolWorker([ProtocolViolation("lying worker")])
+    spawned = [w1]
+    _stub_pool_ensure_worker(pool, spawned)
+
+    with pytest.raises(ProtocolViolation):
+        pool.decode("some.png")
+
+    assert pool.protocol_violations == 1
+    assert pool.timeouts == 0
+    assert pool.crashes == 0
+    assert w1.decode_calls == 1
+    assert spawned == [], "a second worker must never be requested after a ProtocolViolation"
+
+
+def test_pool_timeout_twice_is_permanent():
+    pool = dw.WinDecodePool()
+    w1 = _FakePoolWorker([DecodeServiceError(ErrorCode.TIMEOUT, "slow")])
+    w2 = _FakePoolWorker([DecodeServiceError(ErrorCode.TIMEOUT, "slow again")])
+    _stub_pool_ensure_worker(pool, [w1, w2])
+
+    with pytest.raises(DecodeServiceError) as exc_info:
+        pool.decode("some.png")
+
+    assert exc_info.value.code == ErrorCode.TIMEOUT
+    assert pool.timeouts == 2
+    assert w1.closed is True and w2.closed is True
 
 
 # ---------------------------------------------------------------------------

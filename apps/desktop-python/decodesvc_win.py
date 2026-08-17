@@ -33,6 +33,10 @@ worker (decodesvc_worker_win.py):
     worker -> broker (probe result):
         {"id": N, "op": "probe", "attempt": "...", "allowed": bool,
          "detail": "...", "data_b64": "..."}
+    (test-only `stall` probe attempt: sleeps `seconds` (capped 300s), then
+        replies normally like any other probe -- a live, non-hostile
+        worker that never answers within a job's deadline, exercising the
+        broker's kill-on-timeout path, fauxcasa-i92.3.1, design doc sec 1.)
 
 Every control-channel message is length-prefixed JSON: a 4-byte
 little-endian length, then UTF-8 JSON, hard-capped at MAX_CONTROL_MSG
@@ -57,6 +61,7 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -1157,6 +1162,10 @@ class WinSandboxWorker:
         # cheap, correct minimum -- increment it, kill the worker, no
         # retry (the pool, not this transport, owns retry/respawn).
         self.protocol_violations = 0
+        # fauxcasa-i92.3.1: set by recv_response's deadline timer callback,
+        # read right after a WORKER_CRASHED escapes the read, to tell "the
+        # worker died on its own" apart from "we just killed it".
+        self._deadline_hit = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1288,6 +1297,17 @@ class WinSandboxWorker:
         runs before the pipes are closed (gotcha 5)."""
         self.close()
 
+    def _terminate_child(self) -> None:
+        """fauxcasa-i92.3.1: the deadline-timer hard-kill hook, called
+        from recv_response's background threading.Timer when a job's
+        timeout_ms expires (design doc sec 1: 'never a polite request').
+        Kept as its own small method -- touching self._child only through
+        this one surface -- so a test can inject a fake self._child and
+        monkeypatch just this call to verify the timer fired, without a
+        real Windows process to kill."""
+        if self._child is not None and self.is_alive():
+            kernel32.TerminateProcess(self._child.pi.hProcess, 1)
+
     def __del__(self) -> None:  # pragma: no cover - best-effort GC safety net
         try:
             self.close()
@@ -1337,10 +1357,41 @@ class WinSandboxWorker:
             raise RuntimeError("worker not spawned")
         _write_frame(self._child.in_file, msg)
 
-    def recv_response(self) -> dict:
+    def recv_response(self, timeout_ms: int | None = None) -> dict:
+        """fauxcasa-i92.3.1: with timeout_ms=None, unchanged behavior --
+        block on the read with no deadline. With timeout_ms set, arm a
+        background threading.Timer that hard-kills the child (never a
+        polite request, design doc sec 1) if the read is still blocked
+        when it fires; killing the child closes its end of the pipe, so
+        the blocked read returns EOF and _read_frame raises
+        DecodeServiceError(WORKER_CRASHED) -- which we re-report as
+        TIMEOUT here, since the crash was OUR kill, not the worker dying
+        on its own. A ProtocolViolation (malformed/oversized frame)
+        propagates unchanged even if the timer fired late -- it is
+        evidence of compromise, not a timing artifact."""
         if self._child is None:
             raise RuntimeError("worker not spawned")
-        return _read_frame(self._child.out_file)
+        if timeout_ms is None:
+            return _read_frame(self._child.out_file)
+        self._deadline_hit = False
+
+        def _on_deadline() -> None:
+            self._deadline_hit = True
+            self._terminate_child()
+
+        timer = threading.Timer(timeout_ms / 1000, _on_deadline)
+        timer.daemon = True
+        timer.start()
+        try:
+            return _read_frame(self._child.out_file)
+        except DecodeServiceError as e:
+            if e.code == ErrorCode.WORKER_CRASHED and self._deadline_hit:
+                raise DecodeServiceError(
+                    ErrorCode.TIMEOUT,
+                    f"deadline exceeded (timeout_ms={timeout_ms}); worker killed") from e
+            raise
+        finally:
+            timer.cancel()
 
     def _require_ready(self) -> None:
         if self._child is None:
@@ -1452,7 +1503,11 @@ class WinSandboxWorker:
         finally:
             kernel32.CloseHandle(h)
 
-    def decode(self, path: Path, edge: int = 0) -> DecodeResult:
+    def decode(self, path: Path, edge: int = 0, deadline_ms: int = 20_000) -> DecodeResult:
+        """deadline_ms defaults to 20s (design doc sec 1's still default).
+        fauxcasa-i92.3.1: on DecodeServiceError(TIMEOUT) this worker is
+        killed and the error re-raised -- this transport does not retry;
+        that policy belongs one layer up in WinDecodePool."""
         self._require_ready()
         req_id = self._next_id()
         dup_handle = self._open_and_duplicate_file(Path(path))
@@ -1460,7 +1515,7 @@ class WinSandboxWorker:
                    "pixfmt": PixelFormat.RGBA8.value, "handle": dup_handle}
         try:
             self.send_request(request)
-            resp = self.recv_response()
+            resp = self.recv_response(timeout_ms=deadline_ms)
         except ProtocolViolation:
             # FIX 7 (should-fix, review fix pass): a malformed/oversized
             # incoming frame is evidence of compromise (design doc sec 1)
@@ -1468,6 +1523,15 @@ class WinSandboxWorker:
             # shape), so it isn't counted there -- count it here.
             self.protocol_violations += 1
             self.kill()
+            raise
+        except DecodeServiceError as e:
+            # fauxcasa-i92.3.1: TIMEOUT is this worker's own kill (design
+            # doc sec 1); close it out here too, same as the
+            # ProtocolViolation branch above. Any other DecodeServiceError
+            # (e.g. an honest WORKER_CRASHED) is left alone -- the pool
+            # owns retry/respawn decisions, not this transport.
+            if e.code == ErrorCode.TIMEOUT:
+                self.kill()
             raise
         try:
             source, buf = self._validate_response(resp, expect_id=req_id)
@@ -1490,7 +1554,7 @@ class WinSandboxWorker:
                              pixels_bytes=pixels_bytes)
 
     def probe(self, name: str, target: str | None = None, handle: int | None = None,
-              extra: dict | None = None) -> dict:
+              extra: dict | None = None, deadline_ms: int | None = None) -> dict:
         """Send a probe job (test-only; the worker only honors it when
         spawned with probe=True, i.e. FAUXCASA_DECODESVC_PROBE=1 in its
         environment). Returns {attempt, allowed, detail}. `extra` carries
@@ -1499,6 +1563,11 @@ class WinSandboxWorker:
         gates go through this same fail-closed validation instead of raw
         send_request/recv_response (Codex review PR110 P1); the fixed
         id/op/attempt keys always win over `extra`.
+
+        deadline_ms (fauxcasa-i92.3.1): threaded straight to recv_response,
+        same TIMEOUT->kill semantics as decode() -- needed by the live
+        `stall` probe test, which spawns a worker that accepts a job and
+        never answers, to exercise the broker's deadline path end to end.
 
         FIX 2 (P1, review fix pass): fail-closed. A denial (`allowed:
         False`) is accepted ONLY when the worker's response is well-formed
@@ -1523,7 +1592,16 @@ class WinSandboxWorker:
         if handle is not None:
             request["handle"] = handle
         self.send_request(request)
-        resp = self.recv_response()
+        try:
+            resp = self.recv_response(timeout_ms=deadline_ms)
+        except DecodeServiceError as e:
+            # fauxcasa-i92.3.1: same TIMEOUT->kill semantics as decode();
+            # any other DecodeServiceError (including ProtocolViolation,
+            # a pre-existing gap this task does not widen) propagates
+            # exactly as it did before deadline_ms existed.
+            if e.code == ErrorCode.TIMEOUT:
+                self.kill()
+            raise
         if not isinstance(resp, dict) or resp.get("id") != req_id:
             raise ProtocolViolation(f"probe response id mismatch: {resp!r}")
         if resp.get("ok") is not True:
@@ -1547,6 +1625,89 @@ class WinSandboxWorker:
         self._require_ready()
         dup = self._open_and_duplicate_file(Path(path))
         return self.probe(name, handle=dup)
+
+
+# ---------------------------------------------------------------------------
+# WinDecodePool: the minimal single-slot pool that owns the design-sec-1
+# retry policy WinSandboxWorker itself deliberately defers (fauxcasa-i92.3.1).
+# Importable on any platform -- only _ensure_worker()'s spawn() call needs
+# Windows, same split as WinSandboxWorker above.
+
+class WinDecodePool:
+    """One live worker at a time, with the TIMEOUT/WORKER_CRASHED
+    retry-once-then-permanent policy from design doc sec 1/2.5:
+    ProtocolViolation is evidence of compromise and never retries; TIMEOUT
+    and WORKER_CRASHED each get exactly one retry on a fresh worker before
+    becoming permanent; the honest worker-reported codes (CORRUPT/
+    UNSUPPORTED/TOO_LARGE) are permanent for the file and leave the worker
+    alive and reusable.
+
+    protocol_violations/timeouts/crashes are per-SESSION counters that
+    live on the POOL, not the transport: a WinSandboxWorker's own
+    protocol_violations counter resets to 0 every time a fresh worker is
+    spawned, which is the wrong home for a session-wide tally (the full
+    counter-assertion contract is fauxcasa-i92.3.2; this pool is where
+    that contract's counters actually need to live to survive a respawn)."""
+
+    def __init__(self, arena_bytes: int = ARENA_DEFAULT_BYTES, probe: bool = False,
+                 profile_name: str = PROFILE_NAME,
+                 mem_limit_bytes: int = DEFAULT_MEM_LIMIT_BYTES) -> None:
+        self.arena_bytes = arena_bytes
+        self.probe = probe
+        self.profile_name = profile_name
+        self.mem_limit_bytes = mem_limit_bytes
+        self._worker: WinSandboxWorker | None = None
+        # Per-SESSION counters (design doc sec 1/2.5) -- survive respawns.
+        self.protocol_violations = 0
+        self.timeouts = 0
+        self.crashes = 0
+
+    def _ensure_worker(self) -> WinSandboxWorker:
+        if self._worker is None:
+            worker = WinSandboxWorker(
+                arena_bytes=self.arena_bytes, probe=self.probe,
+                profile_name=self.profile_name, mem_limit_bytes=self.mem_limit_bytes)
+            worker.spawn()
+            self._worker = worker
+        return self._worker
+
+    def decode(self, path: Path, edge: int = 0, deadline_ms: int = 20_000) -> DecodeResult:
+        for attempt in range(2):
+            worker = self._ensure_worker()
+            try:
+                return worker.decode(path, edge=edge, deadline_ms=deadline_ms)
+            except ProtocolViolation:
+                # Evidence of compromise (design doc sec 1/2.5): NO retry.
+                # worker.decode() already killed the worker; just drop our
+                # reference so the next call spawns fresh rather than
+                # reusing a dead one.
+                self.protocol_violations += 1
+                self._worker = None
+                raise
+            except DecodeServiceError as e:
+                if e.code not in (ErrorCode.TIMEOUT, ErrorCode.WORKER_CRASHED):
+                    # Honest CORRUPT/UNSUPPORTED/TOO_LARGE: permanent for
+                    # this file; the worker behaved correctly and stays
+                    # alive and reusable.
+                    raise
+                if e.code is ErrorCode.TIMEOUT:
+                    self.timeouts += 1
+                else:
+                    self.crashes += 1
+                worker.close()
+                self._worker = None
+                if attempt == 1:
+                    # Second TIMEOUT/WORKER_CRASHED in a row: permanent.
+                    raise
+                # else: loop around -- _ensure_worker() spawns a fresh
+                # worker for the one allowed retry (design doc sec 1/2.5).
+        raise AssertionError("unreachable: the loop above always returns or raises")
+
+    def close(self) -> None:
+        """Safe to call twice."""
+        if self._worker is not None:
+            self._worker.close()
+            self._worker = None
 
 
 def spawn_worker(arena_bytes: int = ARENA_DEFAULT_BYTES, probe: bool = False,
