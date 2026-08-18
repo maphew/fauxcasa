@@ -51,8 +51,13 @@ def repo_root() -> Path:
 
 
 def run(cmd: list[str], timeout: int = DEFAULT_TIMEOUT, cwd: Path | None = None,
-        env: dict | None = None) -> tuple[int, str]:
-    """Run cmd, returning (exit_code, combined stdout+stderr text).
+        env: dict | None = None) -> tuple[int, str, str]:
+    """Run cmd, returning (exit_code, stdout text, stderr text).
+
+    stdout and stderr stay separate: a successful command can still emit
+    warnings on stderr (e.g. git warning about an unreadable global
+    excludes file), and mixing those into parsed stdout turns a clean
+    `git status --porcelain` into a false DIRTY (Codex review finding).
 
     Never raises for a missing binary or nonzero exit -- returns a
     negative exit code and a message instead, so callers can degrade
@@ -72,15 +77,21 @@ def run(cmd: list[str], timeout: int = DEFAULT_TIMEOUT, cwd: Path | None = None,
         )
         out = proc.stdout.decode("utf-8", errors="replace")
         err = proc.stderr.decode("utf-8", errors="replace")
-        return proc.returncode, (out + err).strip()
+        return proc.returncode, out.strip(), err.strip()
     except FileNotFoundError:
-        return -1, f"{cmd[0]}: command not found"
+        return -1, "", f"{cmd[0]}: command not found"
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", errors="replace")
         err = (e.stderr or b"").decode("utf-8", errors="replace")
-        return -2, f"TIMEOUT after {timeout}s\n{(out + err).strip()}"
+        return -2, out.strip(), f"TIMEOUT after {timeout}s\n{err.strip()}".strip()
     except OSError as exc:
-        return -3, f"{cmd[0]}: {exc}"
+        return -3, "", f"{cmd[0]}: {exc}"
+
+
+def _text(out: str, err: str) -> str:
+    """Combined display text for sections that just show a command's
+    output verbatim (never for parsing)."""
+    return "\n".join(p for p in (out, err) if p)
 
 
 def _header(title: str) -> str:
@@ -103,47 +114,47 @@ def _trim(text: str, max_lines: int = 30) -> str:
 def section_git(root: Path) -> str:
     lines = [_header("1. GIT"), ""]
 
-    fetch_rc, fetch_out = run(["git", "fetch", "origin", "--quiet"], cwd=root)
+    fetch_rc, fetch_out, fetch_err = run(["git", "fetch", "origin", "--quiet"], cwd=root)
     if fetch_rc != 0:
-        lines.append(f"[warn] git fetch origin failed (rc={fetch_rc}): {fetch_out or '(no output)'}")
+        lines.append(f"[warn] git fetch origin failed (rc={fetch_rc}): {_text(fetch_out, fetch_err) or '(no output)'}")
     else:
         lines.append("git fetch origin: ok")
     lines.append("")
 
-    status_rc, status_out = run(["git", "status", "-sb"], cwd=root)
+    status_rc, status_out, status_err = run(["git", "status", "-sb"], cwd=root)
     lines.append("Branch / ahead-behind (git status -sb):")
     if status_rc == 0:
         lines.append(_trim(status_out))
     else:
-        lines.append(f"  [error] rc={status_rc}: {status_out}")
+        lines.append(f"  [error] rc={status_rc}: {_text(status_out, status_err)}")
     lines.append("")
 
-    ahead_behind_rc, ahead_behind_out = run(
+    ahead_behind_rc, ahead_behind_out, ahead_behind_err = run(
         ["git", "rev-list", "--left-right", "--count", "@{u}...HEAD"], cwd=root)
     if ahead_behind_rc == 0:
         parts = ahead_behind_out.split()
         if len(parts) == 2:
             lines.append(f"Behind / ahead of upstream: {parts[0]} behind, {parts[1]} ahead")
     else:
-        lines.append(f"[info] no upstream configured or rev-list failed: {ahead_behind_out}")
+        lines.append(f"[info] no upstream configured or rev-list failed: {ahead_behind_err or ahead_behind_out}")
     lines.append("")
 
-    dirty_rc, dirty_out = run(["git", "status", "--porcelain"], cwd=root)
+    dirty_rc, dirty_out, dirty_err = run(["git", "status", "--porcelain"], cwd=root)
     if dirty_rc == 0:
         dirty = bool(dirty_out.strip())
         lines.append(f"Working tree: {'DIRTY' if dirty else 'clean'}")
         if dirty:
             lines.append(_trim(dirty_out))
     else:
-        lines.append(f"[error] git status --porcelain rc={dirty_rc}: {dirty_out}")
+        lines.append(f"[error] git status --porcelain rc={dirty_rc}: {_text(dirty_out, dirty_err)}")
     lines.append("")
 
-    wt_rc, wt_out = run(["git", "worktree", "list"], cwd=root)
+    wt_rc, wt_out, wt_err = run(["git", "worktree", "list"], cwd=root)
     lines.append("Worktrees (git worktree list):")
     if wt_rc == 0:
         lines.append(_trim(wt_out))
     else:
-        lines.append(f"  [error] rc={wt_rc}: {wt_out}")
+        lines.append(f"  [error] rc={wt_rc}: {_text(wt_out, wt_err)}")
 
     return "\n".join(lines)
 
@@ -155,25 +166,25 @@ def section_git(root: Path) -> str:
 def section_ci(root: Path) -> str:
     lines = [_header("2. CI"), ""]
 
-    gh_check_rc, _ = run(["gh", "--version"], cwd=root, timeout=15)
+    gh_check_rc, _, _ = run(["gh", "--version"], cwd=root, timeout=15)
     if gh_check_rc != 0:
         lines.append(f"gh unavailable: gh CLI not found on PATH (rc={gh_check_rc})")
         return "\n".join(lines)
 
-    runs_rc, runs_out = run(["gh", "run", "list", "--limit", "5"], cwd=root)
+    runs_rc, runs_out, runs_err = run(["gh", "run", "list", "--limit", "5"], cwd=root)
     lines.append("Recent workflow runs (gh run list --limit 5):")
     if runs_rc == 0:
-        lines.append(_trim(runs_out))
+        lines.append(_trim(_text(runs_out, runs_err)))
     else:
-        lines.append(f"gh unavailable: gh run list failed (rc={runs_rc}): {runs_out or '(no output)'}")
+        lines.append(f"gh unavailable: gh run list failed (rc={runs_rc}): {_text(runs_out, runs_err) or '(no output)'}")
     lines.append("")
 
-    prs_rc, prs_out = run(["gh", "pr", "list", "--state", "open"], cwd=root)
+    prs_rc, prs_out, prs_err = run(["gh", "pr", "list", "--state", "open"], cwd=root)
     lines.append("Open pull requests (gh pr list --state open):")
     if prs_rc == 0:
         lines.append(_trim(prs_out) if prs_out else "  (none)")
     else:
-        lines.append(f"gh unavailable: gh pr list failed (rc={prs_rc}): {prs_out or '(no output)'}")
+        lines.append(f"gh unavailable: gh pr list failed (rc={prs_rc}): {_text(prs_out, prs_err) or '(no output)'}")
 
     return "\n".join(lines)
 
@@ -182,22 +193,35 @@ def section_ci(root: Path) -> str:
 # Section: Beads health
 # ---------------------------------------------------------------------------
 
+def _pollution_gate(root: Path) -> tuple[list[str], bool]:
+    """The .beads/issues.jsonl untracked gate. Only the expected
+    no-match exit (rc 1) is a PASS: rc 0 means git tracks the file
+    (pollution), and anything else (128 corrupt index, timeout, missing
+    git) is an operational error that must FAIL rather than silently
+    pass (Codex review finding)."""
+    gate_rc, gate_out, gate_err = run(
+        ["git", "ls-files", "--error-unmatch", "--", ".beads/issues.jsonl"],
+        cwd=root)
+    gate_passed = gate_rc == 1
+    lines = ["Pollution gate (.beads/issues.jsonl must be untracked):",
+             f"  [{'PASS' if gate_passed else 'FAIL'}] git ls-files --error-unmatch -- .beads/issues.jsonl"]
+    if gate_rc == 0:
+        lines.append("    .beads/issues.jsonl is tracked by git -- this is pollution.")
+    elif gate_rc != 1:
+        lines.append(f"    operational error (rc={gate_rc}): {_text(gate_out, gate_err)}")
+    return lines, gate_passed
+
+
 def section_beads(root: Path) -> tuple[str, bool]:
     """Return (report_text, pollution_gate_passed)."""
     lines = [_header("3. BEADS HEALTH"), ""]
 
-    bd_check_rc, _ = run(["bd", "--version"], cwd=root, timeout=15)
+    bd_check_rc, _, _ = run(["bd", "--version"], cwd=root, timeout=15)
     if bd_check_rc != 0:
         lines.append("bd unavailable: bd CLI not found on PATH")
         lines.append("")
-        gate_rc, gate_out = run(
-            ["git", "ls-files", "--error-unmatch", "--", ".beads/issues.jsonl"],
-            cwd=root)
-        gate_passed = gate_rc != 0  # nonzero = untracked = pass
-        lines.append("Pollution gate (.beads/issues.jsonl must be untracked):")
-        lines.append(f"  [{'PASS' if gate_passed else 'FAIL'}] git ls-files --error-unmatch -- .beads/issues.jsonl")
-        if not gate_passed:
-            lines.append(f"    {gate_out}")
+        gate_lines, gate_passed = _pollution_gate(root)
+        lines.extend(gate_lines)
         return "\n".join(lines), gate_passed
 
     bd_commands = [
@@ -208,26 +232,16 @@ def section_beads(root: Path) -> tuple[str, bool]:
         ("bd orphans", ["bd", "orphans"]),
     ]
     for label, cmd in bd_commands:
-        rc, out = run(cmd, cwd=root)
+        rc, out, err = run(cmd, cwd=root)
         lines.append(f"{label}:")
         if rc == 0:
             lines.append(_trim(out) if out else "  (no output)")
         else:
-            lines.append(f"  [error] rc={rc}: {_trim(out)}")
+            lines.append(f"  [error] rc={rc}: {_trim(_text(out, err))}")
         lines.append("")
 
-    gate_rc, gate_out = run(
-        ["git", "ls-files", "--error-unmatch", "--", ".beads/issues.jsonl"],
-        cwd=root)
-    # rc 0 means git tracks the file (staged or committed) == pollution;
-    # nonzero (typically 1) means untracked == the gate passes.
-    gate_passed = gate_rc != 0
-    lines.append("Pollution gate (.beads/issues.jsonl must be untracked):")
-    lines.append(f"  [{'PASS' if gate_passed else 'FAIL'}] git ls-files --error-unmatch -- .beads/issues.jsonl")
-    if not gate_passed:
-        lines.append(f"    .beads/issues.jsonl is tracked by git -- this is pollution.")
-        lines.append(f"    {gate_out}")
-
+    gate_lines, gate_passed = _pollution_gate(root)
+    lines.extend(gate_lines)
     return "\n".join(lines), gate_passed
 
 
@@ -237,14 +251,14 @@ def section_beads(root: Path) -> tuple[str, bool]:
 
 def section_delegation(root: Path, since: str) -> str:
     lines = [_header("4. DELEGATION REPORT"), ""]
-    rc, out = run(
+    rc, out, err = run(
         ["uv", "run", "scripts/delegation-report.py", "--since", since],
         cwd=root, timeout=180)
     if rc == 0:
         lines.append(out)
     else:
         lines.append(f"[error] delegation-report.py failed (rc={rc}):")
-        lines.append(out)
+        lines.append(_text(out, err))
     return "\n".join(lines)
 
 
@@ -259,11 +273,11 @@ def section_gates(root: Path, enabled: bool) -> tuple[str, bool]:
         lines.append("Skipped (pass --gates to run uv run scripts/preflight.py --fast).")
         return "\n".join(lines), True
 
-    rc, out = run(
+    rc, out, err = run(
         ["uv", "run", "scripts/preflight.py", "--fast"],
         cwd=root, timeout=10 * 60)
     lines.append(f"uv run scripts/preflight.py --fast  (rc={rc})")
-    lines.append(_trim(out, max_lines=60))
+    lines.append(_trim(_text(out, err), max_lines=60))
     return "\n".join(lines), rc == 0
 
 
@@ -286,9 +300,19 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    def _iso_date(s: str) -> str:
+        # Validate here rather than letting the nested delegation-report
+        # argparse fail with a section [error] while this script still
+        # exits 0 (Codex review finding).
+        try:
+            return date.fromisoformat(s).isoformat()
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(f"not a YYYY-MM-DD date: {s!r}") from e
+
     parser.add_argument(
         "--since",
         metavar="YYYY-MM-DD",
+        type=_iso_date,
         default=None,
         help="Start date for the delegation report (default: 7 days ago)",
     )
