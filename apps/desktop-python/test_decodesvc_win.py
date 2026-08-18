@@ -421,6 +421,104 @@ def test_bogus_probe_name_errors(shared_worker):
         shared_worker.probe("this_probe_does_not_exist")
 
 
+# ---------------------------------------------------------------------------
+# 1b. probe() ProtocolViolation counting policy (fauxcasa-i92.3.4), ratified
+# in probe()'s own docstring: worker-lie branches count + kill (mirroring
+# decode()'s FIX 7); an honest ok:false (test_bogus_probe_name_errors above)
+# raises but leaves protocol_violations untouched and the worker alive.
+# Each test below spawns its OWN dedicated worker (never shared_worker,
+# which is module-scoped and reused by every containment/boundary test) --
+# these tests kill their worker on purpose.
+
+@_WINDOWS_ONLY
+def test_probe_transport_protocol_violation_counts_and_kills():
+    """fauxcasa-i92.3.4: a ProtocolViolation raised OUT OF recv_response
+    itself (malformed/oversized frame -- transport-level, not response
+    shape) is worker-lie evidence, same standing as decode()'s FIX 7
+    branch. Before this fix, probe()'s `except DecodeServiceError` caught
+    it too (ProtocolViolation is a DecodeServiceError subclass) but its
+    code is PROTOCOL, never TIMEOUT, so it propagated uncounted and the
+    worker was left alive -- the "pre-existing gap" the old FIX 6 comment
+    named."""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES, probe=True)
+    worker.spawn()
+    try:
+        assert worker.protocol_violations == 0
+
+        def _lying_recv_response(timeout_ms=None):
+            raise ProtocolViolation("oversized control frame")
+
+        worker.recv_response = _lying_recv_response
+        with pytest.raises(ProtocolViolation):
+            worker.probe("arena_write")
+
+        assert worker.protocol_violations == 1
+        assert worker.is_alive() is False
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("case_name,build_resp", [
+    ("resp_not_dict",
+     lambda rid: ["not", "a", "dict"]),
+    ("id_mismatch",
+     lambda rid: {"id": rid + 1, "ok": True, "attempt": "arena_write", "allowed": True}),
+    ("ok_not_bool",
+     lambda rid: {"id": rid, "ok": "yes", "attempt": "arena_write", "allowed": True}),
+    ("attempt_echo_mismatch",
+     lambda rid: {"id": rid, "ok": True, "attempt": "wrong_probe", "allowed": True}),
+    ("allowed_missing",
+     lambda rid: {"id": rid, "ok": True, "attempt": "arena_write"}),
+    ("allowed_non_bool",
+     lambda rid: {"id": rid, "ok": True, "attempt": "arena_write", "allowed": "nope"}),
+])
+@_WINDOWS_ONLY
+def test_probe_worker_lie_counts_and_kills(case_name, build_resp):
+    """fauxcasa-i92.3.4: each response here is the worker CLAIMING
+    something false about a probe (a malformed/mismatched response, or an
+    inconsistency only reachable once it has claimed ok=True) -- a lie,
+    not an honest denial -- so probe() must treat it exactly like
+    decode()'s FIX 7 kill path: count + kill before the raise
+    propagates."""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES, probe=True)
+    worker.spawn()
+    try:
+        assert worker.protocol_violations == 0
+
+        def _lying_recv_response(timeout_ms=None):
+            return build_resp(worker._id_counter)
+
+        worker.recv_response = _lying_recv_response
+        with pytest.raises(ProtocolViolation):
+            worker.probe("arena_write")
+
+        assert worker.protocol_violations == 1
+        assert worker.is_alive() is False
+    finally:
+        worker.close()
+
+
+@_WINDOWS_ONLY
+def test_probe_honest_ok_false_raises_but_does_not_count_or_kill():
+    """fauxcasa-i92.3.4: ok=False is the worker (or harness) HONESTLY
+    reporting the probe did not run -- unknown probe name, PROBE_ENABLED=0,
+    a worker-side exception caught by _handle_probe -- not evidence of
+    compromise. probe() must still raise (fail-closed: never treat this
+    as a denial) but must NOT count it against protocol_violations or
+    kill the worker. Dedicated worker (not shared_worker) so the counter
+    assertion below is not affected by any other test's probe calls."""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES, probe=True)
+    worker.spawn()
+    try:
+        assert worker.protocol_violations == 0
+        with pytest.raises(ProtocolViolation, match="did not run to completion"):
+            worker.probe("this_probe_does_not_exist")
+        assert worker.protocol_violations == 0
+        assert worker.is_alive() is True
+    finally:
+        worker.close()
+
+
 def test_socket_create_documented_not_asserted(shared_worker):
     """Found during Stage B bring-up on this box (not in the spike or the
     bd memory's 6 gotchas -- a 7th, network-flavored analogue of gotcha 4):
@@ -1025,6 +1123,86 @@ def test_probe_stall_deadline_kills_worker():
         worker.close()
 
 
+# ---------------------------------------------------------------------------
+# 2b'. spawn() handshake deadline (fauxcasa-i92.3.4): a worker that spawns
+# but never writes a byte -- a strictly easier attack than stalling an
+# in-progress job -- must not hang the broker forever. Same _DeadlineGuard/
+# timer pattern as recv_response above, now covering spawn()'s three
+# blocking reads (hello incl. resync loop, attach_arena ack, locked).
+
+@_WINDOWS_ONLY
+def test_spawn_handshake_deadline_fires_reports_timeout(monkeypatch):
+    """fauxcasa-i92.3.4: same deterministic race trick as
+    test_recv_response_race_kills_worker_even_though_frame_arrived -- a
+    fake threading.Timer fires its callback SYNCHRONOUSLY from start(),
+    before spawn() ever reaches its first blocking read, so the real
+    child is killed before it can write a single byte. The hello read
+    then sees EOF (DecodeServiceError(WORKER_CRASHED)), which spawn()
+    must convert to TIMEOUT since the crash was OUR kill, not the worker
+    dying on its own. A real AppContainer child is still spawned here --
+    only the timer is faked -- exercising the real Windows spawn path end
+    to end without waiting out a real 30s deadline."""
+
+    class _ImmediateTimer:
+        """Stand-in for threading.Timer: fires its callback synchronously
+        from start(), instead of after a real delay on a background
+        thread -- makes the race deterministic (see the recv_response
+        race test above)."""
+
+        def __init__(self, interval, function):
+            self._function = function
+
+        def start(self):
+            self._function()
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(dw.threading, "Timer", _ImmediateTimer)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    try:
+        with pytest.raises(DecodeServiceError) as exc_info:
+            worker.spawn()
+        assert exc_info.value.code == ErrorCode.TIMEOUT, (
+            f"expected TIMEOUT, got {exc_info.value.code} ({exc_info.value})")
+        assert "spawn handshake deadline exceeded" in str(exc_info.value)
+        assert worker.is_alive() is False
+    finally:
+        worker.close()
+
+
+@_WINDOWS_ONLY
+def test_spawn_deadline_none_arms_no_timer(monkeypatch):
+    """fauxcasa-i92.3.4: spawn_deadline_ms=None disables the handshake
+    deadline entirely (unbounded, prior behavior) -- no threading.Timer
+    is armed at all, not merely armed with a huge value. Records every
+    threading.Timer construction spawn() makes (there must be none) while
+    letting a real spawn() proceed and succeed normally."""
+    timer_calls = []
+
+    class _RecordingTimer:
+        def __init__(self, interval, function):
+            timer_calls.append(interval)
+            self._function = function
+
+        def start(self):
+            pass  # never actually fire -- would kill the real child
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(dw.threading, "Timer", _RecordingTimer)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES, spawn_deadline_ms=None)
+    try:
+        hello = worker.spawn()
+        assert hello is not None
+        assert worker._locked is True
+        assert timer_calls == [], (
+            "spawn_deadline_ms=None must arm no timer at all")
+    finally:
+        worker.close()
+
+
 @_WINDOWS_ONLY
 def test_open_and_duplicate_file_dead_worker_is_worker_crashed(tmp_path, monkeypatch):
     """CODEX FIX 3(a) (P2, Codex review (feat/i92.3-pool-hardening)): if
@@ -1383,6 +1561,31 @@ def test_pool_ensure_worker_does_not_treat_unspawned_worker_as_dead():
     assert worker is unspawned, (
         "the dead-idle gate must not close/replace a worker that was "
         "simply never spawned")
+
+
+def test_pool_ensure_worker_threads_spawn_deadline_ms(monkeypatch):
+    """fauxcasa-i92.3.4: WinDecodePool's spawn_deadline_ms constructor arg
+    must reach the WinSandboxWorker it constructs in _ensure_worker --
+    otherwise a pool-configured deadline would silently revert to the
+    class default. Same monkeypatch-the-class style as
+    test_pool_ensure_worker_replaces_dead_idle_worker above; exercises
+    the real _ensure_worker, not a stub."""
+    captured: dict = {}
+    fresh = _FakePoolWorker(["decoded-ok"])
+    fresh.spawn = lambda: None  # real _ensure_worker calls worker.spawn()
+
+    class _FakeWinSandboxWorker:
+        def __new__(cls, *args, **kwargs):
+            captured.update(kwargs)
+            return fresh
+
+    monkeypatch.setattr(dw, "WinSandboxWorker", _FakeWinSandboxWorker)
+    pool = dw.WinDecodePool(spawn_deadline_ms=1234)
+
+    result = pool.decode("some.png")
+
+    assert result == "decoded-ok"
+    assert captured.get("spawn_deadline_ms") == 1234
 
 
 # ---------------------------------------------------------------------------

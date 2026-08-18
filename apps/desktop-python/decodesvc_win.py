@@ -88,6 +88,14 @@ from decodesvc import (
 PROFILE_NAME = "fauxcasa.decode.worker"
 ARENA_DEFAULT_BYTES = ARENA_BYTES
 DEFAULT_MEM_LIMIT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB, design doc sec 4
+# fauxcasa-i92.3.4: bounds spawn()'s entire handshake (hello read incl. the
+# resync loop, attach_arena ack, locked) the same way recv_response's timer
+# bounds a job -- a worker that spawns but never writes a byte would
+# otherwise hang the broker forever, a strictly easier attack than
+# stalling an in-progress job (today's three blocking reads there are all
+# unbounded). Measured healthy handshake on this box is ~100ms; 30s bounds
+# the hang while leaving slow CI runners enormous headroom.
+DEFAULT_SPAWN_DEADLINE_MS = 30_000
 
 # The only error codes an honest worker ever reports about ITS OWN work
 # (decodesvc_worker_win.py emits exactly these). The rest -- TIMEOUT,
@@ -1373,10 +1381,14 @@ class WinSandboxWorker:
 
     def __init__(self, arena_bytes: int = ARENA_DEFAULT_BYTES, probe: bool = False,
                  profile_name: str = PROFILE_NAME,
-                 mem_limit_bytes: int = DEFAULT_MEM_LIMIT_BYTES) -> None:
+                 mem_limit_bytes: int = DEFAULT_MEM_LIMIT_BYTES,
+                 spawn_deadline_ms: int | None = DEFAULT_SPAWN_DEADLINE_MS) -> None:
         self.arena_bytes = arena_bytes
         self.profile_name = profile_name
         self.mem_limit_bytes = mem_limit_bytes
+        # fauxcasa-i92.3.4: bounds the ENTIRE spawn() handshake below;
+        # None disables it (unbounded, prior behavior).
+        self.spawn_deadline_ms = spawn_deadline_ms
         self._probe_enabled = probe
         self._child = None
         self._sid = None
@@ -1455,43 +1467,113 @@ class WinSandboxWorker:
             raise
         self._child = child
 
+        # fauxcasa-i92.3.4: one _DeadlineGuard/timer bounds the ENTIRE
+        # handshake below (hello read incl. its resync loop, the
+        # attach_arena ack, the locked frame) -- mirrors recv_response's
+        # per-job deadline pattern (FIX 2, reviewer fix pass
+        # (fauxcasa-i92.3.x)) via the same `self._deadline_guard(...)`
+        # factory seam. A worker that spawns but never writes a byte is a
+        # strictly easier attack than stalling an in-progress job, and
+        # the three blocking reads below were, before this fix, all
+        # unbounded. spawn_deadline_ms=None (constructor arg) disables
+        # this entirely, same as recv_response's timeout_ms=None.
+        guard = self._deadline_guard(self._terminate_child)
+        timer = None
+        if self.spawn_deadline_ms is not None:
+            timer = threading.Timer(self.spawn_deadline_ms / 1000, guard.on_deadline)
+            timer.daemon = True
+            timer.start()
+
         try:
-            dup_arena = _duplicate_into_child(arena_handle, child.pi.hProcess)
-
             try:
-                hello_msg, noise = _read_hello_frame_tolerant(child.out_file)
-            except DecodeServiceError as e:
-                # A worker that dies before hello almost always died in
-                # loader/startup; the NTSTATUS exit code (0xC0000142 user32
-                # init, 0xC0000135 DLL not found, 0xC0000022 access denied,
-                # ...) plus the exe we actually spawned is the difference
-                # between a debuggable CI failure and a shrug.
-                kernel32.WaitForSingleObject(child.pi.hProcess, 2000)
-                exit_code = wintypes.DWORD(0)
-                kernel32.GetExitCodeProcess(child.pi.hProcess, ctypes.byref(exit_code))
-                raise DecodeServiceError(
-                    e.code,
-                    f"{e} [worker exit code {exit_code.value:#010x}; "
-                    f"exe {worker_python!r}; pythonpath {worker_pythonpath!r}]") from e
-            self.hello_noise_bytes = noise
-            self.hello = parse_hello(hello_msg, self.arena_bytes)
+                dup_arena = _duplicate_into_child(arena_handle, child.pi.hProcess)
 
-            _write_frame(child.in_file, {"op": "attach_arena", "handle": dup_arena})
-            attach_resp = _read_frame(child.out_file)
-            if (not isinstance(attach_resp, dict) or attach_resp.get("op") != "attach_arena"
-                    or attach_resp.get("ok") is not True):
-                raise ProtocolViolation(f"attach_arena failed: {attach_resp!r}")
+                try:
+                    hello_msg, noise = _read_hello_frame_tolerant(child.out_file)
+                except DecodeServiceError as e:
+                    # A worker that dies before hello almost always died in
+                    # loader/startup; the NTSTATUS exit code (0xC0000142 user32
+                    # init, 0xC0000135 DLL not found, 0xC0000022 access denied,
+                    # ...) plus the exe we actually spawned is the difference
+                    # between a debuggable CI failure and a shrug. `e.code` is
+                    # preserved unchanged (e.g. WORKER_CRASHED), so an
+                    # enriched error here still converts to TIMEOUT correctly
+                    # below if the deadline is what actually killed the child.
+                    kernel32.WaitForSingleObject(child.pi.hProcess, 2000)
+                    exit_code = wintypes.DWORD(0)
+                    kernel32.GetExitCodeProcess(child.pi.hProcess, ctypes.byref(exit_code))
+                    raise DecodeServiceError(
+                        e.code,
+                        f"{e} [worker exit code {exit_code.value:#010x}; "
+                        f"exe {worker_python!r}; pythonpath {worker_pythonpath!r}]") from e
+                self.hello_noise_bytes = noise
+                self.hello = parse_hello(hello_msg, self.arena_bytes)
 
-            locked_msg = _read_frame(child.out_file)
-            is_appc = parse_locked(locked_msg)
-            if not is_appc:
-                raise RuntimeError(
-                    "worker reports is_appcontainer=False after phase 2 -- refusing "
-                    "to trust lockdown; this is a security finding, not a retry case")
-            self._locked = True
+                _write_frame(child.in_file, {"op": "attach_arena", "handle": dup_arena})
+                attach_resp = _read_frame(child.out_file)
+                if (not isinstance(attach_resp, dict) or attach_resp.get("op") != "attach_arena"
+                        or attach_resp.get("ok") is not True):
+                    raise ProtocolViolation(f"attach_arena failed: {attach_resp!r}")
+
+                locked_msg = _read_frame(child.out_file)
+                is_appc = parse_locked(locked_msg)
+                if not is_appc:
+                    raise RuntimeError(
+                        "worker reports is_appcontainer=False after phase 2 -- refusing "
+                        "to trust lockdown; this is a security finding, not a retry case")
+                self._locked = True
+            except Exception as e:
+                # fauxcasa-i92.3.4: the deadline firing while one of the
+                # reads above blocks kills the child (guard.on_deadline()
+                # -> _terminate_child()), which closes its end of the
+                # pipe -- the blocked read then raises
+                # DecodeServiceError(WORKER_CRASHED) from EOF, same as any
+                # other unexpected child death. guard.finish() is the
+                # single point that atomically decides whether the
+                # deadline or the handshake "won" (same race
+                # recv_response's guard closes); if the deadline won AND
+                # the error is our own WORKER_CRASHED-from-EOF, re-report
+                # it as TIMEOUT so the caller sees OUR kill, not an honest
+                # crash. ProtocolViolation IS a DecodeServiceError
+                # subclass but its code is always PROTOCOL, never
+                # WORKER_CRASHED, so this check naturally leaves it -- and
+                # every other exception -- to propagate unchanged even if
+                # the timer fired late: evidence of compromise (or an
+                # unrelated failure), not a timing artifact.
+                hit = guard.finish()
+                if (isinstance(e, DecodeServiceError)
+                        and e.code == ErrorCode.WORKER_CRASHED and hit):
+                    raise DecodeServiceError(
+                        ErrorCode.TIMEOUT,
+                        f"spawn handshake deadline exceeded "
+                        f"(spawn_deadline_ms={self.spawn_deadline_ms}); "
+                        f"worker killed") from e
+                raise
+            else:
+                hit = guard.finish()
+                if hit:
+                    # The handshake completed, but the deadline fired
+                    # first (or concurrently) -- the worker is already
+                    # killed or dying. Never return a hello from a corpse
+                    # (mirrors recv_response's identical comment).
+                    self.close()
+                    raise DecodeServiceError(
+                        ErrorCode.TIMEOUT,
+                        f"spawn handshake deadline exceeded "
+                        f"(spawn_deadline_ms={self.spawn_deadline_ms}); "
+                        f"worker killed")
         except Exception:
             self.close()
             raise
+        finally:
+            # guard.finish() (above, in both the except and else branches)
+            # always runs BEFORE this cancel() -- once finish() has
+            # recorded "done", a timer callback firing later is a
+            # guaranteed no-op, so a straggler thread here can never race
+            # a later job (same ordering argument as recv_response's
+            # finally comment).
+            if timer is not None:
+                timer.cancel()
 
         return self.hello
 
@@ -1884,7 +1966,30 @@ class WinSandboxWorker:
         silently "pass" the containment gate without ever having run.
         Raise ProtocolViolation instead, loudly, so the calling test
         ERRORS rather than green-passing. This is the integrity of the
-        whole gate suite (design doc sec 7 gate 1)."""
+        whole gate suite (design doc sec 7 gate 1).
+
+        fauxcasa-i92.3.4: the counting/kill policy for those
+        ProtocolViolations, ratified. Two categories:
+
+        - Worker-LIE (count self.protocol_violations + kill(), mirroring
+          decode()'s FIX 7 treatment): a transport-level ProtocolViolation
+          out of recv_response (malformed/oversized frame -- closes the
+          "pre-existing gap this task does not widen" noted at FIX 6
+          above); a non-dict response; an id mismatch; a non-bool `ok`
+          (new check below -- see its own comment); an `attempt` echo
+          mismatch or a missing/non-bool `allowed`, both only reachable
+          once `ok` is True, i.e. the worker CLAIMS the probe ran. All of
+          these are the worker (or a malformed transport) asserting
+          something false about a probe attempt -- evidence of
+          compromise, same standing as any other ProtocolViolation.
+        - Harness-error (raise only, no count, worker stays alive): an
+          honest JSON `ok: false` -- the worker truthfully reports the
+          probe did NOT run (unknown probe name, PROBE_ENABLED=0, an
+          exception _handle_probe caught worker-side). Counting these
+          against the escape-gate counter would poison it with harness
+          mistakes that are not compromise events; fail-closed semantics
+          are preserved regardless -- this is still not treated as a
+          denial, it just doesn't kill a perfectly healthy worker."""
         self._require_ready()
         if not self._probe_enabled:
             raise RuntimeError(
@@ -1897,41 +2002,74 @@ class WinSandboxWorker:
         if handle is not None:
             request["handle"] = handle
         self.send_request(request)
+
+        def _worker_lie(message: str) -> None:
+            # fauxcasa-i92.3.4: the shared count+kill+raise seam for every
+            # worker-lie branch below -- see the policy paragraph above.
+            self.protocol_violations += 1
+            self.kill()
+            raise ProtocolViolation(message)
+
         try:
             resp = self.recv_response(timeout_ms=deadline_ms)
+        except ProtocolViolation:
+            # fauxcasa-i92.3.4: closes the transport-level gap FIX 6 left
+            # open -- a malformed/oversized frame is worker-lie evidence,
+            # same as decode()'s own FIX 7 branch, so it must be counted
+            # and killed too. Re-raises the SAME exception (not a new one
+            # via _worker_lie) so its original message is preserved
+            # unchanged, mirroring decode()'s FIX 7 branch exactly.
+            # ProtocolViolation is a DecodeServiceError subclass, so this
+            # must be caught BEFORE the generic except below, or it would
+            # fall into the TIMEOUT-only branch there uncounted.
+            self.protocol_violations += 1
+            self.kill()
+            raise
         except DecodeServiceError as e:
             # fauxcasa-i92.3.1: same TIMEOUT->kill semantics as decode();
-            # any other DecodeServiceError (including ProtocolViolation,
-            # a pre-existing gap this task does not widen) propagates
-            # exactly as it did before deadline_ms existed.
+            # any other DecodeServiceError propagates exactly as it did
+            # before deadline_ms existed.
             if e.code == ErrorCode.TIMEOUT:
                 self.kill()
             raise
         if not isinstance(resp, dict):
-            raise ProtocolViolation(f"probe response is not a JSON object: {resp!r}")
+            _worker_lie(f"probe response is not a JSON object: {resp!r}")
         # FIX 6 (P3, reviewer fix pass (fauxcasa-i92.3.x)): same type-strict
         # id guard as _validate_response_checks -- plain `!=` accepts JSON
         # true for 1 and 1.0 for an int req_id (Python numeric-tower
-        # equality). Deliberately no counter/kill semantics here (unlike
-        # _validate_response_checks): probe() PV raises also cover
-        # harness-side mistakes like an unknown probe name, so blanket
-        # counting would poison the escape-gate counter -- a follow-up
-        # bead will decide that policy.
+        # equality).
         rid = resp.get("id")
         if type(rid) is not int or rid != req_id:
-            raise ProtocolViolation(f"probe response id {rid!r} != request id {req_id}")
-        if resp.get("ok") is not True:
+            _worker_lie(f"probe response id {rid!r} != request id {req_id}")
+        # fauxcasa-i92.3.4: type-strict `ok` check, mirroring
+        # _validate_response_checks's identical fix (Codex review PR110
+        # round 5 deferral) -- plain `is not True` alone lets a malformed,
+        # non-boolean `ok` ("yes", 1, null, ...) fall into the honest
+        # ok=False branch below unnoticed. A non-bool `ok` is protocol-
+        # malformed, a worker lie about its own response shape, not an
+        # honest report -- count + kill.
+        ok = resp.get("ok")
+        if type(ok) is not bool:
+            _worker_lie(f"probe {name!r} response 'ok' field is not a JSON boolean: {ok!r}")
+        if ok is not True:
+            # Harness-error: an honest `ok: false` -- the worker truthfully
+            # reports the probe did not run (unknown attempt,
+            # PROBE_ENABLED=0, a worker-side exception). Fail-closed (still
+            # raised, never treated as a denial) but NOT evidence of
+            # compromise -- no counter bump, no kill (see the policy
+            # paragraph above).
             raise ProtocolViolation(
-                f"probe {name!r} did not run to completion (ok={resp.get('ok')!r}, "
+                f"probe {name!r} did not run to completion (ok=False, "
                 f"error={resp.get('error')!r}, detail={resp.get('detail')!r}) -- "
                 f"a broken or unknown probe must never be treated as a denial")
+        # Everything below is only reachable with ok=True -- the worker is
+        # now CLAIMING it ran the requested probe, so any inconsistency
+        # here is the worker lying about that claim.
         if resp.get("attempt") != name:
-            raise ProtocolViolation(
-                f"probe response attempt {resp.get('attempt')!r} != requested {name!r}")
+            _worker_lie(f"probe response attempt {resp.get('attempt')!r} != requested {name!r}")
         allowed = resp.get("allowed")
         if not isinstance(allowed, bool):
-            raise ProtocolViolation(
-                f"probe {name!r} response missing/non-bool 'allowed': {allowed!r}")
+            _worker_lie(f"probe {name!r} response missing/non-bool 'allowed': {allowed!r}")
         return {"attempt": name, "allowed": allowed,
                 "detail": resp.get("detail"), "data_b64": resp.get("data_b64")}
 
@@ -1977,15 +2115,33 @@ class WinDecodePool:
     LANES (e.g. an interactive job preempting a queued batch job) are
     explicitly NOT this class's job -- that belongs to the future
     multi-worker DecodeService this class is a stepping stone toward
-    (module docstring, design doc sec 2/4)."""
+    (module docstring, design doc sec 2/4).
+
+    fauxcasa-i92.3.4: ratified deviation from design doc sec 1, which
+    describes the broker respawning a dead slot "in the background (~92-
+    400 ms, off the hot path)". `_ensure_worker` above respawns lazily
+    and SYNCHRONOUSLY, inline in the retrying `decode()` call -- a retry
+    pays the full spawn latency on the hot path. Deliberate for this
+    minimal single-slot pool: there is exactly one slot and, with no
+    concurrent lane to protect from a stalled respawn, no hot path worth
+    the complexity of a background respawn yet. Background respawn lands
+    alongside the future multi-worker DecodeService this class is a
+    stepping stone toward, not before."""
 
     def __init__(self, arena_bytes: int = ARENA_DEFAULT_BYTES, probe: bool = False,
                  profile_name: str = PROFILE_NAME,
-                 mem_limit_bytes: int = DEFAULT_MEM_LIMIT_BYTES) -> None:
+                 mem_limit_bytes: int = DEFAULT_MEM_LIMIT_BYTES,
+                 spawn_deadline_ms: int | None = DEFAULT_SPAWN_DEADLINE_MS) -> None:
         self.arena_bytes = arena_bytes
         self.probe = probe
         self.profile_name = profile_name
         self.mem_limit_bytes = mem_limit_bytes
+        # fauxcasa-i92.3.4: threaded straight to each WinSandboxWorker this
+        # pool constructs (_ensure_worker below). A spawn-deadline TIMEOUT
+        # then flows through decode()'s existing except taxonomy below
+        # (counted in self.timeouts, one retry via FIX 3's routing) with
+        # no new pool code needed for it.
+        self.spawn_deadline_ms = spawn_deadline_ms
         self._worker: WinSandboxWorker | None = None
         # Codex review (feat/i92.3-pool-hardening): guards the ENTIRE
         # decode() retry loop (and close(), which must not race a live
@@ -2016,7 +2172,8 @@ class WinDecodePool:
         if self._worker is None:
             worker = WinSandboxWorker(
                 arena_bytes=self.arena_bytes, probe=self.probe,
-                profile_name=self.profile_name, mem_limit_bytes=self.mem_limit_bytes)
+                profile_name=self.profile_name, mem_limit_bytes=self.mem_limit_bytes,
+                spawn_deadline_ms=self.spawn_deadline_ms)
             worker.spawn()
             self._worker = worker
         return self._worker
