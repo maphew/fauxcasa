@@ -1054,6 +1054,42 @@ def test_deadline_guard_finish_then_on_deadline():
     assert calls == []
 
 
+class _ImmediateTimer:
+    """Stand-in for threading.Timer: fires its callback synchronously
+    from start(), instead of after a real delay on a background thread --
+    makes the timer-vs-read race deterministic. NOTE for users: the tests
+    below install this with monkeypatch.setattr(dw.threading, "Timer", ...),
+    which patches the GLOBAL threading module (dw.threading IS threading),
+    i.e. process-wide for the test's duration -- not dw's namespace, even
+    though it reads that way."""
+
+    def __init__(self, interval, function):
+        self._function = function
+
+    def start(self):
+        self._function()
+
+    def cancel(self):
+        pass
+
+
+class _HitGuard:
+    """Stand-in for _DeadlineGuard injected via the _deadline_guard
+    factory seam: reports the deadline as already fired (finish() ->
+    True) without any timer or kill, so a test can force the
+    'deadline won' outcome deterministically on an otherwise-healthy
+    handshake (fauxcasa-i92.3.4, opus review)."""
+
+    def __init__(self, terminate_fn):
+        pass
+
+    def on_deadline(self):
+        return False
+
+    def finish(self):
+        return True
+
+
 def test_recv_response_race_kills_worker_even_though_frame_arrived(monkeypatch):
     """FIX 2: deterministic reproduction of the timer-vs-read race,
     without any real timer -- a fake threading.Timer fires its callback
@@ -1074,20 +1110,6 @@ def test_recv_response_race_kills_worker_even_though_frame_arrived(monkeypatch):
     worker.kill = lambda: killed.__setitem__("called", True)
 
     dw._write_frame(write_file, {"id": 1, "ok": True, "detail": "prompt"})
-
-    class _ImmediateTimer:
-        """Stand-in for threading.Timer: fires its callback synchronously
-        from start(), instead of after a real delay on a background
-        thread -- makes the race deterministic."""
-
-        def __init__(self, interval, function):
-            self._function = function
-
-        def start(self):
-            self._function()
-
-        def cancel(self):
-            pass
 
     monkeypatch.setattr(dw.threading, "Timer", _ImmediateTimer)
     try:
@@ -1141,23 +1163,12 @@ def test_spawn_handshake_deadline_fires_reports_timeout(monkeypatch):
     must convert to TIMEOUT since the crash was OUR kill, not the worker
     dying on its own. A real AppContainer child is still spawned here --
     only the timer is faked -- exercising the real Windows spawn path end
-    to end without waiting out a real 30s deadline."""
-
-    class _ImmediateTimer:
-        """Stand-in for threading.Timer: fires its callback synchronously
-        from start(), instead of after a real delay on a background
-        thread -- makes the race deterministic (see the recv_response
-        race test above)."""
-
-        def __init__(self, interval, function):
-            self._function = function
-
-        def start(self):
-            self._function()
-
-        def cancel(self):
-            pass
-
+    to end without waiting out a real 30s deadline. The timer is armed
+    AFTER the arena-handle duplication (Codex cross-vendor P1), so the
+    immediate fire lands before the first blocking read -- never inside
+    DuplicateHandle, whose failure mode on a just-terminated target is a
+    raw PermissionError rather than the WORKER_CRASHED this conversion
+    keys on."""
     monkeypatch.setattr(dw.threading, "Timer", _ImmediateTimer)
     worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
     try:
@@ -1199,6 +1210,93 @@ def test_spawn_deadline_none_arms_no_timer(monkeypatch):
         assert worker._locked is True
         assert timer_calls == [], (
             "spawn_deadline_ms=None must arm no timer at all")
+    finally:
+        worker.close()
+
+
+@_WINDOWS_ONLY
+def test_spawn_deadline_ms_converts_to_timer_seconds(monkeypatch):
+    """fauxcasa-i92.3.4 (opus review): pin the ms->seconds conversion.
+    A units regression (spawn_deadline_ms handed to threading.Timer
+    unconverted) would silently make the 30s default a 30,000s deadline
+    -- re-opening the unbounded-hang this bead closes -- and no other
+    test would notice, since they either fire the timer synchronously
+    or assert it was never armed."""
+    timer_calls = []
+
+    class _RecordingTimer:
+        def __init__(self, interval, function):
+            timer_calls.append(interval)
+            self._function = function
+
+        def start(self):
+            pass  # never actually fire -- would kill the real child
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(dw.threading, "Timer", _RecordingTimer)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES, spawn_deadline_ms=5000)
+    try:
+        hello = worker.spawn()
+        assert hello is not None
+        assert timer_calls == [5.0], (
+            f"spawn_deadline_ms=5000 must arm one timer at 5.0 SECONDS, "
+            f"got {timer_calls!r}")
+    finally:
+        worker.close()
+
+
+@_WINDOWS_ONLY
+def test_spawn_success_after_deadline_never_returns_hello(monkeypatch):
+    """fauxcasa-i92.3.4 (opus review): the else branch -- the handshake
+    completes normally but the guard reports the deadline fired first
+    (or concurrently). A _HitGuard injected via the _deadline_guard
+    factory seam forces that outcome deterministically on a REAL
+    AppContainer handshake that runs to completion: spawn() must still
+    refuse to return the hello -- close the corpse and raise TIMEOUT
+    (mirrors recv_response's 'never return a result from a corpse')."""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    monkeypatch.setattr(worker, "_deadline_guard", lambda terminate_fn: _HitGuard(terminate_fn))
+    try:
+        with pytest.raises(DecodeServiceError) as exc_info:
+            worker.spawn()
+        assert exc_info.value.code == ErrorCode.TIMEOUT, (
+            f"expected TIMEOUT, got {exc_info.value.code} ({exc_info.value})")
+        assert "spawn handshake deadline exceeded" in str(exc_info.value)
+        # close() ran: no live child, no lockdown claim, and no hello
+        # left advertising a handshake from a worker we refused to trust.
+        assert worker.is_alive() is False
+        assert worker._locked is False
+        assert worker.hello is None
+    finally:
+        worker.close()
+
+
+@_WINDOWS_ONLY
+def test_spawn_protocol_violation_not_converted_even_when_deadline_hit(monkeypatch):
+    """fauxcasa-i92.3.4 (opus review): ProtocolViolation is evidence of
+    compromise, not a timing artifact -- even when the guard reports the
+    deadline fired, a PV from the handshake must propagate unchanged
+    (code PROTOCOL), never be relabelled TIMEOUT. _HitGuard forces the
+    deadline-won outcome; a stubbed parse_hello supplies the violation.
+    (parse_hello, not the hello read: a PV raised from the read itself is
+    re-wrapped by the exit-code enrichment block into a base
+    DecodeServiceError -- code preserved, type not -- so the read path
+    can't pin the type-unchanged claim.)"""
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    monkeypatch.setattr(worker, "_deadline_guard", lambda terminate_fn: _HitGuard(terminate_fn))
+
+    def _bogus_hello(msg, expected_arena_bytes):
+        raise ProtocolViolation("bogus hello (test)")
+
+    monkeypatch.setattr(dw, "parse_hello", _bogus_hello)
+    try:
+        with pytest.raises(ProtocolViolation) as exc_info:
+            worker.spawn()
+        assert exc_info.value.code == ErrorCode.PROTOCOL
+        assert "bogus hello (test)" in str(exc_info.value)
+        assert worker.is_alive() is False
     finally:
         worker.close()
 

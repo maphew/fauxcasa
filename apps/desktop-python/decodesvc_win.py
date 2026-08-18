@@ -1477,17 +1477,31 @@ class WinSandboxWorker:
         # the three blocking reads below were, before this fix, all
         # unbounded. spawn_deadline_ms=None (constructor arg) disables
         # this entirely, same as recv_response's timeout_ms=None.
-        guard = self._deadline_guard(self._terminate_child)
         timer = None
-        if self.spawn_deadline_ms is not None:
-            timer = threading.Timer(self.spawn_deadline_ms / 1000, guard.on_deadline)
-            timer.daemon = True
-            timer.start()
-
         try:
-            try:
-                dup_arena = _duplicate_into_child(arena_handle, child.pi.hProcess)
+            # The arena duplication runs BEFORE the timer is armed (Codex
+            # cross-vendor review, P1): DuplicateHandle is a fast local
+            # syscall on OUR OWN handles that the worker cannot stall, but
+            # a deadline firing mid-call TerminateProcess()es its target
+            # and can make it raise a raw PermissionError instead of the
+            # WORKER_CRASHED-from-EOF the conversion below expects --
+            # escaping both the TIMEOUT re-report here and the pool's
+            # timeout accounting/retry. The deadline exists to bound the
+            # blocking pipe reads, and every one of those comes after.
+            dup_arena = _duplicate_into_child(arena_handle, child.pi.hProcess)
 
+            # Guard/timer setup sits INSIDE this try (opus review): a
+            # timer.start() that raises (thread exhaustion) must reach the
+            # same close() as every other spawn failure, or the per-spawn
+            # SID/arena leak fixes (Codex review PR110 rounds 4+5) regress
+            # for exactly this path.
+            guard = self._deadline_guard(self._terminate_child)
+            if self.spawn_deadline_ms is not None:
+                timer = threading.Timer(self.spawn_deadline_ms / 1000, guard.on_deadline)
+                timer.daemon = True
+                timer.start()
+
+            try:
                 try:
                     hello_msg, noise = _read_hello_frame_tolerant(child.out_file)
                 except DecodeServiceError as e:
@@ -1585,6 +1599,13 @@ class WinSandboxWorker:
             self._child.close()
             self._child = None
         self._locked = False
+        # fauxcasa-i92.3.4 (opus review): a worker we killed or refused to
+        # trust must not keep advertising its handshake -- anything that
+        # logs or inspects a failed spawn would otherwise see a hello from
+        # a corpse. _require_ready() already blocks jobs either way; this
+        # just clears the residue.
+        self.hello = None
+        self.hello_noise_bytes = 0
         if self._arena_addr:
             kernel32.UnmapViewOfFile(ctypes.c_void_p(self._arena_addr))
             self._arena_addr = None
@@ -2003,12 +2024,15 @@ class WinSandboxWorker:
             request["handle"] = handle
         self.send_request(request)
 
-        def _worker_lie(message: str) -> None:
-            # fauxcasa-i92.3.4: the shared count+kill+raise seam for every
+        def _worker_lie(message: str) -> ProtocolViolation:
+            # fauxcasa-i92.3.4: the shared count+kill seam for every
             # worker-lie branch below -- see the policy paragraph above.
+            # RETURNS the exception (call sites say `raise _worker_lie(...)`)
+            # rather than raising it here, so the control flow stays
+            # visible to readers and type checkers (opus review).
             self.protocol_violations += 1
             self.kill()
-            raise ProtocolViolation(message)
+            return ProtocolViolation(message)
 
         try:
             resp = self.recv_response(timeout_ms=deadline_ms)
@@ -2033,14 +2057,14 @@ class WinSandboxWorker:
                 self.kill()
             raise
         if not isinstance(resp, dict):
-            _worker_lie(f"probe response is not a JSON object: {resp!r}")
+            raise _worker_lie(f"probe response is not a JSON object: {resp!r}")
         # FIX 6 (P3, reviewer fix pass (fauxcasa-i92.3.x)): same type-strict
         # id guard as _validate_response_checks -- plain `!=` accepts JSON
         # true for 1 and 1.0 for an int req_id (Python numeric-tower
         # equality).
         rid = resp.get("id")
         if type(rid) is not int or rid != req_id:
-            _worker_lie(f"probe response id {rid!r} != request id {req_id}")
+            raise _worker_lie(f"probe response id {rid!r} != request id {req_id}")
         # fauxcasa-i92.3.4: type-strict `ok` check, mirroring
         # _validate_response_checks's identical fix (Codex review PR110
         # round 5 deferral) -- plain `is not True` alone lets a malformed,
@@ -2050,7 +2074,7 @@ class WinSandboxWorker:
         # honest report -- count + kill.
         ok = resp.get("ok")
         if type(ok) is not bool:
-            _worker_lie(f"probe {name!r} response 'ok' field is not a JSON boolean: {ok!r}")
+            raise _worker_lie(f"probe {name!r} response 'ok' field is not a JSON boolean: {ok!r}")
         if ok is not True:
             # Harness-error: an honest `ok: false` -- the worker truthfully
             # reports the probe did not run (unknown attempt,
@@ -2066,10 +2090,10 @@ class WinSandboxWorker:
         # now CLAIMING it ran the requested probe, so any inconsistency
         # here is the worker lying about that claim.
         if resp.get("attempt") != name:
-            _worker_lie(f"probe response attempt {resp.get('attempt')!r} != requested {name!r}")
+            raise _worker_lie(f"probe response attempt {resp.get('attempt')!r} != requested {name!r}")
         allowed = resp.get("allowed")
         if not isinstance(allowed, bool):
-            _worker_lie(f"probe {name!r} response missing/non-bool 'allowed': {allowed!r}")
+            raise _worker_lie(f"probe {name!r} response missing/non-bool 'allowed': {allowed!r}")
         return {"attempt": name, "allowed": allowed,
                 "detail": resp.get("detail"), "data_b64": resp.get("data_b64")}
 
@@ -2248,9 +2272,11 @@ class WinDecodePool:
 
 def spawn_worker(arena_bytes: int = ARENA_DEFAULT_BYTES, probe: bool = False,
                   profile_name: str = PROFILE_NAME,
-                  mem_limit_bytes: int = DEFAULT_MEM_LIMIT_BYTES) -> WinSandboxWorker:
+                  mem_limit_bytes: int = DEFAULT_MEM_LIMIT_BYTES,
+                  spawn_deadline_ms: int | None = DEFAULT_SPAWN_DEADLINE_MS) -> WinSandboxWorker:
     """Convenience: construct + spawn in one call (mainly for tests)."""
     worker = WinSandboxWorker(arena_bytes=arena_bytes, probe=probe,
-                               profile_name=profile_name, mem_limit_bytes=mem_limit_bytes)
+                               profile_name=profile_name, mem_limit_bytes=mem_limit_bytes,
+                               spawn_deadline_ms=spawn_deadline_ms)
     worker.spawn()
     return worker
