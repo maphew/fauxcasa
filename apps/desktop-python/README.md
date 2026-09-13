@@ -6,10 +6,14 @@ Python + Qt (PySide6) stack — the next step after the
 balloon was a benchmark; this is product architecture: every layer the
 M1 milestone needs exists here in miniature, wired together.
 
-**Status: experiment.** The stack decision (fauxcasa-6hf) is owner-
-confirmed for trial; this code is evidence, not yet the application.
-The app name is provisional — `APP_NAME` in `main.py` is the single
-source of truth.
+**Status: this directory is the 0.1 application.** It ships as Fauxcasa
+0.1.0 — see `docs/releases/v0.1.0.md`. The stack decision (fauxcasa-6hf)
+was confirmed for trial and has since held through a full M1 milestone;
+what was evidence is now the product. Moving the code out of
+`apps/desktop-python/` into its permanent home and running the `tr()`
+externalization pass are 0.2 promotion-PR work (`docs/design/tracer-promotion.md`),
+not blockers for 0.1. The app name is still provisional — `APP_NAME` in
+`main.py` is the single source of truth.
 
 ## What's wired end to end
 
@@ -21,9 +25,9 @@ source of truth.
 | Thumbnail cache | `thumbcache.py` | reads/builds packed fcache; machine-local under `cache/fauxcasa-cache/` (N1/N3); identity = sha256 + relpath, staleness = size+mtime cheap signals (N6). Parallel indexer (threads + **scaled decode**) prioritizes gallery-visible photos and publishes each completed thumbnail live; a determinate activity row directly below the toolbar makes cold-build progress unmistakable — see below |
 | Persistent catalog | `catalog.py` | full catalog (metadata + structure + signals) serialized to JSON; a **warm start loads it and skips the walk** (§7 cold start). Background reconcile diffs cheap signals and rebuilds + atomically swaps on drift |
 | Virtualized grid | `grid.py` | balloon lineage: threaded fcache decode, bounded LRU — plus event-driven repaint, real scrollbar, group headers w/ pinned current folder, selection, star badges, error tiles. Space toggles stars for the selected/current photos, persisted as machine-local Fauxcasa overrides without touching library files. Never reads originals (N4) |
-| Sidebar | `main.py` | All / Starred / folder tree (filesystem truth) / albums (pure references resolved from `albums=` tokens) |
-| Search | `main.py` | substring over filename + caption + keywords, live filter |
-| Viewer | `viewer.py` | double-click / Enter; a visible **← Gallery (Esc)** toolbar action plus Esc; **instant cached preview** (the fcache v2 hi-DPI / loupe consumer — the nearest cached level ≥ the viewport's device pixels via `ThumbCache.best_level()`: 512 on a hi-DPI/large window, 256 from a v1 cache) painted while the async original loads (the explicit N4 exception); ←/→ or J/K navigates and Space toggles the star. **Explicit 1:1 zoom** (the other N4 exception, fauxcasa-q6l.4): `1` (Picasa Photo Viewer's toggle) / `Ctrl+Alt+0` / click (anchored at the click point), one image pixel per **device** pixel; drag or Ctrl+arrows pan, plain arrows stay next/prev; resets to fit on photo change. **Face overlay** (fauxcasa-cam.4): `F` toggles rounded boxes + names over the photo's ini `faces=` regions (dashed + "Unnamed" for unconfirmed/unnamed); stored-pixel rect64 fractions mapped through the composed EXIF-orientation × `rotate=` transform and the live fit/1:1 rect, so boxes track pan and zoom; viewer-only (peek/slideshow are glance surfaces). Picasa documents no view-mode key for face boxes — `F` is this app's own pick |
+| Sidebar | `main.py` | All / Starred / Recently Updated / folder tree or flat view (toggle, filesystem truth) / albums (pure references resolved from `albums=` tokens) / People (named faces) + Unnamed faces |
+| Search | `main.py` | multi-word AND with `-term` negation (§5), live filter, over filename + caption + keywords + people + folder names |
+| Viewer | `viewer.py` | double-click / Enter; a visible **← Gallery (Esc)** toolbar action plus Esc; **instant cached preview** (the fcache v2 hi-DPI / loupe consumer — the nearest cached level ≥ the viewport's device pixels via `ThumbCache.best_level()`: 512 on a hi-DPI/large window, 256 from a v1 cache) painted while the async original loads (the explicit N4 exception); ←/→ or J/K navigates and Space toggles the star. **Explicit 1:1 zoom** (the other N4 exception, fauxcasa-q6l.4): `1` (Picasa Photo Viewer's toggle) / `Ctrl+Alt+0` / click (anchored at the click point), one image pixel per **device** pixel; drag or Ctrl+arrows pan, plain arrows stay next/prev; resets to fit on photo change. **Face overlay** (fauxcasa-cam.4): `F` toggles rounded boxes + names over the photo's ini `faces=` regions (dashed + "Unnamed" for unconfirmed/unnamed); stored-pixel rect64 fractions mapped through the composed EXIF-orientation × `rotate=` transform and the live fit/1:1 rect, so boxes track pan and zoom; viewer-only (peek/slideshow are glance surfaces). Picasa documents no view-mode key for face boxes — `F` is this app's own pick. **Video playback** (fauxcasa-v46.3): a poster frame opens like a still; `P` plays/pauses with audio, `Ctrl+Left`/`Ctrl+Right` seek 5 s (context-layered onto the still pan chords, since 1:1 zoom and pan don't apply to video); videos have no 1:1 view |
 | Hover peek | `peek.py` + grid trigger | Picasa's **Ctrl+Alt while hovering** a grid photo (the shortcut corpus, verbatim): frameless full-screen preview on the cursor's screen, riding the viewer's preview + async-original machinery; input-transparent and non-activating so the grid keeps focus and the event stream; dismisses on hover-out, modifier release, click, or Esc (fauxcasa-q6l.5) |
 | Inspector | `inspector.py` | Metadata inspector panel (fauxcasa-q6l.25): catalog-only fields — name, folder, dimensions, size, dates, star, caption, keywords, location, people, albums, edit state — omitting rows with no data; toggled by the toolbar's **Info** action or bare **`I`** (this app's own pick, no Picasa equivalent) from either the grid or the viewer, since it lives in a splitter around the page stack rather than inside either page |
 | Instrumentation | `main.py` | `READY` line + JSON: cold-start ms, prep ms, `warm`, RSS, and an `indexed` event with photos/s — the §7 numbers |
@@ -202,68 +206,77 @@ transforms). The value is read at **view time** from the original's bytes
 decode worker — deliberately *not* persisted in the catalog, so no
 catalog version bump.
 
-## Deliberate tracer shortcuts (not product decisions)
+## Known simplifications (tracked)
 
-- The viewer's 1:1 toggle binds **both** `1` (Picasa Photo Viewer's own
-  "Toggle 100% zoom") and `Ctrl+Alt+0`. The M2 triage loop will claim bare
-  digits 0–5 as star-**set** keys (spec §5), at which point `1` cedes to
-  star-set and `Ctrl+Alt+0` remains — a key-priority decision deferred
-  until those keys land.
-- In-app cache builder holds all thumb blobs in memory while writing the
-  fcache — fine for fixture/medium libraries; huge libraries adopt a
-  pre-built fcache (`--thumbs`). Throughput itself is no longer the
-  limit (see above).
-- Grid renders a single thumbnail resolution (~256 px native): each tile
-  is decoded **once** at that size and **scaled in paint** to the current
-  tile size, so zoom is pure relayout + re-anchor and never re-decodes the
-  JPEG (fauxcasa-z1e). The fcache format is now **dual-version** (fauxcasa-gtr):
-  v1 (the default, and the shipped benchmark cache) is a single 256 level;
-  v2 (`make-thumbcache.py --levels 512,256,128` or `--levels recommended`,
-  `build_cache(levels=...)`) declares a level set in its header and stores a
-  photo-major per-level index. One reader loads both. The grid still reads
-  the **primary** (256) level, so a v2 cache leaves grid/zoom behaviour
-  unchanged; **consuming** the larger levels for a hi-DPI display or a loupe
-  larger than 256 (the viewer still reads originals, N4) is the remaining
-  product work.
-- Persistent catalog is JSON (readable, language-neutral per N3), not the
-  spec's compact ~50 B/photo binary catalog. Reconcile rebuilds the
-  whole cache on drift rather than patching incrementally, and does not
-  yet do N6 move-detection (the 2×2 hash-path matrix). Adopt-mode
-  catalogs *start* with no per-file signals; a background **backfill
-  pass** (`thumbcache.backfill_catalog`, fauxcasa-cam.12) then fills
+- **1:1 zoom key arbitration** — the viewer's 1:1 toggle binds **both**
+  `1` (Picasa Photo Viewer's own "Toggle 100% zoom") and `Ctrl+Alt+0`.
+  The M2 triage loop will claim bare digits 0–5 as star-**set** keys
+  (spec §5), at which point `1` cedes to star-set and `Ctrl+Alt+0`
+  remains. Deferred until those keys land — product-accepted for 0.1.
+- **In-app cache builder memory use** — holds all thumb blobs in memory
+  while writing the fcache: fine for fixture/medium libraries; huge
+  libraries adopt a pre-built fcache (`--thumbs`). Throughput itself is
+  no longer the limit (see the §7 numbers above). Product-accepted for
+  0.1.
+- **Grid tile resolution** — each tile is decoded **once** and **scaled
+  in paint** to the current tile size, so zoom is pure relayout +
+  re-anchor and never re-decodes the JPEG (fauxcasa-z1e, closed). The
+  fcache format is **dual-version** (fauxcasa-gtr): v1 is a single 256
+  level; v2 (`make-thumbcache.py --levels 512,256,128` or
+  `--levels recommended`, `build_cache(levels=...)`) declares a level
+  set in its header and stores a photo-major per-level index. One
+  reader loads both, and the grid reads the **nearest v2 level ≥ tile
+  size × devicePixelRatio** (fauxcasa-q7m, closed): a v1-only cache
+  still renders the 256 level everywhere, but a v2 cache is consumed for
+  hi-DPI grid tiles, not just the viewer's loupe/1:1 preview. The
+  remaining gap is the min-zoom paint cost at fractional DPR, tracked as
+  fauxcasa-q6l.27.
+- **Persistent catalog format** — JSON (readable, language-neutral per
+  N3), not the spec's compact ~50 B/photo binary catalog. Product-
+  accepted (N3 explicitly allows a swappable format). Reconcile rebuilds
+  the whole cache on drift rather than patching incrementally, and N6
+  move-detection (the 2×2 hash-path matrix) is not implemented — no bead
+  filed yet for either. Adopt-mode catalogs *start* with no per-file
+  signals; a background **backfill pass**
+  (`thumbcache.backfill_catalog`, fauxcasa-cam.12) then fills
   size/mtime/sha256 + in-file metadata — the read side of the indexer,
   throttled to 2 readers, persisting every 500 photos so a killed run
   resumes from its cursor — after which reconcile sees in-place edits
   there too.
-- Search is a linear scan (fast enough ≤100k), not the per-photo word
-  index the spec names.
-- `hidden=yes` photos and stash folders (`.picasaoriginals/`, legacy
-  `Originals/`) are hidden by default; a **"Show hidden"** toggle reveals
-  them (drawn veiled) across the All/Folders/Starred/Search views. Album
-  membership stays visible-only. The folder-level "Hidden Folders" category
-  is honored: `P2category=Hidden Folders` (Picasa 3.x, oracle fixture
-  032-hide-folder) or `category=Hidden Folders` (legacy Picasa 2 spelling,
-  inferred from Picasa-era documentation — not oracle-observed) in a
-  folder's [Picasa] section forces every photo in that folder invisible.
-  No faces, no edits, no writes.
-- In-file metadata: JPEG captions/keywords via the hand-rolled
-  `inmeta.py` (XMP `dc:description`/`dc:subject`, IPTC 2:120/2:25), plus
-  capture date / GPS / XMP Rating via `metareader.py` — the python-exiv2
-  bytes-mode seam ruled by the metadata-library decision
-  (docs/research/metadata-library-decision.md); faces-in-XMP is the
-  remaining gap (fauxcasa-cam.5). Both reads piggyback on the index (the
-  bytes are already in hand for hashing), so a cold walk shows ini-only
-  values until the index fills the in-file ones; warm starts load the
-  merged result from the persisted catalog. In-file wins over the ini per
-  §4 tier-1 (EXIF GPS over `geotag=`; XMP Rating 1–5 over bare
-  `star=yes` — stars are a 0–5 count now, `star=yes` imports as 1). Adopt
-  mode (`--thumbs`) binds an external cache without indexing, so its
-  catalog *starts* ini-only — the background backfill pass (above) then
-  applies the same in-file reads and §4 precedence photo by photo, with
-  inline progress (`backfilling metadata N/M`) and an "indexing
-  metadata…" hint on the Recently Updated collection until real mtimes
-  land.
-- Scripted quits (`--screenshot`/`--quit-after-ready`) abandon an
+- **Search is a linear scan** (fast enough ≤100k), not the per-photo
+  word index the spec names. Product-accepted for 0.1.
+- **Hidden photos/folders**: `hidden=yes` photos and stash folders
+  (`.picasaoriginals/`, legacy `Originals/`) are hidden by default; a
+  **"Show hidden"** toggle reveals them (drawn veiled) across the
+  All/Folders/Starred/Search views. Album membership stays visible-only.
+  The folder-level "Hidden Folders" category is honored:
+  `P2category=Hidden Folders` (Picasa 3.x, oracle fixture
+  032-hide-folder) or `category=Hidden Folders` (legacy Picasa 2
+  spelling, inferred from Picasa-era documentation — not
+  oracle-observed) in a folder's [Picasa] section forces every photo in
+  that folder invisible. Faces (fauxcasa-cam.4) are ingested and shown
+  via the viewer's `F` overlay; edit recipes are ingested and the
+  resulting crop is displayed in the grid and viewer. No writes back to
+  the library either way. Shipped as designed — product-accepted.
+- **In-file metadata coverage**: JPEG captions/keywords via the
+  hand-rolled `inmeta.py` (XMP `dc:description`/`dc:subject`, IPTC
+  2:120/2:25), plus capture date / GPS / XMP Rating via `metareader.py`
+  — the python-exiv2 bytes-mode seam ruled by the metadata-library
+  decision (docs/research/metadata-library-decision.md); faces-in-XMP
+  (mwg-rs RegionInfo) is the remaining gap, tracked as fauxcasa-cam.5.
+  Both reads piggyback on the index (the bytes are already in hand for
+  hashing), so a cold walk shows ini-only values until the index fills
+  the in-file ones; warm starts load the merged result from the
+  persisted catalog. In-file wins over the ini per §4 tier-1 (EXIF GPS
+  over `geotag=`; XMP Rating 1–5 over bare `star=yes` — stars are a 0–5
+  count now, `star=yes` imports as 1). Adopt mode (`--thumbs`) binds an
+  external cache without indexing, so its catalog *starts* ini-only —
+  the background backfill pass (above) then applies the same in-file
+  reads and §4 precedence photo by photo, with inline progress
+  (`backfilling metadata N/M`) and an "indexing metadata…" hint on the
+  Recently Updated collection until real mtimes land.
+- **Scripted quits** (`--screenshot`/`--quit-after-ready`) abandon an
   in-flight cache build cleanly; it completes on a later run. Pass
   `--finish-build` to hold the quit until the cache lands (raise
-  `--timeout` for bigger libraries).
+  `--timeout` for bigger libraries). Product-accepted (test/CI
+  affordance).
