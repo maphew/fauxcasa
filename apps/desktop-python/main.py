@@ -220,6 +220,11 @@ APP_DIR = Path(__file__).resolve().parent
 REPO = APP_DIR.parents[1]
 FROZEN = getattr(sys, "frozen", False)
 
+# Scripted --open + --screenshot runs wait this long for the viewer's
+# original to decode before shooting anyway (with a diagnostic), so a
+# wedged decode is reported, not silently timed out.
+OPEN_WAIT_MS = 10_000
+
 # Application icon (rel-0.1). Wordless on purpose: APP_NAME is provisional,
 # so the mark must never bake the name into pixels. Source of truth is
 # assets/icon.svg; assets/make-icons.py rasterizes the PNG set + .ico that
@@ -4267,7 +4272,20 @@ def main() -> int:
                 win._open_viewer(display[pos], display, pos)
             return
         if state["opened"] and win.viewer.loading:
-            return  # let the original finish loading before the shot
+            # Let the original finish loading before the shot — but never
+            # wait forever: a wedged decode used to turn a scripted
+            # --open/--screenshot run into a bare TIMEOUT with no diagnosis.
+            # Bounded wait, then shoot whatever is painted and say why.
+            state["open_wait"] = state.get("open_wait", 0) + 1
+            if state["open_wait"] * poll.interval() < OPEN_WAIT_MS:
+                return
+            dec = getattr(win.viewer, "_decoder", None)
+            log.error(
+                "viewer original still loading after %d ms (decoder alive=%s,"
+                " queued jobs=%d) — taking the screenshot anyway",
+                OPEN_WAIT_MS, bool(dec is not None and dec.is_alive()),
+                win.viewer._jobs.qsize())
+            win.viewer.loading = False
         if not may_quit():
             return  # --finish-build: hold the quit for the cache build
         if args.screenshot is not None and not state["shot"]:
