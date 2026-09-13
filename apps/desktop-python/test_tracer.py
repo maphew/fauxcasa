@@ -12565,6 +12565,54 @@ def test_fcache_name_legacy_and_explicit() -> None:
     assert thumbcache.fcache_name("a1b2c3d4") == "thumbs-a1b2c3d4.fcache"
 
 
+def test_open_shared_read_returns_a_readable_fd(tmp_path: Path) -> None:
+    """thumbcache.open_shared_read (fauxcasa-ez2.12 finding 2), platform-
+    neutral: it returns an int fd whose seek+read behaves exactly like a
+    plain os.open() fd — the read path is unchanged, only the sharing
+    mode differs."""
+    target = tmp_path / "probe.bin"
+    target.write_bytes(b"hello fcache")
+    fd = thumbcache.open_shared_read(target)
+    try:
+        assert isinstance(fd, int) and fd >= 0
+        os.lseek(fd, 6, 0)
+        assert os.read(fd, 6) == b"fcache"
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"),
+                     reason="FILE_SHARE_DELETE is a Windows-only sharing "
+                            "violation to reproduce")
+def test_open_shared_read_tolerates_concurrent_replace(
+        tmp_path: Path) -> None:
+    """thumbcache.open_shared_read + _replace_fcache (fauxcasa-ez2.12
+    finding 2): on Windows, plain os.open() lacks FILE_SHARE_DELETE, so a
+    reconcile rebuild's tmp.replace(out) can raise PermissionError while
+    the grid's worker fd is open. open_shared_read fixes the missing
+    FILE_SHARE_DELETE half of that — but on-box verification found
+    os.replace() (MoveFileEx/MOVEFILE_REPLACE_EXISTING) can still raise
+    PermissionError against an open destination even WITH
+    FILE_SHARE_DELETE; _replace_fcache's ReplaceFileW retry is the half
+    that actually lands the rebuild. Exercise the real pair together: a
+    handle from open_shared_read must let _replace_fcache succeed, and the
+    already-open fd must keep serving the OLD bytes (an open Windows
+    handle pins its data even after the name is replaced)."""
+    target = tmp_path / "thumbs.fcache"
+    target.write_bytes(b"OLD BYTES...")
+    replacement = tmp_path / "thumbs.fcache.tmp"
+    replacement.write_bytes(b"NEW BYTES!!!")
+
+    fd = thumbcache.open_shared_read(target)
+    try:
+        thumbcache._replace_fcache(replacement, target)   # must not raise
+        os.lseek(fd, 0, 0)
+        assert os.read(fd, len(b"OLD BYTES...")) == b"OLD BYTES..."
+    finally:
+        os.close(fd)
+    assert target.read_bytes() == b"NEW BYTES!!!"
+
+
 def test_build_cache_legacy_root_id_writes_unsuffixed_name(
         tmp_path: Path) -> None:
     """The default root_id (LEGACY_ROOT_ID) writes the unsuffixed

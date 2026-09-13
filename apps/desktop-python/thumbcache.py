@@ -113,6 +113,53 @@ def fcache_name(root_id: str) -> str:
         else f"thumbs-{root_id}.fcache"
 
 
+def open_shared_read(path: str | Path) -> int:
+    """Open `path` read-only for a LONG-LIVED handle that must not block a
+    concurrent replace of the same file.
+
+    Plain os.open() on Windows shares read/write (deny-none) but NOT
+    delete — a handle held for a whole session (e.g. the grid's per-worker
+    fcache fd) blocks thumbcache._write_fcache's tmp.replace(out) with
+    PermissionError ('Access is denied') when a reconcile rebuild lands
+    mid-session, so the rebuilt cache can never replace the old one.
+    CreateFileW with FILE_SHARE_DELETE fixes that; POSIX os.open() already
+    tolerates a concurrent unlink/rename of the same path, so it needs no
+    special handling there. Read access only — callers still seek+read the
+    fd exactly as before, never os.pread (portability, see grid.py)."""
+    if os.name != "nt":
+        return os.open(str(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+
+    handle = kernel32.CreateFileW(
+        str(path), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        err = ctypes.get_last_error()
+        raise OSError(
+            None, f"CreateFileW failed (WinError {err})", str(path), err)
+    return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+
+
 def parse_sidecar_entry(entry: object) -> tuple[str | None, str]:
     """Typed sidecar 'files' entry (sidecar_version 2, design §5): a plain
     STRING means a root-relative path belonging to THIS root — returned as
@@ -728,6 +775,44 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
     return idx, level_blobs, size, mtime, sha, meta, fmeta, primary_img
 
 
+def _replace_fcache(tmp: Path, out: Path) -> None:
+    """tmp -> out, tolerating a reader holding `out` open via
+    open_shared_read (FILE_SHARE_DELETE).
+
+    The fast, portable path is the plain os.replace() every other atomic
+    write in this codebase uses (Path.replace). On Windows that maps to
+    MoveFileEx(MOVEFILE_REPLACE_EXISTING), which can still raise
+    PermissionError against a destination some reader has open EVEN WHEN
+    that reader was opened with FILE_SHARE_DELETE — empirically verified
+    on-box: open_shared_read alone does not make os.replace() succeed
+    against such a reader. The retry path uses ReplaceFileW, the Windows
+    API actually observed to succeed in that case, and is only reached
+    after the fast path fails on Windows with an existing destination —
+    every other case (POSIX, or a first-ever write with no destination
+    yet) is unchanged."""
+    try:
+        os.replace(tmp, out)
+        return
+    except OSError:
+        if os.name != "nt" or not out.exists():
+            raise
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.ReplaceFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+        wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID,
+    ]
+    kernel32.ReplaceFileW.restype = wintypes.BOOL
+    ok = kernel32.ReplaceFileW(str(out), str(tmp), None, 0, None, None)
+    if not ok:
+        err = ctypes.get_last_error()
+        raise OSError(
+            None, f"ReplaceFileW failed (WinError {err})", str(out), err)
+
+
 def _write_fcache(out: Path, levels: list[int],
                   photo_levels: list[list[tuple[bytes, int, int]]]) -> None:
     """Atomically write a packed fcache. `photo_levels[i]` is photo i's list
@@ -756,7 +841,7 @@ def _write_fcache(out: Path, levels: list[int],
         for plist in photo_levels:
             for blob, _w, _h in plist:
                 f.write(blob)
-    tmp.replace(out)
+    _replace_fcache(tmp, out)
 
 
 def _index_submission_order(total: int,
