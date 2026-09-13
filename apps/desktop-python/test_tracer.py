@@ -2364,6 +2364,122 @@ def test_sidebar_rebuild_survives_repeated_toggles(reveal_library: Path) -> None
     assert win.tree.currentItem() is item_for(win, "starred", "")
 
 
+def test_empty_text_search_no_match(library: Path) -> None:
+    """A search with zero hits sets the grid's painted placeholder to the
+    query-specific wording (fauxcasa-ez2.6 empty states); a match clears it
+    again rather than leaving stale copy under real tiles."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    win.search.setText("nonesuch")
+    assert win.grid.display == []
+    assert win.grid.empty_text == 'No photos match "nonesuch"'
+
+    win.search.setText("beach")
+    assert win.grid.display
+    assert win.grid.empty_text == ""
+
+
+def test_empty_text_folder_with_no_photos(tmp_path: Path) -> None:
+    """The "folder" kind gets the gentler folder-specific wording rather
+    than the terminal "empty library" one, distinguished purely by the
+    active sidebar selection — folders with zero photos never actually
+    appear as sidebar items (see _build_sidebar's fcount(folder) > 0
+    filter), so this drives _apply_view("folder", ...) directly the same
+    way _sidebar_clicked would, against a bare empty catalog, to pin the
+    wording _update_empty_text picks for that kind."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItem
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "empty-lib"
+    root.mkdir()
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    item = QTreeWidgetItem(win.tree, ["Empty Folder"])
+    item.setData(0, Qt.ItemDataRole.UserRole, ("folder", "Empty Folder"))
+    win.tree.setCurrentItem(item)
+    win._apply_view("folder", "Empty Folder")
+    assert win.grid.display == []
+    assert win.grid.empty_text == "This folder has no photos"
+
+
+def test_empty_text_empty_library(tmp_path: Path) -> None:
+    """A library with no photos at all names the root and points at
+    Library… — distinct copy from a merely-empty search or folder."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "empty-lib"
+    root.mkdir()
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    assert win.grid.display == []
+    assert win.grid.empty_text == (
+        f"No photos found under {cat.root.name} — use Library… "
+        "to pick another folder")
+
+
+def test_empty_text_cold_scan_pending_preempts_empty_library(
+        tmp_path: Path) -> None:
+    """While a deferred cold scan is in flight the grid is genuinely empty
+    (the placeholder catalog), but the library isn't confirmed empty yet —
+    the scanning wording must win over the terminal "no photos" one, and
+    landing the walk clears it back to real content."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+    from catalog import Catalog
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cfg = libmod.legacy_config(root)
+    empty = Catalog(root=cfg.roots[0].path, photos=[], folders={},
+                    albums={}, roots=list(cfg.roots),
+                    library_id=cfg.library_id)
+    cache_dir = tmp_path / "cachedir"
+    win = MainWindow(empty, None, cache_dir=cache_dir, build_dir=None,
+                     cfg=cfg)
+    assert win.grid.empty_text.startswith("No photos found under")
+
+    win._start_cold_scan(cache_dir)
+    assert win.grid.empty_text == f"Scanning {empty.root.name}…"
+
+    import time as _time
+    deadline = _time.time() + 5.0
+    while win._cold_scan_pending and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    app.processEvents()
+    assert not win._cold_scan_pending
+    assert win.grid.empty_text == ""       # the real, non-empty catalog landed
+    win.shutdown()
+
+
 def test_reveal_preserves_search_view(library: Path) -> None:
     """A Show-hidden toggle while a search is active keeps the search view
     and recomputes it for the new reveal state, instead of clearing the box

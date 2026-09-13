@@ -1718,6 +1718,9 @@ class MainWindow(QMainWindow):
         self._scan_build_dir = cache_dir
         self._scan_t0 = time.perf_counter()
         self._show_activity(f"Scanning {self.catalog.root.name}…")
+        self._update_empty_text()  # grid placeholder: cold scan preempts
+                                    # the "empty library" verdict below it
+        self.grid.viewport().update()  # nothing else repaints the grid here
         bridge = self._bridge
         cfg, scan_filter = self.cfg, self.scan_filter
         contacts, pal_dir, exts, db3_dir = (
@@ -3085,10 +3088,55 @@ class MainWindow(QMainWindow):
 
     # ---------- status ----------
 
+    def _update_empty_text(self) -> None:
+        """Central empty-state wording for the grid's painted placeholder
+        (grid.empty_text, fauxcasa-ez2.4's "an empty view painted nothing"
+        finding). Called after every place the grid's display set can
+        change (_apply_view/_search_changed/_show_counts all flow here;
+        _start_cold_scan/_on_scan_done call it too since they flip
+        _cold_scan_pending WITHOUT going through _show_counts) — reads
+        live state instead of taking a kind/count argument, so it can
+        never drift out of sync with what _apply_view/_search_changed
+        actually left on screen. A non-empty display always wins (no
+        text competes with real tiles). Priority once empty: an active
+        search names the query; a folder view (never the true "no
+        library" case — folders never exist without photos) gets the
+        gentler "this folder" wording; a cold scan in flight preempts
+        the "empty library" verdict below it since the walk hasn't
+        landed yet and the library may not be empty at all; only once
+        neither applies does an empty All-photos view get the terminal
+        "no photos anywhere" copy. Every other empty view (starred,
+        recent, an album, a person) is left wordless by design — those
+        are ordinary "nothing here yet" states, not the three the audit
+        called out."""
+        if self.grid.display:
+            self.grid.empty_text = ""
+            return
+        query = self.search.text().strip()
+        if query:
+            self.grid.empty_text = f'No photos match "{query}"'
+            return
+        kind, _key = self._selected_view()
+        if kind == "folder":
+            self.grid.empty_text = "This folder has no photos"
+            return
+        if getattr(self, "_cold_scan_pending", False):
+            # getattr guard: __init__ calls _show_counts (line ~1583)
+            # before _cold_scan_pending itself is first set (line ~1652).
+            self.grid.empty_text = f"Scanning {self.catalog.root.name}…"
+            return
+        if kind == "all" and self._shown_count() == 0:
+            self.grid.empty_text = (
+                f"No photos found under {self.catalog.root.name} — "
+                "use Library… to pick another folder")
+            return
+        self.grid.empty_text = ""
+
     def _show_counts(self, label: str, n: int) -> None:
         reveal = self.grid.reveal
         folders = sum(1 for f in self.catalog.folders.values()
                       if (f.total_count if reveal else f.photo_count))
+        self._update_empty_text()
         self.counts_label.setText(
             f"  {label}: {n} photos · {folders} folders"
             f" · {len(self.catalog.albums)} albums")
