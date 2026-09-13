@@ -35,6 +35,7 @@ scripts/make-thumbcache.py and adopt via --thumbs.
 from __future__ import annotations
 
 import argparse
+import html
 import importlib
 import json
 import os
@@ -128,6 +129,7 @@ from thumbcache import (  # noqa: E402
 from peek import PeekPage  # noqa: E402
 from slideshow import SlideshowPage  # noqa: E402
 from starstore import (  # noqa: E402
+    STAR_OVERRIDES_NAME,
     apply_star_overrides,
     load_star_overrides,
     photo_key,
@@ -328,41 +330,45 @@ def _remember_library(cache_root: Path, library: Path) -> None:
 # Per-folder sort modes (fauxcasa-q6l.11) — DURABLE-HOME DECISION
 # (2026-07-02): a per-folder sort mode is a VIEW preference of a read-only
 # app, so it lives MACHINE-LOCAL in a per-LIBRARY config.json inside that
-# library's own cache dir (beside catalog.json — cache_dir_for() names the
-# dir by a digest of the library path, so the prefs follow the library
-# without touching it, N1). N3 says durable state lives in the library, and
-# Picasa's MANUAL sort order is on the rebuild-loss regression list — but
+# library's own state dir (library_state_dir() names the dir by a digest
+# of the library identity, so the prefs follow the library without
+# touching it, N1 — and, since fauxcasa-6vk finding 2, without following
+# the WALK: a File-Types change must not lose the user's sort choices).
+# N3 says durable state lives in the library, and Picasa's MANUAL sort
+# order is on the rebuild-loss regression list — but
 # v1's date/name/size modes are recomputable views, not user-authored
 # order (manual mode IS user-authored, and is blocked on the missing db3
 # oracle fixture — out of scope here), so losing this file costs one
 # right-click, not data. REVISIT AT M2: when tier-2 library-home state
 # lands (the albums order file), sort modes may move there so a library
 # carries its view prefs between machines.
-def _library_config_path(cache_dir: Path) -> Path:
-    """Machine-local per-library view prefs, beside catalog.json. The name
-    'config.json' is collision-free in the cache dir (catalog.json,
+def _library_config_path(state_dir: Path) -> Path:
+    """Machine-local per-library view prefs, in the library STATE dir
+    (variant-free — fauxcasa-6vk finding 2; for a default walk that is
+    the same directory catalog.json lives in). The name
+    'config.json' is collision-free there (catalog.json,
     thumbs.fcache, import-report.json) and mirrors the per-user config.json
     at the cache ROOT (_config_path) in shape and fail-soft handling."""
-    return cache_dir / "config.json"
+    return state_dir / "config.json"
 
 
-def _read_library_config(cache_dir: Path) -> dict:
+def _read_library_config(state_dir: Path) -> dict:
     """Read the raw per-library config dict, or {} on any failure.
     View prefs are a convenience, never a gate."""
     try:
-        data = json.loads(_library_config_path(cache_dir).read_text())
+        data = json.loads(_library_config_path(state_dir).read_text())
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def _write_library_config(cache_dir: Path, data: dict) -> None:
+def _write_library_config(state_dir: Path, data: dict) -> None:
     """Persist the per-library config atomically via temp-sibling + os.replace.
     Best-effort: a write failure never breaks the session."""
-    cfg = _library_config_path(cache_dir)
+    cfg = _library_config_path(state_dir)
     tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
     try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        state_dir.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(data))
         os.replace(tmp, cfg)
     except OSError as e:
@@ -373,14 +379,14 @@ def _write_library_config(cache_dir: Path, data: dict) -> None:
             pass
 
 
-def load_sort_modes(cache_dir: Path | None) -> dict[str, str]:
+def load_sort_modes(state_dir: Path | None) -> dict[str, str]:
     """The persisted per-folder sort modes (folder rel-path -> mode), or {}.
     Tolerates a missing/garbage file, a non-object document, and unknown
     mode values (dropped) — view prefs are a convenience, never a gate.
     Default-mode entries are dropped too: absent == DEFAULT_SORT_MODE."""
-    if cache_dir is None:
+    if state_dir is None:
         return {}
-    modes = _read_library_config(cache_dir).get("sort_modes")
+    modes = _read_library_config(state_dir).get("sort_modes")
     if not isinstance(modes, dict):
         return {}
     return {rel: mode for rel, mode in modes.items()
@@ -388,41 +394,113 @@ def load_sort_modes(cache_dir: Path | None) -> dict[str, str]:
             and mode != DEFAULT_SORT_MODE}
 
 
-def save_sort_modes(cache_dir: Path | None, modes: dict[str, str]) -> None:
+def save_sort_modes(state_dir: Path | None, modes: dict[str, str]) -> None:
     """Persist the non-default per-folder sort modes. Best-effort and
     torn-proof via temp-sibling + os.replace. Merges into the existing config
     doc so other view prefs (folder_view_flat) survive the write."""
-    if cache_dir is None:
-        return  # no cache dir (tests, degraded runs): session-only modes
+    if state_dir is None:
+        return  # no state dir (tests, degraded runs): session-only modes
     keep = {rel: mode for rel, mode in sorted(modes.items())
             if mode in SORT_MODES and mode != DEFAULT_SORT_MODE}
-    doc = _read_library_config(cache_dir)
+    doc = _read_library_config(state_dir)
     doc["sort_modes"] = keep
-    _write_library_config(cache_dir, doc)
+    _write_library_config(state_dir, doc)
 
 
-def load_folder_view(cache_dir: Path | None) -> bool:
+def load_folder_view(state_dir: Path | None) -> bool:
     """Whether the folder sidebar should use flat (True) or tree (False) mode.
     Default False (tree). Tolerates missing/garbage config — view prefs are
     a convenience, never a gate. Absent key == tree (False)."""
-    if cache_dir is None:
+    if state_dir is None:
         return False
-    v = _read_library_config(cache_dir).get("folder_view_flat")
+    v = _read_library_config(state_dir).get("folder_view_flat")
     return bool(v) if isinstance(v, bool) else False
 
 
-def save_folder_view(cache_dir: Path | None, flat: bool) -> None:
+def save_folder_view(state_dir: Path | None, flat: bool) -> None:
     """Persist the flat/tree folder sidebar choice. Best-effort and
     torn-proof. Merges into the existing config so sort_modes survives.
     The default (tree/False) is stored as absent, not False."""
-    if cache_dir is None:
+    if state_dir is None:
         return
-    doc = _read_library_config(cache_dir)
+    doc = _read_library_config(state_dir)
     if flat:
         doc["folder_view_flat"] = True
     else:
         doc.pop("folder_view_flat", None)
-    _write_library_config(cache_dir, doc)
+    _write_library_config(state_dir, doc)
+
+
+def library_state_dir(library_key: str, cache_root: Path) -> Path:
+    """The VARIANT-FREE per-library directory that holds user CHOICES —
+    stars.json and the view-prefs config.json (fauxcasa-6vk finding 2).
+
+    `cache_dir_for(library_key, cache_root, variant)` keys the disposable
+    cache on the WALK (scan filter + excluded extensions) so a different
+    walk gets a different thumbs/catalog pair. That is right for derived
+    data and wrong for user choices: changing File Types or
+    --min-image-size would otherwise hide every star the user has set.
+    Passing no variant returns the same directory the default walk uses,
+    so a plain single-variant library keeps one directory for both.
+    """
+    return cache_dir_for(library_key, cache_root)
+
+
+def _migrate_library_state(cache_dir: Path | None,
+                           state_dir: Path | None) -> None:
+    """Adopt user state left in a VARIANT cache dir into the variant-free
+    state dir (fauxcasa-6vk finding 2), so testers who starred photos
+    while running with a File-Types/scan-size variant keep those stars.
+
+    A MERGE, not a one-shot copy (Codex cross-vendor review): a tester who
+    starred photos on the default walk AND more photos under a variant has
+    state in BOTH places, so "skip if the base file already exists" would
+    silently drop every variant-only choice. Every key the base does not
+    have is adopted; every key it does have WINS, because the base dir is
+    where this build has been writing. Per-photo for stars and per-folder
+    for sort modes — the granularity the user actually chose at.
+
+    Idempotent (a second launch finds nothing left to adopt and writes
+    nothing), copy-never-move (the variant file stays where an older build
+    would still find it), and best-effort: state is a convenience."""
+    if state_dir is None or cache_dir is None or state_dir == cache_dir:
+        return
+    try:
+        variant_stars = load_star_overrides(cache_dir)
+        if variant_stars:
+            stars = load_star_overrides(state_dir)
+            adopted = {k: v for k, v in variant_stars.items()
+                       if k not in stars}
+            if adopted:
+                stars.update(adopted)
+                save_star_overrides(state_dir, stars)
+                log.info("adopted %d star choice(s) from %s",
+                         len(adopted), cache_dir)
+        variant_cfg = _read_library_config(cache_dir)
+        if variant_cfg:
+            doc = _read_library_config(state_dir)
+            merged = dict(doc)
+            changed = False
+            for key, value in variant_cfg.items():
+                if key not in merged:
+                    merged[key] = value           # e.g. folder_view_flat
+                    changed = True
+                elif (key == "sort_modes" and isinstance(value, dict)
+                        and isinstance(merged[key], dict)):
+                    # Per-FOLDER merge: the sort-mode analogue of the
+                    # per-photo star merge above — a folder sorted only
+                    # under the variant must not be lost just because some
+                    # OTHER folder was sorted on the base walk.
+                    extra = {rel: mode for rel, mode in value.items()
+                             if rel not in merged[key]}
+                    if extra:
+                        merged[key] = {**merged[key], **extra}
+                        changed = True
+            if changed:
+                _write_library_config(state_dir, merged)
+                log.info("adopted library view prefs from %s", cache_dir)
+    except OSError as e:
+        log.warning("could not migrate library state: %s", e)
 
 
 def _gui_unavailable() -> bool:
@@ -870,6 +948,29 @@ def _reconcile_online_roots(
     return total, labels
 
 
+def _plain_tooltip(text: str) -> str:
+    """Tooltip text that renders LITERALLY (fauxcasa-6vk finding 7).
+
+    QToolTip has no plain-text mode: it hands the string to a QLabel in
+    AutoText, so Qt::mightBeRichText decides — and every tooltip below
+    carries user-authored catalog text (folder/album descriptions, album
+    names, on-disk paths, import-note details). A description of
+    "<img src=http://…>" would be INTERPRETED: the markup swallowed, a
+    broken-image icon shown, an external URL fetched on hover.
+
+    Escaping alone is not the fix: mightBeRichText only notices "&lt;"
+    BEFORE the first newline, and these tooltips are multi-line, so an
+    escaped description on line 2 would show its raw entities instead.
+    Emit explicit HTML with <br> breaks — unambiguously rich text, so
+    every escaped character renders as itself. A string with neither
+    '<' nor '&' can never trip mightBeRichText, so it passes through
+    untouched (the common case: every path-only tooltip)."""
+    if "<" not in text and "&" not in text:
+        return text
+    return "<html>" + "<br>".join(
+        html.escape(line) for line in text.split("\n")) + "</html>"
+
+
 def _folder_tooltip(path, description: str | None) -> str:
     """Sidebar folder-item tooltip text (fauxcasa-cam.14): the on-disk path
     (path on demand, per q6l.10) followed by the folder's .picasa.ini
@@ -879,7 +980,7 @@ def _folder_tooltip(path, description: str | None) -> str:
     tip = str(path)
     if description:
         tip += "\n" + description
-    return tip
+    return _plain_tooltip(tip)
 
 
 def _offline_root_labels(catalog: Catalog) -> list[str]:
@@ -1107,6 +1208,11 @@ def _offline_root_cache(catalog, root_id: str, levels: list[int],
 class _BuildBridge(QObject):
     progress = Signal(int, int)            # done, total (cold build live feed)
     status = Signal(str)                   # inline status text (reconcile)
+    # A TERMINAL notice: the worker has already stopped and this is all
+    # there is to say (fauxcasa-6vk finding 5). Routed separately from
+    # `status` because `status` means "still working" and therefore raises
+    # the activity row's busy indicator, which only `finished` takes down.
+    notice = Signal(str)                   # terminal notice (no more work)
     finished = Signal(object, object, bool)  # (IndexResult|None, Catalog, is_reconcile)
     backfill_done = Signal(bool)           # adopt-mode backfill: completed?
     # Non-blocking first run (fauxcasa-q6l.13): the background library WALK
@@ -1129,13 +1235,21 @@ class MainWindow(QMainWindow):
                  db3_dir: Path | None = None,
                  contacts_path: Path | None = None,
                  cfg: library.LibraryConfig | None = None,
-                 contacts_sig: tuple[int, int] | None = None):
+                 contacts_sig: tuple[int, int] | None = None,
+                 state_dir: Path | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
+        # Where user CHOICES live (fauxcasa-6vk finding 2): the variant-free
+        # per-library dir (library_state_dir), so a File-Types or scan-size
+        # change — which moves cache_dir — never hides the user's stars
+        # and sort modes. Defaults to cache_dir when no state dir is
+        # given (tests, bench harnesses); main() always passes one.
+        self.state_dir = cache_dir if state_dir is None else state_dir
+        _migrate_library_state(cache_dir, self.state_dir)
         # User star choices are overlays in Fauxcasa's machine-local cache,
         # never writes into originals/.picasa.ini (the tracer's N1/N3 rule).
-        self.star_overrides = load_star_overrides(cache_dir)
+        self.star_overrides = load_star_overrides(self.state_dir)
         apply_star_overrides(catalog, self.star_overrides)
         self.scan_filter = scan_filter
         # --thumbs path preserved for any relaunch that walks the same file
@@ -1205,7 +1319,7 @@ class MainWindow(QMainWindow):
         # set_data/set_filter builds the display so a remembered mode shapes
         # the very first paint. cache_dir=None (tests, degraded runs) means
         # session-only modes; durable-home decision at _library_config_path.
-        self.grid.sort_modes = load_sort_modes(cache_dir)
+        self.grid.sort_modes = load_sort_modes(self.state_dir)
         # The viewer shares the grid's cache pair: it paints an instant cached
         # preview (the nearest v2 level) while the full original loads
         # (fauxcasa-9pp). thumbs is None on a cold start until the build lands.
@@ -1230,7 +1344,7 @@ class MainWindow(QMainWindow):
         # Block signals while setting initial state — _toggle_folder_view
         # calls _rebuild_sidebar, which is not safe before __init__ completes.
         self._flat_check.blockSignals(True)
-        self._flat_check.setChecked(load_folder_view(cache_dir))
+        self._flat_check.setChecked(load_folder_view(self.state_dir))
         self._flat_check.blockSignals(False)
         self._build_sidebar()
         # Wire AFTER _build_sidebar so init doesn't trigger a spurious rebuild.
@@ -1361,6 +1475,10 @@ class MainWindow(QMainWindow):
         activity_lay = QHBoxLayout(self.activity_row)
         activity_lay.setContentsMargins(12, 6, 12, 6)
         self.activity_label = QLabel()
+        # Carries the library root's folder NAME ("Scanning <root>…"):
+        # user-authored text, so never let AutoText read it as markup
+        # (fauxcasa-6vk finding 7).
+        self.activity_label.setTextFormat(Qt.TextFormat.PlainText)
         self.activity_label.setStyleSheet("font-weight: 600; border: none;")
         self.activity_progress = QProgressBar()
         self.activity_progress.setTextVisible(True)
@@ -1395,13 +1513,21 @@ class MainWindow(QMainWindow):
 
         # --- status bar ---
         self.setStatusBar(QStatusBar())
+        # PlainText wherever a catalog string lands (fauxcasa-6vk finding
+        # 7): counts_label carries album and people names, meta_label the
+        # caption/keywords/path readout. A QLabel left in the default
+        # AutoText format INTERPRETS a caption of "<b>beach</b>".
         self.counts_label = QLabel()
+        self.counts_label.setTextFormat(Qt.TextFormat.PlainText)
         self.progress_label = QLabel()
+        self.progress_label.setTextFormat(Qt.TextFormat.PlainText)
         self.meta_label = QLabel()
+        self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
         # Import-report count (fauxcasa-cam.13): "N import notes" with the
         # first few entries in the tooltip — deliberately lean; the full
         # inspector surface is N7/M2 work.
         self.notes_label = QLabel()
+        self.notes_label.setTextFormat(Qt.TextFormat.PlainText)
         self.statusBar().addWidget(self.counts_label)
         self.statusBar().addWidget(self.progress_label)
         self.statusBar().addPermanentWidget(self.notes_label)
@@ -1504,6 +1630,7 @@ class MainWindow(QMainWindow):
         self._bridge = _BuildBridge()
         self._bridge.progress.connect(self._build_progress)
         self._bridge.status.connect(self._on_status)
+        self._bridge.notice.connect(self._on_notice)
         self._bridge.finished.connect(self._on_index_finished)
         self._bridge.backfill_done.connect(self._on_backfill_done)
         self._bridge.scan_done.connect(self._on_scan_done)
@@ -1769,7 +1896,7 @@ class MainWindow(QMainWindow):
                     # Nothing changed on the online roots, but the offline
                     # ones are still worth a mention — the user may not
                     # know a drive is unreachable this session.
-                    _emit(bridge.status, f"library unchanged{offline_note}")
+                    _emit(bridge.notice, f"library unchanged{offline_note}")
                 return  # nothing else to do
             multiroot = len(old.roots) > 1
             if self.adopt or multiroot:
@@ -1784,7 +1911,7 @@ class MainWindow(QMainWindow):
                 # per-root rescan-and-merge (option (a)) — safe index
                 # contiguity under a merge needs the per-root
                 # reindex/backfill wiring bead .d lands, not present here.
-                _emit(bridge.status,
+                _emit(bridge.notice,
                       f"library changed since this cache was built "
                       f"({drift.summary()}){offline_note} — showing the "
                       f"indexed snapshot")
@@ -1888,17 +2015,38 @@ class MainWindow(QMainWindow):
             self._apply_view(kind, key)   # the collection just populated
         self.grid.viewport().update()     # star badges may have changed
         self._update_import_notes()       # infile_override entries landed
+        if self.info_action.isChecked():
+            # Same-object mutation, so nothing re-emits a selection: the
+            # open panel would keep rendering the pre-backfill values for
+            # the photo the user is looking at (fauxcasa-6vk finding 6).
+            self._toggle_inspector(True)   # re-derives from the selection
         self.statusBar().showMessage("metadata backfill complete", 8000)
         if self._reconcile_after_backfill:
             self._reconcile_after_backfill = False
             self._start_reconcile()
 
     def _on_status(self, text: str) -> None:
+        """PROGRESS text: a worker is still running, so a non-empty message
+        raises the activity row's busy indicator (an empty one lowers it).
+        A worker whose last act is to explain why it stopped must use
+        `notice` instead — see _on_notice (fauxcasa-6vk finding 5)."""
         self.progress_label.setText(("   " + text) if text else "")
         if text:
             self._show_activity(text)
         else:
             self._hide_activity()
+
+    def _on_notice(self, text: str) -> None:
+        """A worker's TERMINAL notice: the job is over and nothing further
+        will be emitted for it (fauxcasa-6vk finding 5). Reconcile's
+        "library unchanged — offline, skipped: …" and adopt/multiroot
+        "showing the indexed snapshot" branches return right after saying
+        this, so routing them through _on_status left an indeterminate
+        spinner running with no job behind it until the next background
+        job happened to finish."""
+        self.progress_label.setText(("   " + text) if text else "")
+        self.statusBar().showMessage(text, 10000)
+        self._hide_activity()
 
     def _on_index_finished(self, result, catalog, is_reconcile: bool) -> None:
         self.progress_label.setText("")
@@ -1957,6 +2105,12 @@ class MainWindow(QMainWindow):
             # Photo objects in place — the prebuilt haystacks are stale.
             self._rebuild_search_index()
             self._update_import_notes()  # the cold build collected a fresh report
+            if self.info_action.isChecked():
+                # The build merged in-file metadata into these SAME Photo
+                # objects; no selection signal follows, so an open panel
+                # would still show the pre-build values (fauxcasa-6vk
+                # finding 6). reload_data does this for the other branch.
+                self._toggle_inspector(True)
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
         self.statusBar().showMessage(
@@ -1978,6 +2132,11 @@ class MainWindow(QMainWindow):
         # A peeked index belongs to the old catalog too (peek_released
         # -> _hide_peek; idle no-op otherwise).
         self.grid._end_peek()
+        # Leave the viewer the way _close_viewer does (fauxcasa-6vk finding
+        # 4): forcing the page back to the browser without retiring the
+        # viewer-only Gallery/Esc action left it on the toolbar over the
+        # grid, where it does nothing.
+        self.back_action.setVisible(False)
         self.pages.setCurrentWidget(self.pages.widget(0))
         self.search.blockSignals(True)
         self.search.clear()
@@ -2164,7 +2323,7 @@ class MainWindow(QMainWindow):
     def _toggle_folder_view(self, flat: bool) -> None:
         """Switch the folder sidebar between flat and tree layouts, persist the
         choice, and rebuild the sidebar while preserving the current selection."""
-        save_folder_view(self.cache_dir, flat)
+        save_folder_view(self.state_dir, flat)
         kind, key = self._selected_view()
         self._rebuild_sidebar()
         self._reselect_view(kind, key)
@@ -2281,7 +2440,7 @@ class MainWindow(QMainWindow):
                     parent = node_for(parent_rel)
                     item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
-                    item.setToolTip(0, str(root_path / rel))
+                    item.setToolTip(0, _plain_tooltip(str(root_path / rel)))
                     nodes[rel] = item
                     return item
 
@@ -2356,7 +2515,7 @@ class MainWindow(QMainWindow):
                         label += " (offline)"
                     item = QTreeWidgetItem(folders_root, [label])
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-                    item.setToolTip(0, str(root.path))
+                    item.setToolTip(0, _plain_tooltip(str(root.path)))
                     if root.id in cat.offline_ids:
                         font = item.font(0)
                         font.setItalic(True)
@@ -2376,7 +2535,9 @@ class MainWindow(QMainWindow):
                     item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
                     key = folder_key(cat, root_id, rel)
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
-                    item.setToolTip(0, str(roots_by_id[root_id].path / rel))
+                    item.setToolTip(
+                        0,
+                        _plain_tooltip(str(roots_by_id[root_id].path / rel)))
                     nodes2[ident] = item
                     return item
 
@@ -2446,7 +2607,8 @@ class MainWindow(QMainWindow):
                     if album.description:
                         tip_parts.append(album.description)
                     if tip_parts:
-                        item.setToolTip(0, "\n".join(tip_parts))
+                        item.setToolTip(
+                            0, _plain_tooltip("\n".join(tip_parts)))
             albums_root.setExpanded(True)
 
         # People (read-only v1 slice, fauxcasa-cam.3): named people with
@@ -2642,7 +2804,7 @@ class MainWindow(QMainWindow):
             self.grid.sort_modes.pop(rel, None)
         else:
             self.grid.sort_modes[rel] = mode
-        save_sort_modes(self.cache_dir, self.grid.sort_modes)
+        save_sort_modes(self.state_dir, self.grid.sort_modes)
         if self.search.text().strip():
             return
         kind, key = self._selected_view()
@@ -2900,7 +3062,7 @@ class MainWindow(QMainWindow):
         shown = [f"[{e.source}] {e.kind}: {e.detail}" for e in entries[:6]]
         if n > len(shown):
             shown.append(f"… and {n - len(shown)} more (see {REPORT_NAME})")
-        self.notes_label.setToolTip("\n".join(shown))
+        self.notes_label.setToolTip(_plain_tooltip("\n".join(shown)))
         self.notes_label.setVisible(True)
 
     def _selection_changed(self, selection: set) -> None:
@@ -3037,7 +3199,7 @@ class MainWindow(QMainWindow):
             photo.star = target
             self.star_overrides[photo_key(photo)] = target
         try:
-            save_star_overrides(self.cache_dir, self.star_overrides)
+            save_star_overrides(self.state_dir, self.star_overrides)
         except OSError as e:
             log.error("could not save star choices: %s", e)
             self.statusBar().showMessage(
@@ -3046,6 +3208,7 @@ class MainWindow(QMainWindow):
         self.viewer.update()
         self.tray.update()
         self._refresh_star_count()
+        self._resync_starred_view()
         if self.pages.currentWidget() is self.viewer:
             self._photo_selected(self.viewer.current_index())
         elif len(self.grid.selection) > 1:
@@ -3056,6 +3219,36 @@ class MainWindow(QMainWindow):
             self._selection_changed(self.grid.selection)
         else:
             self._photo_selected(self.grid.current)
+
+    def _resync_starred_view(self) -> None:
+        """Re-materialize the Starred view after a star change made from
+        INSIDE it (fauxcasa-6vk finding 1). `set_filter` snapshots the
+        matching catalog indices, so an unstarred photo otherwise keeps
+        its tile — and its slot in `display` — until the next view switch,
+        contradicting the sidebar count `_refresh_star_count` just updated.
+
+        Grid page only. The VIEWER's display list is deliberately frozen
+        for the duration of a navigation session (a photo unstarred while
+        viewing must stay reachable with Left/Right), and an active search
+        owns the display set, so neither is re-derived here."""
+        if self.pages.currentWidget() is self.viewer:
+            return
+        if self._selected_view()[0] != "starred":
+            return
+        if self.search.text().strip():
+            return
+        keep = self.grid.current
+        pos = self.grid.display_pos.get(keep, 0)
+        sb = self.grid.verticalScrollBar()
+        frac = sb.value() / sb.maximum() if sb.maximum() > 0 else 0.0
+        self._apply_view("starred", "")
+        if keep not in self.grid.display_pos and self.grid.display:
+            # The current photo just left the view: land on the nearest
+            # surviving display position rather than on nothing at all
+            # (set_filter clears current to -1 when it vanishes).
+            self.grid._select(
+                self.grid.display[min(pos, len(self.grid.display) - 1)])
+        self.grid.scroll_to_fraction(frac)   # best-effort scroll restore
 
     def _build_progress(self, done: int, total: int) -> None:
         self.progress_label.setText(f"   indexing {done}/{total}…")
@@ -3454,6 +3647,10 @@ def main() -> int:
     cache_dir = cache_dir_for(library_key, args.cache_root,
                               scan_filter.cache_key()
                               + exts_cache_key(excluded_exts))
+    # User choices (stars, sort modes) are keyed on the LIBRARY, never on
+    # the walk variant above (fauxcasa-6vk finding 2) — the two dirs are
+    # the same path whenever the walk is the default one.
+    state_dir = library_state_dir(library_key, args.cache_root)
     cat_path = cache_dir / "catalog.json"
     if adopt and not cfg.is_legacy:
         log.error("--thumbs is a single-cache legacy option; explicit "
@@ -3606,7 +3803,7 @@ def main() -> int:
                      excluded_exts=excluded_exts,
                      thumbs_path=args.thumbs, db3_dir=db3_dir,
                      contacts_path=contacts_path, cfg=cfg,
-                     contacts_sig=contacts_sig)
+                     contacts_sig=contacts_sig, state_dir=state_dir)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
