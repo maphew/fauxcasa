@@ -11216,6 +11216,73 @@ def test_play_tooltip_derives_from_keymap(library: Path) -> None:
             f"{seq.toString()!r} missing from play tooltip: {tip!r}")
 
 
+def test_action_labels_cover_every_scheme_entry() -> None:
+    """keymap.ACTION_LABELS is the single source Help > Keyboard shortcuts…
+    reads (fauxcasa-ez2.6) — a scheme entry with no label would silently
+    drop out of that dialog, so pin 1:1 coverage both ways."""
+    import keymap
+
+    assert set(keymap.ACTION_LABELS) == set(keymap.DEFAULT_SCHEME)
+
+
+def test_keymap_app_search_focuses_and_selects_search_box(
+        tmp_path: Path) -> None:
+    """Ctrl+F or '/' on the grid (keymap.app.search) jumps focus to the
+    search box and selects any existing text, ready to be replaced by
+    typing (fauxcasa-ez2.6)."""
+    from PySide6.QtCore import Qt
+    app = _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.show()
+    win.activateWindow()               # offscreen platform: hasFocus()
+    app.processEvents()                # needs an active window (Qt quirk)
+    win.search.setText("stale")
+    win.grid.setFocus()
+
+    _key(win.grid, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+    assert win.search.hasFocus()
+    assert win.search.selectedText() == "stale"
+
+    win.search.clearFocus()
+    win.grid.setFocus()
+    _key(win.grid, Qt.Key.Key_Slash)
+    assert win.search.hasFocus()
+
+
+def test_grid_has_focus_after_construction_so_space_stars_not_types(
+        tmp_path: Path) -> None:
+    """MainWindow.__init__ lands keyboard focus on the grid (fauxcasa-
+    ez2.6) — without it Qt's default tab order can leave the search box
+    focused at launch, so a Space keystroke meant for star_toggle would
+    instead type a literal space into the query. Drive the actual
+    keyPressEvent through the grid (the same path a real keystroke takes
+    once focus is correct) and confirm the star flipped, the search box
+    stayed empty, and it is indeed the grid holding focus."""
+    from PySide6.QtCore import Qt
+    app = _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.show()
+    win.activateWindow()               # offscreen platform: hasFocus()
+    app.processEvents()                # needs an active window (Qt quirk)
+    assert win.grid.hasFocus()
+
+    win.grid._select(0)
+    assert not cat.photos[0].star
+    _key(win.grid, Qt.Key.Key_Space)
+    assert cat.photos[0].star
+    assert win.search.text() == ""
+
+
 def test_grid_jk_navigate_next_prev(tmp_path: Path) -> None:
     """J/K step the grid's CURRENT item forward/back exactly like
     Right/Left (Picasa's viewer J/K, extended to the grid per q6l.8):

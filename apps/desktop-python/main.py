@@ -1607,6 +1607,7 @@ class MainWindow(QMainWindow):
         # truth for panel visibility (fauxcasa-q6l.25).
         self.grid.info_toggle_requested.connect(self.info_action.toggle)
         self.viewer.info_toggle_requested.connect(self.info_action.toggle)
+        self.grid.search_requested.connect(self._focus_search)
         # Selection-tray wiring (fauxcasa-q6l.2). The readout also listens
         # to selection_changed and the search box directly — SEPARATE
         # connections, so the status-bar dual mode (_selection_changed)
@@ -1698,6 +1699,15 @@ class MainWindow(QMainWindow):
             self._start_backfill()
         elif warm and cache_dir is not None:
             self._start_reconcile()
+
+        # Land keyboard focus on the grid (fauxcasa-ez2.6): the browser's
+        # main surface, and the one Space/J/K/arrows/star_toggle etc. are
+        # bound against — without this, Qt's default first-focusable-widget
+        # tab order can leave the search box focused at launch, so Space
+        # types a literal space into a query instead of starring the
+        # current photo. main() calls it again after win.show() since
+        # focus can only really land on a mapped, visible window.
+        self.grid.setFocus()
 
     # ---------- background index jobs ----------
 
@@ -2910,6 +2920,13 @@ class MainWindow(QMainWindow):
         log.info("search index: %d haystacks in %.0f ms",
                  len(pairs), (time.perf_counter() - t0) * 1000.0)
 
+    def _focus_search(self) -> None:
+        """Ctrl+F / '/' from the grid (fauxcasa-ez2.6, keymap.app.search):
+        jump to the search box and select any existing text, so typing
+        immediately replaces a stale query instead of appending to it."""
+        self.search.setFocus()
+        self.search.selectAll()
+
     @staticmethod
     def _parse_query(text: str) -> tuple[list[str], list[str]]:
         """Whitespace-tokenized query -> (positive, negative) lowercase
@@ -3921,6 +3938,7 @@ def main() -> int:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
     win.show()
+    win.grid.setFocus()  # only really lands once the window is mapped
     if cold_scan_needed:
         # Non-blocking first run (fauxcasa-q6l.13): the window is already
         # painted (empty) — start the deferred walk now, off the startup
