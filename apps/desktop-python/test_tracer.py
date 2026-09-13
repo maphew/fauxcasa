@@ -11337,6 +11337,154 @@ def test_play_tooltip_derives_from_keymap(library: Path) -> None:
             f"{seq.toString()!r} missing from play tooltip: {tip!r}")
 
 
+def test_menu_bar_has_file_view_help_reusing_toolbar_actions(
+        library: Path) -> None:
+    """fauxcasa-ez2.6 §5: File/View/Help menus exist alongside the
+    existing Tools menu, and every item that already has a toolbar
+    QAction (Library…, Info, Play) is the SAME action object in the
+    menu — never a second one with its own state."""
+    from PySide6.QtWidgets import QMenu
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    menus = {m.title().replace("&", ""): m
+            for m in win.menuBar().findChildren(QMenu)}
+    assert {"File", "View", "Help", "Tools"} <= set(menus)
+
+    file_actions = menus["File"].actions()
+    assert win.open_action in file_actions        # reused, not duplicated
+    assert win.open_action.text() == "Library…"    # renamed from "Open..."
+
+    view_actions = menus["View"].actions()
+    assert win.info_action in view_actions
+    assert win.play_action in view_actions
+
+
+def test_view_menu_zoom_in_out_steps_the_slider(library: Path) -> None:
+    """Zoom In/Out (View menu) step the SAME slider the toolbar drags,
+    clamped to its range — one source of truth for tile size."""
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    start = win.zoom.value()
+    win._step_zoom(16)
+    assert win.zoom.value() == start + 16
+    win._step_zoom(-16)
+    assert win.zoom.value() == start
+
+    win.zoom.setValue(win.zoom.maximum())
+    win._step_zoom(16)
+    assert win.zoom.value() == win.zoom.maximum()   # clamped, no overshoot
+    win.zoom.setValue(win.zoom.minimum())
+    win._step_zoom(-16)
+    assert win.zoom.value() == win.zoom.minimum()
+
+
+def test_view_menu_show_hidden_and_flat_folders_sync_checkboxes(
+        library: Path) -> None:
+    """The View menu's Show Hidden / Flat Folders checkable actions stay
+    in lockstep with the toolbar/sidebar QCheckBoxes that actually own
+    the state — driving either one moves the other, and the underlying
+    view behavior (reveal_box's own handler) still fires."""
+    from PySide6.QtWidgets import QMenu
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    view_menu = next(m for m in win.menuBar().findChildren(QMenu)
+                     if m.title().replace("&", "") == "View")
+    show_hidden = next(a for a in view_menu.actions()
+                       if a.text().replace("&", "") == "Show Hidden")
+    flat_folders = next(a for a in view_menu.actions()
+                        if a.text().replace("&", "") == "Flat Folders")
+
+    assert show_hidden.isChecked() == win.reveal_box.isChecked() is False
+    show_hidden.trigger()
+    assert win.reveal_box.isChecked() is True       # action -> checkbox
+    win.reveal_box.setChecked(False)
+    assert show_hidden.isChecked() is False          # checkbox -> action
+
+    assert flat_folders.isChecked() == win._flat_check.isChecked() is False
+    flat_folders.trigger()
+    assert win._flat_check.isChecked() is True
+    win._flat_check.setChecked(False)
+    assert flat_folders.isChecked() is False
+
+
+def test_help_keyboard_shortcuts_dialog_lists_every_action(
+        library: Path) -> None:
+    """Help > Keyboard shortcuts… builds its table at runtime from
+    keymap.DEFAULT_SCHEME + ACTION_LABELS (fauxcasa-ez2.6 §5): every
+    action's plain-English label appears exactly once."""
+    import keymap
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    captured = {}
+
+    def fake_exec(dlg):
+        table = dlg.findChildren(__import__(
+            "PySide6.QtWidgets", fromlist=["QTableWidget"]).QTableWidget)[0]
+        captured["labels"] = [table.item(r, 0).text()
+                              for r in range(table.rowCount())]
+        return 0
+
+    import PySide6.QtWidgets as qtw
+    orig = qtw.QDialog.exec
+    qtw.QDialog.exec = lambda self: fake_exec(self)
+    try:
+        win._show_shortcuts_dialog()
+    finally:
+        qtw.QDialog.exec = orig
+
+    labels = captured["labels"]
+    assert len(labels) == len(keymap.DEFAULT_SCHEME)
+    for action in keymap.DEFAULT_SCHEME:
+        assert keymap.ACTION_LABELS[action] in labels
+
+
+def test_help_about_shows_icon_version_and_license(library: Path) -> None:
+    """Help > About: app icon, version_string() (release identity — same
+    formatter as --version/READY), the tagline, AGPL license, and the
+    project URL, via a real QMessageBox so the icon reliably shows
+    (about()'s convenience function leaves that to the platform)."""
+    import main as mainmod
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    captured = {}
+
+    def fake_exec(self):
+        captured["icon"] = self.iconPixmap()
+        captured["text"] = self.text()
+        return 0
+
+    import PySide6.QtWidgets as qtw
+    orig = qtw.QMessageBox.exec
+    qtw.QMessageBox.exec = fake_exec
+    try:
+        win._show_about()
+    finally:
+        qtw.QMessageBox.exec = orig
+
+    assert not captured["icon"].isNull()
+    assert mainmod.version_string() in captured["text"]
+    assert "AGPL-3.0-or-later" in captured["text"]
+    assert "github.com/maphew/fauxcasa" in captured["text"]
+
+
 def test_action_labels_cover_every_scheme_entry() -> None:
     """keymap.ACTION_LABELS is the single source Help > Keyboard shortcuts…
     reads (fauxcasa-ez2.6) — a scheme entry with no label would silently

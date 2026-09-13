@@ -57,7 +57,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QActionGroup, QIcon, QPalette
+from PySide6.QtGui import QActionGroup, QIcon, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -66,6 +66,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QProgressBar,
     QSlider,
     QSplitter,
@@ -1476,7 +1477,7 @@ class MainWindow(QMainWindow):
         bar = QToolBar()
         bar.setMovable(False)
         self.addToolBar(bar)
-        self.open_action = bar.addAction("Open...")
+        self.open_action = bar.addAction("Library…")
         self.open_action.setToolTip("Choose a different photo library folder")
         self.open_action.triggered.connect(self._change_library)
         self.back_action = bar.addAction("← Gallery  (Esc)")
@@ -1509,7 +1510,8 @@ class MainWindow(QMainWindow):
         self.search.setMaximumWidth(360)
         self.search.textChanged.connect(self._search_changed)
         bar.addWidget(self.search)
-        bar.addWidget(QLabel("  zoom "))
+        bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
+        bar.addWidget(QLabel("Zoom"))
         self.zoom = QSlider(Qt.Orientation.Horizontal)
         self.zoom.setRange(64, 256)
         self.zoom.setValue(160)
@@ -1524,7 +1526,8 @@ class MainWindow(QMainWindow):
         self.zoom.valueChanged.connect(
             lambda _v: self._zoom_timer.start())
         bar.addWidget(self.zoom)
-        self.reveal_box = QCheckBox("  Show hidden")
+        bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
+        self.reveal_box = QCheckBox("Show hidden")
         self.reveal_box.setToolTip(
             "Reveal hidden=yes photos, stash-folder files, and folders in the "
             "Hidden Folders category (shown veiled)")
@@ -1544,6 +1547,8 @@ class MainWindow(QMainWindow):
                                   for s in keymap.shortcuts("app.info"))
         self.info_action.setToolTip(f"Show photo info ({_info_chords})")
         self.info_action.toggled.connect(self._toggle_inspector)
+
+        self._build_menus()
 
         # --- pages ---
         browser = QWidget()
@@ -1775,6 +1780,126 @@ class MainWindow(QMainWindow):
         # current photo. main() calls it again after win.show() since
         # focus can only really land on a mapped, visible window.
         self.grid.setFocus()
+
+    # ---------- menu bar: File / View / Help (fauxcasa-ez2.6) ----------
+
+    def _build_menus(self) -> None:
+        """File / View / Help — added alongside the existing Tools menu
+        (v46.4). Every item that already exists as a toolbar QAction
+        (open_action/play_action/info_action, and the reveal/flat
+        checkboxes) is REUSED here rather than duplicated: a menu click
+        and a toolbar click end up on the exact same QAction (or, for the
+        two plain QCheckBoxes, a thin checkable QAction kept in lockstep
+        with the checkbox so there is still only one place — the
+        checkbox — that owns the actual boolean)."""
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("&File")
+        file_menu.addAction(self.open_action)   # toolbar's "Library…" action
+        file_menu.addSeparator()
+        exit_action = file_menu.addAction("E&xit")
+        exit_action.triggered.connect(self.close)
+
+        view_menu = menubar.addMenu("&View")
+        zoom_in = view_menu.addAction("Zoom &In")
+        zoom_in.setShortcut(QKeySequence.StandardKey.ZoomIn)
+        zoom_in.triggered.connect(lambda: self._step_zoom(16))
+        zoom_out = view_menu.addAction("Zoom &Out")
+        zoom_out.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        zoom_out.triggered.connect(lambda: self._step_zoom(-16))
+        view_menu.addSeparator()
+
+        # reveal_box/_flat_check are plain QCheckBoxes (toolbar/sidebar),
+        # not QActions — a checkable QAction here mirrors each one's
+        # state both ways so the checkbox stays the single source of
+        # truth (its own toggled handler is what actually applies the
+        # view change; the action's toggled just forwards to setChecked,
+        # guarded against the checkbox's own echo back).
+        show_hidden_action = view_menu.addAction("Show &Hidden")
+        show_hidden_action.setCheckable(True)
+        show_hidden_action.setChecked(self.reveal_box.isChecked())
+        show_hidden_action.toggled.connect(self.reveal_box.setChecked)
+        self.reveal_box.toggled.connect(show_hidden_action.setChecked)
+
+        view_menu.addAction(self.info_action)   # toolbar's "Info" action
+
+        flat_folders_action = view_menu.addAction("&Flat Folders")
+        flat_folders_action.setCheckable(True)
+        flat_folders_action.setChecked(self._flat_check.isChecked())
+        flat_folders_action.toggled.connect(self._flat_check.setChecked)
+        self._flat_check.toggled.connect(flat_folders_action.setChecked)
+
+        view_menu.addSeparator()
+        view_menu.addAction(self.play_action)   # toolbar's "▶ Play" action
+
+        help_menu = menubar.addMenu("&Help")
+        shortcuts_action = help_menu.addAction("&Keyboard Shortcuts…")
+        shortcuts_action.triggered.connect(self._show_shortcuts_dialog)
+        help_menu.addSeparator()
+        about_action = help_menu.addAction(f"&About {APP_NAME}")
+        about_action.triggered.connect(self._show_about)
+
+    def _step_zoom(self, delta: int) -> None:
+        """Zoom In/Out menu actions step the SAME slider the toolbar
+        drags — one source of truth for the current tile size, clamped
+        to the slider's own range."""
+        self.zoom.setValue(
+            max(self.zoom.minimum(),
+                min(self.zoom.maximum(), self.zoom.value() + delta)))
+
+    def _show_shortcuts_dialog(self) -> None:
+        """Help > Keyboard shortcuts…: a read-only table built at runtime
+        from keymap.DEFAULT_SCHEME + keymap.ACTION_LABELS — one source
+        of truth, so a chord added/changed in the keymap module shows up
+        here without a second hand-maintained copy."""
+        from PySide6.QtWidgets import (
+            QDialog,
+            QHeaderView,
+            QTableWidget,
+            QTableWidgetItem,
+            QVBoxLayout as _QVBoxLayout,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{APP_NAME} — Keyboard Shortcuts")
+        dlg.resize(520, 480)
+        lay = _QVBoxLayout(dlg)
+        table = QTableWidget(0, 2, dlg)
+        table.setHorizontalHeaderLabels(["Action", "Shortcut"])
+        table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        for action in sorted(keymap.DEFAULT_SCHEME):
+            label = keymap.ACTION_LABELS.get(action, action)
+            chords = " / ".join(
+                s.toString() for s in keymap.shortcuts(action))
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(label))
+            table.setItem(row, 1, QTableWidgetItem(chords))
+        lay.addWidget(table)
+        dlg.exec()
+
+    def _show_about(self) -> None:
+        """Help > About: app icon, name, version (release identity — same
+        formatter as --version/READY), a one-line description, license,
+        and the project URL. Built on QMessageBox (not the about()
+        convenience function) so the app icon is guaranteed to show —
+        about() leaves icon choice to the platform and Windows shows
+        none at all."""
+        box = QMessageBox(self)
+        box.setWindowTitle(f"About {APP_NAME}")
+        box.setIconPixmap(app_icon().pixmap(64, 64))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            f"<h3>{version_string()}</h3>"
+            "<p>Read-only photo browser in the spirit of Picasa.</p>"
+            "<p>License: AGPL-3.0-or-later</p>"
+            "<p><a href=\"https://github.com/maphew/fauxcasa\">"
+            "https://github.com/maphew/fauxcasa</a></p>")
+        box.exec()
 
     # ---------- background index jobs ----------
 
