@@ -1945,7 +1945,11 @@ def test_viewer_original_supersedes_preview_then_falls_back(
         tmp_path: Path) -> None:
     """The decoded original replaces (and frees) the preview; but if the
     original FAILS to decode, the cached preview keeps painting rather than
-    dropping straight to 'could not decode'."""
+    dropping straight to 'could not decode'. release-0.1 review P2-6: this
+    silent-degrade case must also surface a short honest note in the info
+    bar (paintEvent never shows "could not decode this file" here, since a
+    preview is still on screen) -- otherwise a >64 MP panorama just looks
+    permanently blurry with no explanation."""
     _offscreen_app()
     from PySide6.QtGui import QImage
     from viewer import ViewerPage
@@ -1956,14 +1960,22 @@ def test_viewer_original_supersedes_preview_then_falls_back(
     viewer.resize(1280, 800)
     viewer.show_photo(list(range(cache.count)), 0)
     assert viewer.preview is not None
+    assert viewer._decode_note is None
     orig = QImage(800, 600, QImage.Format.Format_RGB32)
     orig.fill(0)
     viewer._on_loaded(viewer._serial, orig)         # the real original lands
     assert viewer.image is orig and viewer.preview is None
+    assert viewer._decode_note is None
     viewer.show_photo(list(range(cache.count)), 1)  # next photo: preview again
     assert viewer.preview is not None
+    assert viewer._decode_note is None              # reset on navigation
     viewer._on_loaded(viewer._serial, QImage())     # original failed to decode
     assert viewer.image is None and viewer.preview is not None
+    assert viewer._decode_note, (
+        "a null original with a preview showing must set an honest note"
+    )
+    assert viewer._decode_note in viewer._info_text(
+        cat.photos[viewer.current_index()])
 
 
 def test_viewer_preview_composes_picasa_rotate(tmp_path: Path) -> None:
@@ -2267,6 +2279,41 @@ def test_default_cache_root_frozen_vs_checkout(monkeypatch, tmp_path: Path) -> N
     monkeypatch.delenv("LOCALAPPDATA")
     assert (main._default_cache_root()
             == tmp_path / "home" / ".cache" / "fauxcasa")
+
+
+def test_bad_sandbox_env_value_shows_messagebox_when_frozen(
+        monkeypatch, capsys) -> None:
+    """release-0.1 review P2-5: a bad FAUXCASA_DECODE_SANDBOX value already
+    prints to stderr and exits 2, but that's invisible in a console-less
+    frozen exe -- the app just silently disappears. FROZEN must also pop a
+    QMessageBox.critical; a non-frozen (source/dev) run must not, since
+    stderr is visible there."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "bogus")
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+
+    critical_calls = []
+    monkeypatch.setattr(
+        main.QMessageBox, "critical",
+        staticmethod(lambda *a, **k: critical_calls.append((a, k))))
+
+    monkeypatch.setattr(main, "FROZEN", False)
+    assert main.main() == 2
+    assert critical_calls == [], (
+        "a non-frozen run has a visible stderr -- no messagebox needed")
+    err = capsys.readouterr().err
+    assert "FAUXCASA_DECODE_SANDBOX" in err
+
+    monkeypatch.setattr(main, "FROZEN", True)
+    assert main.main() == 2
+    assert len(critical_calls) == 1, (
+        "a FROZEN run has no visible console -- must show a messagebox "
+        "or the app just silently disappears")
+    args, _ = critical_calls[0]
+    assert "FAUXCASA_DECODE_SANDBOX" in args[-1]
 
 
 def test_reveal_total_count_and_filter(library: Path, tmp_path: Path) -> None:

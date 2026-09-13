@@ -4191,6 +4191,14 @@ def main() -> int:
         decodefacade.sandbox_mode()
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
+        if FROZEN:
+            # A console-less frozen exe has no stderr any user will ever
+            # see -- the app just silently disappears on a bad env value
+            # (release-0.1 review P2-5). No QApplication exists yet this
+            # early in startup, and QMessageBox needs one -- construct a
+            # throwaway instance just for this one dialog.
+            _err_app = QApplication.instance() or QApplication([])
+            QMessageBox.critical(None, APP_NAME, f"error: {e}")
         return 2
     if args.bundle_self_check:
         failures = _bundle_dependency_failures()
