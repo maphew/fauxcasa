@@ -2072,6 +2072,27 @@ def test_index_activity_row_is_prominent_and_determinate(
     assert win.activity_row.isHidden()
 
 
+def test_index_finished_status_reads_library_ready(
+        library: Path, tmp_path: Path) -> None:
+    """fauxcasa-ez2.6 §7: the completion status bar message is a plain
+    "Library ready — N photos" verdict, not an indexing-rate number
+    nobody but a dev cares about. The machine-readable JSON "indexed"
+    event (§7 protocol) keeps rate_per_s untouched — only the human
+    status-bar wording changed."""
+    import thumbcache
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    assert result is not None and result.photos == len(cat.photos)
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._on_index_finished(result, cat, False)
+    assert win.statusBar().currentMessage() == \
+        f"Library ready — {len(cat.photos):,} photos"
+
+
 def test_grid_stop_retires_decode_workers() -> None:
     """GridView.stop() retires its decode-worker pool so the daemons don't
     leak and accumulate across a process (fauxcasa-gfz). After stop() no worker

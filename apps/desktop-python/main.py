@@ -2178,8 +2178,11 @@ class MainWindow(QMainWindow):
                 self._toggle_inspector(True)
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
+        # User-facing wording (fauxcasa-ez2.6 §7): plain "ready" status, not
+        # an indexing-rate number nobody but a dev cares about. The JSON
+        # "indexed" event above (machine protocol, §7) keeps rate_per_s.
         self.statusBar().showMessage(
-            f"indexed {result.photos} photos at {result.rate:.0f}/s", 8000)
+            f"Library ready — {result.photos:,} photos", 8000)
 
     def reload_data(self, catalog: Catalog, thumbs: ThumbCache) -> None:
         """Atomically swap the whole catalog after a reconcile rebuild:
