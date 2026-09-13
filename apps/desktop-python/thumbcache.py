@@ -3,7 +3,7 @@
 Reads the project's packed fcache format (fcthumbs v1, written by
 scripts/make-thumbcache.py) and can build one in-app for small
 libraries. The cache is a disposable machine-local artifact (N3): it
-lives under cache/tracer-cache/<digest>/, never inside the library
+lives under cache/fauxcasa-cache/<digest>/, never inside the library
 (N1). A catalog.json beside it records per-file (sha256, size, mtime)
 so identity is content-hash + library-relative path (N6) and staleness
 is checked by cheap signals (size + mtime) before trusting the cache.
