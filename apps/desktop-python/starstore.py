@@ -1,9 +1,17 @@
 """Machine-local star overrides for Tracer's read-only library model.
 
 Space may change a photo's Fauxcasa star without ever writing beside the
-original or editing Picasa/EXIF metadata. Overrides therefore live beside
-catalog.json in the disposable per-library cache and are re-applied after
-source metadata indexing or reconciliation.
+original or editing Picasa/EXIF metadata. Overrides therefore live in
+Fauxcasa's own machine-local storage and are re-applied after source
+metadata indexing or reconciliation.
+
+WHERE (fauxcasa-6vk finding 2): the VARIANT-FREE per-library state dir
+(main.library_state_dir), NOT whatever variant cache dir the current walk
+happens to use. A star is a user CHOICE; the thumbs/catalog pair beside
+it is derived data keyed on the walk (scan filter + excluded extensions),
+so keying stars the same way would make a File-Types or --min-image-size
+change silently hide every star the user had set. The two directories
+coincide for a default walk, which is why the old placement looked right.
 """
 
 from __future__ import annotations
@@ -22,12 +30,12 @@ def photo_key(photo: Photo) -> StarKey:
     return photo.root_id, photo.rel
 
 
-def load_star_overrides(cache_dir: Path | None) -> dict[StarKey, int]:
+def load_star_overrides(state_dir: Path | None) -> dict[StarKey, int]:
     """Load valid 0..5 overrides, failing soft on missing/corrupt files."""
-    if cache_dir is None:
+    if state_dir is None:
         return {}
     try:
-        data = json.loads((cache_dir / STAR_OVERRIDES_NAME).read_text())
+        data = json.loads((state_dir / STAR_OVERRIDES_NAME).read_text())
     except (OSError, ValueError):
         return {}
     if not isinstance(data, dict) or data.get("version") != 1:
@@ -61,17 +69,17 @@ def apply_star_overrides(catalog: Catalog,
             photo.star = star
 
 
-def save_star_overrides(cache_dir: Path | None,
+def save_star_overrides(state_dir: Path | None,
                         overrides: dict[StarKey, int]) -> None:
-    """Atomically persist overrides; cache-less runs remain RAM-only."""
-    if cache_dir is None:
+    """Atomically persist overrides; state-dir-less runs remain RAM-only."""
+    if state_dir is None:
         return
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
     rows = [
         {"root_id": root_id, "rel": rel, "star": star}
         for (root_id, rel), star in sorted(overrides.items())
     ]
-    path = cache_dir / STAR_OVERRIDES_NAME
+    path = state_dir / STAR_OVERRIDES_NAME
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps({
         "version": STAR_OVERRIDES_VERSION,

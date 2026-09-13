@@ -15416,3 +15416,78 @@ def test_star_overrides_skip_bad_rows_but_keep_good_ones(
         ],
     }))
     assert starstore.load_star_overrides(cache_dir) == {("", "a.jpg"): 1}
+
+
+def test_star_and_sort_state_is_shared_across_cache_variants(
+        library: Path, tmp_path: Path) -> None:
+    """Finding 2: stars and sort modes are USER CHOICES keyed on the
+    library, not on the walk variant. Two windows over the same library
+    with different scan filters (hence different cache_dirs) see the same
+    state dir, so a star set under one variant is live under the other."""
+    from PySide6.QtCore import Qt
+    from main import MainWindow, library_state_dir, load_sort_modes
+    from starstore import STAR_OVERRIDES_NAME
+
+    _offscreen_app()
+    cache_root = tmp_path / "cache"
+    key = str(library.resolve())
+    state_dir = library_state_dir(key, cache_root)
+    plain_dir = thumbcache.cache_dir_for(key, cache_root)
+    small_dir = thumbcache.cache_dir_for(key, cache_root, "scan:min=200x200")
+    assert state_dir == plain_dir != small_dir   # variant moves the cache
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=plain_dir, build_dir=None,
+                     state_dir=state_dir)
+    idx = next(i for i, p in enumerate(cat.photos) if p.name == "c.jpg")
+    win.grid._select(idx)
+    _press(win.grid, Qt.Key.Key_Space)             # star it under variant A
+    win._set_folder_sort("2021-05-05 Picnic", "date")
+    assert (state_dir / STAR_OVERRIDES_NAME).is_file()
+    assert load_sort_modes(state_dir) == {"2021-05-05 Picnic": "date"}
+
+    # Variant B: a different cache dir, the SAME state dir.
+    other = scan_library(library)
+    win2 = MainWindow(other, None, cache_dir=small_dir, build_dir=None,
+                      state_dir=state_dir)
+    assert other.photos[idx].star == 1            # star survived the variant
+    assert win2.grid.sort_modes == {"2021-05-05 Picnic": "date"}
+    assert not (small_dir / STAR_OVERRIDES_NAME).exists()
+
+
+def test_library_state_migrates_out_of_a_variant_cache_dir(
+        library: Path, tmp_path: Path) -> None:
+    """Finding 2 migration: stars/sort modes written by an older build
+    into the VARIANT cache dir are lifted into the state dir on the next
+    open — and the old file is left in place, never deleted."""
+    import main as mainmod
+    import starstore
+    from main import MainWindow, load_sort_modes
+    from starstore import STAR_OVERRIDES_NAME
+
+    _offscreen_app()
+    cache_root = tmp_path / "cache"
+    key = str(library.resolve())
+    state_dir = mainmod.library_state_dir(key, cache_root)
+    variant_dir = thumbcache.cache_dir_for(key, cache_root, "exts:no=.png")
+    cat = scan_library(library)
+    idx = next(i for i, p in enumerate(cat.photos) if p.name == "c.jpg")
+    key_c = starstore.photo_key(cat.photos[idx])
+    starstore.save_star_overrides(variant_dir, {key_c: 3})
+    mainmod.save_sort_modes(variant_dir, {"2021-05-05 Picnic": "size"})
+
+    win = MainWindow(cat, None, cache_dir=variant_dir, build_dir=None,
+                     state_dir=state_dir)
+    assert cat.photos[idx].star == 3                     # applied at open
+    assert (state_dir / STAR_OVERRIDES_NAME).is_file()   # migrated
+    assert (variant_dir / STAR_OVERRIDES_NAME).is_file() # old copy kept
+    assert load_sort_modes(state_dir) == {"2021-05-05 Picnic": "size"}
+    assert win.grid.sort_modes == {"2021-05-05 Picnic": "size"}
+
+    # A state dir that already has its own file wins — no re-migration.
+    starstore.save_star_overrides(state_dir, {key_c: 1})
+    fresh = scan_library(library)
+    win2 = MainWindow(fresh, None, cache_dir=variant_dir, build_dir=None,
+                      state_dir=state_dir)
+    assert fresh.photos[idx].star == 1
+    assert win2 is not None

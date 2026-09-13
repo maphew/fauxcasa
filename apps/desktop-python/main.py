@@ -128,6 +128,7 @@ from thumbcache import (  # noqa: E402
 from peek import PeekPage  # noqa: E402
 from slideshow import SlideshowPage  # noqa: E402
 from starstore import (  # noqa: E402
+    STAR_OVERRIDES_NAME,
     apply_star_overrides,
     load_star_overrides,
     photo_key,
@@ -276,41 +277,45 @@ def _remember_library(cache_root: Path, library: Path) -> None:
 # Per-folder sort modes (fauxcasa-q6l.11) — DURABLE-HOME DECISION
 # (2026-07-02): a per-folder sort mode is a VIEW preference of a read-only
 # app, so it lives MACHINE-LOCAL in a per-LIBRARY config.json inside that
-# library's own cache dir (beside catalog.json — cache_dir_for() names the
-# dir by a digest of the library path, so the prefs follow the library
-# without touching it, N1). N3 says durable state lives in the library, and
-# Picasa's MANUAL sort order is on the rebuild-loss regression list — but
+# library's own state dir (library_state_dir() names the dir by a digest
+# of the library identity, so the prefs follow the library without
+# touching it, N1 — and, since fauxcasa-6vk finding 2, without following
+# the WALK: a File-Types change must not lose the user's sort choices).
+# N3 says durable state lives in the library, and Picasa's MANUAL sort
+# order is on the rebuild-loss regression list — but
 # v1's date/name/size modes are recomputable views, not user-authored
 # order (manual mode IS user-authored, and is blocked on the missing db3
 # oracle fixture — out of scope here), so losing this file costs one
 # right-click, not data. REVISIT AT M2: when tier-2 library-home state
 # lands (the albums order file), sort modes may move there so a library
 # carries its view prefs between machines.
-def _library_config_path(cache_dir: Path) -> Path:
-    """Machine-local per-library view prefs, beside catalog.json. The name
-    'config.json' is collision-free in the cache dir (catalog.json,
+def _library_config_path(state_dir: Path) -> Path:
+    """Machine-local per-library view prefs, in the library STATE dir
+    (variant-free — fauxcasa-6vk finding 2; for a default walk that is
+    the same directory catalog.json lives in). The name
+    'config.json' is collision-free there (catalog.json,
     thumbs.fcache, import-report.json) and mirrors the per-user config.json
     at the cache ROOT (_config_path) in shape and fail-soft handling."""
-    return cache_dir / "config.json"
+    return state_dir / "config.json"
 
 
-def _read_library_config(cache_dir: Path) -> dict:
+def _read_library_config(state_dir: Path) -> dict:
     """Read the raw per-library config dict, or {} on any failure.
     View prefs are a convenience, never a gate."""
     try:
-        data = json.loads(_library_config_path(cache_dir).read_text())
+        data = json.loads(_library_config_path(state_dir).read_text())
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def _write_library_config(cache_dir: Path, data: dict) -> None:
+def _write_library_config(state_dir: Path, data: dict) -> None:
     """Persist the per-library config atomically via temp-sibling + os.replace.
     Best-effort: a write failure never breaks the session."""
-    cfg = _library_config_path(cache_dir)
+    cfg = _library_config_path(state_dir)
     tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
     try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        state_dir.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(data))
         os.replace(tmp, cfg)
     except OSError as e:
@@ -321,14 +326,14 @@ def _write_library_config(cache_dir: Path, data: dict) -> None:
             pass
 
 
-def load_sort_modes(cache_dir: Path | None) -> dict[str, str]:
+def load_sort_modes(state_dir: Path | None) -> dict[str, str]:
     """The persisted per-folder sort modes (folder rel-path -> mode), or {}.
     Tolerates a missing/garbage file, a non-object document, and unknown
     mode values (dropped) — view prefs are a convenience, never a gate.
     Default-mode entries are dropped too: absent == DEFAULT_SORT_MODE."""
-    if cache_dir is None:
+    if state_dir is None:
         return {}
-    modes = _read_library_config(cache_dir).get("sort_modes")
+    modes = _read_library_config(state_dir).get("sort_modes")
     if not isinstance(modes, dict):
         return {}
     return {rel: mode for rel, mode in modes.items()
@@ -336,41 +341,83 @@ def load_sort_modes(cache_dir: Path | None) -> dict[str, str]:
             and mode != DEFAULT_SORT_MODE}
 
 
-def save_sort_modes(cache_dir: Path | None, modes: dict[str, str]) -> None:
+def save_sort_modes(state_dir: Path | None, modes: dict[str, str]) -> None:
     """Persist the non-default per-folder sort modes. Best-effort and
     torn-proof via temp-sibling + os.replace. Merges into the existing config
     doc so other view prefs (folder_view_flat) survive the write."""
-    if cache_dir is None:
+    if state_dir is None:
         return  # no cache dir (tests, degraded runs): session-only modes
     keep = {rel: mode for rel, mode in sorted(modes.items())
             if mode in SORT_MODES and mode != DEFAULT_SORT_MODE}
-    doc = _read_library_config(cache_dir)
+    doc = _read_library_config(state_dir)
     doc["sort_modes"] = keep
-    _write_library_config(cache_dir, doc)
+    _write_library_config(state_dir, doc)
 
 
-def load_folder_view(cache_dir: Path | None) -> bool:
+def load_folder_view(state_dir: Path | None) -> bool:
     """Whether the folder sidebar should use flat (True) or tree (False) mode.
     Default False (tree). Tolerates missing/garbage config — view prefs are
     a convenience, never a gate. Absent key == tree (False)."""
-    if cache_dir is None:
+    if state_dir is None:
         return False
-    v = _read_library_config(cache_dir).get("folder_view_flat")
+    v = _read_library_config(state_dir).get("folder_view_flat")
     return bool(v) if isinstance(v, bool) else False
 
 
-def save_folder_view(cache_dir: Path | None, flat: bool) -> None:
+def save_folder_view(state_dir: Path | None, flat: bool) -> None:
     """Persist the flat/tree folder sidebar choice. Best-effort and
     torn-proof. Merges into the existing config so sort_modes survives.
     The default (tree/False) is stored as absent, not False."""
-    if cache_dir is None:
+    if state_dir is None:
         return
-    doc = _read_library_config(cache_dir)
+    doc = _read_library_config(state_dir)
     if flat:
         doc["folder_view_flat"] = True
     else:
         doc.pop("folder_view_flat", None)
-    _write_library_config(cache_dir, doc)
+    _write_library_config(state_dir, doc)
+
+
+def library_state_dir(library_key: str, cache_root: Path) -> Path:
+    """The VARIANT-FREE per-library directory that holds user CHOICES —
+    stars.json and the view-prefs config.json (fauxcasa-6vk finding 2).
+
+    `cache_dir_for(library_key, cache_root, variant)` keys the disposable
+    cache on the WALK (scan filter + excluded extensions) so a different
+    walk gets a different thumbs/catalog pair. That is right for derived
+    data and wrong for user choices: changing File Types or
+    --min-image-size would otherwise hide every star the user has set.
+    Passing no variant returns the same directory the default walk uses,
+    so a plain single-variant library keeps one directory for both.
+    """
+    return cache_dir_for(library_key, cache_root)
+
+
+def _migrate_library_state(cache_dir: Path | None,
+                           state_dir: Path | None) -> None:
+    """One-time lift of user state from a VARIANT cache dir into the
+    variant-free state dir (fauxcasa-6vk finding 2), so testers who
+    starred photos while running with a File-Types/scan-size variant keep
+    those stars. Copy, never move: the old file stays where an older
+    build would still find it. Best-effort — state is a convenience."""
+    if state_dir is None or cache_dir is None or state_dir == cache_dir:
+        return
+    try:
+        if (not (state_dir / STAR_OVERRIDES_NAME).exists()
+                and (cache_dir / STAR_OVERRIDES_NAME).exists()):
+            overrides = load_star_overrides(cache_dir)
+            if overrides:
+                save_star_overrides(state_dir, overrides)
+                log.info("migrated %d star choices into %s",
+                         len(overrides), state_dir)
+        if (not _library_config_path(state_dir).exists()
+                and _library_config_path(cache_dir).exists()):
+            doc = _read_library_config(cache_dir)
+            if doc:
+                _write_library_config(state_dir, doc)
+                log.info("migrated library view prefs into %s", state_dir)
+    except OSError as e:
+        log.warning("could not migrate library state: %s", e)
 
 
 def _gui_unavailable() -> bool:
@@ -1076,13 +1123,21 @@ class MainWindow(QMainWindow):
                  db3_dir: Path | None = None,
                  contacts_path: Path | None = None,
                  cfg: library.LibraryConfig | None = None,
-                 contacts_sig: tuple[int, int] | None = None):
+                 contacts_sig: tuple[int, int] | None = None,
+                 state_dir: Path | None = None):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
+        # Where user CHOICES live (fauxcasa-6vk finding 2): the variant-free
+        # per-library dir (library_state_dir), so a File-Types or scan-size
+        # change — which moves cache_dir — never hides the user's stars
+        # and sort modes. Defaults to cache_dir when no state dir is
+        # given (tests, bench harnesses); main() always passes one.
+        self.state_dir = cache_dir if state_dir is None else state_dir
+        _migrate_library_state(cache_dir, self.state_dir)
         # User star choices are overlays in Fauxcasa's machine-local cache,
         # never writes into originals/.picasa.ini (the tracer's N1/N3 rule).
-        self.star_overrides = load_star_overrides(cache_dir)
+        self.star_overrides = load_star_overrides(self.state_dir)
         apply_star_overrides(catalog, self.star_overrides)
         self.scan_filter = scan_filter
         # --thumbs path preserved for any relaunch that walks the same file
@@ -1151,7 +1206,7 @@ class MainWindow(QMainWindow):
         # set_data/set_filter builds the display so a remembered mode shapes
         # the very first paint. cache_dir=None (tests, degraded runs) means
         # session-only modes; durable-home decision at _library_config_path.
-        self.grid.sort_modes = load_sort_modes(cache_dir)
+        self.grid.sort_modes = load_sort_modes(self.state_dir)
         # The viewer shares the grid's cache pair: it paints an instant cached
         # preview (the nearest v2 level) while the full original loads
         # (fauxcasa-9pp). thumbs is None on a cold start until the build lands.
@@ -1176,7 +1231,7 @@ class MainWindow(QMainWindow):
         # Block signals while setting initial state — _toggle_folder_view
         # calls _rebuild_sidebar, which is not safe before __init__ completes.
         self._flat_check.blockSignals(True)
-        self._flat_check.setChecked(load_folder_view(cache_dir))
+        self._flat_check.setChecked(load_folder_view(self.state_dir))
         self._flat_check.blockSignals(False)
         self._build_sidebar()
         # Wire AFTER _build_sidebar so init doesn't trigger a spurious rebuild.
@@ -2110,7 +2165,7 @@ class MainWindow(QMainWindow):
     def _toggle_folder_view(self, flat: bool) -> None:
         """Switch the folder sidebar between flat and tree layouts, persist the
         choice, and rebuild the sidebar while preserving the current selection."""
-        save_folder_view(self.cache_dir, flat)
+        save_folder_view(self.state_dir, flat)
         kind, key = self._selected_view()
         self._rebuild_sidebar()
         self._reselect_view(kind, key)
@@ -2588,7 +2643,7 @@ class MainWindow(QMainWindow):
             self.grid.sort_modes.pop(rel, None)
         else:
             self.grid.sort_modes[rel] = mode
-        save_sort_modes(self.cache_dir, self.grid.sort_modes)
+        save_sort_modes(self.state_dir, self.grid.sort_modes)
         if self.search.text().strip():
             return
         kind, key = self._selected_view()
@@ -2983,7 +3038,7 @@ class MainWindow(QMainWindow):
             photo.star = target
             self.star_overrides[photo_key(photo)] = target
         try:
-            save_star_overrides(self.cache_dir, self.star_overrides)
+            save_star_overrides(self.state_dir, self.star_overrides)
         except OSError as e:
             log.error("could not save star choices: %s", e)
             self.statusBar().showMessage(
@@ -3424,6 +3479,10 @@ def main() -> int:
     cache_dir = cache_dir_for(library_key, args.cache_root,
                               scan_filter.cache_key()
                               + exts_cache_key(excluded_exts))
+    # User choices (stars, sort modes) are keyed on the LIBRARY, never on
+    # the walk variant above (fauxcasa-6vk finding 2) — the two dirs are
+    # the same path whenever the walk is the default one.
+    state_dir = library_state_dir(library_key, args.cache_root)
     cat_path = cache_dir / "catalog.json"
     if adopt and not cfg.is_legacy:
         log.error("--thumbs is a single-cache legacy option; explicit "
@@ -3572,7 +3631,7 @@ def main() -> int:
                      excluded_exts=excluded_exts,
                      thumbs_path=args.thumbs, db3_dir=db3_dir,
                      contacts_path=contacts_path, cfg=cfg,
-                     contacts_sig=contacts_sig)
+                     contacts_sig=contacts_sig, state_dir=state_dir)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
