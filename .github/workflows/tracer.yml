@@ -64,6 +64,46 @@ jobs:
           --screenshot tracer-ci.png --scroll-to 0.5
       - name: Warm second run binds the built cache
         run: uv run apps/desktop-python/main.py ci-library --quit-after-ready
+      - name: Decode-sandbox e2e (Windows, real AppContainer, source run)
+        # fauxcasa-ez2.9 Stage 2: proves the sandbox on a source run under
+        # the actual production default (sandbox_mode() defaults to "1" on
+        # win32 outside pytest -- this is main.py directly, not the pinned-
+        # off pytest suite above). --require-sandbox makes a failed hello
+        # a hard CI failure here (unlike bundle.yml/release.yml's frozen
+        # go/no-go, which is continue-on-error): a real windows-latest
+        # runner failing to sandbox from SOURCE is a regression, not the
+        # frozen-artifact go/no-go's softer "ship degraded" case.
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set +e
+          OUT=$(uv run apps/desktop-python/main.py ci-library \
+            --cache-root ./sbx-cache --finish-build --require-sandbox \
+            --quit-after-ready 2>&1)
+          RC=$?
+          set -e
+          printf '%s\n' "$OUT"
+          echo "exit=$RC"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::--require-sandbox source run exited $RC"; exit 1
+          fi
+          if ! printf '%s\n' "$OUT" | grep '"event": "decode-sandbox"' \
+              | grep -q '"state": "sandboxed"'; then
+            echo "::error::missing {\"event\": \"decode-sandbox\", \"state\": \"sandboxed\", ...} in stdout"
+            exit 1
+          fi
+          echo "OK: source run's decode sandbox hellos (state=sandboxed)"
+      - name: Decode-sandbox e2e (Windows, wired call sites, real AppContainer)
+        # fauxcasa-ez2.9 Stage 2 review P2-5: the source run above proves
+        # the sandbox STARTS on this runner; this proves thumbcache.
+        # _index_one and viewer.load_original_oriented actually ROUTE
+        # through it (parity + hostile-file taxonomy) against a real
+        # worker, not a stub -- the one suite that was previously wired
+        # into nothing (test_sandbox_e2e.py module docstring).
+        if: runner.os == 'Windows'
+        run: uv run apps/desktop-python/test_sandbox_e2e.py -q
+        env:
+          QT_QPA_PLATFORM: offscreen
       - uses: actions/upload-artifact@v4
         with:
           name: tracer-screenshot-${{ matrix.os }}

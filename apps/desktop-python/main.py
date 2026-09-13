@@ -4288,6 +4288,33 @@ def main() -> int:
     # dialog, ...) inherits it; MainWindow/slideshow/peek also set it
     # explicitly so a window built outside main() (tests) carries it too.
     app.setWindowIcon(app_icon())
+
+    # Decode-sandbox session-start decision (fauxcasa-ez2.9 Stage 1, item
+    # 6): try the sandbox (or note in-process/off) ONCE, BEFORE
+    # MainWindow() is constructed (review P2-7) -- MainWindow.__init__
+    # can start _start_cold_build/_start_backfill/_start_reconcile,
+    # every one of which reaches thumbcache.build_cache and reads
+    # decodefacade.get_service().state at the thumbcache._index_one call
+    # site (fauxcasa-ez2.9 Stage 2). Left after window construction (as
+    # it was previously), those indexing threads could start and finish
+    # entirely on the STATE_IN_PROCESS default before ensure_started()
+    # ever ran, decoding unsandboxed while the run later prints
+    # {"event": "decode-sandbox", "state": "sandboxed"} -- correct
+    # pixels, but an overstated security claim. Nothing below needs the
+    # window; the --require-sandbox early `return 1` is now also
+    # strictly better -- it no longer flashes a window first. The
+    # READY-time event print and the status-bar sync timer stay where
+    # they were, after win.show() -- state is already final by then.
+    import decodefacade
+    decode_svc = decodefacade.get_service()
+    try:
+        decode_svc.ensure_started()
+    except decodefacade.DecodeSandboxRequiredError as e:
+        log.error("--require-sandbox: decode sandbox unavailable: %s", e)
+        print(f"error: --require-sandbox but the decode sandbox failed to "
+              f"start: {e}", file=sys.stderr)
+        return 1
+
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
                      contacts=contacts, pal_dir=pal_dir,
@@ -4300,21 +4327,6 @@ def main() -> int:
         win.zoom.setValue(args.zoom)
     win.show()
     win.grid.setFocus()  # only really lands once the window is mapped
-
-    # Decode-sandbox session-start decision (fauxcasa-ez2.9 Stage 1, item
-    # 6): try the sandbox (or note in-process/off) ONCE, right after the
-    # window is up. --require-sandbox (mapped to env "require" above) is
-    # fail-loud: a startup failure here exits main() non-zero with a
-    # clear message instead of degrading silently.
-    import decodefacade
-    decode_svc = decodefacade.get_service()
-    try:
-        decode_svc.ensure_started()
-    except decodefacade.DecodeSandboxRequiredError as e:
-        log.error("--require-sandbox: decode sandbox unavailable: %s", e)
-        print(f"error: --require-sandbox but the decode sandbox failed to "
-              f"start: {e}", file=sys.stderr)
-        return 1
 
     # P3 finding: a MID-SESSION degrade (decodefacade.DecodeService.
     # decode() flips state -> "degraded" on a per-file spawn/OSError/

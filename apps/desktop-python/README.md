@@ -62,6 +62,30 @@ RAW list in lockstep (`catalog.py` / `scripts/make-thumbcache.py`) so
 caches keep binding; a pre-RAW cache fails `bind()` on the count
 mismatch and rebuilds via the existing path.
 
+## Decode sandbox
+
+On Windows, still images (JPEG, PNG, GIF, BMP, TIFF-8bit, WebP, TGA — the
+Qt image plugins, the richest exploit surface) are decoded inside a
+Windows AppContainer sandbox for both the indexer's thumbnails
+(`thumbcache._index_one`, the top fcache level, batch lane) and the
+viewer's full-resolution originals (`viewer.load_original_oriented`,
+edge=0, the reserved interactive lane) — see `decodefacade.py` for the
+facade and `docs/decode-threat-model.md` for the design. RAW, PSD, 16-bit
+TIFF, and video (poster and playback) are **not yet sandboxed in 0.1**:
+they decode in-process, same as before this feature existed. On Linux
+everything decodes in-process (no AppContainer equivalent wired yet).
+
+The sandbox is default-ON on Windows outside tests; force it off with
+`FAUXCASA_DECODE_SANDBOX=0`, force it required (fail loud, non-zero exit,
+on a failed startup) with `FAUXCASA_DECODE_SANDBOX=1` and `--require-
+sandbox`, or leave the default. If the sandbox cannot start (or dies
+mid-session), the app degrades to in-process decoding for the rest of
+the session and says so in the status bar — never silently (N7). A
+sandboxed-vs-in-process decode failure is never retried in-process: a
+file the sandbox refuses or that trips a protocol violation stays an
+honest error tile rather than falling back to decoding the same
+untrusted bytes unsandboxed.
+
 ## The §7 numbers (Linux dev machine, offscreen; overshoots reference HW)
 
 - **Cold start, already-indexed (warm load, no walk):** 100k photos in

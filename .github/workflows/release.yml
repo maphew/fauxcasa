@@ -284,6 +284,73 @@ jobs:
               sys.exit("DNG not found in ci-cache — was it indexed?")
           EOF
 
+      # --- Decode-sandbox go/no-go (fauxcasa-ez2.9 Stage 2) -----------------
+      # Mirrors bundle.yml's go/no-go step exactly -- see that file's
+      # comment for the rationale. Windows-only; continue-on-error so a
+      # sandbox that cannot hello degrades the RELEASE artifact to
+      # in-process + banner rather than blocking a release.
+      - name: Decode-sandbox go/no-go (frozen artifact, real AppContainer)
+        if: runner.os == 'Windows'
+        shell: bash
+        continue-on-error: true
+        run: |
+          EXE="dist/fauxcasa-console/fauxcasa-console.exe"
+          set +e
+          OUT=$("$EXE" ci-library --cache-root ./sbx-cache \
+            --quit-after-ready --require-sandbox 2>&1)
+          RC=$?
+          set -e
+          printf '%s\n' "$OUT"
+          echo "exit=$RC"
+          if ! printf '%s\n' "$OUT" | grep '"event": "decode-sandbox"' \
+              | grep -q '"state": "sandboxed"'; then
+            echo "::warning::frozen release artifact could not hello the AppContainer decode sandbox (go/no-go NOT met) -- exit $RC, see output above. Shipping with the sandbox unavailable degrades to in-process decode + the status-bar banner (N7), not a build failure."
+            exit 0
+          fi
+          echo "OK: frozen release artifact's decode sandbox hellos (state=sandboxed)"
+
+      - name: Decode-sandbox indexes real JPEG tiles in the frozen artifact
+        if: runner.os == 'Windows'
+        shell: bash
+        continue-on-error: true
+        run: |
+          EXE="dist/fauxcasa-console/fauxcasa-console.exe"
+          set +e
+          "$EXE" ci-library --cache-root ./sbx-cache --finish-build \
+            --require-sandbox --screenshot sandboxed-ci.png --scroll-to 0.5
+          RC=$?
+          set -e
+          echo "exit=$RC"
+          if [ "$RC" -ne 0 ] || [ ! -s sandboxed-ci.png ]; then
+            echo "::warning::frozen release artifact's --require-sandbox indexed run did not produce a screenshot (exit $RC) -- go/no-go not met, see the prior hello step"
+            exit 0
+          fi
+          echo "sandboxed_screenshot_ok=1" >> "$GITHUB_ENV"
+
+      - name: Assert the sandboxed screenshot is non-blank (stills decoded through the sandbox)
+        if: runner.os == 'Windows' && env.sandboxed_screenshot_ok == '1'
+        shell: bash
+        continue-on-error: true
+        run: |
+          uv run --with "${{ env.PYSIDE6 }}" python - <<'EOF'
+          import sys
+          from collections import Counter
+          from PySide6.QtGui import QImage
+          img = QImage("sandboxed-ci.png")
+          if img.isNull():
+              sys.exit("sandboxed screenshot did not load")
+          c = Counter()
+          for y in range(0, img.height(), 5):
+              for x in range(0, img.width(), 5):
+                  p = img.pixelColor(x, y)
+                  c[(p.red() // 32 * 32, p.green() // 32 * 32, p.blue() // 32 * 32)] += 1
+          blue = sum(n for (r, g, b), n in c.items() if b >= 128 and b > g and g >= 64)
+          print(f"blue-photo samples: {blue}")
+          if blue < 50:
+              sys.exit("BLANK sandboxed grid — stills did not decode through the sandbox")
+          print("OK: frozen release artifact decodes still thumbnails through the sandboxed index path")
+          EOF
+
       - name: Frozen no-arg launch fails GRACEFULLY (shipping double-click UX)
         shell: bash
         run: |

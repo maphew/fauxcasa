@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
+import decodefacade
 import inmeta
 import metareader
 from catalog import (
@@ -606,6 +607,79 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
         _tiff = photo.rel.lower().endswith((".tif", ".tiff"))
         if data and _tiff and tiff_is_16bit(data):
             img = pillow_qimage(data, top)
+        elif data and photo.rel.lower().endswith(".psd"):
+            # Pre-route PSD to Pillow on ALL platforms, sandboxed or not:
+            # the pinned PySide6 build ships no PSD plugin at all
+            # (pillowload module doc), so the worker's canRead() would
+            # always be false and the sandbox route would return
+            # UNSUPPORTED -> a permanent zero-byte tile (fauxcasa-ez2.9
+            # Stage 2 review P1-1). This is a header-agnostic extension
+            # check, not a pixel decode -- exactly like the 16-bit TIFF
+            # pre-route above.
+            img = pillow_qimage(data, top)
+        elif (not from_preview and src is not None
+              and decodefacade.get_service().state
+              == decodefacade.STATE_SANDBOXED):
+            # STILL route through the decode sandbox (fauxcasa-ez2.9 Stage
+            # 2). Only the plain path-constructed case (not RAW's
+            # in-memory embedded preview, which has no file path a
+            # sandboxed worker could open) and only while the service is
+            # actually sandboxed -- "in-process"/"degraded" fall through
+            # to the unchanged QImageReader path below. The worker
+            # applies EXIF autoTransform itself (decodesvc_worker_win.py),
+            # so `img` comes back display-upright exactly like the local
+            # reader.setAutoTransform(True) path, and the crop-bake step
+            # below (which maps the STORED-frame rect through the read
+            # orientation) applies unchanged.
+            #
+            # Resolution note: the facade's decode(edge=...) op has no
+            # ROI/clip parameter (decodesvc_worker_win._handle_decode
+            # takes only a handle + edge), so the setClipRect optimisation
+            # above (decode only the crop sub-rect at higher resolution)
+            # is NOT available here -- the worker always scales the WHOLE
+            # frame to fit `edge` on its long axis, then the crop-bake
+            # step below crops out the sub-rect. Left at edge=top, a tight
+            # crop= recipe on a large source would throw away most of the
+            # thumbnail's resolution before the crop ever ran (fauxcasa-
+            # ez2.9 Stage 2 review P2-4). Compensate by requesting a
+            # LARGER edge so that after the worker's whole-frame scale-
+            # down, the KEPT crop sub-rect (not the whole frame) is the
+            # one that ends up ~`top` px: with box = crop_pixel_box(crop,
+            # w, h) in STORED-frame (header) pixels, scaling the whole
+            # frame by s = edge / max(w, h) scales the box by the same s
+            # (an isotropic scale, so this ratio is orientation-agnostic),
+            # so solving max(box_w, box_h) * s == top gives
+            # edge = top * max(w, h) / max(box_w, box_h). Capped at
+            # MAX_EDGE so this can never request a decode the worker
+            # itself would refuse as TOO_LARGE (decodesvc.MAX_EDGE, mirrored
+            # in decodesvc_worker_win.py).
+            edge = top
+            if crop is not None and data:
+                # Header-only size read via a PATH-constructed reader (C++
+                # QFile device) -- never a Python QBuffer from this worker
+                # thread: the format-probe loop holds the image-plugin
+                # factory mutex while reading the device, and a shiboken
+                # device needs the GIL per read() (bd memory
+                # qt-decode-gil-mutex-deadlock: that pairing deadlocked
+                # the pool, fauxcasa-5dk). Same form the clip path uses.
+                _hdr_sz = QImageReader(str(src)).size()  # header-only
+                if _hdr_sz.isValid() and _hdr_sz.width() > 0 and _hdr_sz.height() > 0:
+                    _box = crop_pixel_box(crop, _hdr_sz.width(), _hdr_sz.height())
+                    if _box is not None and _box[2] > 0 and _box[3] > 0:
+                        from decodesvc import MAX_EDGE
+                        edge = min(MAX_EDGE, round(
+                            top * max(_hdr_sz.width(), _hdr_sz.height())
+                            / max(_box[2], _box[3])))
+            img = decodefacade.get_service().decode(
+                str(src), route="still", edge=edge)
+            clip_applied = False
+            # Facade contract: null on ANY failure (open error, CORRUPT/
+            # UNSUPPORTED DecodeServiceError, ProtocolViolation, spawn-
+            # class degrade) -- fall straight to the existing error-tile
+            # path below. Deliberately NO Pillow in-process retry here:
+            # that would decode the same untrusted bytes in-process right
+            # after the sandbox specifically failed/refused them, which is
+            # exactly the escape the sandbox exists to close.
         else:
             if from_preview:
                 # RAW embedded preview: `data` is in-memory bytes extracted
