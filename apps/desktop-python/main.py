@@ -1979,6 +1979,11 @@ class MainWindow(QMainWindow):
         # A peeked index belongs to the old catalog too (peek_released
         # -> _hide_peek; idle no-op otherwise).
         self.grid._end_peek()
+        # Leave the viewer the way _close_viewer does (fauxcasa-6vk finding
+        # 4): forcing the page back to the browser without retiring the
+        # viewer-only Gallery/Esc action left it on the toolbar over the
+        # grid, where it does nothing.
+        self.back_action.setVisible(False)
         self.pages.setCurrentWidget(self.pages.widget(0))
         self.search.blockSignals(True)
         self.search.clear()

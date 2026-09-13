@@ -15491,3 +15491,27 @@ def test_library_state_migrates_out_of_a_variant_cache_dir(
                       state_dir=state_dir)
     assert fresh.photos[idx].star == 1
     assert win2 is not None
+
+
+def test_reload_data_retires_the_viewer_gallery_action(library: Path,
+                                                       tmp_path: Path) -> None:
+    """Finding 4: a reconcile swap forces the page back to the browser, so
+    it must also retire the viewer-only Gallery/Esc action — otherwise it
+    sits on the toolbar over the grid doing nothing."""
+    from main import MainWindow
+
+    _offscreen_app()
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    display = list(win.grid.display)
+    win._open_viewer(display[0], display, 0)
+    assert win.back_action.isVisible()
+    assert win.pages.currentWidget() is win.viewer
+
+    other = tmp_path / "other-lib"
+    make_jpeg(other / "2022 Aurora" / "borealis.jpg")
+    win.reload_data(scan_library(other), None)
+
+    assert win.pages.currentWidget() is win.pages.widget(0)
+    assert not win.back_action.isVisible()
+    win.viewer.quiesce()
