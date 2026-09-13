@@ -176,15 +176,10 @@ def test_decode_returns_null_for_crashed_file_then_in_process_for_next(
     assert img2.width() == 2 and img2.height() == 2
 
 
-@pytest.mark.parametrize("exc", [
-    OSError("simulated CreateProcess/profile failure"),
-    queue.Empty(),
-])
-def test_decode_oserror_and_queue_empty_degrade_to_null(monkeypatch, synthetic_png, exc):
+def test_decode_oserror_degrades_to_null(monkeypatch, synthetic_png):
     """P2 finding: OSError (create_or_derive_profile/CreateProcess
-    failures) and queue.Empty (WinSandboxTransport.decode's 30s lease
-    timeout) must NOT escape the "null QImage on ANY failure" contract --
-    both map to the same session-level degrade + null-for-this-file
+    failures) must NOT escape the "null QImage on ANY failure" contract --
+    it maps to the same session-level degrade + null-for-this-file
     behaviour as RuntimeError."""
     monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
 
@@ -196,7 +191,7 @@ def test_decode_oserror_and_queue_empty_degrade_to_null(monkeypatch, synthetic_p
             pass
 
         def decode(self, path, route="still", edge=0):
-            raise exc
+            raise OSError("simulated CreateProcess/profile failure")
 
         def close(self):
             pass
@@ -208,6 +203,57 @@ def test_decode_oserror_and_queue_empty_degrade_to_null(monkeypatch, synthetic_p
     img = svc.decode(synthetic_png, route="still", edge=0)
     assert img.isNull()
     assert svc.state == df.STATE_DEGRADED
+
+
+def test_decode_queue_empty_is_per_file_null_not_session_degrade(
+        monkeypatch, synthetic_png):
+    """Re-review residual (item 1): a queue.Empty from a contended
+    INTERACTIVE lease (one reserved worker, timeout 30s) is NOT a
+    spawn-class failure -- the sandbox is fine, just busy. It must map to
+    a PER-FILE null image only; the session must stay 'sandboxed' so the
+    next call still tries the sandbox. Simulated here with two
+    "concurrent" interactive decodes where the second's lease call raises
+    queue.Empty (as WinDecodePoolSet.lease(timeout=30) does when the
+    reserved interactive worker stays checked out)."""
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+
+    calls = []
+
+    class _ContendedSandbox:
+        def __init__(self, n_batch):
+            pass
+
+        def start(self):
+            pass
+
+        def decode(self, path, route="still", edge=0):
+            calls.append(path)
+            if len(calls) == 1:
+                from PySide6.QtGui import QImage
+                return QImage(2, 2, QImage.Format.Format_RGBA8888)
+            raise queue.Empty()  # second concurrent interactive lease times out
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(df, "WinSandboxTransport", _ContendedSandbox)
+    if sys.platform != "win32":
+        pytest.skip("sandboxed decode path only reached on win32")
+    svc = df.get_service()
+
+    img1 = svc.decode(synthetic_png, route="still", edge=0)
+    assert not img1.isNull()
+    assert svc.state == df.STATE_SANDBOXED
+
+    img2 = svc.decode(synthetic_png, route="still", edge=0)
+    assert img2.isNull(), "the timed-out call gets a null image"
+    assert svc.state == df.STATE_SANDBOXED, (
+        "a lease timeout must not degrade the session")
+    assert svc.reason == ""
+
+    # the sandbox is still in use -- a third call goes through it again.
+    img3 = svc.decode(synthetic_png, route="still", edge=0)
+    assert len(calls) == 3
 
 
 def test_ensure_started_closes_transport_on_start_failure(monkeypatch):
@@ -305,6 +351,99 @@ def test_decode_non_still_route_falls_back_without_touching_sandbox(monkeypatch,
     missing = tmp_path / "does-not-exist.raw"
     img = svc.decode(missing, route="raw", edge=0)
     assert img.isNull()  # OSError on open -> null, no crash
+
+
+def test_decode_concurrent_degrade_never_raises_attributeerror(monkeypatch, synthetic_png):
+    """Re-review residual (item 2): decode() must read self._sandbox ONCE
+    into a local under the lock. Simulated here with a transport whose
+    decode() degrades the service (mutating svc._sandbox to None) from
+    "another thread" mid-call -- i.e. the mutation happens INSIDE the
+    stub's decode(), after decode() has already read the (now-stale)
+    local. A second call must still see a consistent local and never
+    raise AttributeError out of decode()."""
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+
+    class _DegradingMidCallSandbox:
+        def __init__(self, n_batch):
+            pass
+
+        def start(self):
+            pass
+
+        def decode(self, path, route="still", edge=0):
+            # Simulate a concurrent thread's degrade branch mutating
+            # svc._sandbox to None WHILE this call is in flight -- the
+            # local `sandbox` this call captured under the lock must
+            # still be used for the remainder of this call.
+            svc._sandbox = None
+            raise RuntimeError("simulated concurrent spawn-class failure")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(df, "WinSandboxTransport", _DegradingMidCallSandbox)
+    if sys.platform != "win32":
+        pytest.skip("sandboxed decode path only reached on win32")
+    svc = df.get_service()
+
+    # decode() must not raise AttributeError even though svc._sandbox is
+    # concurrently nulled out from inside the stub's decode() call.
+    img = svc.decode(synthetic_png, route="still", edge=0)
+    assert img.isNull()
+    assert svc.state == df.STATE_DEGRADED
+
+    # a later call, with self._sandbox already None, must not raise
+    # either -- it falls through to in-process.
+    img2 = svc.decode(synthetic_png, route="still", edge=0)
+    assert not img2.isNull()
+
+
+def test_decode_require_mode_mid_session_failure_never_falls_back(
+        monkeypatch, synthetic_png):
+    """Re-review residual (item 3): under FAUXCASA_DECODE_SANDBOX=require,
+    a MID-SESSION spawn-class failure must set _require_failed, return
+    null for THIS and every LATER call, log.error once, and set
+    state='degraded' reason='require: sandbox lost mid-session' -- it
+    must NEVER fall back to in-process (proven with an in-process stub
+    that raises if ever called)."""
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "require")
+
+    class _BoomAfterStartSandbox:
+        def __init__(self, n_batch):
+            pass
+
+        def start(self):
+            pass  # startup succeeds
+
+        def decode(self, path, route="still", edge=0):
+            raise RuntimeError("simulated mid-session spawn failure")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(df, "WinSandboxTransport", _BoomAfterStartSandbox)
+    if sys.platform != "win32":
+        pytest.skip("sandboxed decode path only reached on win32")
+    svc = df.get_service()
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("in-process decode must NEVER run under "
+                              "require mode after a mid-session sandbox loss")
+
+    monkeypatch.setattr(svc._in_process, "decode", _must_not_be_called)
+
+    img1 = svc.decode(synthetic_png, route="still", edge=0)
+    assert img1.isNull()
+    assert svc.state == df.STATE_DEGRADED
+    assert svc.reason == "require: sandbox lost mid-session"
+    assert svc._require_failed is True
+
+    # every later call also returns null, forever, without ever touching
+    # in-process (the monkeypatched stub above would raise).
+    img2 = svc.decode(synthetic_png, route="still", edge=0)
+    assert img2.isNull()
+    img3 = svc.decode(synthetic_png, route="raw", edge=0)
+    assert img3.isNull()
 
 
 # ---------------------------------------------------------------------------

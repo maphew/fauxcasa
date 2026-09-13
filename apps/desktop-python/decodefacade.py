@@ -200,6 +200,12 @@ class DecodeService:
         self._sandbox: WinSandboxTransport | None = None
         self._lock = threading.Lock()
         self._started = False
+        # require-mode fail-closed latch (design doc sec "Fallback
+        # policy" / require mode): once a MID-SESSION spawn-class failure
+        # degrades the service under FAUXCASA_DECODE_SANDBOX=require, this
+        # flips True and every later decode() call returns a null image
+        # forever -- it must NEVER fall back to in-process under require.
+        self._require_failed = False
 
     def ensure_started(self) -> None:
         """Idempotent session-start decision (design doc sec "Fallback
@@ -262,9 +268,27 @@ class DecodeService:
         self.ensure_started()
         from decodesvc import DecodeServiceError, ProtocolViolation
 
-        if self._sandbox is not None:
+        if self._require_failed:
+            # Require mode fail-closed latch: a prior mid-session
+            # spawn-class failure already degraded the service and
+            # FAUXCASA_DECODE_SANDBOX=require forbids ANY in-process
+            # fallback -- every later call returns null forever.
+            from PySide6.QtGui import QImage
+            return QImage()
+
+        # P3 finding "self._sandbox read twice": read the attribute ONCE
+        # into a local under the lock. A concurrent degrade (another
+        # thread's RuntimeError/OSError branch below, which reassigns
+        # self._sandbox under the lock) must never be observed between a
+        # "is not None" check and the subsequent `.decode()` call, or this
+        # call raises AttributeError out of decode() instead of returning
+        # a null image.
+        with self._lock:
+            sandbox = self._sandbox
+
+        if sandbox is not None:
             try:
-                return self._sandbox.decode(path, route=route, edge=edge)
+                return sandbox.decode(path, route=route, edge=edge)
             except NotSandboxed:
                 pass  # route not sandboxed in Stage 1 -- fall through
             except ProtocolViolation as e:
@@ -278,26 +302,50 @@ class DecodeService:
                 log.info("decode(%r): %s", path, e)
                 from PySide6.QtGui import QImage
                 return QImage()
-            except (RuntimeError, OSError, queue.Empty) as e:
-                # Spawn-class failure (RuntimeError), a raw OSError from
-                # create_or_derive_profile/CreateProcess, or a lease
-                # timeout (queue.Empty, WinSandboxTransport.decode's 30s
-                # lease wait) -- P1/P2 findings: SESSION-level degrade,
-                # never per-file. Critically (P1 finding "facade escape"),
-                # THIS call returns a null QImage for the CURRENT path --
-                # a file that crashed/killed the sandbox worker must never
-                # be decoded in-process; only SUBSEQUENT calls (after the
-                # degrade below) may fall through to InProcessTransport.
-                log.error("decode sandbox failure, degrading to "
-                          "in-process for the rest of the session: %s", e)
+            except queue.Empty as e:
+                # A contended lease (WinSandboxTransport.decode's 30s
+                # lease wait on the interactive lane's single reserved
+                # worker, or the batch lane) is NOT a spawn-class failure
+                # -- the sandbox is fine, it is just busy. PER-FILE null
+                # only; the session state/reason is untouched so the next
+                # call still tries the sandbox.
+                log.info("decode(%r): sandbox lease contended (timeout), "
+                         "per-file null: %s", path, e)
+                from PySide6.QtGui import QImage
+                return QImage()
+            except (RuntimeError, OSError) as e:
+                # Spawn-class failure (RuntimeError), or a raw OSError
+                # from create_or_derive_profile/CreateProcess -- P1/P2
+                # findings: SESSION-level degrade, never per-file.
+                # Critically (P1 finding "facade escape"), THIS call
+                # returns a null QImage for the CURRENT path -- a file
+                # that crashed/killed the sandbox worker must never be
+                # decoded in-process; only SUBSEQUENT calls (after the
+                # degrade below) may fall through to InProcessTransport
+                # -- UNLESS require mode is active, in which case they
+                # never fall through either (see _require_failed above).
+                require_mode = sandbox_mode() == "require"
                 with self._lock:
                     self.state = STATE_DEGRADED
-                    self.reason = f"{type(e).__name__}: {e}"
-                    sandbox, self._sandbox = self._sandbox, None
+                    if require_mode:
+                        self.reason = "require: sandbox lost mid-session"
+                        self._require_failed = True
+                    else:
+                        self.reason = f"{type(e).__name__}: {e}"
+                    if self._sandbox is sandbox:
+                        self._sandbox = None
                 try:
                     sandbox.close()
                 except Exception:
                     pass
+                if require_mode:
+                    log.error("decode sandbox required (FAUXCASA_DECODE_SANDBOX="
+                              "require) but lost mid-session, refusing "
+                              "in-process fallback for the rest of the "
+                              "session: %s", e)
+                else:
+                    log.error("decode sandbox failure, degrading to "
+                              "in-process for the rest of the session: %s", e)
                 from PySide6.QtGui import QImage
                 return QImage()
         try:
