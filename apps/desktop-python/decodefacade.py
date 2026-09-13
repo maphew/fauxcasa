@@ -219,8 +219,11 @@ class WinSandboxTransport(Transport):
         finally:
             self._pool_set.release(pool)
         from PySide6.QtGui import QImage
+        pixels = result.pixels_bytes
+        if pixels is None:
+            return QImage()
         buf = result.pixels
-        return QImage(result.pixels_bytes, buf.w, buf.h, buf.stride,
+        return QImage(pixels, buf.w, buf.h, buf.stride,
                       QImage.Format.Format_RGBA8888).copy()
 
     def close(self) -> None:
@@ -410,9 +413,11 @@ class DecodeService:
         return self._in_process.decode(path, route="video", edge=edge)
 
     def close(self) -> None:
-        if self._sandbox is not None:
-            self._sandbox.close()
+        with self._lock:
+            sandbox = self._sandbox
             self._sandbox = None
+        if sandbox is not None:
+            sandbox.close()
 
 
 _service: DecodeService | None = None
