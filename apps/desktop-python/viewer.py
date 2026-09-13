@@ -110,6 +110,15 @@ TRANSPORT_TRACK = QColor(255, 255, 255, 60)  # unplayed seek-bar track
 AFFORDANCE_BG = QColor(0, 0, 0, 140)   # centered play badge disc
 SEEK_STEP_US = 5_000_000    # Ctrl+Left / Ctrl+Right skip (±5 s)
 
+# Hover-revealed prev/next chevrons (fauxcasa-ez2.14): shown while the
+# cursor sits within this many logical px of either edge, hidden
+# otherwise — theme.TEXT_MUTED at 40% alpha, matching HOVER_OUTLINE's
+# "hover-only chrome" alpha convention (theme.py) rather than a fresh
+# literal.
+CHEVRON_MARGIN = 80
+CHEVRON_FG = QColor(theme.TEXT_MUTED.red(), theme.TEXT_MUTED.green(),
+                    theme.TEXT_MUTED.blue(), 102)
+
 
 def _play_triangle(cx: float, cy: float, r: float) -> QPolygonF:
     """Right-pointing play triangle, grid._play_polygon's proportions
@@ -118,6 +127,19 @@ def _play_triangle(cx: float, cy: float, r: float) -> QPolygonF:
     return QPolygonF([QPointF(cx - r * 0.75, cy - r),
                       QPointF(cx + r * 0.75, cy),
                       QPointF(cx - r * 0.75, cy + r)])
+
+
+def _chevron_polygon(cx: float, cy: float, r: float,
+                     point_left: bool) -> QPolygonF:
+    """A "<"/">" chevron triangle centered at (cx, cy), r half-height —
+    the viewer's hover-revealed prev/next affordance (ez2.14)."""
+    if point_left:
+        return QPolygonF([QPointF(cx + r * 0.6, cy - r),
+                          QPointF(cx - r * 0.6, cy),
+                          QPointF(cx + r * 0.6, cy + r)])
+    return QPolygonF([QPointF(cx - r * 0.6, cy - r),
+                      QPointF(cx + r * 0.6, cy),
+                      QPointF(cx - r * 0.6, cy + r)])
 
 
 def _format_us(us: int) -> str:
@@ -766,6 +788,14 @@ class ViewerPage(QWidget):
         # whether it traveled past CLICK_SLOP (then it pans, never toggles).
         self._press_pos = None
         self._dragging = False
+        # Hover-revealed prev/next chevrons (fauxcasa-ez2.14): mouse
+        # tracking so mouseMoveEvent fires without a button held, and two
+        # flags paintEvent reads to decide whether to draw either margin's
+        # chevron. Reset on hideEvent/leaveEvent so a chevron never stays
+        # "stuck" shown after the cursor leaves the widget.
+        self.setMouseTracking(True)
+        self._hover_prev = False
+        self._hover_next = False
         # ONE persistent, lazily started decode worker fed by a job queue —
         # NOT a thread per navigation. Short-lived Qt-touching threads exit
         # through Qt's per-thread native cleanup, and on offscreen Windows
@@ -1477,19 +1507,40 @@ class ViewerPage(QWidget):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            x = event.position().x()
+            w = self.width()
+            # A click inside either margin navigates (ez2.14) instead of
+            # starting the click-vs-drag zoom-toggle disambiguation below —
+            # _step clamps at the ends, so this is a harmless no-op there.
+            if x < CHEVRON_MARGIN and self.pos > 0:
+                self._step(-1)
+                return
+            if x > w - CHEVRON_MARGIN and self.pos < len(self.display) - 1:
+                self._step(1)
+                return
             self._press_pos = event.position()
             self._dragging = False
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        # Only arrives while a button is held (no mouse tracking): past the
-        # click slop this press is a DRAG — pan at 1:1, and never toggle on
-        # the release. Incremental (press_pos walks with the cursor), so a
-        # long drag pans smoothly rather than jumping from the press point.
         if self._press_pos is None:
+            # Hover-only move (setMouseTracking, ez2.14): update prev/next
+            # chevron visibility — shown while the cursor sits within
+            # CHEVRON_MARGIN px of either edge, hidden otherwise.
+            x = event.position().x()
+            w = self.width()
+            hover_prev = x < CHEVRON_MARGIN
+            hover_next = x > w - CHEVRON_MARGIN
+            if (hover_prev, hover_next) != (self._hover_prev, self._hover_next):
+                self._hover_prev, self._hover_next = hover_prev, hover_next
+                self.update()
             super().mouseMoveEvent(event)
             return
+        # Arrives here while a button IS held: past the click slop this
+        # press is a DRAG — pan at 1:1, and never toggle on the release.
+        # Incremental (press_pos walks with the cursor), so a long drag
+        # pans smoothly rather than jumping from the press point.
         d = event.position() - self._press_pos
         if not self._dragging and d.manhattanLength() < CLICK_SLOP:
             return
@@ -1515,6 +1566,14 @@ class ViewerPage(QWidget):
             self._dragging = False
         else:
             super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        # Cursor left the widget entirely (e.g. jumped past the edge) —
+        # hide any shown chevron rather than leaving it stuck (ez2.14).
+        if self._hover_prev or self._hover_next:
+            self._hover_prev = self._hover_next = False
+            self.update()
+        super().leaveEvent(event)
 
     def hideEvent(self, event) -> None:
         # Leaving the viewer (the pages stack switched away, or teardown)
@@ -1691,4 +1750,22 @@ class ViewerPage(QWidget):
             painter.setPen(CAPTION_FG)
             painter.drawText(10, h - CAPTION_H, w - 20, CAPTION_H,
                              Qt.AlignmentFlag.AlignVCenter, bar)
+        self._paint_chevrons(painter, w, h)
         painter.end()
+
+    def _paint_chevrons(self, painter: QPainter, w: int, h: int) -> None:
+        """Hover-revealed prev/next chevrons (ez2.14): painted only while
+        _hover_prev/_hover_next is set (mouseMoveEvent), in CHEVRON_FG —
+        theme.TEXT_MUTED at 40% alpha."""
+        if not (self._hover_prev or self._hover_next):
+            return
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(CHEVRON_FG)
+        cy = h / 2
+        r = 22.0
+        if self._hover_prev:
+            painter.drawPolygon(
+                _chevron_polygon(CHEVRON_MARGIN / 2, cy, r, True))
+        if self._hover_next:
+            painter.drawPolygon(
+                _chevron_polygon(w - CHEVRON_MARGIN / 2, cy, r, False))

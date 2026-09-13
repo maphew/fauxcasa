@@ -5741,6 +5741,82 @@ def test_viewer_zoom_click_anchor_stays_put(tmp_path: Path,
     assert not v.zoomed                          # click toggles back to fit
 
 
+def test_viewer_chevron_hover_sets_flag_and_repaints(tmp_path: Path) -> None:
+    """Mouse move within CHEVRON_MARGIN of an edge (ez2.14), with no button
+    held, sets the matching hover flag; moving to the middle clears both.
+    A viewport 1280 wide: x=20 is within the left margin, x=1260 within
+    the right, x=640 is neither."""
+    from PySide6.QtCore import QEvent
+    from viewer import CHEVRON_MARGIN
+    v, _orig = _viewer_with_original(tmp_path)
+    assert not v._hover_prev and not v._hover_next
+
+    _mouse(v, QEvent.Type.MouseMove, 20.0, 400.0)
+    assert v._hover_prev and not v._hover_next
+
+    _mouse(v, QEvent.Type.MouseMove, 1280.0 - 20.0, 400.0)
+    assert v._hover_next and not v._hover_prev
+
+    _mouse(v, QEvent.Type.MouseMove, 640.0, 400.0)
+    assert not v._hover_prev and not v._hover_next
+    assert CHEVRON_MARGIN < 640.0   # sanity: the middle is really outside it
+
+
+def test_viewer_chevron_click_navigates(tmp_path: Path) -> None:
+    """A click inside the left/right margin calls the existing prev/next
+    step (ez2.14) instead of toggling zoom; a click in the middle keeps
+    doing the ordinary click-to-zoom toggle."""
+    from PySide6.QtCore import QEvent
+    v, _orig = _viewer_with_original(tmp_path)  # 2 photos, showing index 0
+    assert v.pos == 0
+
+    _mouse(v, QEvent.Type.MouseButtonPress, 1280.0 - 20.0, 400.0)
+    assert v.pos == 1                 # right-margin click -> next
+    assert not v.zoomed               # never a zoom toggle
+
+    _mouse(v, QEvent.Type.MouseButtonPress, 20.0, 400.0)
+    assert v.pos == 0                 # left-margin click -> prev
+    assert not v.zoomed
+
+    # A middle click still does the ordinary click-to-zoom toggle (press +
+    # release, matching test_viewer_zoom_click_anchor_stays_put's pattern).
+    _mouse(v, QEvent.Type.MouseButtonPress, 640.0, 400.0)
+    _mouse(v, QEvent.Type.MouseButtonRelease, 640.0, 400.0)
+    assert v.zoomed
+    assert v.pos == 0                 # unchanged by the middle click
+
+
+def test_viewer_chevron_paints_only_when_hovered(tmp_path: Path) -> None:
+    """paintEvent draws a chevron only while its hover flag is set — a
+    fresh viewer (no hover yet) paints neither, and setting a flag makes
+    the grabbed frame differ from the no-hover baseline."""
+    v, _orig = _viewer_with_original(tmp_path)
+    baseline = v.grab().toImage()
+
+    v._hover_prev = True
+    v.update()
+    v.repaint()
+    with_prev = v.grab().toImage()
+    assert with_prev != baseline
+
+    v._hover_prev = False
+    v._hover_next = True
+    v.update()
+    v.repaint()
+    with_next = v.grab().toImage()
+    assert with_next != baseline
+
+
+def test_viewer_chevron_leave_event_clears_hover(tmp_path: Path) -> None:
+    """The cursor leaving the widget (leaveEvent) hides any shown chevron
+    rather than leaving it stuck (ez2.14)."""
+    from PySide6.QtCore import QEvent
+    v, _orig = _viewer_with_original(tmp_path)
+    v._hover_prev = True
+    v.leaveEvent(QEvent(QEvent.Type.Leave))
+    assert not v._hover_prev and not v._hover_next
+
+
 def test_viewer_zoom_drag_pans_and_release_does_not_toggle(
         tmp_path: Path, monkeypatch) -> None:
     """While at 1:1 a drag pans (the photo follows the cursor) and its
