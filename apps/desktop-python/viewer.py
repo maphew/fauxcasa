@@ -71,6 +71,7 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 import keymap
+import theme
 from catalog import Catalog, format_date_taken, format_geotag
 from cropmap import (
     crop_qimage_upright,
@@ -80,8 +81,17 @@ from cropmap import (
 from locate import reveal_in_file_manager
 from thumbcache import THUMB_EDGE, ThumbCache
 
-BACKGROUND = QColor(12, 12, 12)
-CAPTION_BG = QColor(0, 0, 0, 170)
+# Colors are theme.py's named constants (fauxcasa-ez2.4). BACKGROUND takes
+# theme.VIEWER_BG — deliberately darker than the grid's theme.WINDOW, a
+# photo-viewing surface with no sibling chrome to compete with.
+BACKGROUND = theme.VIEWER_BG
+CAPTION_BG = theme.CAPTION_BG
+CAPTION_FG = theme.CAPTION_FG
+TEXT_MUTED = theme.TEXT_MUTED
+# Bottom caption/info bar height (fauxcasa-ez2.4 UX audit: the viewer used
+# to fit the photo into the FULL widget height, so the semi-transparent
+# bar could cover the bottom of the image — see _caption_h/paintEvent).
+CAPTION_H = 30
 # A press that travels less than this (logical px, Manhattan) before its
 # release is a CLICK (zoom toggle); at or past it, a DRAG (pan at 1:1).
 CLICK_SLOP = 6
@@ -90,8 +100,8 @@ FACE_PEN = QColor(255, 255, 255, 215)
 FACE_RADIUS = 6  # rounded-rect corner, logical px (chrome, so zoom-invariant)
 # Video transport chrome (fauxcasa-v46.3): painted-in-widget, like every
 # other viewer overlay — no child widget tree, keyboard keeps working.
-TRANSPORT_H = 34            # transport strip height, above the 30 px info bar
-TRANSPORT_FG = QColor(235, 235, 235)   # glyphs + seek progress (grid PLAY_WHITE)
+TRANSPORT_H = 34            # transport strip height, above the CAPTION_H info bar
+TRANSPORT_FG = theme.PLAY_WHITE   # glyphs + seek progress
 TRANSPORT_TRACK = QColor(255, 255, 255, 60)  # unplayed seek-bar track
 AFFORDANCE_BG = QColor(0, 0, 0, 140)   # centered play badge disc
 SEEK_STEP_US = 5_000_000    # Ctrl+Left / Ctrl+Right skip (±5 s)
@@ -1129,7 +1139,7 @@ class ViewerPage(QWidget):
     # -- transport strip geometry (hit-testing + painting share these) --
 
     def _transport_rect(self) -> QRect:
-        return QRect(0, self.height() - 30 - TRANSPORT_H,
+        return QRect(0, self.height() - CAPTION_H - TRANSPORT_H,
                      self.width(), TRANSPORT_H)
 
     def _transport_seek_rect(self) -> QRect:
@@ -1347,7 +1357,7 @@ class ViewerPage(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(CAPTION_BG)
             painter.drawRoundedRect(chip, 4, 4)
-            painter.setPen(QColor(235, 235, 235))
+            painter.setPen(TRANSPORT_FG)
             painter.drawText(chip, Qt.AlignmentFlag.AlignCenter, label)
 
     def _step(self, delta: int) -> None:
@@ -1574,7 +1584,7 @@ class ViewerPage(QWidget):
         dur = pb.info.duration_us if pb is not None \
             else (self._video_duration_us or 0)
         posn = pb.position_us if pb is not None else 0
-        painter.setPen(QColor(220, 220, 220))
+        painter.setPen(CAPTION_FG)
         painter.drawText(QRect(36, strip.y(), 110, strip.height()),
                          Qt.AlignmentFlag.AlignVCenter,
                          f"{_format_us(posn)} / {_format_us(dur)}")
@@ -1586,6 +1596,20 @@ class ViewerPage(QWidget):
                                    round(bar.width() * frac), bar.height()),
                              TRANSPORT_FG)
 
+    def _caption_visible(self) -> bool:
+        """Whether the bottom caption/info bar is drawn THIS frame — always
+        True for the plain viewer; SlideshowPage overrides to tie it to
+        the same auto-hiding state as its top hint strip."""
+        return True
+
+    def _caption_h(self) -> int:
+        """CAPTION_H when the bar is drawn this frame, else 0 — the
+        headroom paintEvent reserves so the bar never covers the bottom
+        of the photo (fauxcasa-ez2.4 UX audit: the fit rect used to fit
+        into the FULL widget height, so the semi-transparent bar could
+        cover the image instead of just sitting over background)."""
+        return CAPTION_H if self._caption_visible() else 0
+
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), BACKGROUND)
@@ -1594,6 +1618,8 @@ class ViewerPage(QWidget):
         if idx < 0:
             painter.end()
             return
+        cap_visible = self._caption_visible()
+        box_h = h - (CAPTION_H if cap_visible else 0)
         # A live playback session's latest streamed frame wins (painted
         # into the same fit rect the poster used — cap=True, video never
         # upscales past native, matching the poster's own paint); then
@@ -1604,13 +1630,13 @@ class ViewerPage(QWidget):
         if vframe is not None and not vframe.isNull():
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.drawImage(self._display_rect(
-                w, h, vframe.width(), vframe.height(), cap=True), vframe)
+                w, box_h, vframe.width(), vframe.height(), cap=True), vframe)
         elif shown is not None:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            painter.drawImage(self._shown_rect(w, h, shown), shown)
+            painter.drawImage(self._shown_rect(w, box_h, shown), shown)
             self._paint_faces(painter)   # no-op unless toggled on + faces
         else:
-            painter.setPen(QColor(150, 150, 150))
+            painter.setPen(TEXT_MUTED)
             msg = "loading…" if self.loading else "could not decode this file"
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, msg)
 
@@ -1618,9 +1644,10 @@ class ViewerPage(QWidget):
                 and self.catalog.photos[idx].media == "video":
             self._paint_video_chrome(painter, w, h)
 
-        bar = self._info_text(self.catalog.photos[idx])
-        painter.fillRect(0, h - 30, w, 30, CAPTION_BG)
-        painter.setPen(QColor(220, 220, 220))
-        painter.drawText(10, h - 30, w - 20, 30,
-                         Qt.AlignmentFlag.AlignVCenter, bar)
+        if cap_visible:
+            bar = self._info_text(self.catalog.photos[idx])
+            painter.fillRect(0, h - CAPTION_H, w, CAPTION_H, CAPTION_BG)
+            painter.setPen(CAPTION_FG)
+            painter.drawText(10, h - CAPTION_H, w - 20, CAPTION_H,
+                             Qt.AlignmentFlag.AlignVCenter, bar)
         painter.end()
