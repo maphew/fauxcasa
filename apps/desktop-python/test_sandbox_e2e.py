@@ -114,6 +114,31 @@ def _write_ihdr_png(path: Path, w: int, h: int) -> None:
     path.write_bytes(bytes(png))
 
 
+def _make_psd(path: Path, w: int = 64, h: int = 48,
+              color: tuple[int, int, int] = (200, 60, 120)) -> Path:
+    """A synthetic 'maximize compatibility' PSD -- same hand-built shape
+    as test_tracer.py's _make_psd (not imported: this file stays a
+    self-contained script per repo convention). Qt ships no PSD plugin
+    at all (pillowload module doc), so this exercises the P1-1 PSD
+    pre-route: with the sandbox on, .psd must still reach pillow_qimage
+    ahead of the sandboxed branch instead of round-tripping through a
+    worker that will always report UNSUPPORTED."""
+    r, g, b = color
+    out = (b"8BPS" + struct.pack(">H", 1) + b"\x00" * 6
+           + struct.pack(">H", 3)            # channels
+           + struct.pack(">II", h, w)        # rows, columns
+           + struct.pack(">HH", 8, 3))       # 8-bit, mode 3 = RGB
+    out += struct.pack(">I", 0)              # color mode data: empty
+    out += struct.pack(">I", 0)              # image resources: empty
+    out += struct.pack(">I", 0)              # layer & mask info: empty
+    planes = (bytes([r]) * (w * h) + bytes([g]) * (w * h)
+              + bytes([b]) * (w * h))
+    data = struct.pack(">H", 0) + planes     # compression 0 = raw
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(out + data)
+    return path
+
+
 def _make_wide_png(path: Path) -> None:
     """32769x1 -- under MAX_PIXELS but over the per-axis MAX_EDGE cap."""
     from PySide6.QtGui import QImage
@@ -207,6 +232,38 @@ def test_viewer_parity_sandboxed_vs_in_process(tmp_path, monkeypatch):
     # orientation=6 on a 64x32 source -> EXIF-upright 32x64.
     assert (img0.width(), img0.height()) == (32, 64)
     assert (img1.width(), img1.height()) == (32, 64)
+
+
+# ---------------------------------------------------------------------------
+# PSD pre-route (fauxcasa-ez2.9 Stage 2 review P1-1): Qt ships no PSD
+# plugin at all, so with the sandbox ON, .psd must still be pre-routed to
+# pillow_qimage ahead of the sandboxed branch -- otherwise the worker's
+# canRead() is always false (UNSUPPORTED) and every PSD permanently
+# indexes to a zero-byte tile / null viewer image.
+
+@_WINDOWS_ONLY
+def test_psd_indexes_and_views_with_sandbox_on(tmp_path, monkeypatch):
+    root = tmp_path / "lib"
+    _make_psd(root / "f" / "photo.psd")
+
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+    df.reset_service()
+    svc = df.get_service()
+    svc.ensure_started()
+    assert svc.state == df.STATE_SANDBOXED, f"sandbox failed: {svc.reason}"
+
+    cat = scan_library(root)
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    cache = thumbcache.load_cache(result.path)
+    by_rel = dict(zip(cache.files, cache.entries))
+    assert by_rel["f/photo.psd"][1] > 0, (
+        "PSD must pre-route to pillow_qimage, not the sandbox, and "
+        "produce a non-empty tile")
+
+    img, _ = load_original_oriented(str(root / "f" / "photo.psd"), rotate=0)
+    assert not img.isNull(), (
+        "the viewer's PSD pre-route must also bypass the sandbox branch")
+    assert (img.width(), img.height()) == (64, 48)
 
 
 # ---------------------------------------------------------------------------

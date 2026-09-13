@@ -246,6 +246,15 @@ def load_original_oriented(path: str, rotate: int,
             _is_tiff = path.lower().endswith((".tif", ".tiff"))
             if _is_tiff and tiff_is_16bit(data):
                 img = pillow_qimage(data)
+            elif path.lower().endswith(".psd"):
+                # Pre-route PSD to Pillow, sandboxed or not: the pinned
+                # PySide6 build ships no PSD plugin, so the worker's
+                # canRead() would always be false and the sandbox route
+                # would return UNSUPPORTED -> a null image every time
+                # (fauxcasa-ez2.9 Stage 2 review P1-1). Header-agnostic
+                # extension check, exactly like the 16-bit TIFF pre-route
+                # above.
+                img = pillow_qimage(data)
             elif decodefacade.get_service().state == decodefacade.STATE_SANDBOXED:
                 # STILL route through the decode sandbox (fauxcasa-ez2.9
                 # Stage 2), full resolution (edge=0 -> the reserved

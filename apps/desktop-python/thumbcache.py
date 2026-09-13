@@ -607,6 +607,16 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
         _tiff = photo.rel.lower().endswith((".tif", ".tiff"))
         if data and _tiff and tiff_is_16bit(data):
             img = pillow_qimage(data, top)
+        elif data and photo.rel.lower().endswith(".psd"):
+            # Pre-route PSD to Pillow on ALL platforms, sandboxed or not:
+            # the pinned PySide6 build ships no PSD plugin at all
+            # (pillowload module doc), so the worker's canRead() would
+            # always be false and the sandbox route would return
+            # UNSUPPORTED -> a permanent zero-byte tile (fauxcasa-ez2.9
+            # Stage 2 review P1-1). This is a header-agnostic extension
+            # check, not a pixel decode -- exactly like the 16-bit TIFF
+            # pre-route above.
+            img = pillow_qimage(data, top)
         elif (not from_preview and src is not None
               and decodefacade.get_service().state
               == decodefacade.STATE_SANDBOXED):
