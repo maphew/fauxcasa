@@ -2996,6 +2996,32 @@ def test_remember_library_atomic_leaves_no_temp(tmp_path: Path) -> None:
     assert main._remembered_library(cache_root) == lib
 
 
+def test_remember_library_preserves_filetypes_exclusions(tmp_path: Path) -> None:
+    """main._remember_library (fauxcasa-ez2.12 finding 1) used to overwrite
+    the WHOLE cache-root config.json with just {"library": ...}, wiping
+    every library's File Types exclusions that filetypes.save_excluded_exts
+    stores in the same file (filetypes.py's preserved-keys contract).
+    Saving exclusions and then remembering a library must leave the
+    exclusions readable afterward."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import filetypes
+    import main
+
+    cache_root = tmp_path / "cr"
+    lib = tmp_path / "lib"
+    lib.mkdir()
+
+    excluded = {".bmp"}
+    assert filetypes.save_excluded_exts(cache_root, lib, excluded)
+    assert filetypes.load_excluded_exts(cache_root, lib) == excluded
+
+    main._remember_library(cache_root, lib)
+
+    assert main._remembered_library(cache_root) == lib
+    assert filetypes.load_excluded_exts(cache_root, lib) == excluded
+
+
 def test_remember_library_oserror_is_soft(tmp_path: Path, capsys) -> None:
     """_remember_library (fauxcasa-7e5) is best-effort: an unwritable cache
     root — here its parent is a regular file, so mkdir raises NotADirectoryError
@@ -3571,7 +3597,8 @@ def test_slideshow_prefetch_makes_advance_a_pure_swap(tmp_path: Path) -> None:
     def prefetched_next() -> bool:
         with show._prefetch_lock:
             got = show._prefetched
-        return got is not None and got[0] == display[1] and got[1] is not None
+        key = (id(show.catalog), display[1])
+        return got is not None and got[0] == key and got[1] is not None
 
     assert _spin(app, prefetched_next)
     _press(show, Qt.Key.Key_Right)
@@ -3600,11 +3627,70 @@ def test_slideshow_prefetch_failure_falls_back_to_async(
     show = SlideshowPage(cat, None, delay_ms=60_000)
     show.start(display, 0)
     assert _spin(app, lambda: show._prefetched is not None)
-    assert show._prefetched == (display[1], None)      # tried, failed
+    key = (id(show.catalog), display[1])
+    assert show._prefetched == (key, None)              # tried, failed
     _press(show, Qt.Key.Key_Right)
     assert show.pos == 1 and show.image is None        # async path taken
     assert _spin(app, lambda: not show.loading)        # decode fails soft
     assert show.image is None                          # "could not decode"
+
+
+def test_slideshow_prefetch_ignored_after_catalog_swap(
+        tmp_path: Path) -> None:
+    """slideshow._prefetched (fauxcasa-ez2.12 finding 4): a reconcile
+    catalog swap must not let a stale decoded image from the OLD catalog
+    be served for an index in the NEW catalog. Prefetch for index 1, swap
+    self.catalog to a new Catalog object, and confirm _take_prefetched no
+    longer serves the pre-swap decode."""
+    import copy
+    app = _offscreen_app()
+    from slideshow import SlideshowPage
+    cat = scan_library(_show_library(tmp_path))
+    show = SlideshowPage(cat, None, delay_ms=60_000)
+    display = list(range(len(cat.photos)))
+    show.start(display, 0)
+
+    def prefetched_next() -> bool:
+        with show._prefetch_lock:
+            got = show._prefetched
+        key = (id(show.catalog), display[1])
+        return got is not None and got[0] == key and got[1] is not None
+
+    assert _spin(app, prefetched_next)
+
+    # Simulate a reconcile swap: a new Catalog object, same indices.
+    show.catalog = copy.copy(cat)
+
+    assert show._take_prefetched(display[1]) is None
+
+
+def test_slideshow_start_and_exit_clear_stale_prefetch(
+        tmp_path: Path) -> None:
+    """start() and _exit() drop any leftover _prefetched entry (and age out
+    an in-flight job via the serial) so a decode queued before a catalog
+    swap can never land in the fresh session."""
+    app = _offscreen_app()
+    from slideshow import SlideshowPage
+    cat = scan_library(_show_library(tmp_path))
+    show = SlideshowPage(cat, None, delay_ms=60_000)
+    display = list(range(len(cat.photos)))
+
+    with show._prefetch_lock:
+        show._prefetched = ((id(cat), display[1]), None)
+    show.start(display, 0)
+    with show._prefetch_lock:
+        assert show._prefetched is None
+
+    def prefetched_next() -> bool:
+        with show._prefetch_lock:
+            got = show._prefetched
+        key = (id(show.catalog), display[1])
+        return got is not None and got[0] == key and got[1] is not None
+
+    assert _spin(app, prefetched_next)
+    show._exit()
+    with show._prefetch_lock:
+        assert show._prefetched is None
 
 
 def test_mainwindow_play_action_plays_current_view_and_esc_restores(
@@ -5506,6 +5592,18 @@ def test_metareader_rating_clamps_to_0_5() -> None:
     assert metareader.read_file_meta(_meta_jpeg(rating=0)).rating == 0
     assert metareader.read_file_meta(_meta_jpeg(rating="3.0")).rating == 3
     assert metareader.read_file_meta(_jpeg_bytes()).rating is None
+
+
+def test_metareader_parse_rating_rejects_non_finite() -> None:
+    """metareader._parse_rating (fauxcasa-ez2.12 finding 3): a writer that
+    emits a non-finite Rating string ('inf', '-inf', or '1e999' — which
+    Python's float() parses to inf) used to raise OverflowError out of
+    int(float(...)), breaking read_file_meta's never-raises contract and
+    aborting the whole index build. Must return None instead, same as any
+    other unparsable value."""
+    assert metareader._parse_rating("inf") is None
+    assert metareader._parse_rating("-inf") is None
+    assert metareader._parse_rating("1e999") is None
 
 
 def test_metareader_fail_soft_on_garbage_bytes() -> None:
@@ -12502,6 +12600,54 @@ def test_fcache_name_legacy_and_explicit() -> None:
     own 'thumbs-<root_id>.fcache'."""
     assert thumbcache.fcache_name("") == "thumbs.fcache"
     assert thumbcache.fcache_name("a1b2c3d4") == "thumbs-a1b2c3d4.fcache"
+
+
+def test_open_shared_read_returns_a_readable_fd(tmp_path: Path) -> None:
+    """thumbcache.open_shared_read (fauxcasa-ez2.12 finding 2), platform-
+    neutral: it returns an int fd whose seek+read behaves exactly like a
+    plain os.open() fd — the read path is unchanged, only the sharing
+    mode differs."""
+    target = tmp_path / "probe.bin"
+    target.write_bytes(b"hello fcache")
+    fd = thumbcache.open_shared_read(target)
+    try:
+        assert isinstance(fd, int) and fd >= 0
+        os.lseek(fd, 6, 0)
+        assert os.read(fd, 6) == b"fcache"
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"),
+                     reason="FILE_SHARE_DELETE is a Windows-only sharing "
+                            "violation to reproduce")
+def test_open_shared_read_tolerates_concurrent_replace(
+        tmp_path: Path) -> None:
+    """thumbcache.open_shared_read + _replace_fcache (fauxcasa-ez2.12
+    finding 2): on Windows, plain os.open() lacks FILE_SHARE_DELETE, so a
+    reconcile rebuild's tmp.replace(out) can raise PermissionError while
+    the grid's worker fd is open. open_shared_read fixes the missing
+    FILE_SHARE_DELETE half of that — but on-box verification found
+    os.replace() (MoveFileEx/MOVEFILE_REPLACE_EXISTING) can still raise
+    PermissionError against an open destination even WITH
+    FILE_SHARE_DELETE; _replace_fcache's ReplaceFileW retry is the half
+    that actually lands the rebuild. Exercise the real pair together: a
+    handle from open_shared_read must let _replace_fcache succeed, and the
+    already-open fd must keep serving the OLD bytes (an open Windows
+    handle pins its data even after the name is replaced)."""
+    target = tmp_path / "thumbs.fcache"
+    target.write_bytes(b"OLD BYTES...")
+    replacement = tmp_path / "thumbs.fcache.tmp"
+    replacement.write_bytes(b"NEW BYTES!!!")
+
+    fd = thumbcache.open_shared_read(target)
+    try:
+        thumbcache._replace_fcache(replacement, target)   # must not raise
+        os.lseek(fd, 0, 0)
+        assert os.read(fd, len(b"OLD BYTES...")) == b"OLD BYTES..."
+    finally:
+        os.close(fd)
+    assert target.read_bytes() == b"NEW BYTES!!!"
 
 
 def test_build_cache_legacy_root_id_writes_unsuffixed_name(

@@ -44,7 +44,7 @@ import keymap
 from catalog import Catalog
 from keymap import PEEK_MODS  # noqa: F401 -- re-export (see _MOD_OF note)
 from locate import reveal_in_file_manager
-from thumbcache import THUMB_EDGE, ThumbCache
+from thumbcache import THUMB_EDGE, ThumbCache, open_shared_read
 
 HEADER_H = 26
 GROUP_GAP = 10
@@ -781,12 +781,16 @@ class GridView(QAbstractScrollArea):
                     if fd >= 0:
                         os.close(fd)
                     fd, fd_thumbs, fd_path = -1, None, None
-                    # O_BINARY (Windows) keeps text-mode translation from
-                    # corrupting JPEG bytes; it is 0/absent on POSIX, so the
-                    # getattr keeps this portable (fauxcasa-uix).
-                    fd = os.open(
-                        source_path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
-                    )
+                    # open_shared_read (not os.open): this fd is held for
+                    # the worker's whole session, and plain os.open() on
+                    # Windows shares read/write but not delete — it would
+                    # block a reconcile rebuild's tmp.replace(out) on the
+                    # same fcache path with PermissionError. O_BINARY
+                    # (Windows) keeps text-mode translation from corrupting
+                    # JPEG bytes; open_shared_read applies it on the POSIX
+                    # fallback path too (fauxcasa-uix, fauxcasa-ez2.12
+                    # finding 2).
+                    fd = open_shared_read(source_path)
                     fd_thumbs = thumbs
                     fd_path = source_path
                 # fcache v2 hi-DPI consumer (fauxcasa-q7m): read the cheapest
