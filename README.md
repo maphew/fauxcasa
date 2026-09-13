@@ -20,14 +20,17 @@ Linux x64.
 3. Choose the top-level folder containing the photos you want to browse.
 
 Fauxcasa scans photos in place but does **not** modify photos, Picasa
-sidecars, or the Picasa database — it never writes into your library. It
-writes only a rebuildable catalog and thumbnail cache under your user cache
-directory: `%LOCALAPPDATA%\Fauxcasa\cache` on Windows, or
+sidecars, or the Picasa database, and normal browsing never writes into your
+library. It writes a rebuildable catalog and thumbnail cache under your user
+cache directory: `%LOCALAPPDATA%\Fauxcasa\cache` on Windows, or
 `$XDG_CACHE_HOME/fauxcasa` (`~/.cache/fauxcasa` if unset) elsewhere. That
-cache directory also holds `config.json` (remembered library and
-preferences), `library.json` (known multi-root libraries), and
-`fauxcasa.log` (a rotating diagnostic log — include a redacted copy when
-filing a bug).
+cache directory also holds `config.json` (remembered library, preferences,
+and File Types selections) and `fauxcasa.log` (a rotating diagnostic log —
+include a redacted copy when filing a bug). The optional `--promote`,
+`--add-root`, and `--import-picasa-watched` CLI commands, and the first-run
+"Use Picasa's watched folders" button, do write a `library.json` and/or a
+small `.fauxcasa-root` marker into the library itself — see "Files this app
+writes" in the [release notes](docs/releases/v0.1.0.md) for the full list.
 
 This is an unsigned build, so Windows SmartScreen may show an
 unknown-publisher warning: right-click the zip, open Properties, and click
