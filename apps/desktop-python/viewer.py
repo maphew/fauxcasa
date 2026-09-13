@@ -71,6 +71,7 @@ from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPolygonF
 from PySide6.QtWidgets import QWidget
 
+import decodefacade
 import keymap
 import theme
 from catalog import Catalog, format_date_taken, format_geotag
@@ -245,6 +246,22 @@ def load_original_oriented(path: str, rotate: int,
             _is_tiff = path.lower().endswith((".tif", ".tiff"))
             if _is_tiff and tiff_is_16bit(data):
                 img = pillow_qimage(data)
+            elif decodefacade.get_service().state == decodefacade.STATE_SANDBOXED:
+                # STILL route through the decode sandbox (fauxcasa-ez2.9
+                # Stage 2), full resolution (edge=0 -> the reserved
+                # interactive lane, decodefacade.WinSandboxTransport.
+                # decode). The worker applies EXIF autoTransform itself
+                # (decodesvc_worker_win.py), so `img` is already display-
+                # upright -- skip the manual apply_orientation() call
+                # below the same way the sandboxed thumbcache path skips
+                # it (both paths report `orientation` from
+                # read_orientation(data) unchanged, for the crop-bake and
+                # face-overlay math). Facade contract: null on ANY
+                # failure -- and deliberately NO Pillow in-process retry
+                # here (that would decode the same untrusted bytes
+                # in-process right after the sandbox refused/failed them,
+                # closing exactly the escape it exists to prevent).
+                img = decodefacade.get_service().decode(path, route="still", edge=0)
             else:
                 # QImage.fromData decodes into an internal C++ buffer — no
                 # Python-created QIODevice for QImageReader to probe, so no

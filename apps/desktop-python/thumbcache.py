@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
+import decodefacade
 import inmeta
 import metareader
 from catalog import (
@@ -606,6 +607,41 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
         _tiff = photo.rel.lower().endswith((".tif", ".tiff"))
         if data and _tiff and tiff_is_16bit(data):
             img = pillow_qimage(data, top)
+        elif (not from_preview and src is not None
+              and decodefacade.get_service().state
+              == decodefacade.STATE_SANDBOXED):
+            # STILL route through the decode sandbox (fauxcasa-ez2.9 Stage
+            # 2). Only the plain path-constructed case (not RAW's
+            # in-memory embedded preview, which has no file path a
+            # sandboxed worker could open) and only while the service is
+            # actually sandboxed -- "in-process"/"degraded" fall through
+            # to the unchanged QImageReader path below. The worker
+            # applies EXIF autoTransform itself (decodesvc_worker_win.py),
+            # so `img` comes back display-upright exactly like the local
+            # reader.setAutoTransform(True) path, and the crop-bake step
+            # below (which maps the STORED-frame rect through the read
+            # orientation) applies unchanged.
+            #
+            # Resolution note: the facade's decode(edge=top) op has no
+            # ROI/clip parameter (decodesvc_worker_win._handle_decode
+            # takes only a handle + edge), so the setClipRect optimisation
+            # above (decode only the crop sub-rect at higher resolution)
+            # is NOT available here -- the full frame is decoded and
+            # scaled to `top`, then cropped afterward like any other
+            # non-optimised path. A tight crop on a very large sandboxed
+            # source therefore yields a lower-resolution thumbnail than
+            # the in-process path would for the same file; documented,
+            # not silently regressed.
+            img = decodefacade.get_service().decode(
+                str(src), route="still", edge=top)
+            clip_applied = False
+            # Facade contract: null on ANY failure (open error, CORRUPT/
+            # UNSUPPORTED DecodeServiceError, ProtocolViolation, spawn-
+            # class degrade) -- fall straight to the existing error-tile
+            # path below. Deliberately NO Pillow in-process retry here:
+            # that would decode the same untrusted bytes in-process right
+            # after the sandbox specifically failed/refused them, which is
+            # exactly the escape the sandbox exists to close.
         else:
             if from_preview:
                 # RAW embedded preview: `data` is in-memory bytes extracted
