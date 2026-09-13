@@ -306,11 +306,18 @@ class DecodeService:
         self.ensure_started()
         from decodesvc import DecodeServiceError, ProtocolViolation
 
-        if self._require_failed:
+        if self._require_failed and route == "still":
             # Require mode fail-closed latch: a prior mid-session
             # spawn-class failure already degraded the service and
             # FAUXCASA_DECODE_SANDBOX=require forbids ANY in-process
-            # fallback -- every later call returns null forever.
+            # fallback for "still" -- the only route the sandbox actually
+            # serves (Stage 1 scope) -- so every later "still" call
+            # returns null forever. raw/video/tiff16/psd are documented
+            # in-process-by-design regardless of sandbox state (never
+            # routed through the sandbox even when it is healthy), so
+            # gating the latch on route == "still" avoids blanking those
+            # routes for a spawn-class failure that has nothing to do
+            # with them (release-0.1 review P1-2).
             from PySide6.QtGui import QImage
             return QImage()
 

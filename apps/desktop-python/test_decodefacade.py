@@ -473,10 +473,16 @@ def test_decode_require_mode_mid_session_failure_never_falls_back(
         monkeypatch, synthetic_png):
     """Re-review residual (item 3): under FAUXCASA_DECODE_SANDBOX=require,
     a MID-SESSION spawn-class failure must set _require_failed, return
-    null for THIS and every LATER call, log.error once, and set
-    state='degraded' reason='require: sandbox lost mid-session' -- it
+    null for THIS and every LATER "still" call, log.error once, and set
+    state='degraded' reason='require: sandbox lost mid-session' -- "still"
     must NEVER fall back to in-process (proven with an in-process stub
-    that raises if ever called)."""
+    that raises if ever called with route="still").
+
+    release-0.1 review P1-2: the fail-closed latch must only blank
+    "still" -- the only route the sandbox actually serves -- not
+    raw/video/tiff16/psd, which are documented in-process-by-design
+    regardless of sandbox state and must keep working normally even
+    after a "still"-route require-mode failure."""
     monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "require")
 
     class _BoomAfterStartSandbox:
@@ -497,11 +503,18 @@ def test_decode_require_mode_mid_session_failure_never_falls_back(
         pytest.skip("sandboxed decode path only reached on win32")
     svc = df.get_service()
 
-    def _must_not_be_called(*a, **k):
-        raise AssertionError("in-process decode must NEVER run under "
-                              "require mode after a mid-session sandbox loss")
+    orig_in_process_decode = svc._in_process.decode
+    non_still_calls = []
 
-    monkeypatch.setattr(svc._in_process, "decode", _must_not_be_called)
+    def _still_must_not_be_called(path, route="still", edge=0):
+        if route == "still":
+            raise AssertionError(
+                "in-process decode must NEVER run for route='still' "
+                "under require mode after a mid-session sandbox loss")
+        non_still_calls.append(route)
+        return orig_in_process_decode(path, route=route, edge=edge)
+
+    monkeypatch.setattr(svc._in_process, "decode", _still_must_not_be_called)
 
     img1 = svc.decode(synthetic_png, route="still", edge=0)
     assert img1.isNull()
@@ -509,12 +522,22 @@ def test_decode_require_mode_mid_session_failure_never_falls_back(
     assert svc.reason == "require: sandbox lost mid-session"
     assert svc._require_failed is True
 
-    # every later call also returns null, forever, without ever touching
-    # in-process (the monkeypatched stub above would raise).
+    # every later "still" call also returns null, forever, without ever
+    # touching in-process (the monkeypatched stub above would raise).
     img2 = svc.decode(synthetic_png, route="still", edge=0)
     assert img2.isNull()
-    img3 = svc.decode(synthetic_png, route="raw", edge=0)
-    assert img3.isNull()
+
+    # a non-"still" route is NOT covered by the latch: it must keep
+    # reaching its documented in-process path (proven by the spy above
+    # recording the call) instead of the latch short-circuiting it to a
+    # null blank before in-process is ever touched (the synthetic_png
+    # bytes are not a real RAW file, so the decode result itself is
+    # incidental -- what matters is that in-process was reached at all).
+    svc.decode(synthetic_png, route="raw", edge=0)
+    assert non_still_calls == ["raw"], (
+        "route='raw' must reach InProcessTransport.decode even after a "
+        "require-mode 'still' failure latched _require_failed -- the "
+        "latch must only blank 'still' (release-0.1 review P1-2)")
 
 
 # ---------------------------------------------------------------------------
