@@ -5497,6 +5497,18 @@ def test_metareader_rating_clamps_to_0_5() -> None:
     assert metareader.read_file_meta(_jpeg_bytes()).rating is None
 
 
+def test_metareader_parse_rating_rejects_non_finite() -> None:
+    """metareader._parse_rating (fauxcasa-ez2.12 finding 3): a writer that
+    emits a non-finite Rating string ('inf', '-inf', or '1e999' — which
+    Python's float() parses to inf) used to raise OverflowError out of
+    int(float(...)), breaking read_file_meta's never-raises contract and
+    aborting the whole index build. Must return None instead, same as any
+    other unparsable value."""
+    assert metareader._parse_rating("inf") is None
+    assert metareader._parse_rating("-inf") is None
+    assert metareader._parse_rating("1e999") is None
+
+
 def test_metareader_fail_soft_on_garbage_bytes() -> None:
     """The fail-soft contract: hostile/degenerate bytes yield all-None,
     never an exception (one corrupt photo must not abort an index)."""

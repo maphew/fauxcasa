@@ -32,6 +32,7 @@ bytes (JPEG/TIFF/PNG/WebP for the tracer's walk set; GIF/BMP fail soft).
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from dataclasses import dataclass
 
@@ -146,12 +147,19 @@ def _rational_to_degrees(text: str | None, ref: str | None) -> float | None:
 
 def _parse_rating(value: str | None) -> int | None:
     """xmp:Rating string -> int clamped to 0..5 (None = no Rating present).
-    Accepts the float form ('3.0') some writers emit."""
+    Accepts the float form ('3.0') some writers emit. A non-finite writer
+    value ('inf', '-inf', '1e999' — the last parses to a Python float
+    'inf') must not raise: int() on an infinite float raises
+    OverflowError, which would otherwise escape read_file_meta's
+    never-raises contract and abort the whole index build."""
     if value is None:
         return None
     try:
-        r = int(float(value.strip()))
-    except (ValueError, TypeError):
+        f = float(value.strip())
+        if not math.isfinite(f):
+            return None
+        r = int(f)
+    except (ValueError, OverflowError, TypeError):
         return None
     return max(0, min(5, r))
 
