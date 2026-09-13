@@ -85,7 +85,7 @@ class CompositeThumbCache:
     """Catalog-index facade over N independent per-root fcaches.
 
     Existing consumers intentionally keep the small ``ThumbCache`` duck type
-    (``count``, ``best_level()``, ``entry()``, ``path``). ``entry`` maps a
+    (``count``, ``best_level()``, ``entry()``, ``path``, ``levels``). ``entry`` maps a
     global catalog index to the owning root's local cache index and records
     that cache path thread-locally; the immediately following read therefore
     opens the matching per-root file even in the grid's worker pool.
@@ -137,6 +137,14 @@ class CompositeThumbCache:
         if path is not None:
             return path
         return next(iter(self._caches.values())).path
+
+    @property
+    def levels(self) -> list[int]:
+        # Safe by the same __init__ invariant best_level() relies on: every
+        # per-root cache shares an identical levels list (fauxcasa-q6l.27
+        # needs this to pick a zoom-banded decode edge without knowing
+        # which per-root cache a given photo belongs to).
+        return next(iter(self._caches.values())).levels
 # Decoded-tile RAM bound. The real cost is BYTES, not entries. Tiles are
 # kept at native cache resolution (~256 px, TILE_NATIVE) and SCALED IN
 # PAINT to the current zoom, so ONE decode serves every zoom level — zoom
@@ -205,7 +213,49 @@ CACHE_MAX_ENTRIES = 4096
 # decoded bytes -> its own RSS/scroll-fps re-measurement is owed (fauxcasa-q7m,
 # pairs with the §7 v2 re-baseline fauxcasa-k5p).
 TILE_NATIVE = THUMB_EDGE
+# Hysteresis band (fauxcasa-q6l.27): pick_decode_edge keeps the CURRENT
+# (larger) level while want_px has dropped no more than this fraction below
+# the level that would otherwise trigger a drop, so a single-pixel zoom-
+# slider move at a level boundary never flips the decode edge back and
+# forth every frame.
+DECODE_EDGE_HYSTERESIS = 0.06
 PREFETCH_SCREENS = 1.0
+
+
+def pick_decode_edge(tile_px: int, dpr: float, levels: list[int],
+                      current_edge: int | None) -> int:
+    """Smallest cached level that covers one tile at the current zoom and
+    DPR (fauxcasa-q6l.27, option d). _refresh_tile_native's old rule was
+    zoom-INDEPENDENT — max(TILE_NATIVE, round(TILE_NATIVE * dpr)) — so at
+    dpr 1.25 every tile read the 512 level even at min zoom, where a tile
+    is only 64 logical = 80 device px (a 16x-pixel overshoot; see the bead
+    for the measured 10x first-paint slowdown). This picks the smallest
+    entry in `levels` whose edge covers ceil(tile_px * dpr) device px,
+    capped at the old dpr-scaled TILE_NATIVE edge so default zoom on a
+    hi-DPI display still reads the same level it always has (a v1 cache
+    with only [THUMB_EDGE] is therefore a no-op at every zoom, same as
+    before this bead). HYSTERESIS: only drops to a level SMALLER than
+    `current_edge` when want_px is more than DECODE_EDGE_HYSTERESIS below
+    the smaller level's own edge — keeps a single-pixel slider move at a
+    boundary from flip-flopping the decode level (and the tile invalidation
+    that follows) every frame. Pure function of its arguments (no Qt, no
+    I/O) so set_zoom, paintEvent (via _refresh_tile_native) and the unit
+    tests all share one rule."""
+    cap = max(TILE_NATIVE, round(TILE_NATIVE * dpr))
+    if not levels:
+        # No cache bound yet (thumbs is None) or a level-less duck type:
+        # fall back to the old DPR-only edge (fauxcasa-q7m) — the same cap
+        # formula, just with nothing to band against.
+        return cap
+    want = max(1, math.ceil(tile_px * dpr))
+    want = min(want, cap)
+    ordered = sorted(levels)  # ascending: smallest level first
+    natural = next((edge for edge in ordered if edge >= want), ordered[-1])
+    if (current_edge is not None and current_edge in levels
+            and current_edge > natural
+            and want >= natural * (1.0 - DECODE_EDGE_HYSTERESIS)):
+        return current_edge
+    return natural
 
 
 def prefetch_margin(viewport_w: int, viewport_h: int, tile_px: int,
@@ -778,10 +828,15 @@ class GridView(QAbstractScrollArea):
             anchor = (g, n)  # group objects survive a zoom relayout
             break
         self.tile = tile
-        # No tile invalidation on zoom: tiles are kept at native cache
-        # resolution and scaled in paint, so the same decoded tile serves
-        # every zoom level. Zoom is pure relayout + re-anchor; the JPEG is
-        # never re-decoded just because the tile size changed (fauxcasa-z1e).
+        # Tiles are kept at (banded) native cache resolution and scaled in
+        # paint, so most zoom steps still serve the same decoded tile
+        # (z1e). But the band now follows zoom (fauxcasa-q6l.27): a step
+        # that crosses a level boundary must invalidate so tiles re-decode
+        # at the new level — _refresh_tile_native already does that when
+        # its want changes, so call it here too instead of waiting for the
+        # next paintEvent (zoom can change the band; before q6l.27 only DPR
+        # could).
+        self._refresh_tile_native()
         # The per-zoom scaled-paint variants ARE keyed to the tile size,
         # though — drop them so their bytes free up now (q6l.14).
         self._drop_scaled()
@@ -1164,15 +1219,25 @@ class GridView(QAbstractScrollArea):
         return True
 
     def _refresh_tile_native(self) -> None:
-        """Recompute the DPR-scaled native decode edge on the GUI thread
-        (fauxcasa-q7m). devicePixelRatioF() needs a live screen, so this runs
-        in paintEvent, not the worker. The base is TILE_NATIVE (the max zoom
-        tile), not self.tile, so the native size is zoom-independent (z1e: one
-        decode per photo serves every zoom). On a change — first real paint, or
-        the window dragged to a monitor with a different ratio — invalidate so
-        in-flight and cached tiles re-decode at the new level; unchanged is the
-        common case and costs one int compare."""
-        want = max(TILE_NATIVE, round(TILE_NATIVE * self.devicePixelRatioF()))
+        """Recompute the decode edge on the GUI thread (fauxcasa-q7m,
+        banded per-zoom pick fauxcasa-q6l.27). devicePixelRatioF() needs a
+        live screen, so this runs in paintEvent (and set_zoom, since a zoom
+        change can now move the band too — pick_decode_edge is no longer
+        zoom-independent the way the old dpr-only rule was). Delegates the
+        actual choice to pick_decode_edge (pure, unit-tested): the smallest
+        cached level that covers the CURRENT self.tile at this DPR, with
+        hysteresis against current._tile_native so a single-pixel zoom
+        move can't flip levels back and forth. thumbs is None before a
+        library loads, or a cache duck type exposes no levels list —
+        pick_decode_edge's no-levels guard falls back to the plain
+        DPR-scaled cap (fauxcasa-q7m, unchanged by this bead). On
+        a change — first real paint, a zoom step that crosses a level
+        band, or the window dragged to a monitor with a different ratio —
+        invalidate so in-flight and cached tiles re-decode at the new
+        level; unchanged is the common case and costs one function call."""
+        levels = self.thumbs.levels if self.thumbs is not None else []
+        want = pick_decode_edge(self.tile, self.devicePixelRatioF(), levels,
+                                 self._tile_native)
         if want != self._tile_native:
             self._tile_native = want
             self._invalidate_tiles()

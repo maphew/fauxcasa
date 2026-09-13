@@ -4322,6 +4322,89 @@ def test_refresh_tile_native_dpr_and_invalidation(monkeypatch) -> None:
     assert g._tile_native == gridmod.TILE_NATIVE          # never below the base
 
 
+def test_pick_decode_edge_bands_by_zoom(monkeypatch) -> None:
+    """fauxcasa-q6l.27: pick_decode_edge is the pure rule behind
+    _refresh_tile_native's banded pick. Headline case: min zoom (64) at
+    the box's native dpr 1.25 needs only 80 device px/tile, so the 128
+    level suffices -- not the always-512 dpr*TILE_NATIVE edge the old
+    zoom-independent rule picked for every zoom (the measured 10x
+    first-paint slowdown this bead fixes)."""
+    import grid as gridmod
+    from grid import pick_decode_edge
+
+    levels = [512, 256, 128]
+
+    # min zoom, native dpr 1.25 -> 80 device px -> smallest sufficient
+    # level is 128 (today's bug picked 512 here).
+    assert pick_decode_edge(64, 1.25, levels, None) == 128
+    # mid zoom -> 200 device px -> 256.
+    assert pick_decode_edge(160, 1.25, levels, None) == 256
+    # default/max zoom -> 320 device px -> 512, unchanged from today.
+    assert pick_decode_edge(256, 1.25, levels, None) == 512
+    # v1 cache (single level): always that level, at every zoom/dpr --
+    # the fauxcasa-q7m no-op invariant this bead must not disturb.
+    assert pick_decode_edge(64, 1.0, [256], None) == 256
+    assert pick_decode_edge(256, 1.0, [256], None) == 256
+    # no cache bound yet (thumbs is None): falls back to the old DPR-only
+    # cap, exactly reproducing pre-bead _refresh_tile_native behavior.
+    assert pick_decode_edge(64, 1.25, [], None) == max(
+        gridmod.TILE_NATIVE, round(gridmod.TILE_NATIVE * 1.25))
+
+    # --- hysteresis around the 128/256 boundary ---------------------
+    # Currently on the 256 band; want_px eases down to just above the 128
+    # boundary (within DECODE_EDGE_HYSTERESIS, 6%) -- stays on 256 so a
+    # single zoom-slider pixel can't flip the decode level back and forth.
+    assert pick_decode_edge(100, 1.25, levels, 256) == 256   # want=125, boundary=128, 125>=128*0.94
+    # Comfortably below the boundary (more than 6%) -> flips down to 128.
+    assert pick_decode_edge(90, 1.25, levels, 256) == 128    # want=113 < 128*0.94=120.32
+    # No current band recorded (e.g. first paint): no hysteresis to apply,
+    # picks the natural (smallest sufficient) level directly.
+    assert pick_decode_edge(100, 1.25, levels, None) == 128
+    # Zooming back UP always takes the larger level immediately -- hysteresis
+    # only holds the larger band on the way DOWN, never delays picking up
+    # detail on the way up.
+    assert pick_decode_edge(160, 1.25, levels, 128) == 256
+
+
+def test_grid_set_zoom_reads_banded_v2_level(tmp_path: Path, monkeypatch) -> None:
+    """fauxcasa-q6l.27, widget-level: set_zoom on a v2 cache must move the
+    decode band with the new zoom (not just DPR) -- min zoom at the box's
+    native dpr 1.25 now reads the 128 level, proven by the ACTUAL decoded
+    image size (same technique as test_grid_decodes_dpr_scaled_v2_level)."""
+    import queue as _queue
+    _offscreen_app()
+    from grid import GridView
+
+    root = tmp_path / "lib"
+    _big_library(root)                    # land.jpg 600x400 (idx 0)
+    cat, v2 = _bound_cache(tmp_path, root, levels=[512, 256, 128])
+    assert v2.levels == [512, 256, 128]
+
+    g = GridView()
+    monkeypatch.setattr(g, "devicePixelRatioF", lambda: 1.25)
+    g.set_data(cat, v2)
+
+    g.set_zoom(64)                        # min zoom
+    assert g._tile_native == 128          # banded pick, not the old 512 edge
+
+    g.generation += 1
+    g.wanted = frozenset({0})
+    with g.pending_lock:
+        g.pending.discard(0)
+    g.tiles.pop(0, None)
+    g._request(0)
+    img = None
+    for _ in range(200):                  # bounded wait (~10s worst case)
+        try:
+            gen, di, im = g.done.get(timeout=0.05)
+        except _queue.Empty:
+            continue
+        if gen == g.generation and di == 0:
+            img = im
+            break
+    assert img is not None and max(img.width(), img.height()) == 128
+
+
 if __name__ == "__main__":
     # Forward CLI args so `uv run test_tracer.py -k X -x` selects tests
     # instead of silently running the whole suite (fauxcasa-q6l.17 — this
