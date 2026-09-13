@@ -129,11 +129,28 @@ _qt_excludes = [
 _other_excludes = ["PyQt5", "PyQt6", "PySide2",
                    "tkinter", "unittest", "test", "lib2to3"]
 
+# Application icon (rel-0.1): icon.ico embeds into BOTH EXEs below (Windows
+# only — PyInstaller logs "Ignoring icon" and carries on for the Linux leg
+# of the CI matrix); the PNG set + SVG ship as datas so main.asset_path()
+# finds them at sys._MEIPASS/assets exactly as it does under a source
+# checkout (app_icon loads the PNGs — QtSvg is excluded above on purpose).
+# Regenerate with assets/make-icons.py after editing icon.svg. A missing
+# file fails the build HERE: the alternative is an artifact that silently
+# ships the generic PyInstaller glyph again.
+_assets = os.path.join(_here, "assets")
+_icon_ico = os.path.join(_assets, "icon.ico")
+_icon_datas = [os.path.join(_assets, "icon.svg")] + [
+    os.path.join(_assets, "icon.png" if px == 256 else f"icon-{px}.png")
+    for px in (16, 32, 48, 64, 128, 256)]  # == main.ICON_SIZES
+for _p in [_icon_ico] + _icon_datas:
+    if not os.path.isfile(_p):
+        raise SystemExit(f"missing icon asset {_p}: run assets/make-icons.py")
+
 a = Analysis(
     [os.path.join(_here, "main.py")],
     pathex=[_here, os.path.join(_repo, "scripts")],  # siblings + picasa_db
     binaries=[],
-    datas=[],
+    datas=[(_p, "assets") for _p in _icon_datas],
     hiddenimports=_hidden,
     hookspath=[],
     excludes=_qt_excludes + _other_excludes,
@@ -197,6 +214,7 @@ _exe_common = dict(
     debug=False,
     strip=False,
     upx=False,
+    icon=_icon_ico,          # Explorer/taskbar-pin icon, both variants
 )
 
 exe_console = EXE(
