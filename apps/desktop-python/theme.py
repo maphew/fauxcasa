@@ -36,6 +36,11 @@ WINDOW = QColor(24, 24, 24)       # app/grid background
 BASE = QColor(18, 18, 18)         # list/tree/edit field backgrounds
 SURFACE = QColor(34, 34, 34)      # raised panel: headers, tray, buttons
 ALT_BASE = QColor(28, 28, 28)     # zebra/alternate rows
+# Deliberately darker than WINDOW: the viewer/slideshow/peek surfaces are
+# a photo-viewing context (no sibling chrome competing for attention), so
+# they keep their own near-black backdrop rather than adopting the grid's
+# lighter WINDOW gray — a named, intentional surface, not a stray literal.
+VIEWER_BG = QColor(12, 12, 12)
 
 # ---- text ---------------------------------------------------------
 TEXT = QColor(220, 220, 220)
@@ -48,7 +53,8 @@ ACCENT_SOFT = QColor(0xF0, 0x59, 0x2E, 60)  # translucent gutter fill
 HOVER_OUTLINE = QColor(255, 255, 255, 102)  # 40% white — hover-only chrome
 
 # ---- semantic ---------------------------------------------------------
-PLAY = QColor(80, 200, 80)          # play glyphs (header + video badge)
+PLAY = QColor(80, 200, 80)          # actionable play glyph (group-header button)
+PLAY_WHITE = QColor(235, 235, 235)  # passive "this is a video" badge/transport glyph
 STAR = QColor(255, 200, 40)
 STAR_OUTLINE = QColor(40, 30, 0, 200)   # 1px dark outline so gold reads on gold/yellow photos
 GEOTAG = QColor(64, 205, 175)

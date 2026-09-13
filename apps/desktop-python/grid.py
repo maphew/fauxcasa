@@ -13,6 +13,7 @@ pair, never originals (N4).
 
 from __future__ import annotations
 
+import html
 import math
 import os
 import queue
@@ -22,10 +23,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from time import perf_counter
 
-from PySide6.QtCore import QObject, QPointF, QRect, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPointF, QRect, Qt, Signal
 from PySide6.QtGui import (
-    QColor,
     QCursor,
+    QFont,
+    QFontMetrics,
     QImage,
     QPainter,
     QPen,
@@ -36,17 +38,23 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QStyle,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
 import keymap
-from catalog import Catalog
+import theme
+from catalog import Catalog, format_date_taken
 from keymap import PEEK_MODS  # noqa: F401 -- re-export (see _MOD_OF note)
 from locate import reveal_in_file_manager
 from thumbcache import THUMB_EDGE, ThumbCache
 
-HEADER_H = 26
+# Header band height (fauxcasa-ez2.4 UX audit: 26px read cramped next to the
+# folder description now painted alongside the title). 11pt semibold title +
+# elided description share one line; count + play glyph anchor the right edge.
+HEADER_H = 32
+HEADER_TITLE_PT = 11
 GROUP_GAP = 10
 PAD = 8
 WORKERS = 4
@@ -226,28 +234,44 @@ def prefetch_margin(viewport_w: int, viewport_h: int, tile_px: int,
     rows_per_side = (max_band_tiles - visible) // cols // 2
     return min(int(viewport_h * PREFETCH_SCREENS), rows_per_side * cell)
 
-PLACEHOLDER = QColor(60, 60, 60)
-ERROR_TILE = QColor(96, 40, 40)
-BACKGROUND = QColor(24, 24, 24)
-HEADER_BG = QColor(34, 34, 34)
-HEADER_FG = QColor(200, 200, 200)
-SELECT = QColor(64, 140, 255)
-STAR_GOLD = QColor(255, 200, 40)
-GEO_TEAL = QColor(64, 205, 175)  # geotag badge (fauxcasa-cam.10)
-PLAY_WHITE = QColor(235, 235, 235)  # video play badge (fauxcasa-v46.2)
-HEADER_PLAY = QColor(80, 200, 80)   # group header play button (fauxcasa-q6l.16)
-HIDDEN_VEIL = QColor(0, 0, 0, 110)  # reveal mode: dim hidden/stash tiles
+# Colors are theme.py's named constants (fauxcasa-ez2.4): module-level
+# aliases here so the paint code below (and callers/tests that import
+# these names off `grid`, e.g. grid.STAR_GOLD, grid.GEO_TEAL) don't need
+# to change. See theme.py for the palette and the ACCENT color decision.
+PLACEHOLDER = theme.PLACEHOLDER
+ERROR_TILE = theme.ERROR_TILE
+BACKGROUND = theme.WINDOW
+HEADER_BG = theme.HEADER_BG
+HEADER_FG = theme.HEADER_FG
+HEADER_RULE = theme.HEADER_RULE       # 1px lighter top rule (fauxcasa-ez2.4)
+SELECT = theme.ACCENT
+SELECT_SOFT = theme.ACCENT_SOFT       # translucent gutter fill under selection
+HOVER_OUTLINE = theme.HOVER_OUTLINE
+STAR_GOLD = theme.STAR
+STAR_OUTLINE = theme.STAR_OUTLINE     # 1px dark outline so gold reads on gold/yellow photos
+GEO_TEAL = theme.GEOTAG  # geotag badge (fauxcasa-cam.10)
+PLAY_WHITE = theme.PLAY_WHITE  # video play badge (fauxcasa-v46.2)
+HEADER_PLAY = theme.PLAY   # group header play button (fauxcasa-q6l.16)
+HIDDEN_VEIL = theme.HIDDEN_VEIL  # reveal mode: dim hidden/stash tiles
+TEXT_MUTED = theme.TEXT_MUTED
 # Width (px) of the play-glyph hit area at the right end of every group header
 # (fauxcasa-q6l.16). Chosen to be comfortably clickable while leaving enough
 # label space; constant so hit-test and draw use the same geometry.
 HEADER_PLAY_W = 22
 # Selection pens, hoisted out of the paint loop (fauxcasa-q6l.1): every
-# member of the selection set gets the thin rect; the CURRENT item gets the
-# stronger border; a current item the user Ctrl-toggled OUT of the set keeps
-# a dashed focus cue so keyboard navigation never goes invisible.
-PEN_SELECTED = QPen(SELECT, 1)
+# member of the selection set gets the 2px rect (thicker than a hairline —
+# the UX audit flagged the old 1px/64,140,255 outline as too faint to read
+# at a glance); the CURRENT item gets the stronger 3px border; a current
+# item the user Ctrl-toggled OUT of the set keeps a dashed focus cue so
+# keyboard navigation never goes invisible.
+PEN_SELECTED = QPen(SELECT, 2)
 PEN_CURRENT = QPen(SELECT, 3)
 PEN_FOCUS = QPen(SELECT, 1, Qt.PenStyle.DashLine)
+PEN_HOVER = QPen(HOVER_OUTLINE, 1)
+# How far the selection halo (soft fill + outline) reaches into the PAD
+# gutter around a tile (fauxcasa-ez2.4): PAD is 8, so 4 leaves each tile's
+# own half of the gutter without ever touching its neighbor's.
+SELECT_MARGIN = 4
 # The hover-peek trigger chord (fauxcasa-q6l.5) lives in the keymap —
 # the single source of truth for bindings (fauxcasa-q6l.8); re-exported
 # here because tests and callers know it as grid.PEEK_MODS.
@@ -350,11 +374,88 @@ def _pin_polygon(cx: float, cy: float, r: float) -> QPolygonF:
     return poly
 
 
+def _elide(fm: QFontMetrics, text: str, width: int) -> str:
+    """Ellipsis-truncate `text` to fit `width` px under font metrics `fm`
+    (fauxcasa-ez2.4: group-header title/description elision) — "" for an
+    empty/None-ish text or a width too small to show anything."""
+    if width <= 0 or not text:
+        return ""
+    return fm.elidedText(text, Qt.TextElideMode.ElideRight, width)
+
+
+def _chevron_polygon(cx: float, cy: float, w: float, h: float,
+                     up: bool) -> QPolygonF:
+    """An open '^' (up) or 'v' (down) chevron — three points, meant to be
+    STROKED (drawPolyline), never filled — centered at (cx, cy), `w` half
+    width and `h` half height (fauxcasa-ez2.4 UX audit: the jump-cluster
+    buttons' unicode glyphs ⤒/↑/↓/⤓ render as near-invisible tofu boxes on
+    fonts that lack them; a drawn glyph never depends on font coverage)."""
+    if up:
+        return QPolygonF([QPointF(cx - w, cy + h), QPointF(cx, cy - h),
+                          QPointF(cx + w, cy + h)])
+    return QPolygonF([QPointF(cx - w, cy - h), QPointF(cx, cy + h),
+                      QPointF(cx + w, cy - h)])
+
+
+class _JumpButton(QToolButton):
+    """One jump-cluster button (fauxcasa-q6l.9 / fauxcasa-ez2.4): paints
+    its own 16px chevron rather than relying on a unicode glyph. `double`
+    stacks two chevrons (jump to top/end); a single one marks the
+    previous/next-folder buttons."""
+
+    def __init__(self, up: bool, double: bool, tip: str, slot,
+                parent=None):
+        super().__init__(parent)
+        self._up = up
+        self._double = double
+        self.setToolTip(tip)
+        self.setAutoRaise(True)
+        # Never steal keyboard focus from the grid (triage keys live
+        # there); these are mouse affordances only.
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.clicked.connect(slot)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)  # hover/pressed chrome from the style
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(HEADER_FG, 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0
+        rows = (cy - 3.0, cy + 3.0) if self._double else (cy,)
+        for row_y in rows:
+            painter.drawPolyline(
+                _chevron_polygon(cx, row_y, 4.0, 2.6, self._up))
+        painter.end()
+
+
+class _HeaderRule(QWidget):
+    """A 1px HEADER_RULE separator (fauxcasa-ez2.4) between the scrollbar
+    track and the jump-button cluster below it."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(1)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), HEADER_RULE)
+        painter.end()
+
+
 @dataclass
 class _Group:
     folder: str
     title: str
     items: list[int]  # catalog/cache indices
+    # Folder.description (.picasa.ini [Picasa] description=, catalog.py) —
+    # painted elided next to the title (fauxcasa-ez2.4 UX audit: headers
+    # showed only "title · N" and silently dropped it). None when the
+    # folder carries no description, or isn't in cat.folders at all.
+    description: str | None = None
     y: int = 0  # header top, content coords
     grid_y: int = 0
     height: int = 0  # header + rows, excl. gap
@@ -437,6 +538,17 @@ class GridView(QAbstractScrollArea):
         self._hover: QPointF | None = None
         self._peek_idx = -1
         self._peek_suppressed = False
+        # Hover chrome (fauxcasa-ez2.4 UX audit: no hover feedback at all):
+        # the catalog idx the cursor currently sits over, -1 = none. Only
+        # THAT tile's rect is repainted on change (mouseMoveEvent) rather
+        # than the whole viewport — a hover ring is cheap only if it stays
+        # cheap on a 1000+ tile grid.
+        self._hover_idx = -1
+        # Centered TEXT_MUTED message painted when the display is empty
+        # (fauxcasa-ez2.4 UX audit: an empty view used to paint nothing at
+        # all). No default wording here — the owner (main.py, out of this
+        # bead's scope) sets copy appropriate to the current view.
+        self.empty_text = ""
 
         # decode machinery (balloon lineage)
         self.generation = 0  # bumped on zoom/cache change; stale results drop
@@ -503,25 +615,21 @@ class GridView(QAbstractScrollArea):
         lay = QVBoxLayout(cluster)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
+        lay.addWidget(_HeaderRule(cluster))  # separator from the scrollbar
 
-        def btn(glyph: str, tip: str, slot) -> QToolButton:
-            b = QToolButton(cluster)
-            b.setText(glyph)
-            b.setToolTip(tip)
-            b.setAutoRaise(True)
+        def btn(up: bool, double: bool, tip: str, slot) -> _JumpButton:
+            b = _JumpButton(up, double, tip, slot, cluster)
             b.setFixedSize(ext, ext)
-            # Never steal keyboard focus from the grid (triage keys live
-            # there); these are mouse affordances only.
-            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            b.clicked.connect(slot)
             lay.addWidget(b)
             return b
 
-        self.btn_top = btn("⤒", "Jump to top", self.jump_to_top)
-        self.btn_prev_folder = btn("↑", "Previous folder (from mid-folder: "
+        self.btn_top = btn(True, True, "Jump to top", self.jump_to_top)
+        self.btn_prev_folder = btn(True, False,
+                                   "Previous folder (from mid-folder: "
                                    "top of this folder)", self.jump_prev_folder)
-        self.btn_next_folder = btn("↓", "Next folder", self.jump_next_folder)
-        self.btn_end = btn("⤓", "Jump to end", self.jump_to_end)
+        self.btn_next_folder = btn(False, False, "Next folder",
+                                   self.jump_next_folder)
+        self.btn_end = btn(False, True, "Jump to end", self.jump_to_end)
         self.addScrollBarWidget(cluster, Qt.AlignmentFlag.AlignBottom)
 
     # ---------- data & layout ----------
@@ -577,6 +685,7 @@ class GridView(QAbstractScrollArea):
         catalog indices so decode mapping is unaffected."""
         if self.catalog is None:
             return
+        self._hover_idx = -1  # stale index into the OLD self.loc/groups
         cat = self.catalog
         default_view = indices is None
         if default_view:
@@ -589,8 +698,11 @@ class GridView(QAbstractScrollArea):
             f = folder_key(cat, photo.root_id, photo.folder)
             g = by_folder.get(f)
             if g is None:
-                title = cat.folders[f].title if f in cat.folders else f
-                g = by_folder[f] = _Group(folder=f, title=title, items=[])
+                folder = cat.folders.get(f)
+                title = folder.title if folder is not None else f
+                desc = folder.description if folder is not None else None
+                g = by_folder[f] = _Group(folder=f, title=title, items=[],
+                                          description=desc)
             g.items.append(i)
         self.groups = list(by_folder.values())
         # Per-folder sort modes (fauxcasa-q6l.11): reorder each group's
@@ -998,6 +1110,38 @@ class GridView(QAbstractScrollArea):
                     return g.folder
         return None
 
+    # ---------- per-photo tooltip (fauxcasa-ez2.4) ----------
+
+    def _photo_tooltip_html(self, photo) -> str:
+        """name · "caption" · date, HTML-escaped and wrapped in <html> so
+        a caption containing markup (e.g. "<b>hi</b>") renders LITERALLY
+        as text rather than being interpreted as HTML (UX audit: a caption
+        is untrusted user text)."""
+        parts = [html.escape(photo.name)]
+        if photo.caption:
+            parts.append(html.escape(f"“{photo.caption}”"))
+        if photo.date_taken:
+            parts.append(html.escape(format_date_taken(photo.date_taken)))
+        return "<html>" + " &middot; ".join(parts) + "</html>"
+
+    def viewportEvent(self, event) -> bool:
+        """Per-photo tooltips (fauxcasa-ez2.4 UX audit: the grid-wide
+        static tooltip — the Ctrl+Alt peek hint, still self.toolTip() —
+        hid per-photo names entirely). Hit-tests the item under the
+        cursor and shows name/caption/date; off any photo (background or
+        a header) falls back to the peek hint. QAbstractScrollArea routes
+        events that land on the viewport widget through here."""
+        if event.type() == QEvent.Type.ToolTip:
+            pos = event.pos()
+            idx = self.photo_at(pos.x(), pos.y())
+            if idx >= 0 and self.catalog is not None:
+                text = self._photo_tooltip_html(self.catalog.photos[idx])
+            else:
+                text = self.toolTip()
+            QToolTip.showText(event.globalPos(), text, self.viewport())
+            return True
+        return super().viewportEvent(event)
+
     def all_visible_decoded(self) -> bool:
         """READY instrumentation: every strictly-visible tile decoded
         (or marked error). Empty view counts as decoded."""
@@ -1053,9 +1197,22 @@ class GridView(QAbstractScrollArea):
         painter = QPainter(vp)
         painter.fillRect(vp.rect(), BACKGROUND)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        # One Antialiasing hint for the whole frame (fauxcasa-ez2.4 UX
+        # audit: badges, the header play glyph, and selection/hover chrome
+        # all painted with jagged edges) — cheaper than toggling it per
+        # shape, and every shape below wants it.
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         font = painter.font()
         font.setBold(True)
         painter.setFont(font)
+
+        if not self.display and self.empty_text:
+            # No automatic wording (main.py picks copy per view) — just
+            # make sure an empty display doesn't paint literally nothing
+            # (fauxcasa-ez2.4 UX audit).
+            painter.setPen(TEXT_MUTED)
+            painter.drawText(vp.rect(), Qt.AlignmentFlag.AlignCenter,
+                             self.empty_text)
 
         blank = False  # bench: any strictly-visible tile still undecoded
         dpr = self.devicePixelRatioF()  # constant per paint (q7m)
@@ -1066,7 +1223,7 @@ class GridView(QAbstractScrollArea):
                 painter.fillRect(r, PLACEHOLDER)
                 blank = True
             elif t[0] is None:
-                painter.fillRect(r, ERROR_TILE)
+                self._draw_error_tile(painter, r, self.catalog.photos[idx].name)
                 t[1] = self.frame_no
             else:
                 t[1] = self.frame_no
@@ -1133,9 +1290,11 @@ class GridView(QAbstractScrollArea):
                 painter.fillRect(r, HIDDEN_VEIL)
             if photo.star:
                 # count >= 1 shows the badge (star is 0-5 now; the exact
-                # count reads out in the status bar / viewer info line)
+                # count reads out in the status bar / viewer info line).
+                # A 1px dark outline (fauxcasa-ez2.4 UX audit) so the gold
+                # fill still reads as a star over a gold/yellow photo.
                 s = max(7.0, self.tile / 14.0)
-                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setPen(QPen(STAR_OUTLINE, 1))
                 painter.setBrush(STAR_GOLD)
                 painter.drawPolygon(_star_polygon(
                     r.right() - s - 2, r.y() + s + 2, s))
@@ -1158,19 +1317,33 @@ class GridView(QAbstractScrollArea):
                 painter.setBrush(PLAY_WHITE)
                 painter.drawPolygon(_play_polygon(
                     r.x() + s + 2, r.bottom() - s - 2, s))
-            # Multi-select paint (fauxcasa-q6l.1): every selected tile
-            # shows the selection rect; the current item is distinct via
-            # the stronger border (dashed focus cue if Ctrl-toggled out of
-            # the set). Pens are module constants — no per-tile allocation.
-            if idx == self.current:
-                painter.setPen(PEN_CURRENT if idx in self.selection
-                               else PEN_FOCUS)
+            # Multi-select paint (fauxcasa-q6l.1): a selected tile gets a
+            # translucent ACCENT halo filling its half of the PAD gutter
+            # plus an outline; the current item is distinct via the
+            # stronger 3px border (dashed focus cue if Ctrl-toggled out of
+            # the set); an unselected hovered tile gets a plain hover ring
+            # (fauxcasa-ez2.4 UX audit: the old 1px hairline was too faint
+            # to read at a glance, and hover had no feedback at all). Pens
+            # are module constants — no per-tile allocation.
+            in_sel = idx in self.selection
+            is_cur = idx == self.current
+            m = SELECT_MARGIN
+            if in_sel:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(SELECT_SOFT)
+                painter.drawRect(r.adjusted(-m, -m, m, m))
+            if is_cur:
+                painter.setPen(PEN_CURRENT if in_sel else PEN_FOCUS)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(r.adjusted(-2, -2, 1, 1))
-            elif idx in self.selection:
+                painter.drawRect(r.adjusted(-2, -2, 2, 2))
+            elif in_sel:
                 painter.setPen(PEN_SELECTED)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(r.adjusted(-2, -2, 1, 1))
+                painter.drawRect(r.adjusted(-1, -1, 1, 1))
+            elif idx == self._hover_idx:
+                painter.setPen(PEN_HOVER)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(r.adjusted(-1, -1, 0, 0))
 
         # in-flow group headers, then the pinned copy of the current one
         for g in self._visible_groups(top, bottom):
@@ -1191,21 +1364,83 @@ class GridView(QAbstractScrollArea):
 
     def _draw_header(self, painter: QPainter, g: _Group, y: int,
                      width: int) -> None:
+        """32px band (fauxcasa-ez2.4 UX audit — was 26px, cramped): an
+        11pt semibold title, the folder's .picasa.ini description= elided
+        alongside it in TEXT_MUTED (catalog.py parses it; headers used to
+        drop it silently), the item count right-aligned before the play
+        glyph, and a 1px HEADER_RULE top rule separating this band from
+        whatever scrolled up above it."""
         painter.fillRect(0, y, width, HEADER_H, HEADER_BG)
-        painter.setPen(HEADER_FG)
-        label = f"{g.title}   ·   {len(g.items)}"
-        # Reserve room for the play glyph so the label never overlaps it
-        # (fauxcasa-q6l.16).
-        label_w = width - 2 * PAD - HEADER_PLAY_W - PAD
-        painter.drawText(QRect(PAD, y, label_w, HEADER_H),
-                         Qt.AlignmentFlag.AlignVCenter, label)
+        painter.setPen(HEADER_RULE)
+        painter.drawLine(0, y, width, y)
+
         # Play glyph: right-pointing triangle at the right of the header
+        # (fauxcasa-q6l.16) — reserved first so the count/title budget
+        # their width around it.
         cx = width - PAD - HEADER_PLAY_W // 2
         cy = y + HEADER_H // 2
-        r = HEADER_H * 0.32
+        play_r = HEADER_H * 0.28
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(HEADER_PLAY)
-        painter.drawPolygon(_play_polygon(cx, cy, r))
+        painter.drawPolygon(_play_polygon(cx, cy, play_r))
+
+        base_font = painter.font()
+        base_font.setBold(False)
+        base_fm = QFontMetrics(base_font)
+        count_text = str(len(g.items))
+        count_w = base_fm.horizontalAdvance(count_text) + PAD
+        count_x = width - PAD - HEADER_PLAY_W - count_w
+        painter.setFont(base_font)
+        painter.setPen(HEADER_FG)
+        painter.drawText(QRect(count_x, y, count_w, HEADER_H),
+                         Qt.AlignmentFlag.AlignVCenter
+                         | Qt.AlignmentFlag.AlignRight, count_text)
+
+        title_font = QFont(base_font)
+        title_font.setPointSize(HEADER_TITLE_PT)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        title_fm = QFontMetrics(title_font)
+        title_avail = max(0, count_x - PAD - PAD)
+        title_text = _elide(title_fm, g.title, title_avail)
+        painter.setFont(title_font)
+        painter.setPen(HEADER_FG)
+        painter.drawText(QRect(PAD, y, title_avail, HEADER_H),
+                         Qt.AlignmentFlag.AlignVCenter, title_text)
+
+        if g.description:
+            desc_x = PAD + title_fm.horizontalAdvance(title_text) + PAD
+            desc_w = count_x - PAD - desc_x
+            desc_text = _elide(base_fm, g.description, desc_w)
+            if desc_text:
+                painter.setFont(base_font)
+                painter.setPen(TEXT_MUTED)
+                painter.drawText(QRect(desc_x, y, desc_w, HEADER_H),
+                                 Qt.AlignmentFlag.AlignVCenter, desc_text)
+
+    def _draw_error_tile(self, painter: QPainter, r: QRect,
+                         name: str) -> None:
+        """An undecodable entry (fauxcasa-ez2.4 UX audit: used to be a
+        flat maroon square with no other information) — the fill, plus a
+        simple broken-image glyph and the elided filename so the tile at
+        least says WHICH photo failed."""
+        painter.fillRect(r, ERROR_TILE)
+        pad = max(6, r.width() // 6)
+        frame = QRect(r.x() + pad, r.y() + pad,
+                     max(1, r.width() - 2 * pad),
+                     max(1, r.height() - 2 * pad - 14))
+        if frame.width() > 4 and frame.height() > 4:
+            painter.setPen(QPen(TEXT_MUTED, 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(frame)
+            painter.drawLine(frame.topLeft(), frame.center())
+            painter.drawLine(frame.center(), frame.bottomRight())
+        painter.setPen(TEXT_MUTED)
+        fm = painter.fontMetrics()
+        label = fm.elidedText(name, Qt.TextElideMode.ElideMiddle,
+                              max(0, r.width() - 8))
+        painter.drawText(QRect(r.x() + 4, r.bottom() - 16,
+                               max(0, r.width() - 8), 14),
+                         Qt.AlignmentFlag.AlignLeft, label)
 
     # ---------- hover peek trigger (fauxcasa-q6l.5) ----------
 
@@ -1251,12 +1486,30 @@ class GridView(QAbstractScrollArea):
         # moves keep arriving while it covers the cursor.
         self._hover = event.position()
         self._peek_update(event.modifiers())
+        pos = event.position()
+        self._set_hover_idx(self.photo_at(int(pos.x()), int(pos.y())))
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event) -> None:
         self._hover = None
         self._end_peek()
+        self._set_hover_idx(-1)
         super().leaveEvent(event)
+
+    def _set_hover_idx(self, idx: int) -> None:
+        """Update the hovered tile (fauxcasa-ez2.4 UX audit: no hover
+        feedback at all), repainting only the OLD and NEW hovered rects
+        — not the whole viewport — so hover stays cheap on a large grid."""
+        if idx == self._hover_idx:
+            return
+        top = self.verticalScrollBar().value()
+        for old in (self._hover_idx, idx):
+            if old >= 0 and old in self.loc:
+                gi, n = self.loc[old]
+                rect = self._item_rect(self.groups[gi], n)
+                rect = rect.translated(0, -top).adjusted(-4, -4, 4, 4)
+                self.viewport().update(rect)
+        self._hover_idx = idx
 
     def keyReleaseEvent(self, event) -> None:
         if event.key() in _MOD_OF:
