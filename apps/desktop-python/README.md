@@ -75,16 +75,30 @@ TIFF, and video (poster and playback) are **not yet sandboxed in 0.1**:
 they decode in-process, same as before this feature existed. On Linux
 everything decodes in-process (no AppContainer equivalent wired yet).
 
-The sandbox is default-ON on Windows outside tests; force it off with
-`FAUXCASA_DECODE_SANDBOX=0`, force it required (fail loud, non-zero exit,
-on a failed startup) with `FAUXCASA_DECODE_SANDBOX=1` and `--require-
-sandbox`, or leave the default. If the sandbox cannot start (or dies
-mid-session), the app degrades to in-process decoding for the rest of
-the session and says so in the status bar — never silently (N7). A
-sandboxed-vs-in-process decode failure is never retried in-process: a
-file the sandbox refuses or that trips a protocol violation stays an
-honest error tile rather than falling back to decoding the same
-untrusted bytes unsandboxed.
+`FAUXCASA_DECODE_SANDBOX=1` is already the default on Windows outside
+tests, so the sandbox is on without setting anything; force it off with
+`FAUXCASA_DECODE_SANDBOX=0`, or force it required (fail loud, non-zero
+exit, on a failed startup) with `--require-sandbox` alone — the flag sets
+`FAUXCASA_DECODE_SANDBOX=require` itself, so the env var need not be set
+by hand. If the sandbox cannot start (or dies mid-session), the app
+degrades to in-process decoding for the rest of the session and says so
+in the status bar — never silently (N7). A sandboxed-vs-in-process decode
+failure is never retried in-process: a file the sandbox refuses or that
+trips a protocol violation stays an honest error tile rather than falling
+back to decoding the same untrusted bytes unsandboxed.
+
+Two residual gaps, honestly noted rather than silently absorbed:
+
+- **Still images over `decodesvc.MAX_PIXELS` (64 MP) return TOO_LARGE in
+  the sandboxed viewer on Windows.** Before the sandbox was wired in, the
+  in-process decode path handled these (no such cap existed); a large
+  panorama or scan now honest-error-tiles instead of decoding, until a
+  tiled-decode follow-up raises or removes the cap.
+- **The scan-time header size sniff still runs in-process, unsandboxed.**
+  `catalog.py`'s walk calls `QImageReader(path).size()` directly (not
+  through the decode-sandbox seam) to read a file's declared dimensions
+  before any full decode — that one Qt call on untrusted bytes happens
+  outside the AppContainer.
 
 ## The §7 numbers (Linux dev machine, offscreen; overshoots reference HW)
 

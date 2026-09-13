@@ -12033,15 +12033,23 @@ def test_menu_bar_has_file_view_help_reusing_toolbar_actions(
     cat = scan_library(library)
     win = MainWindow(cat, None, cache_dir=None, build_dir=None)
 
-    menus = {m.title().replace("&", ""): m
-            for m in win.menuBar().findChildren(QMenu)}
-    assert {"File", "View", "Help", "Tools"} <= set(menus)
+    # The window holds durable references to its menus (like tools_menu).
+    # Do NOT re-discover them through findChildren(QMenu) / QAction.menu():
+    # those transient wrappers proved timing-sensitive under the script
+    # runner (uv run test_tracer.py) — "Internal C++ object already
+    # deleted" on the File menu, while python -m pytest passed.
+    menus = {"File": win.file_menu, "View": win.view_menu,
+             "Help": win.help_menu, "Tools": win.tools_menu}
+    for name, menu in menus.items():
+        assert isinstance(menu, QMenu), name
+        assert menu.title().replace("&", "") == name
 
     # fauxcasa-ez2.9: reading order in the bar itself -- File, View,
     # Tools, Help (Tools is created first in __init__, v46.4, so without
-    # the ez2.9 reposition it lands leftmost instead).
-    bar_order = [a.menu().title().replace("&", "")
-                 for a in win.menuBar().actions() if a.menu() is not None]
+    # the ez2.9 reposition it lands leftmost instead). Menu actions carry
+    # the menu title as their text, so no QMenu wrapper is needed here.
+    bar_order = [a.text().replace("&", "") for a in win.menuBar().actions()
+                 if a.text().replace("&", "") in menus]
     assert bar_order == ["File", "View", "Tools", "Help"], bar_order
 
     file_actions = menus["File"].actions()
