@@ -3286,7 +3286,7 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
     cancelled (empty) picker still yields None."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+    from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
     import main
 
     app = QApplication.instance() or QApplication([])
@@ -3306,6 +3306,13 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
         "warning",
         staticmethod(lambda _parent, _title, msg: warnings.append(msg)),
     )
+    # Drive the WelcomeDialog programmatically (never a real exec()) —
+    # "Choose a folder…" clicked, exercising the folder-picker fallback
+    # path this test is actually about.
+    def _fake_welcome_exec(self):
+        self.choice = "folder"
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(main.WelcomeDialog, "exec", _fake_welcome_exec)
 
     got = main._prompt_for_library(cache_root)
     assert got == chosen.resolve()
@@ -3328,6 +3335,172 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
     assert main._remembered_library(cache_root_3) == chosen.resolve()
     assert len(warnings) == 1
     assert "not the filesystem root" in warnings[0]
+
+
+def test_welcome_dialog_hides_picasa_button_when_zero_watched(
+        monkeypatch) -> None:
+    """WelcomeDialog (fauxcasa-ez2.14) shows only 'Choose a folder…' + Cancel
+    when the registry read returns 0 existing watched folders — the
+    Picasa-import button is a dead end otherwise and must not appear."""
+    _offscreen_app()
+    import main
+
+    monkeypatch.setattr(main, "_existing_picasa_watched_count", lambda: 0)
+    dlg = main.WelcomeDialog(main._existing_picasa_watched_count())
+    assert dlg.picasa_button is None
+    assert dlg.folder_button is not None
+    assert dlg.windowTitle() == main.APP_NAME
+
+
+def test_welcome_dialog_shows_picasa_button_with_count(monkeypatch) -> None:
+    """With N >= 1 existing watched folders, the button text carries the
+    count, and clicking it sets .choice = 'picasa' + accepts (drives the
+    dialog programmatically, never a real exec(), per ez2.14's test note)."""
+    _offscreen_app()
+    from PySide6.QtWidgets import QDialog
+    import main
+
+    dlg = main.WelcomeDialog(3)
+    assert dlg.picasa_button is not None
+    assert dlg.picasa_button.text() == "Use Picasa's watched folders (3 found)"
+
+    dlg.picasa_button.click()
+    assert dlg.choice == "picasa"
+    assert dlg.result() == QDialog.DialogCode.Accepted
+
+
+def test_welcome_dialog_choose_folder_sets_choice() -> None:
+    """Clicking 'Choose a folder…' sets .choice = 'folder' + accepts."""
+    _offscreen_app()
+    from PySide6.QtWidgets import QDialog
+    import main
+
+    dlg = main.WelcomeDialog(0)
+    dlg.folder_button.click()
+    assert dlg.choice == "folder"
+    assert dlg.result() == QDialog.DialogCode.Accepted
+
+
+def test_welcome_dialog_cancel_exits_as_today(monkeypatch, tmp_path: Path) -> None:
+    """Cancel in the WelcomeDialog still yields None from _prompt_for_library
+    (ez2.14 preserves the existing cancel contract)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QDialog
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    monkeypatch.setattr(main, "_gui_unavailable", lambda: False)
+    monkeypatch.setattr(QApplication, "platformName", lambda self: "xcb")
+
+    def _fake_cancel_exec(self):
+        self.reject()
+        return QDialog.DialogCode.Rejected
+    monkeypatch.setattr(main.WelcomeDialog, "exec", _fake_cancel_exec)
+
+    assert main._prompt_for_library(tmp_path / "cr") is None
+
+
+def test_existing_picasa_watched_count_filters_missing_dirs(
+        monkeypatch, tmp_path: Path) -> None:
+    """_existing_picasa_watched_count (ez2.14) counts only registry entries
+    that still exist as directories on disk, and fails soft to 0 when the
+    registry read raises (no key, non-Windows, empty value)."""
+    import main
+    import library
+
+    real = tmp_path / "RealFolder"
+    real.mkdir()
+    missing = tmp_path / "GoneFolder"
+
+    monkeypatch.setattr(library, "picasa_watched_from_registry",
+                        lambda: [real, missing])
+    assert main._existing_picasa_watched_count() == 1
+
+    def _raise():
+        raise RuntimeError("no registry entry")
+    monkeypatch.setattr(library, "picasa_watched_from_registry", _raise)
+    assert main._existing_picasa_watched_count() == 0
+
+
+def test_import_picasa_watched_for_welcome_creates_multiroot_home(
+        monkeypatch, tmp_path: Path) -> None:
+    """The WelcomeDialog's 'picasa' choice (fauxcasa-ez2.14) runs the same
+    import_picasa_watched path --import-picasa-watched registry uses,
+    entirely inside cache_root (never touching the watched folders
+    themselves), and returns the new library-home for _prompt_for_library
+    to remember and open."""
+    import main
+    import library
+
+    root_a = tmp_path / "Watched" / "A"
+    root_b = tmp_path / "Watched" / "B"
+    make_jpeg(root_a / "a.jpg")
+    make_jpeg(root_b / "b.jpg")
+    cache_root = tmp_path / "cr"
+
+    monkeypatch.setattr(library, "picasa_watched_from_registry",
+                        lambda: [root_a, root_b])
+
+    home = main._import_picasa_watched_for_welcome(cache_root)
+    assert home is not None
+    assert home == (cache_root / "picasa-watched-library").resolve()
+    cfg = library.resolve_open_path(home)
+    assert not cfg.is_legacy
+    assert len(cfg.roots) == 2
+    assert {r.path.resolve() for r in cfg.roots} == {
+        root_a.resolve(), root_b.resolve()}
+    # Neither watched folder itself was touched — only cache_root grew.
+    assert not (root_a / ".fauxcasa").exists()
+    assert not (root_b / ".fauxcasa").exists()
+
+
+def test_import_picasa_watched_for_welcome_no_usable_folders_returns_none(
+        monkeypatch, tmp_path: Path) -> None:
+    """A registry list with nothing usable (all missing/nested) fails soft
+    to None — the WelcomeDialog's caller falls back to the folder picker,
+    it never crashes first-run."""
+    import main
+    import library
+
+    monkeypatch.setattr(library, "picasa_watched_from_registry",
+                        lambda: [tmp_path / "does-not-exist"])
+    assert main._import_picasa_watched_for_welcome(tmp_path / "cr") is None
+
+
+def test_prompt_for_library_picasa_choice_end_to_end(
+        monkeypatch, tmp_path: Path) -> None:
+    """_prompt_for_library with the WelcomeDialog's 'picasa' choice (driven
+    programmatically) imports the watched folders, remembers the new
+    library-home, and returns it — the end-to-end path the welcome button
+    triggers in the real app."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QDialog
+    import main
+    import library
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    monkeypatch.setattr(main, "_gui_unavailable", lambda: False)
+    monkeypatch.setattr(QApplication, "platformName", lambda self: "xcb")
+
+    watched = tmp_path / "Watched"
+    make_jpeg(watched / "p.jpg")
+    monkeypatch.setattr(library, "picasa_watched_from_registry",
+                        lambda: [watched])
+
+    def _fake_picasa_exec(self):
+        self.choice = "picasa"
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(main.WelcomeDialog, "exec", _fake_picasa_exec)
+
+    cache_root = tmp_path / "cr"
+    got = main._prompt_for_library(cache_root)
+    expected_home = (cache_root / "picasa-watched-library").resolve()
+    assert got == expected_home
+    assert main._remembered_library(cache_root) == expected_home
 
 
 def test_mainwindow_open_action_relaunches_with_selected_library(

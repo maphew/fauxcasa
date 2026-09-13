@@ -81,6 +81,7 @@ from PySide6.QtGui import QActionGroup, QIcon, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -88,6 +89,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QPushButton,
     QSlider,
     QSplitter,
     QStackedWidget,
@@ -640,11 +642,111 @@ def _gui_unavailable() -> bool:
     return False
 
 
+class WelcomeDialog(QDialog):
+    """First-run welcome (fauxcasa-ez2.14): replaces the bare folder
+    picker with the app icon, APP_NAME, and a one-paragraph read-only
+    promise, then one or two ways to pick a library. `watched_count` is
+    the number of Picasa watched folders found to still exist on disk —
+    the "Use Picasa's watched folders" button only appears when it is
+    >= 1, since offering to import zero folders is a dead end.
+
+    Not exec()'d by this class itself — callers (_prompt_for_library,
+    tests) call exec() or drive .choice programmatically, matching the
+    keyboard-shortcuts/about dialogs' pattern elsewhere in this module.
+    `.choice` is None until a button is clicked: "picasa" or "folder"."""
+
+    def __init__(self, watched_count: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(APP_NAME)
+        self.choice: str | None = None
+
+        lay = QVBoxLayout(self)
+        header = QHBoxLayout()
+        icon_label = QLabel()
+        icon_label.setPixmap(app_icon().pixmap(64, 64))
+        header.addWidget(icon_label)
+        title = QLabel(f"<span style='font-size: 16pt;'>{APP_NAME}</span>")
+        header.addWidget(title)
+        header.addStretch(1)
+        lay.addLayout(header)
+
+        para = QLabel(
+            "Fauxcasa browses your existing photo folders read-only. It "
+            "never modifies photos, .picasa.ini files or the Picasa "
+            "database; it only writes its own cache.")
+        para.setWordWrap(True)
+        lay.addWidget(para)
+
+        self.picasa_button: QPushButton | None = None
+        if watched_count >= 1:
+            self.picasa_button = QPushButton(
+                f"Use Picasa's watched folders ({watched_count} found)")
+            self.picasa_button.clicked.connect(self._pick_picasa)
+            lay.addWidget(self.picasa_button)
+
+        self.folder_button = QPushButton("Choose a folder…")
+        self.folder_button.clicked.connect(self._pick_folder)
+        lay.addWidget(self.folder_button)
+
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        lay.addWidget(cancel_button)
+
+    def _pick_picasa(self) -> None:
+        self.choice = "picasa"
+        self.accept()
+
+    def _pick_folder(self) -> None:
+        self.choice = "folder"
+        self.accept()
+
+
+def _existing_picasa_watched_count() -> int:
+    """How many of Picasa's registry-listed watched folders still exist on
+    disk — the WelcomeDialog's gate for offering the one-click import.
+    Fails soft to 0 (no registry entry, wrong platform, or a vanished
+    key) exactly like _db3_rescue_enabled's own registry read."""
+    try:
+        watched = library.picasa_watched_from_registry()
+    except RuntimeError:
+        return 0
+    return sum(1 for w in watched if w.is_dir())
+
+
+def _import_picasa_watched_for_welcome(cache_root: Path) -> Path | None:
+    """The WelcomeDialog's "Use Picasa's watched folders" action: build a
+    fresh multi-root library-home from the registry list, entirely inside
+    our own cache_root (never touching Picasa's own folders/database —
+    the same promise the welcome paragraph makes), reusing
+    library.import_picasa_watched exactly as --import-picasa-watched
+    registry does. Returns the new library-home path, or None if the
+    registry yields nothing usable (fails soft; caller falls back to the
+    folder picker)."""
+    try:
+        folders = library.picasa_watched_from_registry()
+    except RuntimeError as e:
+        log.error(str(e))
+        return None
+    home = (cache_root / "picasa-watched-library").expanduser().resolve()
+    skipped: list[str] = []
+    cfg = library.import_picasa_watched(
+        folders, home, name="Picasa Watched Folders", skipped=skipped)
+    for msg in skipped:
+        log.warning("picasa import: skipped %s", msg)
+    if not cfg.roots:
+        log.error("no usable Picasa watched folders found — nothing imported")
+        return None
+    library.save_library(cfg)
+    for r in cfg.roots:
+        library.write_root_marker(r.path.resolve(), r.id)  # fail-soft
+    return cfg.home
+
+
 def _prompt_for_library(cache_root: Path) -> Path | None:
-    """First-run picker for a frozen build with no library yet: ask the
-    user to choose a photo-library folder and remember it. Returns None if
-    cancelled — or, under a headless/offscreen platform, immediately,
-    rather than blocking forever on a modal dialog nobody can answer."""
+    """First-run picker for a frozen build with no library yet: show the
+    WelcomeDialog and act on the user's choice. Returns None if cancelled
+    — or, under a headless/offscreen platform, immediately, rather than
+    blocking forever on a modal dialog nobody can answer."""
     # Pre-construction guard: bail BEFORE touching QApplication so a Linux
     # no-DISPLAY launch can't abort the whole process (see _gui_unavailable).
     if _gui_unavailable():
@@ -663,10 +765,18 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     # guard too.
     if app.platformName() in ("offscreen", "minimal", ""):
         return None
-    library = _choose_library_from_dialog(cache_root)
-    if library is not None:
-        _remember_library(cache_root, library)
-    return library
+
+    dlg = WelcomeDialog(_existing_picasa_watched_count())
+    if dlg.exec() != QDialog.DialogCode.Accepted or dlg.choice is None:
+        return None
+
+    if dlg.choice == "picasa":
+        chosen = _import_picasa_watched_for_welcome(cache_root)
+    else:
+        chosen = _choose_library_from_dialog(cache_root)
+    if chosen is not None:
+        _remember_library(cache_root, chosen)
+    return chosen
 
 
 def _choose_library_from_dialog(cache_root: Path, parent=None,
