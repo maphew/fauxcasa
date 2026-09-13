@@ -19,10 +19,12 @@ teal tile (#1E7A82) with a cream lens, a warm orange sun (#F0592E), and a
 green hill (#3F9B6E). Selection/current-item chrome takes the sun orange
 rather than the old generic UI blue (64,140,255) — checked in the polish
 scratch driver against warm (orange/yellow) photo content specifically,
-the risk case for a warm accent: ACCENT_SOFT's translucent wash covers
-the whole tile (not just the PAD gutter — grid.py's SELECT_MARGIN only
-adds a few px beyond the tile edge), yet the outline and star-badge
-contrast both hold up — the ACCENT outline reads as a crisper, more
+the risk case for a warm accent. A selected photo keeps its own true
+colors: grid.py paints ACCENT_SOFT's translucent wash only in the ring
+between the halo rect and the tile rect itself (QRegion subtraction,
+behind the pixmap), never over the thumbnail's own pixels, so the check
+was of the OUTLINE and the star badge's contrast against warm/yellow
+tiles — both hold up: the ACCENT outline reads as a crisper, more
 saturated edge than the photo's own warm fill, and the star keeps its
 own 1px dark outline regardless. PLAY stays a plain green — it names an
 action (playback), not brand identity, and doesn't compete with ACCENT

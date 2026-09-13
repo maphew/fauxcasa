@@ -15460,6 +15460,48 @@ def test_grid_empty_text_paints_only_when_set(tmp_path: Path) -> None:
     assert found_text
 
 
+def test_grid_selection_wash_never_tints_the_photo_pixels(
+        tmp_path: Path) -> None:
+    """A selected tile keeps its own true colors: the translucent ACCENT
+    halo paints only in the ring between the tile rect and its margin
+    (QRegion subtraction, behind the pixmap) — never over the photo's own
+    pixels. The margin just outside the tile DOES pick up chrome
+    (coordinator follow-up on fauxcasa-ez2.4: painting the fill over/
+    after the image used to tint every selected thumbnail — e.g. a blue
+    tile reading mauve in 02-grid-multi-select.png)."""
+    from PySide6.QtGui import QColor, QImage
+
+    from grid import BACKGROUND
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    idx = d[0]
+    solid = QColor(90, 140, 190)
+    img = QImage(g.tile, g.tile, QImage.Format.Format_RGB32)  # fills `r` exactly
+    img.fill(solid)
+    gen = g.generation
+    g.done.put((gen, idx, img))
+    g._pump_decoded()
+
+    gi, n = g.loc[idx]
+    r = g._item_rect(g.groups[gi], n)
+    top = g.verticalScrollBar().value()
+    cx, cy = r.center().x(), r.center().y() - top
+    ring_y = cy
+    ring_pts = [(r.x() - o, ring_y) for o in (1, 2, 3, 4)]
+
+    shot0 = g.grab().toImage().convertToFormat(QImage.Format.Format_RGB32)
+    assert shot0.pixelColor(cx, cy) == solid   # sanity: the fed tile painted
+
+    _click(g, idx)   # select it (also current: the strongest chrome)
+    shot1 = g.grab().toImage().convertToFormat(QImage.Format.Format_RGB32)
+    assert shot1.pixelColor(cx, cy) == solid   # untouched by selection
+
+    found_chrome = any(shot1.pixelColor(x, y) != BACKGROUND
+                       for x, y in ring_pts)
+    assert found_chrome   # the halo/outline still shows — just not on the photo
+
+
 def test_grid_tooltip_shows_name_caption_date_html_escaped(
         tmp_path: Path, monkeypatch) -> None:
     """viewportEvent(QEvent.ToolTip) hit-tests the item under the cursor

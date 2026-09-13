@@ -32,6 +32,7 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QPolygonF,
+    QRegion,
     QTransform,
 )
 from PySide6.QtWidgets import (
@@ -1218,6 +1219,24 @@ class GridView(QAbstractScrollArea):
         dpr = self.devicePixelRatioF()  # constant per paint (q7m)
         for g, n, idx in self._visible_items(top, bottom):
             r = self._item_rect(g, n).translated(0, -top)
+            in_sel = idx in self.selection
+            is_cur = idx == self.current
+            if in_sel:
+                # The translucent ACCENT halo goes BEHIND the pixmap, and
+                # only in the ring between the halo rect and the tile rect
+                # itself (QRegion subtraction) — a selected photo must
+                # keep its own true colors; only the margin around it
+                # carries the tint (coordinator follow-up on
+                # fauxcasa-ez2.4: painting the fill over/after the image
+                # tinted every selected thumbnail, e.g. blue tiles reading
+                # mauve).
+                m = SELECT_MARGIN
+                halo = r.adjusted(-m, -m, m, m)
+                ring = QRegion(halo).subtracted(QRegion(r))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(SELECT_SOFT)
+                for ring_rect in ring:  # QRegion iterates its rectangles
+                    painter.drawRect(ring_rect)
             t = self.tiles.get(idx)
             if t is None:
                 painter.fillRect(r, PLACEHOLDER)
@@ -1317,21 +1336,14 @@ class GridView(QAbstractScrollArea):
                 painter.setBrush(PLAY_WHITE)
                 painter.drawPolygon(_play_polygon(
                     r.x() + s + 2, r.bottom() - s - 2, s))
-            # Multi-select paint (fauxcasa-q6l.1): a selected tile gets a
-            # translucent ACCENT halo filling its half of the PAD gutter
-            # plus an outline; the current item is distinct via the
-            # stronger 3px border (dashed focus cue if Ctrl-toggled out of
-            # the set); an unselected hovered tile gets a plain hover ring
+            # Multi-select paint (fauxcasa-q6l.1): the translucent ACCENT
+            # halo (ring-filled above, behind the pixmap) plus an outline;
+            # the current item is distinct via the stronger 3px border
+            # (dashed focus cue if Ctrl-toggled out of the set); an
+            # unselected hovered tile gets a plain hover ring
             # (fauxcasa-ez2.4 UX audit: the old 1px hairline was too faint
             # to read at a glance, and hover had no feedback at all). Pens
             # are module constants — no per-tile allocation.
-            in_sel = idx in self.selection
-            is_cur = idx == self.current
-            m = SELECT_MARGIN
-            if in_sel:
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(SELECT_SOFT)
-                painter.drawRect(r.adjusted(-m, -m, m, m))
             if is_cur:
                 painter.setPen(PEN_CURRENT if in_sel else PEN_FOCUS)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
