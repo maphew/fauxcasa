@@ -1,5 +1,17 @@
 # M1 gate clause 3 — family-archive confirmation
 
+## Status as of 0.1.0
+
+Fauxcasa 0.1.0 ships with clauses 1 and 2 of the M1 gate automated and
+mostly green (clause 1's N4 budgets are green except for min-zoom
+scrolling on high-DPI displays, tracked as `fauxcasa-q6l.27`; clause 2's
+survey cross-check is green in CI). **Clause 3 — the owner confirmation on
+the family archive below — is still a pending owner action** (tracked as
+`fauxcasa-6g8`) and has not been recorded as of this release. 0.1.0 ships
+without it; the runbook below remains the path to close it, or an owner
+may instead record a dated waiver here explicitly accepting the release
+without clause 3 confirmed.
+
 Vehicle for the third clause of the M1 gate (docs/product-spec.md, "M1 —
 See your library again"):
 

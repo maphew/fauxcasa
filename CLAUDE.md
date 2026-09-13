@@ -182,7 +182,27 @@ uv run scripts/preflight.py            # add --fast to skip the slow suites (tra
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+The shipping 0.1 app (`apps/desktop-python/`, Python + PySide6/Qt) is
+layered catalog → thumbcache → grid/viewer/sidebar:
+
+- **`catalog.py`** walks the library in place and merges Picasa metadata
+  (via `scripts/picasa_db.py`, the shared `.picasa.ini`/db3/`contacts.xml`
+  parser used by both the app and the standalone build/research scripts)
+  with in-file metadata (`inmeta.py`, `metareader.py`) into a persisted
+  JSON catalog; a warm start loads it and skips the walk, and a
+  background reconcile rebuilds on drift.
+- **`thumbcache.py`** reads/builds the packed `fcache` thumbnail cache
+  (dual-version: v1 single-level, v2 multi-resolution) that the catalog's
+  photos bind to by content hash + path.
+- **`grid.py`**, **`viewer.py`**, and the sidebar/search in `main.py`
+  consume the catalog and thumbcache to render the library — the grid
+  never reads original files; the viewer and RAW/PSD paths do, behind the
+  decode seam below.
+- **Decode-sandbox seam**: `rawload.py`/`decodesvc.py` (`decodesvc_win.py`
+  + `decodesvc_worker_win.py` on Windows) are the seam the app's original-
+  media decoding is meant to route through — a Windows AppContainer
+  sandbox exists and is CI-tested but not yet wired into thumbcache/viewer
+  by default (`docs/decode-threat-model.md`).
 
 ## Conventions & Patterns
 
@@ -198,3 +218,8 @@ _Add a brief overview of your project architecture_
 - **Privacy**: real Picasa test data is personal and lives outside the repo;
   committed fixtures must be synthetic. See `bd remember` key
   `privacy-real-picasa-data` for the full rules (loaded at session start).
+- **Release docs must enumerate files written to disk.** Every release-notes
+  document must list every file the app writes (cache-root and per-library),
+  since "what does this app touch on my machine" is a trust question users
+  ask before running an unsigned binary. See `docs/releases/v0.1.0.md`
+  ("Files this app writes") for the pattern (fauxcasa-p93).
