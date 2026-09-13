@@ -2581,6 +2581,14 @@ class WinDecodePool:
         self.protocol_violations = 0
         self.timeouts = 0
         self.crashes = 0
+        # fauxcasa-ez2.9 Stage 2 review P2-6: a monotonically increasing
+        # count of SUCCESSFUL decode() calls -- the only counter this
+        # class exposed before this (protocol_violations/timeouts/
+        # crashes) counts FAILURES, so a test asserting "the sandbox
+        # started" could never tell a real routed decode from a deleted
+        # routing branch that never called decode() at all. Never reset
+        # (mirrors the other per-session counters).
+        self.jobs = 0
 
     def _ensure_worker(self) -> WinSandboxWorker:
         if (self._worker is not None and self._worker._child is not None
@@ -2626,7 +2634,9 @@ class WinDecodePool:
                     # same except clauses as decode failures gives them the
                     # same counting/retry/kill treatment.
                     worker = self._ensure_worker()
-                    return worker.decode(path, edge=edge, deadline_ms=deadline_ms)
+                    result = worker.decode(path, edge=edge, deadline_ms=deadline_ms)
+                    self.jobs += 1
+                    return result
                 except ProtocolViolation:
                     # Evidence of compromise (design doc sec 1/2.5): NO retry.
                     # worker.decode() already killed the worker (and a

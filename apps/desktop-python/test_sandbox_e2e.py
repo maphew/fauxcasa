@@ -169,6 +169,18 @@ def _protocol_violation_total(svc: "df.DecodeService") -> int:
     return sum(m.protocol_violations for m in members)
 
 
+def _jobs_total(svc: "df.DecodeService") -> int:
+    """fauxcasa-ez2.9 Stage 2 review P2-6: sum of WinDecodePool.jobs
+    across every pool member -- a monotonically increasing count of
+    SUCCESSFUL sandboxed decode() calls. Unlike `state == STATE_SANDBOXED`
+    (which only proves the sandbox STARTED), this proves the routing
+    branch at the call site actually REACHED the sandbox -- a deleted
+    `elif ... STATE_SANDBOXED` branch would leave this at 0."""
+    pool_set = svc._sandbox._pool_set
+    members = list(pool_set._batch) + [pool_set._interactive]
+    return sum(m.jobs for m in members)
+
+
 # ---------------------------------------------------------------------------
 # (a) parity: build_cache under sandbox=1 vs sandbox=0
 
@@ -190,10 +202,20 @@ def test_index_parity_sandboxed_vs_in_process(tmp_path, monkeypatch):
     svc.ensure_started()
     assert svc.state == df.STATE_SANDBOXED, (
         f"sandbox failed to start: {svc.reason}")
+    jobs_before = _jobs_total(svc)
     cat1 = scan_library(root)
     res1 = thumbcache.build_cache(cat1, tmp_path / "c1")
     cache1 = thumbcache.load_cache(res1.path)
     by_rel1 = dict(zip(cache1.files, cache1.entries))
+
+    # Discriminating assertion (P2-6): `state == STATE_SANDBOXED` alone
+    # only proves the sandbox STARTED, not that _index_one's routing
+    # branch actually used it -- this fails if that `elif` is deleted.
+    # 3 successfully-decoded stills (plain.jpg, plain.png, rotated.jpg);
+    # corrupt.jpg raises before WinDecodePool.decode's success increment.
+    jobs_after = _jobs_total(svc)
+    assert jobs_after - jobs_before == 3, (
+        f"expected 3 sandboxed decode jobs, got {jobs_after - jobs_before}")
 
     # Error-tile set (zero-length blob) must match exactly.
     err0 = {rel for rel, e in by_rel0.items() if e[1] == 0}
@@ -225,7 +247,13 @@ def test_viewer_parity_sandboxed_vs_in_process(tmp_path, monkeypatch):
     svc = df.get_service()
     svc.ensure_started()
     assert svc.state == df.STATE_SANDBOXED, f"sandbox failed: {svc.reason}"
+    jobs_before = _jobs_total(svc)
     img1, orient1 = load_original_oriented(str(p), rotate=0)
+
+    # Discriminating assertion (P2-6): proves the viewer's routing branch
+    # actually reached the sandbox, not just that it started.
+    assert _jobs_total(svc) - jobs_before == 1, (
+        "expected exactly 1 sandboxed decode job from the viewer load")
 
     assert not img0.isNull() and not img1.isNull()
     assert orient0 == orient1 == 6
