@@ -93,6 +93,15 @@ _hidden = ["catalog", "grid", "thumbcache", "viewer", "slideshow", "peek",
            # is ALSO in main.BUNDLE_RUNTIME_MODULES so --bundle-self-check
            # fails loudly on a build without PySide6-Addons.
            "videostream", "decodesvc", "PySide6.QtMultimedia",
+           # Windows sandboxed decode pool (fauxcasa-ez2.9 Stage 1): the
+           # frozen worker is `<exe> --decode-worker` (main.py dispatches
+           # it to decodesvc_worker_win.worker_entrypoint() before argparse,
+           # same re-entry pattern as videostream's --worker above) --
+           # named here so the module graph can't drop either half of the
+           # broker/worker pair (decodefacade imports decodesvc_win lazily
+           # on win32 only, which PyInstaller's static analysis would miss
+           # without this hiddenimport).
+           "decodesvc_win", "decodesvc_worker_win", "decodefacade",
            "zstandard",
            # _buildinfo (rel-0.1 release workflow, fauxcasa-ez2.7): the
            # release job writes apps/desktop-python/_buildinfo.py (git sha +

@@ -48,6 +48,26 @@ from pathlib import Path
 
 T0 = time.perf_counter()
 
+# P3 finding: an exact-match check (not "in") -- the broker fully
+# controls this cmdline, but a substring/membership check would also
+# fire for a file literally named "--decode-worker" opened via
+# drag-drop/file association, turning the GUI into a pipe-reading worker.
+if sys.argv[1:] == ["--decode-worker"]:
+    # Windows AppContainer decode worker re-entry (fauxcasa-ez2.9 Stage 1,
+    # frozen-bundle P0 finding): a FROZEN bundle spawns its OWN exe as
+    # [sys.executable, "--decode-worker"] (decodesvc_win.resolve_worker_
+    # python()'s frozen branch + WinSandboxWorker.spawn()) -- sys.executable
+    # IS this app, so dispatch to the worker entrypoint BEFORE the heavy
+    # app-layer imports below (~200ms wall per the audit measurement) and
+    # before argparse could reject the flag. Mirrors the existing
+    # videostream `--worker` re-entry pattern. decodesvc_worker_win imports
+    # only PySide6.QtCore/QtGui itself (the ~72ms QtGui-offscreen cost the
+    # design doc's spawn budget assumes) -- never the rest of this module.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import decodesvc_worker_win
+
+    sys.exit(decodesvc_worker_win.worker_entrypoint())
+
 from PySide6.QtCore import (
     QByteArray,
     QObject,
@@ -1472,8 +1492,8 @@ class MainWindow(QMainWindow):
         # menu bar (not another toolbar button) because configuration
         # belongs off the browsing surface — Picasa's own Tools > Options
         # > File Types location, minus the Options tabs we don't have.
-        tools_menu = self.menuBar().addMenu("&Tools")
-        self.file_types_action = tools_menu.addAction("File &Types…")
+        self.tools_menu = self.menuBar().addMenu("&Tools")
+        self.file_types_action = self.tools_menu.addAction("File &Types…")
         self.file_types_action.setStatusTip(
             "Choose which file types are scanned into this library")
         self.file_types_action.triggered.connect(self._show_file_types)
@@ -1653,9 +1673,18 @@ class MainWindow(QMainWindow):
         # inspector surface is N7/M2 work.
         self.notes_label = QLabel()
         self.notes_label.setTextFormat(Qt.TextFormat.PlainText)
+        # Decode-sandbox degrade banner (fauxcasa-ez2.9 Stage 1, item 6):
+        # a SEPARATE permanent label from notes_label above -- notes_label
+        # is the import-report count (_update_import_notes), a different
+        # concern with its own show/hide lifecycle; sharing it would let
+        # one overwrite the other. Hidden unless state == "degraded".
+        self.decode_sandbox_label = QLabel()
+        self.decode_sandbox_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.decode_sandbox_label.setVisible(False)
         self.statusBar().addWidget(self.counts_label)
         self.statusBar().addWidget(self.progress_label)
         self.statusBar().addPermanentWidget(self.notes_label)
+        self.statusBar().addPermanentWidget(self.decode_sandbox_label)
         self.statusBar().addPermanentWidget(self.meta_label)
         self._show_counts("All photos", self._shown_count())
         self._update_import_notes()
@@ -1838,6 +1867,11 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.play_action)   # toolbar's "▶ Play" action
 
         help_menu = menubar.addMenu("&Help")
+        # fauxcasa-ez2.9: Tools was created first (v46.4, __init__, before
+        # this method runs) so it landed leftmost in the bar; reposition it
+        # between View and Help so the bar reads File, View, Tools, Help.
+        menubar.removeAction(self.tools_menu.menuAction())
+        menubar.insertMenu(help_menu.menuAction(), self.tools_menu)
         shortcuts_action = help_menu.addAction("&Keyboard Shortcuts…")
         shortcuts_action.triggered.connect(self._show_shortcuts_dialog)
         help_menu.addSeparator()
@@ -3854,7 +3888,26 @@ def main() -> int:
                          "abort with exit 1 after this many seconds")
     ap.add_argument("--bundle-self-check", action="store_true",
                     help=argparse.SUPPRESS)
+    ap.add_argument("--require-sandbox", action="store_true",
+                    help="fail loud (nonzero exit) instead of degrading "
+                         "to in-process decoding if the Windows decode "
+                         "sandbox cannot start (fauxcasa-ez2.9); maps to "
+                         "FAUXCASA_DECODE_SANDBOX=require")
     args = ap.parse_args()
+    if args.require_sandbox:
+        os.environ["FAUXCASA_DECODE_SANDBOX"] = "require"
+    # P3 finding: validate FAUXCASA_DECODE_SANDBOX here, at startup -- a
+    # bad value must be a clear error, never fail-open. decodefacade.
+    # sandbox_mode() raises ValueError for a bad value; previously that
+    # only surfaced from inside DecodeService.ensure_started()'s first
+    # call, AFTER it had already marked itself started, so every later
+    # call silently returned in-process with no error at all.
+    import decodefacade
+    try:
+        decodefacade.sandbox_mode()
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if args.bundle_self_check:
         failures = _bundle_dependency_failures()
         print(json.dumps({
@@ -4142,6 +4195,43 @@ def main() -> int:
         win.zoom.setValue(args.zoom)
     win.show()
     win.grid.setFocus()  # only really lands once the window is mapped
+
+    # Decode-sandbox session-start decision (fauxcasa-ez2.9 Stage 1, item
+    # 6): try the sandbox (or note in-process/off) ONCE, right after the
+    # window is up. --require-sandbox (mapped to env "require" above) is
+    # fail-loud: a startup failure here exits main() non-zero with a
+    # clear message instead of degrading silently.
+    import decodefacade
+    decode_svc = decodefacade.get_service()
+    try:
+        decode_svc.ensure_started()
+    except decodefacade.DecodeSandboxRequiredError as e:
+        log.error("--require-sandbox: decode sandbox unavailable: %s", e)
+        print(f"error: --require-sandbox but the decode sandbox failed to "
+              f"start: {e}", file=sys.stderr)
+        return 1
+
+    # P3 finding: a MID-SESSION degrade (decodefacade.DecodeService.
+    # decode() flips state -> "degraded" on a per-file spawn/OSError/
+    # queue.Empty failure, well after the READY-time snapshot below) must
+    # still update the status-bar label -- N7 "never silent" applies for
+    # the whole session, not just at startup. check_ready's scripted
+    # `poll` timer is stopped once an interactive run's instrumentation is
+    # done, so this uses its OWN long-lived timer instead.
+    def _sync_decode_sandbox_label() -> None:
+        if decode_svc.state == "degraded" and not win.decode_sandbox_label.isVisible():
+            log.error("decode sandbox degraded: %s", decode_svc.reason)
+            win.decode_sandbox_label.setText(
+                f"Decoding is not sandboxed on this machine: "
+                f"{decode_svc.reason}  ")
+            win.decode_sandbox_label.setToolTip(decode_svc.reason)
+            win.decode_sandbox_label.setVisible(True)
+
+    decode_sandbox_poll = QTimer(win)
+    decode_sandbox_poll.setInterval(1000)
+    decode_sandbox_poll.timeout.connect(_sync_decode_sandbox_label)
+    decode_sandbox_poll.start()
+
     if cold_scan_needed:
         # Non-blocking first run (fauxcasa-q6l.13): the window is already
         # painted (empty) — start the deferred walk now, off the startup
@@ -4229,6 +4319,21 @@ def main() -> int:
             except OSError:
                 cat_bytes = 0
             print("READY", flush=True)
+            # fauxcasa-ez2.9 Stage 1, item 6: one line right after READY,
+            # every run (CI's --require-sandbox smoke asserts state ==
+            # "sandboxed" on this exact key). Logged via applog too, and
+            # "degraded" additionally gets a persistent status-bar note
+            # (N7: never silent) -- "in-process" (non-Windows, or
+            # FAUXCASA_DECODE_SANDBOX=0) is a softer log-only note.
+            print(json.dumps({"event": "decode-sandbox",
+                              "state": decode_svc.state,
+                              "reason": decode_svc.reason}), flush=True)
+            if decode_svc.state == "degraded":
+                _sync_decode_sandbox_label()
+            elif decode_svc.state == "in-process":
+                log.info("decode sandbox: in-process (%s)", decode_svc.reason)
+            else:
+                log.info("decode sandbox: sandboxed")
             # fauxcasa-q6l.13: win.catalog, not the outer `catalog` closed
             # over above — on the non-blocking cold-scan path that outer
             # binding is the EMPTY placeholder forever, while win.catalog

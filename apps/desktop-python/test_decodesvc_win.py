@@ -46,8 +46,10 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import io
 import os
+import queue
 import socket
 import struct
 import subprocess
@@ -2241,6 +2243,488 @@ def test_meta_unnamed_face_is_honest(face):
     meta = v.validate_meta({"faces": [face]})
     assert meta.faces == (FaceRegion(name="", x=0.1, y=0.1, w=0.1, h=0.1),)
     assert v.protocol_violations == 0
+
+
+# ---------------------------------------------------------------------------
+# 5. fauxcasa-ez2.9 Stage 1: frozen-worker resolution, spawn-cost caching,
+# best-effort ACL grants, and the DecodePoolSet lease pool.
+
+@_WINDOWS_ONLY
+def test_resolve_worker_python_frozen_no_probe_subprocess(monkeypatch):
+    """P0 finding: a PyInstaller onedir has no python.exe to probe with
+    `-c`. The frozen branch must short-circuit BEFORE any subprocess.run
+    call and return (sys.executable, None) -- argv shape for _spawn_
+    appcontainer's cmdline builder is [worker_python] + ["--decode-worker"]."""
+    called = []
+    monkeypatch.setattr(dw.subprocess, "run",
+                         lambda *a, **k: called.append((a, k)) or (_ for _ in ()).throw(
+                             AssertionError("probe subprocess must not run when frozen")))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", r"C:\fake\bundle\_internal", raising=False)
+    try:
+        exe, pythonpath = dw.resolve_worker_python()
+    finally:
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    assert exe == sys.executable
+    assert pythonpath is None
+    assert called == [], "frozen resolution must never spawn a probe subprocess"
+
+
+@_WINDOWS_ONLY
+def test_resolve_worker_python_caches_result(monkeypatch):
+    """P1 finding: resolve_worker_python() previously ran the ~110ms
+    subprocess probe on EVERY call/spawn; it is now cached per process,
+    keyed on FAUXCASA_WORKER_PYTHON. A second call with the same env must
+    not re-invoke subprocess.run."""
+    dw._resolve_cache.clear()
+    real_run = dw.subprocess.run
+    calls = []
+
+    def counting_run(*a, **k):
+        calls.append((a, k))
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(dw.subprocess, "run", counting_run)
+    monkeypatch.delenv("FAUXCASA_WORKER_PYTHON", raising=False)
+    first = dw.resolve_worker_python()
+    second = dw.resolve_worker_python()
+    assert first == second
+    assert len(calls) == 1, f"expected exactly one probe subprocess, got {len(calls)}"
+    dw._resolve_cache.clear()
+
+
+@_WINDOWS_ONLY
+def test_grant_read_execute_once_skips_after_marker(tmp_path, monkeypatch):
+    """P1 finding: one-time-per-(SID,dir) ACL grant via an in-process set
+    AND an on-disk marker file -- a second call for the same (sid, dir)
+    (even a FRESH process, simulated here by clearing the in-process set)
+    must not re-invoke the underlying SetNamedSecurityInfoW grant."""
+    sid = dw.create_or_derive_profile(dw.PROFILE_NAME)
+    target = str(tmp_path)
+    calls = []
+    monkeypatch.setattr(dw, "grant_read_execute",
+                         lambda path, s, inherit=None: calls.append(path))
+
+    err1 = dw.grant_read_execute_once(target, sid)
+    assert err1 is None
+    assert calls == [target]
+
+    # Simulate a fresh process: clear the in-process set, keep the marker.
+    dw._acl_granted_this_process.clear()
+    err2 = dw.grant_read_execute_once(target, sid)
+    assert err2 is None
+    assert calls == [target], "marker file did not prevent a second real grant call"
+
+
+@_WINDOWS_ONLY
+def test_acl_marker_key_stable_across_directory_mtime_change(tmp_path):
+    """Re-review residual (item 5): the marker path must be STABLE across
+    a directory mtime change (e.g. a __pycache__ write inside a granted
+    directory) -- the old (sid|directory|mtime) key orphaned a new marker
+    file on every touch (observed: 13 files after one day of normal
+    use), defeating the marker's purpose."""
+    target_dir = tmp_path / "granted"
+    target_dir.mkdir()
+    sid = dw.create_or_derive_profile(dw.PROFILE_NAME)
+    sid_str = dw.sid_to_string(sid)
+
+    path_before = dw._acl_marker_path(str(target_dir), sid_str)
+    os.utime(target_dir, None)  # bump mtime, simulating a __pycache__ write
+    path_after = dw._acl_marker_path(str(target_dir), sid_str)
+
+    assert path_before == path_after
+
+
+@_WINDOWS_ONLY
+def test_acl_marker_old_scheme_marker_is_ignored_and_pruned(tmp_path, monkeypatch):
+    """Re-review residual (item 5): a marker written under the OLD
+    (sid|directory|mtime) key scheme must not satisfy the NEW
+    (sid, directory)-only lookup -- grant_read_execute_once() must still
+    issue a real grant for a directory whose only marker is old-scheme.
+    The stale marker is also pruned (aged past 30 days) the next time
+    _prune_acl_markers() runs."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    sid = dw.create_or_derive_profile(dw.PROFILE_NAME)
+    sid_str = dw.sid_to_string(sid)
+    target_dir = tmp_path / "granted"
+    target_dir.mkdir()
+    target = str(target_dir)
+
+    root = dw._acl_marker_root(sid_str)
+    mtime = int(target_dir.stat().st_mtime)
+    old_key = f"{sid_str}|{target}|{mtime}"
+    old_digest = hashlib.sha256(old_key.encode("utf-8")).hexdigest()[:16]
+    old_marker = root / f"acl-{old_digest}"
+    old_marker.write_text("granted\n", encoding="utf-8")
+    old_ts = time.time() - dw.ACL_MARKER_MAX_AGE_SECONDS - 3600
+    os.utime(old_marker, (old_ts, old_ts))
+
+    calls = []
+    monkeypatch.setattr(dw, "grant_read_execute",
+                         lambda path, s, inherit=None: calls.append(path))
+    err = dw.grant_read_execute_once(target, sid)
+    assert err is None
+    assert calls == [target], "an old-scheme marker must not skip the real grant"
+
+    dw._prune_acl_markers(root, sid_str)
+    assert not old_marker.exists(), "an aged-out old-scheme marker must be pruned"
+
+
+@_WINDOWS_ONLY
+def test_grant_read_execute_once_best_effort_on_failure(tmp_path, monkeypatch):
+    """P1 finding: a grant OSError must be BEST-EFFORT (logged, returned
+    as a detail string) -- never raised. This is the trusted-side half of
+    'ACL grant failure is fatal even where access already exists'."""
+    sid = dw.create_or_derive_profile(dw.PROFILE_NAME)
+    target = str(tmp_path / "denied")
+
+    def boom(path, s, inherit=None):
+        raise OSError("simulated WRITE_DAC denial")
+
+    monkeypatch.setattr(dw, "grant_read_execute", boom)
+    err = dw.grant_read_execute_once(target, sid)
+    assert err is not None and "simulated WRITE_DAC denial" in err
+
+
+@_WINDOWS_ONLY
+def test_spawn_refuses_frozen_grant_on_known_user_folder(monkeypatch, tmp_path):
+    """P2 finding "frozen grant scope" / re-review residual (item 4): a
+    frozen build must never receive a RECURSIVE ACL grant (sys._MEIPASS)
+    when that grant target sits inside a known user folder (profile
+    root/Desktop/Downloads/Documents/Pictures) -- spawn() must refuse
+    (fail startup, no grant issued) instead of widening the
+    AppContainer's read to the rest of the user's files. Here
+    sys._MEIPASS == the exe's own directory (an "extract in place"
+    layout with no distinct payload subfolder), exercising both the
+    plain "meipass is a known folder" case and the "exe dir when
+    _MEIPASS == exe dir" case named in the fix. SHGetKnownFolderPath is
+    monkeypatched to fail for every folder so the %USERPROFILE% fallback
+    heuristic is what actually catches it."""
+    fake_home = tmp_path / "home"
+    fake_desktop = fake_home / "Desktop"
+    fake_desktop.mkdir(parents=True)
+    fake_exe = fake_desktop / "fauxcasa.exe"
+    fake_exe.write_bytes(b"")
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(fake_desktop), raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    monkeypatch.setattr(dw, "_sh_get_known_folder_path", lambda name: None)
+    called = []
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda *a, **k: called.append((a, k)))
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    with pytest.raises(RuntimeError, match="known user folder"):
+        worker.spawn()
+    assert called == [], "no grant may be issued once the refusal fires"
+
+
+@_WINDOWS_ONLY
+def test_spawn_allows_frozen_build_in_known_folder_with_scoped_meipass(monkeypatch, tmp_path):
+    """Re-review residual (item 4): the refusal applies ONLY to the
+    actual recursive grant target (sys._MEIPASS), not to the exe's
+    directory in general. A frozen build whose exe sits inside a known
+    user folder (Downloads) but whose _MEIPASS payload is scoped to its
+    OWN `_internal` subfolder (the normal onedir layout) must be allowed
+    to spawn -- the recursive grant never touches Downloads itself, only
+    the app's own subfolder, and the exe FILE grant is NO_INHERITANCE
+    (non-recursive, single file). Checking exe_dir unconditionally (the
+    pre-fix behaviour) wrongly refused this safe layout."""
+    fake_home = tmp_path / "home"
+    fake_downloads = fake_home / "Downloads"
+    fake_internal = fake_downloads / "_internal"
+    fake_internal.mkdir(parents=True)
+    fake_exe = fake_downloads / "fauxcasa.exe"
+    fake_exe.write_bytes(b"")
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(fake_internal), raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    monkeypatch.setattr(dw, "_sh_get_known_folder_path", lambda name: None)
+    seen = []
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda path, sid, inherit=dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT:
+                         seen.append((path, inherit)) or None)
+
+    def _boom_winsta(sid):
+        raise RuntimeError("stop before an actual CreateProcess (test scope)")
+
+    monkeypatch.setattr(dw, "grant_winsta_desktop", _boom_winsta)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    with pytest.raises(RuntimeError, match="stop before"):
+        worker.spawn()  # must NOT raise "known user folder"
+    assert seen, "grants must have been issued -- the refusal must not fire"
+
+
+@_WINDOWS_ONLY
+def test_is_known_user_folder_onedrive_redirected_desktop(monkeypatch, tmp_path):
+    """Re-review residual (item 4): SHGetKnownFolderPath is the source of
+    truth, not a %USERPROFILE%\\Desktop name guess -- a OneDrive-
+    redirected Desktop (a real folder elsewhere on disk) must still be
+    caught."""
+    onedrive_desktop = tmp_path / "OneDrive" / "Desktop"
+    onedrive_desktop.mkdir(parents=True)
+
+    def _fake_sh(name):
+        return str(onedrive_desktop) if name == "Desktop" else None
+
+    monkeypatch.setattr(dw, "_sh_get_known_folder_path", _fake_sh)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+
+    assert dw.is_known_user_folder(str(onedrive_desktop)) is True
+    assert dw.is_known_user_folder(str(onedrive_desktop) + "-not-it") is False
+
+
+@_WINDOWS_ONLY
+def test_is_known_user_folder_case_insensitive(monkeypatch, tmp_path):
+    """Re-review residual (item 4): comparison is case-insensitive on
+    normalized real paths."""
+    folder = tmp_path / "Pics"
+    folder.mkdir()
+
+    def _fake_sh(name):
+        return str(folder) if name == "Pictures" else None
+
+    monkeypatch.setattr(dw, "_sh_get_known_folder_path", _fake_sh)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+
+    assert dw.is_known_user_folder(str(folder).upper()) is True
+    assert dw.is_known_user_folder(str(folder).lower()) is True
+
+
+@_WINDOWS_ONLY
+def test_is_known_user_folder_falls_back_to_userprofile_heuristic(monkeypatch, tmp_path):
+    """Re-review residual (item 4): when SHGetKnownFolderPath fails for a
+    given folder, the %USERPROFILE%\\<name> heuristic still catches it."""
+    fake_home = tmp_path / "home"
+    fake_docs = fake_home / "Documents"
+    fake_docs.mkdir(parents=True)
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setattr(dw, "_sh_get_known_folder_path", lambda name: None)
+
+    assert dw.is_known_user_folder(str(fake_docs)) is True
+    assert dw.is_known_user_folder(str(fake_home)) is True
+    assert dw.is_known_user_folder(str(fake_home / "not-a-known-folder")) is False
+
+
+@_WINDOWS_ONLY
+def test_spawn_grants_frozen_exe_file_without_inheritance(monkeypatch, tmp_path):
+    """P2 finding "frozen grant scope": the frozen exe's OWN FILE gets a
+    NO_INHERITANCE grant (never the exe's directory, and never
+    inheritable) while sys._MEIPASS gets the recursive default."""
+    fake_dir = tmp_path / "install"
+    fake_internal = fake_dir / "_internal"
+    fake_internal.mkdir(parents=True)
+    fake_exe = fake_dir / "fauxcasa.exe"
+    fake_exe.write_bytes(b"")
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(fake_internal), raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    seen = []
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda path, sid, inherit=dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT:
+                         seen.append((path, inherit)) or None)
+
+    def _boom_winsta(sid):
+        raise RuntimeError("stop before an actual CreateProcess (test scope)")
+
+    monkeypatch.setattr(dw, "grant_winsta_desktop", _boom_winsta)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    with pytest.raises(RuntimeError, match="stop before"):
+        worker.spawn()
+    paths = dict(seen)
+    # meipass is used as-is (no .resolve() in spawn()); the exe path IS
+    # resolved (matches Path(sys.executable).resolve() in spawn()).
+    assert paths[str(fake_internal)] == dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    assert paths[str(fake_exe.resolve())] == dw.NO_INHERITANCE
+
+
+@_WINDOWS_ONLY
+def test_spawn_survives_denied_acl_grant(monkeypatch, synthetic_png):
+    """P1 finding: a grant failure on a directory the container can
+    already read (e.g. a Program-Files-class install) must not block
+    spawn() -- the hello handshake is the real readability proof. Forces
+    EVERY grant_read_execute_once call to report a (fake) failure and
+    confirms a real worker still spawns, hellos, and decodes."""
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda path, sid, inherit=None: "simulated denial (access already exists)")
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    worker.spawn()
+    try:
+        assert worker.grant_errors, "expected grant_errors to be populated"
+        result = worker.decode(synthetic_png)
+        assert result.source_w == 2
+        assert result.source_h == 2
+    finally:
+        worker.close()
+
+
+class _FakeWinDecodePool:
+    """Stand-in for decodesvc_win.WinDecodePool used to test DecodePoolSet's
+    lease/borrow semantics WITHOUT spawning any real worker -- runs on
+    every platform (DecodePoolSet composition itself is not Windows-only;
+    only a real WinSandboxWorker.spawn() is)."""
+
+    def __init__(self, arena_bytes=0, **kw):
+        self.arena_bytes = arena_bytes
+        self.spawned = False
+        self.closed = False
+
+    def _ensure_worker(self):
+        self.spawned = True
+        return self
+
+    def close(self):
+        self.closed = True
+
+
+def _make_pool_set(n_batch: int, monkeypatch, fail_indices: frozenset[int] = frozenset()):
+    """A DecodePoolSet whose batch/interactive members are _FakeWinDecodePool
+    instances (via monkeypatched WinDecodePool), with a job_lock stand-in
+    since warm() takes pool._job_lock."""
+    import threading as _threading
+
+    monkeypatch.setattr(dw, "WinDecodePool", _FakeWinDecodePool)
+    pool_set = dw.DecodePoolSet(n_batch=n_batch)
+    for p in list(pool_set._batch) + [pool_set._interactive]:
+        p._job_lock = _threading.Lock()
+    return pool_set
+
+
+def test_decodepoolset_batch_lease_never_takes_interactive(monkeypatch):
+    pool_set = _make_pool_set(2, monkeypatch)
+    a = pool_set.lease("batch", timeout=1)
+    b = pool_set.lease("batch", timeout=1)
+    assert a is not b
+    assert a is not pool_set._interactive
+    assert b is not pool_set._interactive
+    with pytest.raises(Exception):
+        # batch pool exhausted (2 leased, none free) -- must NOT silently
+        # hand back the interactive instance.
+        pool_set._batch_free.get_nowait()
+
+
+def test_decodepoolset_interactive_lease_prefers_reserved_instance(monkeypatch):
+    pool_set = _make_pool_set(2, monkeypatch)
+    leased = pool_set.lease("interactive", timeout=1)
+    assert leased is pool_set._interactive
+
+
+def test_decodepoolset_interactive_lease_never_borrows_batch_member(monkeypatch):
+    """P2 finding "arena lanes": an interactive (edge=0, full-resolution)
+    lease must never borrow an 8 MiB batch member -- decoding full-res
+    into that arena fails TOO_LARGE. Forbidding cross-lane borrowing
+    means a lease() call while the reserved instance is busy blocks/times
+    out instead of silently handing back a too-small batch member."""
+    pool_set = _make_pool_set(1, monkeypatch)
+    held_interactive = pool_set.lease("interactive", timeout=1)  # takes the reserved one
+    assert held_interactive is pool_set._interactive
+    with pytest.raises(queue.Empty):
+        pool_set.lease("interactive", timeout=0.2)
+    assert pool_set._batch_free.qsize() == 1, "the idle batch member must stay untouched"
+
+
+def test_decodepoolset_release_returns_to_correct_free_queue(monkeypatch):
+    pool_set = _make_pool_set(1, monkeypatch)
+    b = pool_set.lease("batch", timeout=1)
+    pool_set.release(b)
+    assert pool_set._batch_free.get_nowait() is b
+    i = pool_set.lease("interactive", timeout=1)
+    pool_set.release(i)
+    assert pool_set._interactive_free.get_nowait() is i
+
+
+def test_decodepoolset_release_ignores_double_release(monkeypatch, caplog):
+    """P3 finding: a double release() (or releasing a member not
+    currently leased) must not silently re-add a duplicate to the free
+    queue -- validated via an in-use set, logged, and ignored."""
+    pool_set = _make_pool_set(1, monkeypatch)
+    b = pool_set.lease("batch", timeout=1)
+    pool_set.release(b)
+    assert pool_set._batch_free.qsize() == 1
+    pool_set.release(b)  # double release -- must be ignored, not duplicated
+    assert pool_set._batch_free.qsize() == 1
+
+
+def test_decodepoolset_warm_spawns_every_member(monkeypatch):
+    pool_set = _make_pool_set(3, monkeypatch)
+    surviving = pool_set.warm()
+    assert surviving == 3
+    for p in pool_set._batch:
+        assert p.spawned
+    assert pool_set._interactive.spawned
+
+
+def test_decodepoolset_warm_drops_failing_batch_member(monkeypatch):
+    import threading as _threading
+
+    monkeypatch.setattr(dw, "WinDecodePool", _FakeWinDecodePool)
+    pool_set = dw.DecodePoolSet(n_batch=3)
+    members = list(pool_set._batch) + [pool_set._interactive]
+    for p in members:
+        p._job_lock = _threading.Lock()
+    # Make the SECOND batch member's spawn fail (commitment-limit style).
+    failing = pool_set._batch[1]
+
+    def _boom():
+        raise RuntimeError("ERROR_COMMITMENT_LIMIT (simulated)")
+
+    failing._ensure_worker = _boom
+    surviving = pool_set.warm()
+    assert surviving == 2
+    assert failing not in pool_set._batch
+    assert pool_set._interactive.spawned
+
+
+def test_decodepoolset_warm_reraises_interactive_failure(monkeypatch):
+    import threading as _threading
+
+    monkeypatch.setattr(dw, "WinDecodePool", _FakeWinDecodePool)
+    pool_set = dw.DecodePoolSet(n_batch=2)
+    for p in list(pool_set._batch):
+        p._job_lock = _threading.Lock()
+    pool_set._interactive._job_lock = _threading.Lock()
+
+    def _boom():
+        raise RuntimeError("interactive spawn failed (simulated)")
+
+    pool_set._interactive._ensure_worker = _boom
+    with pytest.raises(RuntimeError, match="interactive spawn failed"):
+        pool_set.warm()
+    # Batch members should still have been attempted/spawned.
+    assert all(p.spawned for p in pool_set._batch)
+
+
+def test_decodepoolset_close_closes_every_member(monkeypatch):
+    pool_set = _make_pool_set(2, monkeypatch)
+    members = list(pool_set._batch) + [pool_set._interactive]
+    pool_set.close()
+    assert all(p.closed for p in members)
+
+
+@_WINDOWS_ONLY
+def test_decodepoolset_real_lease_two_batch_one_interactive_decode(synthetic_png):
+    """One REAL end-to-end test (no fakes): two batch WinDecodePool
+    instances (8 MiB arenas) + one interactive instance (256 MiB), each
+    leased and used to decode a synthetic JPEG/PNG through decode()."""
+    pool_set = dw.DecodePoolSet(n_batch=2)
+    try:
+        b1 = pool_set.lease("batch", timeout=30)
+        b2 = pool_set.lease("batch", timeout=30)
+        interactive = pool_set.lease("interactive", timeout=30)
+        try:
+            for pool in (b1, b2, interactive):
+                result = pool.decode(synthetic_png)
+                assert result.source_w == 2
+                assert result.source_h == 2
+        finally:
+            pool_set.release(b1)
+            pool_set.release(b2)
+            pool_set.release(interactive)
+    finally:
+        pool_set.close()
 
 
 if __name__ == "__main__":

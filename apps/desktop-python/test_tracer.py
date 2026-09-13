@@ -38,6 +38,26 @@ from catalog import (
 REPO = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _pin_decode_sandbox_off():
+    """fauxcasa-ez2.9 Stage 1: decodefacade.sandbox_mode() already
+    defaults to "0" whenever "pytest" is in sys.modules, but this pins
+    FAUXCASA_DECODE_SANDBOX=0 explicitly (belt-and-suspenders, per the
+    lens plan) for the whole session -- this suite calls build_cache
+    ~86 times and load_original ~29 times; once Stage 2 wires those call
+    sites onto decodefacade, spawning a real AppContainer worker per call
+    would blow tracer.yml's 15-minute timeout and cannot run at all on
+    Linux CI. Restores whatever was there before (normally unset) on
+    teardown."""
+    prev = os.environ.get("FAUXCASA_DECODE_SANDBOX")
+    os.environ["FAUXCASA_DECODE_SANDBOX"] = "0"
+    yield
+    if prev is None:
+        os.environ.pop("FAUXCASA_DECODE_SANDBOX", None)
+    else:
+        os.environ["FAUXCASA_DECODE_SANDBOX"] = prev
+
+
 @pytest.fixture(autouse=True)
 def _isolate_qt_per_test():
     """Per-test Qt isolation. Two things otherwise accumulate across the whole
@@ -11487,6 +11507,13 @@ def test_menu_bar_has_file_view_help_reusing_toolbar_actions(
     menus = {m.title().replace("&", ""): m
             for m in win.menuBar().findChildren(QMenu)}
     assert {"File", "View", "Help", "Tools"} <= set(menus)
+
+    # fauxcasa-ez2.9: reading order in the bar itself -- File, View,
+    # Tools, Help (Tools is created first in __init__, v46.4, so without
+    # the ez2.9 reposition it lands leftmost instead).
+    bar_order = [a.menu().title().replace("&", "")
+                 for a in win.menuBar().actions() if a.menu() is not None]
+    assert bar_order == ["File", "View", "Tools", "Help"], bar_order
 
     file_actions = menus["File"].actions()
     assert win.open_action in file_actions        # reused, not duplicated
