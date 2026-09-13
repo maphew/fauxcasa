@@ -263,6 +263,71 @@ def test_viewer_parity_sandboxed_vs_in_process(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# ensure_started() ordering (fauxcasa-ez2.9 Stage 2 review P2-7):
+# decode_svc.ensure_started() must run BEFORE MainWindow(...) is
+# constructed -- MainWindow.__init__ can start background indexing
+# (_start_reconcile on a warm start with drift) that reaches
+# thumbcache.build_cache -> _index_one's STATE_SANDBOXED check. Left
+# after window construction, those threads could start and finish on
+# the STATE_IN_PROCESS default before ensure_started() ever ran.
+
+@_WINDOWS_ONLY
+def test_ensure_started_runs_before_mainwindow_reaches_build_cache(
+        tmp_path, monkeypatch):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    QApplication.instance() or QApplication([])
+
+    root = tmp_path / "lib"
+    _make_jpeg(root / "a.jpg")
+    cache_root = tmp_path / "cr"
+
+    # First run: sandbox off (fast) -- just needs to produce the
+    # persisted catalog + per-root cache the second run's WARM start
+    # (and its _start_reconcile) requires.
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "0")
+    df.reset_service()
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa", str(root), "--cache-root", str(cache_root),
+        "--finish-build", "--quit-after-ready", "--timeout", "30"])
+    assert main.main() == 0
+
+    # Drift since the cache was built: the next (warm) launch's
+    # _start_reconcile() detects it and calls build_cache from a
+    # background thread started inside MainWindow.__init__.
+    _make_jpeg(root / "b.jpg")
+
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+    df.reset_service()
+
+    observed_states: list[str] = []
+    orig_build_cache = main.build_cache
+
+    def spy_build_cache(*a, **kw):
+        import decodefacade
+        observed_states.append(decodefacade.get_service().state)
+        return orig_build_cache(*a, **kw)
+
+    monkeypatch.setattr(main, "build_cache", spy_build_cache)
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa", str(root), "--cache-root", str(cache_root),
+        "--finish-build", "--quit-after-ready", "--timeout", "30"])
+    assert main.main() == 0
+
+    assert observed_states, (
+        "reconcile's build_cache never ran -- drift wasn't detected; "
+        "this is a test-setup problem, not the ordering fix")
+    assert all(s == df.STATE_SANDBOXED for s in observed_states), (
+        f"build_cache observed {observed_states!r} -- ensure_started() "
+        f"must complete before MainWindow() is constructed so the state "
+        f"is already final by the time any background indexing thread "
+        f"can reach build_cache")
+
+
+# ---------------------------------------------------------------------------
 # PSD pre-route (fauxcasa-ez2.9 Stage 2 review P1-1): Qt ships no PSD
 # plugin at all, so with the sandbox ON, .psd must still be pre-routed to
 # pillow_qimage ahead of the sandboxed branch -- otherwise the worker's
