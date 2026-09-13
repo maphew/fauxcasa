@@ -78,3 +78,39 @@ Criteria 2–8 are a few days of mechanical work with CI as the net. The only
 scheduling constraint worth stating: do the rename (2) and README flip (5)
 in the same PR, so no commit range exists where the code lives in a product
 home while calling itself an experiment, or vice versa.
+
+## Amendment — 2026-09-13
+
+Fauxcasa 0.1.0 ships from `apps/desktop-python/` — the tracer stops being
+disposable evidence at this release, but the directory does not move yet.
+Status against the gate checklist:
+
+- **Item 1 (M1 gate green).** Clause 1 (N4 budgets on the 100k synthetic
+  library) is mostly green; min-zoom scrolling on high-DPI displays remains
+  over budget (`fauxcasa-q6l.27`). Clause 2 (survey cross-check, zero
+  ingest loss on synthetic corpora) is green in CI. Clause 3 (owner
+  confirmation on the family archive) has not yet been recorded — see
+  `docs/m1-gate-confirmation.md` (`fauxcasa-6g8`).
+- **Item 3 (APP_NAME honored everywhere)** — done for 0.1 (fauxcasa-ez2's
+  identity work: window titles, cache directory names, config keys,
+  bundle/installer names, CI artifact names, and `fauxcasa-tracer.spec` all
+  derive from `APP_NAME`/the release identity constants; nothing left
+  hard-coding "tracer").
+- **Item 5 (README flip)** — done for 0.1. `apps/desktop-python/README.md`'s
+  "Status: experiment… evidence, not yet the application" paragraph is
+  replaced with product framing, and the "Deliberate tracer shortcuts"
+  section is now "Known simplifications (tracked)", each item tagged with
+  its bead or `product-accepted`.
+- **Items 2 (rename out of `apps/desktop-python/`), 4 (`tr()` i18n
+  externalization pass), 6 (CI rename), and 7 (test suite carried whole)**
+  — deferred to the 0.2 promotion PR. Nothing in 0.1 depends on them.
+
+**Waiver of the same-PR rule (Sequencing note, above).** That rule ties the
+rename (item 2) and the README flip (item 5) to one PR, so no commit range
+calls the code an experiment while it lives in a product home, or vice
+versa. For 0.1, item 5 lands **without** item 2: the README flip here is a
+release-notes truth requirement (0.1.0 ships and must not describe itself
+as "not yet the application"), not a code-home statement — the code still
+lives in `apps/desktop-python/`, and the README says so. The rule is waived
+for this one case; it resumes governing the eventual 0.2 rename + any
+further README changes tied to it.
