@@ -12,6 +12,16 @@ the call-site-facing shape from docs/design/decode-service.md sec 5:
     svc.index(path, top, crop=None, orientation=1, route="still") -> QImage
     svc.poster(path, edge=512)                                 -> QImage
 
+DecodeService.decode() is ALWAYS display-upright for route="still",
+regardless of which transport served it (fauxcasa-ez2.9 Stage 2 review
+P2-2): WinSandboxTransport's worker applies EXIF autoTransform itself
+(decodesvc_worker_win.py); InProcessTransport applies inmeta.
+apply_orientation to its QImage.fromData decode (its pillow_qimage
+fallback applies its own exif_transpose). Callers that need the
+orientation value for crop/face math read it separately via
+metareader.read_orientation(data) and must NOT re-apply it to the
+returned QImage.
+
 Every call returns a null QImage on ANY failure (open error, decode
 error, sandbox unavailable) so callers keep their existing fail-soft
 shape -- exactly like today's rawload/videoload/pillowload/QImageReader
@@ -133,6 +143,22 @@ class InProcessTransport(Transport):
                 img = pillow_qimage(data)
             else:  # "still" (default) -- QImageReader-class formats first
                 img = QImage.fromData(data)
+                if not img.isNull():
+                    # Orientation parity (fauxcasa-ez2.9 Stage 2 review
+                    # P2-2): WinSandboxTransport's worker applies EXIF
+                    # autoTransform itself (decodesvc_worker_win.py), so
+                    # this branch must apply it too -- DecodeService.
+                    # decode() is documented as ALWAYS display-upright,
+                    # and both call sites (thumbcache._index_one, viewer.
+                    # load_original_oriented) skip their own manual
+                    # orientation step on the sandboxed branch. Mirrors
+                    # viewer.load_original_oriented's own QImage.fromData
+                    # branch. The pillow_qimage fallback below already
+                    # applies orientation itself (exif_transpose) -- never
+                    # composed with this.
+                    from inmeta import apply_orientation
+                    from metareader import read_orientation
+                    img = apply_orientation(img, read_orientation(data))
                 if img.isNull():
                     from pillowload import pillow_qimage
                     img = pillow_qimage(data)

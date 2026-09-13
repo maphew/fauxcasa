@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import queue
+import struct
 import sys
 from pathlib import Path
 
@@ -41,6 +42,36 @@ def synthetic_png(tmp_path: Path) -> Path:
     p = tmp_path / "synthetic_2x2_red.png"
     p.write_bytes(SYNTHETIC_PNG_2X2_RED)
     return p
+
+
+def _make_oriented_jpeg(path: Path, w: int = 64, h: int = 32,
+                        orientation: int = 6) -> Path:
+    """A synthetic JPEG carrying an EXIF Orientation tag -- same
+    construction as test_sandbox_e2e.py's _make_jpeg (not imported: this
+    file stays a self-contained script). Used for the P2-2 orientation-
+    parity test: both DecodeService transports must return the SAME
+    display-upright dims for an orientation-6 source."""
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QColor, QImage
+
+    img = QImage(w, h, QImage.Format.Format_RGB32)
+    img.fill(QColor(120, 160, 200))
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert img.save(buf, "JPEG", 90)
+    data = bytes(buf.data())
+    assert data[:2] == b"\xff\xd8"
+    tiff = b"II" + struct.pack("<H", 42) + struct.pack("<I", 8)
+    ifd = (struct.pack("<H", 1)
+           + struct.pack("<HHI", 0x0112, 3, 1)
+           + struct.pack("<HH", orientation, 0)
+           + struct.pack("<I", 0))
+    payload = b"Exif\x00\x00" + tiff + ifd
+    seg = bytes([0xFF, 0xE1]) + struct.pack(">H", len(payload) + 2) + payload
+    data = data[:2] + seg + data[2:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
 
 
 @pytest.fixture(autouse=True)
@@ -458,6 +489,47 @@ def test_decode_real_sandbox_still(monkeypatch, synthetic_png):
     assert svc.state == df.STATE_SANDBOXED
     assert not img.isNull()
     assert img.width() == 2 and img.height() == 2
+
+
+def test_decode_in_process_applies_orientation(monkeypatch, tmp_path):
+    """fauxcasa-ez2.9 Stage 2 review P2-2: InProcessTransport's
+    QImage.fromData branch must apply EXIF orientation itself --
+    DecodeService.decode() is documented as ALWAYS display-upright, and
+    both wired call sites (thumbcache._index_one, viewer.
+    load_original_oriented) skip their own manual apply_orientation()
+    step on the sandboxed branch, trusting the facade to have already
+    oriented the image on every transport."""
+    p = _make_oriented_jpeg(tmp_path / "rotated.jpg", w=64, h=32, orientation=6)
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "0")
+    svc = df.get_service()
+    img = svc.decode(str(p), route="still", edge=0)
+    assert not img.isNull()
+    assert (img.width(), img.height()) == (32, 64), (
+        "orientation=6 on a 64x32 source must decode display-upright (32x64)")
+
+
+@_WINDOWS_ONLY
+def test_decode_orientation_parity_sandboxed_vs_in_process(monkeypatch, tmp_path):
+    """fauxcasa-ez2.9 Stage 2 review P2-2: both transports must agree on
+    orientation. Before the fix, InProcessTransport returned 64x32
+    (sideways) for this file while WinSandboxTransport returned 32x64
+    (upright) -- a concurrent mid-session degrade could hand a caller a
+    sideways image with no way to tell."""
+    p = _make_oriented_jpeg(tmp_path / "rotated.jpg", w=64, h=32, orientation=6)
+
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "0")
+    df.reset_service()
+    img0 = df.get_service().decode(str(p), route="still", edge=0)
+
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+    df.reset_service()
+    svc1 = df.get_service()
+    img1 = svc1.decode(str(p), route="still", edge=0)
+    assert svc1.state == df.STATE_SANDBOXED, f"sandbox failed: {svc1.reason}"
+
+    assert not img0.isNull() and not img1.isNull()
+    assert (img0.width(), img0.height()) == (32, 64)
+    assert (img1.width(), img1.height()) == (32, 64)
 
 
 @_WINDOWS_ONLY
