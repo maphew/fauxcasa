@@ -1,0 +1,90 @@
+# Changelog
+
+All notable user-facing changes to Fauxcasa are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Fauxcasa is pre-1.0 preview software; version numbers below refer to
+GitHub release tags, not a semantic-versioning contract.
+
+## [Unreleased]
+
+Changes since the `tracer-test-v1` preview (2026-08-10, commit `553d31a`).
+
+### Added
+
+- Video playback with audio, via a sandboxed PyAV streaming seam (PR 99,
+  fauxcasa-v46.3).
+- Info panel: a photo metadata inspector showing EXIF/IPTC/XMP and catalog
+  fields for the selected photo (PR 95, fauxcasa-q6l.25).
+- Non-blocking first run: the window appears immediately and the initial
+  library walk continues in the background instead of blocking startup
+  (PR 108, fauxcasa-q6l.13).
+- Flat/tree folder view toggle in the sidebar, with path-on-demand tooltips
+  (PR 105, fauxcasa-q6l.10).
+- Folder descriptions surfaced in sidebar tooltips across all four folder
+  display shapes (PR 106, fauxcasa-cam.14).
+- Catalog files are now written as a zstd-compressed store instead of
+  grouped JSON, keeping the on-disk catalog within its size budget
+  (PR 98, fauxcasa-ed5.5).
+- Windows AppContainer decode pool: a sandboxed worker/broker transport for
+  original-media decoding, with escape-resistance gates
+  (`apps/desktop-python/test_decodesvc_win.py`), deadline enforcement, and
+  a `TIMEOUT` taxonomy (PRs 110, 111, 113, fauxcasa-i92.3.x). This is
+  CI-gated and validated but **not yet wired into the running app** — the
+  desktop UI does not use the sandboxed pool for decoding yet.
+- Application icon: a wordless "lens horizon" photo-mark icon, wired into
+  the taskbar, window chrome, and the PyInstaller build, plus Windows
+  AppUserModelID identity (PR 114, fauxcasa-ez2.2).
+- `scripts/daily-report.py`: a one-shot repo status/health report
+  (PR 112).
+
+### Changed
+
+- Windows 4K min-zoom: a scaled-paint cache and byte-budgeted "want band"
+  reduce min-zoom cost at 4K; re-measured as an improvement, not a full
+  close of the underlying performance bead (PRs 100, 109,
+  fauxcasa-q6l.14 / q6l.26).
+- Catalog gained ini/contacts freshness signatures and a new
+  `CATALOG_VERSION` (14), so stale sidecar data is detected and refreshed
+  (PR 107, fauxcasa-cam.14).
+
+### Fixed
+
+Seven post-merge findings from earlier Codex reviews, all user-visible in
+the shipped preview (PR 115, fauxcasa-ez2.1; **pending merge** at the time
+of writing):
+
+- Unstarring a photo inside the Starred view now re-materializes the grid
+  instead of leaving it stale.
+- Star and sort state (`stars.json`, per-library `config.json`) now live in
+  a variant-free per-library state directory, so changing File Types or
+  scan-size settings no longer hides existing stars.
+- A `stars.json` file with a non-list `stars` field no longer raises at
+  startup.
+- The gallery action stays visible after a reconcile swap leaves the
+  viewer.
+- The activity spinner now stops on terminal reconcile notices (offline
+  root unchanged, adopt/multiroot drift) instead of spinning forever.
+- The Info panel is re-derived after an in-place cold build or adopt-mode
+  backfill finishes, instead of showing stale metadata.
+- Inspector and status-bar labels render as plain text, and sidebar/
+  import-note tooltips escape catalog strings explicitly, avoiding
+  accidental rich-text interpretation of captions or paths.
+
+## [tracer-test-v1] - 2026-08-10
+
+Read-only friend preview for Windows 10/11 x64. See the [release
+notes](https://github.com/maphew/fauxcasa/releases/tag/tracer-test-v1) for
+full scope. Scans a photo library in place; writes only a rebuildable
+catalog and thumbnail cache. Video files show poster images but did not
+play yet. Original-media decoding was not sandboxed.
+
+## [tracer-test-v0] - 2026-06-15
+
+Earlier Windows tracer preview build. See the [release
+notes](https://github.com/maphew/fauxcasa/releases/tag/tracer-test-v0) for
+scope at that time.
+
+[Unreleased]: https://github.com/maphew/fauxcasa/compare/tracer-test-v1...HEAD
+[tracer-test-v1]: https://github.com/maphew/fauxcasa/releases/tag/tracer-test-v1
+[tracer-test-v0]: https://github.com/maphew/fauxcasa/releases/tag/tracer-test-v0
