@@ -69,11 +69,12 @@ commit under test, or build locally with the command at the top of
 `apps/desktop-python/fauxcasa-tracer.spec`.
 
 ```
-dist\fauxcasa-tracer-gui\fauxcasa-tracer-gui.exe X:\archive-copy\library
+dist\fauxcasa\fauxcasa.exe X:\archive-copy\library
 ```
 
-The frozen app writes its own disposable cache under `%XDG_CACHE_HOME%` or
-`~\.cache\fauxcasa-tracer` — never into the library. Confirm, by browsing:
+The frozen Windows app writes its disposable cache under
+`%LOCALAPPDATA%\Fauxcasa\cache` (other platforms use `$XDG_CACHE_HOME/fauxcasa`
+or `~/.cache/fauxcasa`) — never into the library. Confirm, by browsing:
 
 - [ ] app starts and the grid populates over the full archive
 - [ ] folder tree, albums, starred view, and faces/people all present

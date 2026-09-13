@@ -1,3 +1,4 @@
+# Historical filename: this is the PyInstaller spec for Fauxcasa.
 # PyInstaller spec for the tracer bullet app (fauxcasa-ncv: M1 Windows
 # packaging spike). A real distributable bundle so the Windows CI gates run
 # on "the artifact users would get", not on source. Decided per the
@@ -24,10 +25,10 @@
 #     directly fails §7's cold-start anchor.
 #   * TWO variants from one Analysis (fauxcasa-pqw) — one analysis/PYZ, an
 #     extra cheap COLLECT copy, no second pyinstaller run:
-#       - dist/fauxcasa-tracer/      console=True  — the CI/smoke build. It
+#       - dist/fauxcasa-console/     console=True  — the CI/smoke build. It
 #         prints READY/JSON to stdout (the offscreen headless gate parses it)
 #         and its stderr carries the diagnostics bundle.yml greps.
-#       - dist/fauxcasa-tracer-gui/  console=False — the shipping, double-
+#       - dist/fauxcasa/             console=False — the shipping, double-
 #         clickable build: no black console window. A windowed PyInstaller
 #         process has sys.stdout/sys.stderr == None, so the §7 stdout prints
 #         become harmless no-ops and the human diagnostics + Qt messages +
@@ -47,6 +48,7 @@
 #     decompression (hurts cold start).
 
 import os
+import sys
 
 # Paths are resolved relative to this spec file (SPECPATH =
 # apps/desktop-python), so the build works regardless of the CWD
@@ -139,6 +141,7 @@ _other_excludes = ["PyQt5", "PyQt6", "PySide2",
 # ships the generic PyInstaller glyph again.
 _assets = os.path.join(_here, "assets")
 _icon_ico = os.path.join(_assets, "icon.ico")
+_version_info = os.path.join(_here, "version_info.txt")
 _icon_datas = [os.path.join(_assets, "icon.svg")] + [
     os.path.join(_assets, "icon.png" if px == 256 else f"icon-{px}.png")
     for px in (16, 32, 48, 64, 128, 256)]  # == main.ICON_SIZES
@@ -216,18 +219,19 @@ _exe_common = dict(
     upx=False,
     icon=_icon_ico,          # Explorer/taskbar-pin icon, both variants
 )
+_version_kwargs = {"version": _version_info} if sys.platform == "win32" else {}
 
 exe_console = EXE(
     pyz, a.scripts, [],
-    name="fauxcasa-tracer",
+    name="fauxcasa-console",
     console=True,            # CI/smoke: READY/JSON on stdout, diagnostics on stderr
-    **_exe_common,
+    **_exe_common, **_version_kwargs,
 )
 exe_gui = EXE(
     pyz, a.scripts, [],
-    name="fauxcasa-tracer-gui",
+    name="fauxcasa",
     console=False,           # shipping double-click: no console window
-    **_exe_common,
+    **_exe_common, **_version_kwargs,
 )
 
 # One COLLECT (onedir tree) per variant. a.binaries/a.datas are shared, so
@@ -235,10 +239,10 @@ exe_gui = EXE(
 coll_console = COLLECT(
     exe_console, a.binaries, a.datas,
     strip=False, upx=False,
-    name="fauxcasa-tracer",
+    name="fauxcasa-console",
 )
 coll_gui = COLLECT(
     exe_gui, a.binaries, a.datas,
     strip=False, upx=False,
-    name="fauxcasa-tracer-gui",
+    name="fauxcasa",
 )

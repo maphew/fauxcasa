@@ -14,7 +14,7 @@ A read-only preview for Windows 10/11 x64 is available for trusted testers:
    [`fauxcasa-tracer-tracer-test-v1-windows-x64.zip`](https://github.com/maphew/fauxcasa/releases/download/tracer-test-v1/fauxcasa-tracer-tracer-test-v1-windows-x64.zip).
 2. Use **Extract All**. The app is not a one-file executable; keep the
    extracted folder together.
-3. Open `fauxcasa-tracer-gui` and run `fauxcasa-tracer-gui.exe`.
+3. Open `fauxcasa` and run `fauxcasa.exe`.
 4. Choose the top-level folder containing the photos you want to browse.
 
 The preview scans photos in place but does **not** modify photos, Picasa
@@ -68,13 +68,16 @@ only its own rebuildable catalog and thumbnail cache.
 
 By default, that cache is stored outside the photo library:
 
-- Source checkout: `cache/tracer-cache/<library-digest>/`
-- Frozen app build: `$XDG_CACHE_HOME/fauxcasa-tracer/`, or
-  `~/.cache/fauxcasa-tracer/` when `XDG_CACHE_HOME` is not set
+- Source checkout: `cache/fauxcasa-cache/<library-digest>/`
+- Frozen Windows build: `%LOCALAPPDATA%\\Fauxcasa\\cache/`
+- Frozen other builds: `$XDG_CACHE_HOME/fauxcasa/`, or `~/.cache/fauxcasa/`
+  when `XDG_CACHE_HOME` is not set
 
 Pass `--cache-root <path>` to choose a different cache location. The per-library
 cache currently contains files such as `catalog.json`, `thumbs.fcache`, and
 `thumbs.fcache.json`.
+The old preview cache `~/.cache/fauxcasa-tracer` is no longer read and can be
+deleted.
 
 Existing Picasa sidecar files are read today. The prototype reads
 `.picasa.ini`, `Picasa.ini`, and `picasa.ini` files for stars, captions,
