@@ -15577,3 +15577,52 @@ def test_offline_only_reconcile_leaves_no_spinner_running(
     assert "offline, skipped: Archive" in win.progress_label.text()
     assert win.activity_row.isHidden()        # the spinner never started
     win.shutdown()
+
+
+def test_inspector_rederives_after_in_place_cold_build(
+        library: Path, tmp_path: Path) -> None:
+    """Finding 6: the cold-build branch of _on_index_finished merges
+    in-file metadata into the SAME Photo objects, so no selection signal
+    follows and an open panel would keep rendering the pre-build values."""
+    from main import MainWindow
+
+    _offscreen_app()
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.info_action.setChecked(True)
+    idx = next(i for i, p in enumerate(cat.photos)
+               if p.rel.endswith("Trip/a.jpg"))
+    win.grid._select(idx)
+    assert "the beach" in _inspector_text(win.inspector)
+
+    # What the cold build does: merge in-file metadata into the LIVE Photo
+    # objects, then report through the same-catalog branch.
+    result = thumbcache.build_cache(cat, tmp_path / "build")
+    cat.photos[idx].caption = "in-file caption wins"
+    win._on_index_finished(result, cat, False)
+
+    text = _inspector_text(win.inspector)
+    assert "in-file caption wins" in text
+    assert "the beach" not in text
+
+
+def test_inspector_rederives_after_metadata_backfill(library: Path) -> None:
+    """Finding 6, the adopt-mode twin: backfill_catalog mutates the bound
+    catalog in place, so _on_backfill_done must refresh an open panel."""
+    from main import MainWindow
+
+    _offscreen_app()
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None, adopt=True)
+    win.info_action.setChecked(True)
+    idx = next(i for i, p in enumerate(cat.photos)
+               if p.rel.endswith("Trip/a.jpg"))
+    win.grid._select(idx)
+    assert "the beach" in _inspector_text(win.inspector)
+
+    cat.photos[idx].caption = "backfilled caption"
+    win._on_backfill_done(True)
+
+    text = _inspector_text(win.inspector)
+    assert "backfilled caption" in text
+    assert "the beach" not in text

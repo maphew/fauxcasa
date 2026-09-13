@@ -1895,6 +1895,11 @@ class MainWindow(QMainWindow):
             self._apply_view(kind, key)   # the collection just populated
         self.grid.viewport().update()     # star badges may have changed
         self._update_import_notes()       # infile_override entries landed
+        if self.info_action.isChecked():
+            # Same-object mutation, so nothing re-emits a selection: the
+            # open panel would keep rendering the pre-backfill values for
+            # the photo the user is looking at (fauxcasa-6vk finding 6).
+            self._toggle_inspector(True)   # re-derives from the selection
         self.statusBar().showMessage("metadata backfill complete", 8000)
         if self._reconcile_after_backfill:
             self._reconcile_after_backfill = False
@@ -1980,6 +1985,12 @@ class MainWindow(QMainWindow):
             # Photo objects in place — the prebuilt haystacks are stale.
             self._rebuild_search_index()
             self._update_import_notes()  # the cold build collected a fresh report
+            if self.info_action.isChecked():
+                # The build merged in-file metadata into these SAME Photo
+                # objects; no selection signal follows, so an open panel
+                # would still show the pre-build values (fauxcasa-6vk
+                # finding 6). reload_data does this for the other branch.
+                self._toggle_inspector(True)
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
         self.statusBar().showMessage(
