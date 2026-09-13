@@ -2992,6 +2992,7 @@ class MainWindow(QMainWindow):
         self.viewer.update()
         self.tray.update()
         self._refresh_star_count()
+        self._resync_starred_view()
         if self.pages.currentWidget() is self.viewer:
             self._photo_selected(self.viewer.current_index())
         elif len(self.grid.selection) > 1:
@@ -3002,6 +3003,36 @@ class MainWindow(QMainWindow):
             self._selection_changed(self.grid.selection)
         else:
             self._photo_selected(self.grid.current)
+
+    def _resync_starred_view(self) -> None:
+        """Re-materialize the Starred view after a star change made from
+        INSIDE it (fauxcasa-6vk finding 1). `set_filter` snapshots the
+        matching catalog indices, so an unstarred photo otherwise keeps
+        its tile — and its slot in `display` — until the next view switch,
+        contradicting the sidebar count `_refresh_star_count` just updated.
+
+        Grid page only. The VIEWER's display list is deliberately frozen
+        for the duration of a navigation session (a photo unstarred while
+        viewing must stay reachable with Left/Right), and an active search
+        owns the display set, so neither is re-derived here."""
+        if self.pages.currentWidget() is self.viewer:
+            return
+        if self._selected_view()[0] != "starred":
+            return
+        if self.search.text().strip():
+            return
+        keep = self.grid.current
+        pos = self.grid.display_pos.get(keep, 0)
+        sb = self.grid.verticalScrollBar()
+        frac = sb.value() / sb.maximum() if sb.maximum() > 0 else 0.0
+        self._apply_view("starred", "")
+        if keep not in self.grid.display_pos and self.grid.display:
+            # The current photo just left the view: land on the nearest
+            # surviving display position rather than on nothing at all
+            # (set_filter clears current to -1 when it vanishes).
+            self.grid._select(
+                self.grid.display[min(pos, len(self.grid.display) - 1)])
+        self.grid.scroll_to_fraction(frac)   # best-effort scroll restore
 
     def _build_progress(self, done: int, total: int) -> None:
         self.progress_label.setText(f"   indexing {done}/{total}…")

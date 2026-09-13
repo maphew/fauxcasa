@@ -15304,3 +15304,80 @@ def test_viewer_video_star_toggle_still_works(tmp_path: Path) -> None:
     _press(v, Qt.Key.Key_Space)                        # while playing
     assert requested == [idx, idx]
     v.quiesce()
+
+
+# ---------------------------------------------------------------------------
+# Post-merge review findings (fauxcasa-6vk): seven small correctness bugs
+# found by a cross-vendor pass over the 0.1 release candidate. Each test
+# below fails on the pre-fix code and names its finding number.
+# ---------------------------------------------------------------------------
+
+
+def _sidebar_text(win, kind: str, key: str) -> str:
+    """The sidebar label text of the (kind, key) item — the counts a user
+    reads, so a test can assert the view and the sidebar agree."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+
+    it = QTreeWidgetItemIterator(win.tree)
+    while it.value():
+        if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+            return it.value().text(0)
+        it += 1
+    raise AssertionError(f"sidebar item {(kind, key)} not found")
+
+
+def test_unstar_inside_starred_view_drops_the_photo(library: Path) -> None:
+    """Finding 1: Space inside the live Starred view must remove the
+    unstarred photo from the grid's materialized display — not leave a
+    stale tile that contradicts the sidebar count."""
+    from PySide6.QtCore import Qt
+    from main import MainWindow
+
+    _offscreen_app()
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    idx_a = next(i for i, p in enumerate(cat.photos)
+                 if p.rel.endswith("Trip/a.jpg"))       # star=yes in the ini
+    idx_c = next(i for i, p in enumerate(cat.photos) if p.name == "c.jpg")
+
+    win.grid._select(idx_c)
+    _press(win.grid, Qt.Key.Key_Space)                  # star the second one
+    assert cat.photos[idx_c].star == 1
+    _sidebar_click(win, "starred", "")
+    assert sorted(win.grid.display) == sorted([idx_a, idx_c])
+    assert _sidebar_text(win, "starred", "") == "★ Starred  (2)"
+
+    win.grid._select(idx_a)
+    _press(win.grid, Qt.Key.Key_Space)                  # unstar from inside
+    assert cat.photos[idx_a].star == 0
+    assert idx_a not in win.grid.display_pos
+    assert win.grid.display == [idx_c]
+    assert _sidebar_text(win, "starred", "") == "★ Starred  (1)"
+    assert win.grid.current == idx_c                    # sensible landing spot
+    assert "Starred: 1 photos" in win.counts_label.text()
+
+
+def test_unstar_in_viewer_keeps_its_frozen_display_list(library: Path) -> None:
+    """Finding 1 boundary: the viewer's display list stays frozen, so a
+    photo unstarred while viewing remains reachable with Left/Right."""
+    from main import MainWindow
+
+    _offscreen_app()
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    idx_a = next(i for i, p in enumerate(cat.photos)
+                 if p.rel.endswith("Trip/a.jpg"))
+    idx_c = next(i for i, p in enumerate(cat.photos) if p.name == "c.jpg")
+    win.grid._select(idx_c)
+    from PySide6.QtCore import Qt
+    _press(win.grid, Qt.Key.Key_Space)
+    _sidebar_click(win, "starred", "")
+    display = list(win.grid.display)
+    win._open_viewer(idx_a, display, display.index(idx_a))
+
+    win._toggle_stars([idx_a])                          # unstar while viewing
+    assert cat.photos[idx_a].star == 0
+    assert win.viewer.display == display                # untouched
+    assert win.grid.display == display                  # grid left alone too
+    win.viewer.quiesce()
