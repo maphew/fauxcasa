@@ -373,7 +373,9 @@ jobs:
               > dist/fauxcasa/THIRD-PARTY-NOTICES.md
           fi
           cp LICENSE dist/fauxcasa/
-          NOTES="docs/releases/v${VER}.md"
+          # Notes are written per release VERSION, not per tag: a v0.1.0-rc1
+          # dry run reads docs/releases/v0.1.0.md (same rule as the assert).
+          NOTES="docs/releases/v${VER%%-*}.md"
           if [ -f "$NOTES" ]; then
             if uv run --with markdown python -m markdown "$NOTES" > dist/fauxcasa/README.html; then
               echo "OK: rendered README.html from $NOTES"
@@ -453,7 +455,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd release-assets
-          NOTES="../docs/releases/v${VER}.md"
+          NOTES="../docs/releases/v${VER%%-*}.md"   # per version, not per tag
           if [ -f "$NOTES" ]; then
             gh release create "$TAG" --draft --prerelease \
               --title "Fauxcasa ${VER} - See your library again" \
