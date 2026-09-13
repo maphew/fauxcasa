@@ -2302,7 +2302,7 @@ def test_grant_read_execute_once_skips_after_marker(tmp_path, monkeypatch):
     target = str(tmp_path)
     calls = []
     monkeypatch.setattr(dw, "grant_read_execute",
-                         lambda path, s: calls.append(path))
+                         lambda path, s, inherit=None: calls.append(path))
 
     err1 = dw.grant_read_execute_once(target, sid)
     assert err1 is None
@@ -2323,12 +2323,70 @@ def test_grant_read_execute_once_best_effort_on_failure(tmp_path, monkeypatch):
     sid = dw.create_or_derive_profile(dw.PROFILE_NAME)
     target = str(tmp_path / "denied")
 
-    def boom(path, s):
+    def boom(path, s, inherit=None):
         raise OSError("simulated WRITE_DAC denial")
 
     monkeypatch.setattr(dw, "grant_read_execute", boom)
     err = dw.grant_read_execute_once(target, sid)
     assert err is not None and "simulated WRITE_DAC denial" in err
+
+
+@_WINDOWS_ONLY
+def test_spawn_refuses_frozen_grant_on_known_user_folder(monkeypatch, tmp_path):
+    """P2 finding "frozen grant scope": a frozen build's exe directory
+    must never receive a recursive ACL grant when it sits inside a known
+    user folder (profile root/Desktop/Downloads/Documents/Pictures) --
+    spawn() must refuse (fail startup, no grant issued) instead of
+    widening the AppContainer's read to the rest of the user's files."""
+    fake_home = tmp_path / "home"
+    fake_downloads = fake_home / "Downloads"
+    fake_downloads.mkdir(parents=True)
+    fake_exe = fake_downloads / "fauxcasa.exe"
+    fake_exe.write_bytes(b"")
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(fake_downloads / "_internal"), raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    called = []
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda *a, **k: called.append((a, k)))
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    with pytest.raises(RuntimeError, match="known user folder"):
+        worker.spawn()
+    assert called == [], "no grant may be issued once the refusal fires"
+
+
+@_WINDOWS_ONLY
+def test_spawn_grants_frozen_exe_file_without_inheritance(monkeypatch, tmp_path):
+    """P2 finding "frozen grant scope": the frozen exe's OWN FILE gets a
+    NO_INHERITANCE grant (never the exe's directory, and never
+    inheritable) while sys._MEIPASS gets the recursive default."""
+    fake_dir = tmp_path / "install"
+    fake_internal = fake_dir / "_internal"
+    fake_internal.mkdir(parents=True)
+    fake_exe = fake_dir / "fauxcasa.exe"
+    fake_exe.write_bytes(b"")
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(fake_internal), raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    seen = []
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda path, sid, inherit=dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT:
+                         seen.append((path, inherit)) or None)
+
+    def _boom_winsta(sid):
+        raise RuntimeError("stop before an actual CreateProcess (test scope)")
+
+    monkeypatch.setattr(dw, "grant_winsta_desktop", _boom_winsta)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    with pytest.raises(RuntimeError, match="stop before"):
+        worker.spawn()
+    paths = dict(seen)
+    # meipass is used as-is (no .resolve() in spawn()); the exe path IS
+    # resolved (matches Path(sys.executable).resolve() in spawn()).
+    assert paths[str(fake_internal)] == dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    assert paths[str(fake_exe.resolve())] == dw.NO_INHERITANCE
 
 
 @_WINDOWS_ONLY
@@ -2339,7 +2397,7 @@ def test_spawn_survives_denied_acl_grant(monkeypatch, synthetic_png):
     EVERY grant_read_execute_once call to report a (fake) failure and
     confirms a real worker still spawns, hellos, and decodes."""
     monkeypatch.setattr(dw, "grant_read_execute_once",
-                         lambda path, sid: "simulated denial (access already exists)")
+                         lambda path, sid, inherit=None: "simulated denial (access already exists)")
     worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
     worker.spawn()
     try:

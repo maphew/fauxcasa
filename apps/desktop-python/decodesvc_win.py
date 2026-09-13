@@ -860,6 +860,37 @@ if sys.platform == "win32":
             return sid
         raise OSError(f"CreateAppContainerProfile failed HRESULT=0x{hr:08X}")
 
+    # fauxcasa-ez2.9 Stage 1 rework (P1 finding "Profile/SID race"):
+    # CreateAppContainerProfile/DeriveAppContainerSidFromAppContainerName
+    # are NOT safe to call concurrently -- DecodePoolSet.warm() spawns all
+    # N members in parallel threads (design), and every one of them used
+    # to call create_or_derive_profile() itself, reliably racing the
+    # userenv profile-store APIs (observed: 0x80070020 SHARING_VIOLATION,
+    # 0x80070005 ACCESS_DENIED, 0x800703FA ERROR_KEY_DELETED, and a
+    # "successful" warm that silently spawned fewer members than
+    # requested). Resolve the SID for a given profile name EXACTLY ONCE
+    # per process -- a module-level cache guarded by a lock -- and hand
+    # every spawn() the same cached SID object; the lock is only ever
+    # held around the (cheap, once cached) profile API call, never around
+    # spawn() itself.
+    _profile_sid_cache: dict[str, LPVOID] = {}
+    _profile_sid_lock = threading.Lock()
+
+    def get_cached_profile_sid(name: str) -> LPVOID:
+        """Resolve `name`'s AppContainer SID once per process and cache
+        it; every caller reuses the same SID rather than re-entering the
+        racy userenv profile APIs."""
+        sid = _profile_sid_cache.get(name)
+        if sid is not None:
+            return sid
+        with _profile_sid_lock:
+            sid = _profile_sid_cache.get(name)
+            if sid is not None:
+                return sid
+            sid = create_or_derive_profile(name)
+            _profile_sid_cache[name] = sid
+            return sid
+
     def sid_to_string(sid: LPVOID) -> str:
         ptr = wintypes.LPWSTR()
         if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(ptr)):
@@ -870,7 +901,8 @@ if sys.platform == "win32":
 
     # -- ACL grant / revoke ----------------------------------------------
 
-    def _set_file_dacl(path: str, sid: LPVOID, mode: int) -> None:
+    def _set_file_dacl(path: str, sid: LPVOID, mode: int,
+                        inherit: int = SUB_CONTAINERS_AND_OBJECTS_INHERIT) -> None:
         p_owner = LPVOID()
         p_group = LPVOID()
         p_dacl = LPVOID()
@@ -886,7 +918,11 @@ if sys.platform == "win32":
             ea = EXPLICIT_ACCESS_W()
             ea.grfAccessPermissions = GENERIC_READ | GENERIC_EXECUTE
             ea.grfAccessMode = mode
-            ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT
+            # P2 finding "frozen grant scope": callers now pass
+            # NO_INHERITANCE for a single FILE grant (the frozen exe
+            # itself) -- only a directory-recursive grant (sys._MEIPASS)
+            # uses the inheritable default.
+            ea.grfInheritance = inherit
             ea.Trustee.pMultipleTrustee = None
             ea.Trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE
             ea.Trustee.TrusteeForm = TRUSTEE_IS_SID
@@ -975,8 +1011,33 @@ if sys.platform == "win32":
             out["desktop"] = str(e)
         return out
 
-    def grant_read_execute(path: str, sid: LPVOID) -> None:
-        _set_file_dacl(path, sid, GRANT_ACCESS)
+    def grant_read_execute(path: str, sid: LPVOID,
+                            inherit: int = SUB_CONTAINERS_AND_OBJECTS_INHERIT) -> None:
+        _set_file_dacl(path, sid, GRANT_ACCESS, inherit=inherit)
+
+    def is_known_user_folder(path: str) -> bool:
+        """True when `path` resolves to the user's profile root or one of
+        its Desktop/Downloads/Documents/Pictures folders (P2 finding
+        "frozen grant scope"): granting a recursive, inheritable RX ACL
+        there would defeat the "user files are denied" property the
+        threat model relies on -- a portable exe dropped in Downloads (or
+        the profile root itself) must never widen the AppContainer's read
+        to the rest of the user's files."""
+        try:
+            p = Path(path).resolve()
+        except OSError:
+            return False
+        home = os.environ.get("USERPROFILE")
+        if not home:
+            return False
+        try:
+            home_p = Path(home).resolve()
+        except OSError:
+            return False
+        candidates = {home_p}
+        candidates.update(home_p / name for name in
+                           ("Desktop", "Downloads", "Documents", "Pictures"))
+        return p in candidates
 
     def revoke(path: str, sid: LPVOID) -> None:
         try:
@@ -998,42 +1059,92 @@ if sys.platform == "win32":
     # best-effort (a read-only target dir just means paying the ACL cost
     # again next spawn, not a functional failure).
     _acl_granted_this_process: set[tuple[str, str]] = set()
+    # P2 finding "grant_read_execute_once is not thread-safe": guards
+    # BOTH _acl_granted_this_process and the marker-file check+write below
+    # -- warm() spawns all N pool members in parallel threads, and without
+    # this lock every one of them misses the in-process cache and issues
+    # its own concurrent SetNamedSecurityInfoW on the same directory (the
+    # optimisation this set exists for silently doesn't apply in the one
+    # case it was built for).
+    _acl_grant_lock = threading.Lock()
+
+    def _acl_marker_root() -> Path:
+        """Marker storage root -- %LOCALAPPDATA%\\Fauxcasa\\cache\\acl-markers
+        (P3 finding: the old per-directory marker lived inside the
+        interpreter/site-packages/repo trees it was granting access to --
+        user-writable AND, for the repo case, a one-file sandbox
+        off-switch any same-user process could plant). Falls back to TEMP
+        or the home dir when LOCALAPPDATA is unset, matching the
+        catalog.py/db3rescue.py LOCALAPPDATA pattern."""
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
+        root = Path(base) / "Fauxcasa" / "cache" / "acl-markers"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
 
     def _acl_marker_path(directory: str, sid_str: str) -> Path:
-        digest = hashlib.sha256(sid_str.encode("utf-8")).hexdigest()[:16]
-        return Path(directory) / f".fauxcasa-acl-{digest}"
+        # Keyed by (SID, directory path, directory mtime) -- P2/P3
+        # findings: including mtime means an ACL reset (icacls /reset),
+        # install move/repair, or profile re-creation that touches the
+        # directory invalidates the marker automatically instead of
+        # requiring a manual delete.
+        try:
+            mtime = int(Path(directory).stat().st_mtime)
+        except OSError:
+            mtime = 0
+        key = f"{sid_str}|{directory}|{mtime}"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        return _acl_marker_root() / f"acl-{digest}"
 
-    def grant_read_execute_once(path: str, sid: LPVOID) -> str | None:
+    def invalidate_acl_grant(path: str, sid: LPVOID) -> None:
+        """Drop the in-process + on-disk cache entries for (sid, path) so
+        the next grant_read_execute_once() call re-issues the real grant
+        (P2 finding "self-heal for stale markers": a spawn failure at
+        loader init, e.g. 0xC0000142, is exactly the symptom of a stale
+        marker withholding a grant that is genuinely needed -- the prior
+        behavior required manually deleting a hidden marker file)."""
+        sid_str = sid_to_string(sid)
+        with _acl_grant_lock:
+            _acl_granted_this_process.discard((sid_str, path))
+            try:
+                _acl_marker_path(path, sid_str).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def grant_read_execute_once(path: str, sid: LPVOID,
+                                 inherit: int = SUB_CONTAINERS_AND_OBJECTS_INHERIT) -> str | None:
         """Grant read+execute for `sid` on `path`, skipping the OS call
         entirely once already granted this process or a prior process
-        (marker file present). Returns None on success/skip, or a string
-        error detail on a (non-fatal) grant failure."""
+        (marker file present). `inherit` is NO_INHERITANCE for a single
+        FILE grant target (the frozen exe itself, P2 finding) or the
+        recursive default for a directory. Returns None on success/skip,
+        or a string error detail on a (non-fatal) grant failure."""
         sid_str = sid_to_string(sid)
         key = (sid_str, path)
-        if key in _acl_granted_this_process:
-            return None
-        marker = _acl_marker_path(path, sid_str)
-        try:
-            if marker.exists():
-                _acl_granted_this_process.add(key)
+        with _acl_grant_lock:
+            if key in _acl_granted_this_process:
                 return None
-        except OSError:
-            pass
-        try:
-            grant_read_execute(path, sid)
-        except OSError as e:
-            # Best-effort (P1 finding): do NOT raise -- the hello
-            # handshake below is the real readability proof, and a
-            # Program-Files-class install where ALL APPLICATION PACKAGES
-            # already has RX must still be able to spawn.
-            _log.info("ACL grant best-effort failure on %r for %r: %s", path, sid_str, e)
-            return str(e)
-        _acl_granted_this_process.add(key)
-        try:
-            marker.write_text("granted\n", encoding="utf-8")
-        except OSError:
-            pass  # non-fatal: next spawn just re-grants (cheap once cached in-process)
-        return None
+            marker = _acl_marker_path(path, sid_str)
+            try:
+                if marker.exists():
+                    _acl_granted_this_process.add(key)
+                    return None
+            except OSError:
+                pass
+            try:
+                grant_read_execute(path, sid, inherit=inherit)
+            except OSError as e:
+                # Best-effort (P1 finding): do NOT raise -- the hello
+                # handshake below is the real readability proof, and a
+                # Program-Files-class install where ALL APPLICATION
+                # PACKAGES already has RX must still be able to spawn.
+                _log.info("ACL grant best-effort failure on %r for %r: %s", path, sid_str, e)
+                return str(e)
+            _acl_granted_this_process.add(key)
+            try:
+                marker.write_text("granted\n", encoding="utf-8")
+            except OSError:
+                pass  # non-fatal: next spawn just re-grants (cheap once cached in-process)
+            return None
 
     # -- Job object --------------------------------------------------------
 
@@ -1518,15 +1629,34 @@ class WinSandboxWorker:
             # exe re-invoked as `<exe> --decode-worker` -- main.py dispatches
             # that flag to decodesvc_worker_win.main() before its own
             # argparse (mirrors the existing videostream `--worker` pattern).
-            # No worker-script path, no PYTHONPATH. ACL grant targets are
-            # sys._MEIPASS (the extracted onedir _internal payload) and the
-            # exe's own directory -- best-effort (see grant_read_execute_once).
+            # No worker-script path, no PYTHONPATH.
+            #
+            # P2 finding "frozen grant scope": ACL grant targets are
+            # sys._MEIPASS (the extracted onedir _internal payload,
+            # RECURSIVE grant) and the exe FILE ITSELF (NO_INHERITANCE --
+            # never the exe's directory: a directory-recursive grant on a
+            # portable exe dropped in a user folder, e.g.
+            # %USERPROFILE%\Downloads, would give the AppContainer
+            # recursive read on the user's own files, defeating the
+            # threat model's "user files are denied" property). Refuse to
+            # grant -- fail startup with a clear reason instead of
+            # silently widening access -- when either target is inside a
+            # known user folder.
             worker_args = ["--decode-worker"]
             meipass = getattr(sys, "_MEIPASS", None)
-            grant_targets = []
-            for d in (meipass, str(Path(sys.executable).resolve().parent)):
-                if d and d not in grant_targets:
-                    grant_targets.append(d)
+            exe_path = str(Path(sys.executable).resolve())
+            exe_dir = str(Path(exe_path).parent)
+            for target_dir in (d for d in (meipass, exe_dir) if d):
+                if is_known_user_folder(target_dir):
+                    raise RuntimeError(
+                        f"refusing to grant AppContainer read+execute: "
+                        f"{target_dir!r} is a known user folder (profile "
+                        "root/Desktop/Downloads/Documents/Pictures) -- "
+                        "move the install elsewhere and retry")
+            grant_targets: list[tuple[str, int]] = []
+            if meipass:
+                grant_targets.append((meipass, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
+            grant_targets.append((exe_path, NO_INHERITANCE))
         else:
             worker_script = str(Path(__file__).resolve().with_name("decodesvc_worker_win.py"))
             worker_dir = str(Path(worker_script).parent)
@@ -1534,10 +1664,14 @@ class WinSandboxWorker:
             worker_args = [worker_script]
             grant_targets = []
             for d in (base_dir, worker_pythonpath, worker_dir):
-                if d and d not in grant_targets:
-                    grant_targets.append(d)
+                if d and d not in [t for t, _ in grant_targets]:
+                    grant_targets.append((d, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
 
-        sid = create_or_derive_profile(self.profile_name)
+        # P1 finding "Profile/SID race": resolve the SID exactly once per
+        # process (module-level cache + lock) -- never call the userenv
+        # profile API concurrently, which every parallel warm() spawn used
+        # to do.
+        sid = get_cached_profile_sid(self.profile_name)
         self._sid = sid
 
         # Everything from here to a live child runs under one cleanup
@@ -1553,10 +1687,10 @@ class WinSandboxWorker:
             # Program-Files-class install where ALL APPLICATION PACKAGES
             # already has RX must still spawn even if WRITE_DAC is denied.
             self.grant_errors = {}
-            for d in grant_targets:
-                err = grant_read_execute_once(d, sid)
+            for target_path, target_inherit in grant_targets:
+                err = grant_read_execute_once(target_path, sid, inherit=target_inherit)
                 if err is not None:
-                    self.grant_errors[d] = err
+                    self.grant_errors[target_path] = err
 
             winsta_result = grant_winsta_desktop(sid)
             self._winsta_grant = winsta_result
@@ -1627,6 +1761,16 @@ class WinSandboxWorker:
                     kernel32.WaitForSingleObject(child.pi.hProcess, 2000)
                     exit_code = wintypes.DWORD(0)
                     kernel32.GetExitCodeProcess(child.pi.hProcess, ctypes.byref(exit_code))
+                    # P2 finding "self-heal for stale markers": a worker
+                    # that dies before hello is exactly the symptom of a
+                    # stale ACL marker withholding a grant it actually
+                    # needs (loader init, e.g. 0xC0000142). Drop the
+                    # marker + in-process entry for every grant target now
+                    # so the pool's existing WORKER_CRASHED retry (which
+                    # calls spawn() again) re-issues the real grant instead
+                    # of skipping it a second time.
+                    for target_path, _target_inherit in grant_targets:
+                        invalidate_acl_grant(target_path, sid)
                     raise DecodeServiceError(
                         e.code,
                         f"{e} [worker exit code {exit_code.value:#010x}; "
@@ -1723,13 +1867,14 @@ class WinSandboxWorker:
         if self._arena_handle:
             kernel32.CloseHandle(self._arena_handle)
             self._arena_handle = None
-        # The SID from create_or_derive_profile is a per-spawn native
-        # allocation (MSDN: caller must FreeSid); the reusable AppContainer
-        # *profile* is untouched. Only ever set inside spawn() (Windows-only),
-        # so the advapi32 call is unreachable off-Windows.
-        if self._sid is not None:
-            advapi32.FreeSid(self._sid)
-            self._sid = None
+        # P1 finding "Profile/SID race" fix: the SID now comes from the
+        # process-wide get_cached_profile_sid() cache and is SHARED across
+        # every WinSandboxWorker for this profile_name -- deliberately NOT
+        # FreeSid()'d here (that would free memory every other cached
+        # worker/future spawn still points at). The reusable AppContainer
+        # *profile* itself was always left untouched; the cached SID now
+        # simply lives for the lifetime of the process too.
+        self._sid = None
 
     def kill(self) -> None:
         """Hard-stop path (design doc sec 1: 'never a polite request to
