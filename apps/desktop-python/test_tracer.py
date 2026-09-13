@@ -3286,7 +3286,7 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
     cancelled (empty) picker still yields None."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+    from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
     import main
 
     app = QApplication.instance() or QApplication([])
@@ -3306,6 +3306,13 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
         "warning",
         staticmethod(lambda _parent, _title, msg: warnings.append(msg)),
     )
+    # Drive the WelcomeDialog programmatically (never a real exec()) —
+    # "Choose a folder…" clicked, exercising the folder-picker fallback
+    # path this test is actually about.
+    def _fake_welcome_exec(self):
+        self.choice = "folder"
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(main.WelcomeDialog, "exec", _fake_welcome_exec)
 
     got = main._prompt_for_library(cache_root)
     assert got == chosen.resolve()
@@ -3328,6 +3335,172 @@ def test_prompt_for_library_picker_success(monkeypatch, tmp_path: Path) -> None:
     assert main._remembered_library(cache_root_3) == chosen.resolve()
     assert len(warnings) == 1
     assert "not the filesystem root" in warnings[0]
+
+
+def test_welcome_dialog_hides_picasa_button_when_zero_watched(
+        monkeypatch) -> None:
+    """WelcomeDialog (fauxcasa-ez2.14) shows only 'Choose a folder…' + Cancel
+    when the registry read returns 0 existing watched folders — the
+    Picasa-import button is a dead end otherwise and must not appear."""
+    _offscreen_app()
+    import main
+
+    monkeypatch.setattr(main, "_existing_picasa_watched_count", lambda: 0)
+    dlg = main.WelcomeDialog(main._existing_picasa_watched_count())
+    assert dlg.picasa_button is None
+    assert dlg.folder_button is not None
+    assert dlg.windowTitle() == main.APP_NAME
+
+
+def test_welcome_dialog_shows_picasa_button_with_count(monkeypatch) -> None:
+    """With N >= 1 existing watched folders, the button text carries the
+    count, and clicking it sets .choice = 'picasa' + accepts (drives the
+    dialog programmatically, never a real exec(), per ez2.14's test note)."""
+    _offscreen_app()
+    from PySide6.QtWidgets import QDialog
+    import main
+
+    dlg = main.WelcomeDialog(3)
+    assert dlg.picasa_button is not None
+    assert dlg.picasa_button.text() == "Use Picasa's watched folders (3 found)"
+
+    dlg.picasa_button.click()
+    assert dlg.choice == "picasa"
+    assert dlg.result() == QDialog.DialogCode.Accepted
+
+
+def test_welcome_dialog_choose_folder_sets_choice() -> None:
+    """Clicking 'Choose a folder…' sets .choice = 'folder' + accepts."""
+    _offscreen_app()
+    from PySide6.QtWidgets import QDialog
+    import main
+
+    dlg = main.WelcomeDialog(0)
+    dlg.folder_button.click()
+    assert dlg.choice == "folder"
+    assert dlg.result() == QDialog.DialogCode.Accepted
+
+
+def test_welcome_dialog_cancel_exits_as_today(monkeypatch, tmp_path: Path) -> None:
+    """Cancel in the WelcomeDialog still yields None from _prompt_for_library
+    (ez2.14 preserves the existing cancel contract)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QDialog
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    monkeypatch.setattr(main, "_gui_unavailable", lambda: False)
+    monkeypatch.setattr(QApplication, "platformName", lambda self: "xcb")
+
+    def _fake_cancel_exec(self):
+        self.reject()
+        return QDialog.DialogCode.Rejected
+    monkeypatch.setattr(main.WelcomeDialog, "exec", _fake_cancel_exec)
+
+    assert main._prompt_for_library(tmp_path / "cr") is None
+
+
+def test_existing_picasa_watched_count_filters_missing_dirs(
+        monkeypatch, tmp_path: Path) -> None:
+    """_existing_picasa_watched_count (ez2.14) counts only registry entries
+    that still exist as directories on disk, and fails soft to 0 when the
+    registry read raises (no key, non-Windows, empty value)."""
+    import main
+    import library
+
+    real = tmp_path / "RealFolder"
+    real.mkdir()
+    missing = tmp_path / "GoneFolder"
+
+    monkeypatch.setattr(library, "picasa_watched_from_registry",
+                        lambda: [real, missing])
+    assert main._existing_picasa_watched_count() == 1
+
+    def _raise():
+        raise RuntimeError("no registry entry")
+    monkeypatch.setattr(library, "picasa_watched_from_registry", _raise)
+    assert main._existing_picasa_watched_count() == 0
+
+
+def test_import_picasa_watched_for_welcome_creates_multiroot_home(
+        monkeypatch, tmp_path: Path) -> None:
+    """The WelcomeDialog's 'picasa' choice (fauxcasa-ez2.14) runs the same
+    import_picasa_watched path --import-picasa-watched registry uses,
+    entirely inside cache_root (never touching the watched folders
+    themselves), and returns the new library-home for _prompt_for_library
+    to remember and open."""
+    import main
+    import library
+
+    root_a = tmp_path / "Watched" / "A"
+    root_b = tmp_path / "Watched" / "B"
+    make_jpeg(root_a / "a.jpg")
+    make_jpeg(root_b / "b.jpg")
+    cache_root = tmp_path / "cr"
+
+    monkeypatch.setattr(library, "picasa_watched_from_registry",
+                        lambda: [root_a, root_b])
+
+    home = main._import_picasa_watched_for_welcome(cache_root)
+    assert home is not None
+    assert home == (cache_root / "picasa-watched-library").resolve()
+    cfg = library.resolve_open_path(home)
+    assert not cfg.is_legacy
+    assert len(cfg.roots) == 2
+    assert {r.path.resolve() for r in cfg.roots} == {
+        root_a.resolve(), root_b.resolve()}
+    # Neither watched folder itself was touched — only cache_root grew.
+    assert not (root_a / ".fauxcasa").exists()
+    assert not (root_b / ".fauxcasa").exists()
+
+
+def test_import_picasa_watched_for_welcome_no_usable_folders_returns_none(
+        monkeypatch, tmp_path: Path) -> None:
+    """A registry list with nothing usable (all missing/nested) fails soft
+    to None — the WelcomeDialog's caller falls back to the folder picker,
+    it never crashes first-run."""
+    import main
+    import library
+
+    monkeypatch.setattr(library, "picasa_watched_from_registry",
+                        lambda: [tmp_path / "does-not-exist"])
+    assert main._import_picasa_watched_for_welcome(tmp_path / "cr") is None
+
+
+def test_prompt_for_library_picasa_choice_end_to_end(
+        monkeypatch, tmp_path: Path) -> None:
+    """_prompt_for_library with the WelcomeDialog's 'picasa' choice (driven
+    programmatically) imports the watched folders, remembers the new
+    library-home, and returns it — the end-to-end path the welcome button
+    triggers in the real app."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QDialog
+    import main
+    import library
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    monkeypatch.setattr(main, "_gui_unavailable", lambda: False)
+    monkeypatch.setattr(QApplication, "platformName", lambda self: "xcb")
+
+    watched = tmp_path / "Watched"
+    make_jpeg(watched / "p.jpg")
+    monkeypatch.setattr(library, "picasa_watched_from_registry",
+                        lambda: [watched])
+
+    def _fake_picasa_exec(self):
+        self.choice = "picasa"
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(main.WelcomeDialog, "exec", _fake_picasa_exec)
+
+    cache_root = tmp_path / "cr"
+    got = main._prompt_for_library(cache_root)
+    expected_home = (cache_root / "picasa-watched-library").resolve()
+    assert got == expected_home
+    assert main._remembered_library(cache_root) == expected_home
 
 
 def test_mainwindow_open_action_relaunches_with_selected_library(
@@ -5566,6 +5739,82 @@ def test_viewer_zoom_click_anchor_stays_put(tmp_path: Path,
     _mouse(v, QEvent.Type.MouseButtonPress, ax, ay)
     _mouse(v, QEvent.Type.MouseButtonRelease, ax, ay)
     assert not v.zoomed                          # click toggles back to fit
+
+
+def test_viewer_chevron_hover_sets_flag_and_repaints(tmp_path: Path) -> None:
+    """Mouse move within CHEVRON_MARGIN of an edge (ez2.14), with no button
+    held, sets the matching hover flag; moving to the middle clears both.
+    A viewport 1280 wide: x=20 is within the left margin, x=1260 within
+    the right, x=640 is neither."""
+    from PySide6.QtCore import QEvent
+    from viewer import CHEVRON_MARGIN
+    v, _orig = _viewer_with_original(tmp_path)
+    assert not v._hover_prev and not v._hover_next
+
+    _mouse(v, QEvent.Type.MouseMove, 20.0, 400.0)
+    assert v._hover_prev and not v._hover_next
+
+    _mouse(v, QEvent.Type.MouseMove, 1280.0 - 20.0, 400.0)
+    assert v._hover_next and not v._hover_prev
+
+    _mouse(v, QEvent.Type.MouseMove, 640.0, 400.0)
+    assert not v._hover_prev and not v._hover_next
+    assert CHEVRON_MARGIN < 640.0   # sanity: the middle is really outside it
+
+
+def test_viewer_chevron_click_navigates(tmp_path: Path) -> None:
+    """A click inside the left/right margin calls the existing prev/next
+    step (ez2.14) instead of toggling zoom; a click in the middle keeps
+    doing the ordinary click-to-zoom toggle."""
+    from PySide6.QtCore import QEvent
+    v, _orig = _viewer_with_original(tmp_path)  # 2 photos, showing index 0
+    assert v.pos == 0
+
+    _mouse(v, QEvent.Type.MouseButtonPress, 1280.0 - 20.0, 400.0)
+    assert v.pos == 1                 # right-margin click -> next
+    assert not v.zoomed               # never a zoom toggle
+
+    _mouse(v, QEvent.Type.MouseButtonPress, 20.0, 400.0)
+    assert v.pos == 0                 # left-margin click -> prev
+    assert not v.zoomed
+
+    # A middle click still does the ordinary click-to-zoom toggle (press +
+    # release, matching test_viewer_zoom_click_anchor_stays_put's pattern).
+    _mouse(v, QEvent.Type.MouseButtonPress, 640.0, 400.0)
+    _mouse(v, QEvent.Type.MouseButtonRelease, 640.0, 400.0)
+    assert v.zoomed
+    assert v.pos == 0                 # unchanged by the middle click
+
+
+def test_viewer_chevron_paints_only_when_hovered(tmp_path: Path) -> None:
+    """paintEvent draws a chevron only while its hover flag is set — a
+    fresh viewer (no hover yet) paints neither, and setting a flag makes
+    the grabbed frame differ from the no-hover baseline."""
+    v, _orig = _viewer_with_original(tmp_path)
+    baseline = v.grab().toImage()
+
+    v._hover_prev = True
+    v.update()
+    v.repaint()
+    with_prev = v.grab().toImage()
+    assert with_prev != baseline
+
+    v._hover_prev = False
+    v._hover_next = True
+    v.update()
+    v.repaint()
+    with_next = v.grab().toImage()
+    assert with_next != baseline
+
+
+def test_viewer_chevron_leave_event_clears_hover(tmp_path: Path) -> None:
+    """The cursor leaving the widget (leaveEvent) hides any shown chevron
+    rather than leaving it stuck (ez2.14)."""
+    from PySide6.QtCore import QEvent
+    v, _orig = _viewer_with_original(tmp_path)
+    v._hover_prev = True
+    v.leaveEvent(QEvent(QEvent.Type.Leave))
+    assert not v._hover_prev and not v._hover_next
 
 
 def test_viewer_zoom_drag_pans_and_release_does_not_toggle(
@@ -10860,8 +11109,10 @@ def test_folder_view_flat_listing(tmp_path: Path) -> None:
         if d is not None and d[0] == "folder":
             parent_data = it2.value().parent().data(
                 0, Qt.ItemDataRole.UserRole)
-            # Parent carries no UserRole data (it is the unselectable root).
-            assert parent_data is None, (
+            # Parent is the unselectable root — it carries ("folders_root",
+            # "") (ez2.14: lets the right-click menu find it), not a
+            # ("folder", rel) tuple of its own.
+            assert parent_data == ("folders_root", ""), (
                 f"folder item {d[1]!r} has parent with data {parent_data!r}")
         it2 += 1
 
@@ -10902,12 +11153,14 @@ def test_folder_view_flat_root_rel_photos(tmp_path: Path) -> None:
     assert root_item.toolTip(0) == str(cat.root)
 
     # Tree mode: the stand-in root node (the "Folders" header, which carries
-    # no ("folder", rel) item data) keeps the path-on-demand tooltip.
+    # ("folders_root", "") item data — ez2.14 — not a ("folder", rel) tuple
+    # of its own) keeps the path-on-demand tooltip.
     win._flat_check.setChecked(False)
     headers = [win.tree.topLevelItem(i)
                for i in range(win.tree.topLevelItemCount())]
-    folders_header = [h for h in headers
-                      if h.data(0, Qt.ItemDataRole.UserRole) is None]
+    folders_header = [
+        h for h in headers
+        if h.data(0, Qt.ItemDataRole.UserRole) == ("folders_root", "")]
     assert folders_header, "Folders header not found"
     assert folders_header[0].toolTip(0) == str(cat.root)
 
@@ -16379,14 +16632,14 @@ def test_unstar_inside_starred_view_drops_the_photo(library: Path) -> None:
     assert cat.photos[idx_c].star == 1
     _sidebar_click(win, "starred", "")
     assert sorted(win.grid.display) == sorted([idx_a, idx_c])
-    assert _sidebar_text(win, "starred", "") == "★ Starred  (2)"
+    assert _sidebar_text(win, "starred", "") == "Starred  (2)"
 
     win.grid._select(idx_a)
     _press(win.grid, Qt.Key.Key_Space)                  # unstar from inside
     assert cat.photos[idx_a].star == 0
     assert idx_a not in win.grid.display_pos
     assert win.grid.display == [idx_c]
-    assert _sidebar_text(win, "starred", "") == "★ Starred  (1)"
+    assert _sidebar_text(win, "starred", "") == "Starred  (1)"
     assert win.grid.current == idx_c                    # sensible landing spot
     assert "Starred: 1 photos" in win.counts_label.text()
 
@@ -17140,3 +17393,163 @@ def test_viewer_fit_rect_excludes_caption_bar(tmp_path: Path) -> None:
     shot = v.grab().toImage().convertToFormat(QImage.Format.Format_RGB32)
     assert shot.pixelColor(200, 5).red() > 200     # photo, not letterboxed
     v.quiesce()
+
+
+# ---------- polish day 2 (fauxcasa-ez2.14): icons, welcome dialog, chevrons ----------
+
+
+def test_icons_make_icon_every_glyph_has_1x_and_2x() -> None:
+    """make_icon() paints a real (non-null) pixmap at both 16px (1x) and
+    32px (2x) for every glyph name the toolbar/sidebar use, and raises
+    KeyError — loud, not a blank tile — on an unknown name."""
+    _offscreen_app()
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QColor
+
+    import icons
+
+    for name in ("library", "back", "play", "info", "folder", "album",
+                "person", "star", "clock", "zoom_small", "zoom_large"):
+        icon = icons.make_icon(name, QColor(220, 220, 220))
+        sizes = set(icon.availableSizes())
+        assert QSize(16, 16) in sizes and QSize(32, 32) in sizes, name
+        pm = icon.pixmap(16, 16)
+        assert not pm.isNull()
+        # The real content check is that SOME pixel carries alpha — proof
+        # the glyph actually painted something onto the transparent ground.
+        img = pm.toImage()
+        painted = any(
+            img.pixelColor(x, y).alpha() > 0
+            for x in range(16) for y in range(16))
+        assert painted, f"{name}: pixmap is fully transparent"
+
+    with pytest.raises(KeyError):
+        icons.make_icon("not-a-glyph", QColor(0, 0, 0))
+
+
+def test_toolbar_actions_carry_icons(tmp_path: Path) -> None:
+    """The Library/Gallery/Play/Info toolbar actions (ez2.14) each carry a
+    non-null QIcon, and text labels stay (ToolButtonTextBesideIcon) —
+    icons are a scan aid, not a replacement for the label."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+    for action in (win.open_action, win.back_action, win.play_action,
+                  win.info_action):
+        assert not action.icon().isNull(), action.text()
+        assert action.text()   # label kept
+
+
+def test_sidebar_items_carry_icons(tmp_path: Path) -> None:
+    """Starred/Recently-Updated/Folders/Albums/People root rows and their
+    Folder/Album/Person children all carry a non-null icon (ez2.14)."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "Animals" / "cat.jpg")
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    kinds_seen = set()
+    it = QTreeWidgetItemIterator(win.tree)
+    while it.value():
+        item = it.value()
+        d = item.data(0, Qt.ItemDataRole.UserRole)
+        if d is not None and d[0] in ("starred", "recent", "folders_root",
+                                      "folder"):
+            assert not item.icon(0).isNull(), d
+            kinds_seen.add(d[0])
+        it += 1
+    assert {"starred", "recent", "folders_root", "folder"} <= kinds_seen
+
+
+def test_flat_checkbox_removed_from_sidebar_panel(tmp_path: Path) -> None:
+    """The bare 'Flat' QCheckBox no longer sits above the tree (ez2.14) —
+    only the tree fills the sidebar panel; the View menu's Flat Folders
+    action and the Folders-root context menu are the two surfaces left."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+
+    layout = win._sidebar_panel.layout()
+    widgets = [layout.itemAt(i).widget() for i in range(layout.count())]
+    assert win._flat_check not in widgets
+    assert win.tree in widgets
+    # The state holder still exists and still drives _build_sidebar/menus.
+    assert win._flat_check.isChecked() is False
+
+
+def test_folders_root_context_menu_toggles_flat_and_stays_in_sync(
+        tmp_path: Path) -> None:
+    """Right-clicking the Folders root (ez2.14) gets a checkable 'Flat
+    Folders' action mirroring the View menu's identical action — both
+    read/write the same self._flat_check state, so toggling either one
+    rebuilds the sidebar and leaves the other in sync."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "Animals" / "cat.jpg")
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+
+    menu = win._folders_root_menu()
+    acts = [a for a in menu.actions() if a.isCheckable()]
+    assert len(acts) == 1 and acts[0].text() == "Flat Folders"
+    assert not acts[0].isChecked()
+
+    acts[0].trigger()   # toggles ON via the context-menu action
+    assert win._flat_check.isChecked() is True
+
+    # The View menu action was built from the same _flat_check and stays
+    # in sync going the other way too.
+    win._flat_check.setChecked(False)
+    remenu = win._folders_root_menu()
+    assert not remenu.actions()[0].isChecked()
+
+
+def test_sidebar_menu_ignores_folders_root_click_for_view_selection(
+        tmp_path: Path) -> None:
+    """Clicking (not right-clicking) the Folders header must not reset the
+    active grid view to All photos — only real folder/album/etc rows do
+    that (regression guard for ez2.14's header now carrying UserRole
+    data so the context menu can find it)."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "Animals" / "cat.jpg")
+    make_jpeg(root / "Zebra" / "z.jpg")
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+
+    # Select a specific folder first, so we can detect an unwanted reset.
+    it = QTreeWidgetItemIterator(win.tree)
+    folder_item = None
+    while it.value():
+        d = it.value().data(0, Qt.ItemDataRole.UserRole)
+        if d is not None and d == ("folder", "Zebra"):
+            folder_item = it.value()
+            break
+        it += 1
+    assert folder_item is not None
+    win._sidebar_clicked(folder_item, 0)
+    before = list(win.grid.display)
+
+    headers = [win.tree.topLevelItem(i)
+               for i in range(win.tree.topLevelItemCount())]
+    folders_header = next(
+        h for h in headers
+        if h.data(0, Qt.ItemDataRole.UserRole) == ("folders_root", ""))
+    win._sidebar_clicked(folders_header, 0)
+    assert win.grid.display == before
