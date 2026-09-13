@@ -61,6 +61,7 @@ place. Face rects on a cropped photo rebase through the crop first
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -80,6 +81,8 @@ from cropmap import (
 )
 from locate import reveal_in_file_manager
 from thumbcache import THUMB_EDGE, ThumbCache
+
+log = logging.getLogger("fauxcasa")
 
 # Colors are theme.py's named constants (fauxcasa-ez2.4). BACKGROUND takes
 # theme.VIEWER_BG — deliberately darker than the grid's theme.WINDOW, a
@@ -766,7 +769,15 @@ class ViewerPage(QWidget):
             job = self._jobs.get()
             if job is None:
                 return  # quiesce() sentinel: retire the worker
-            job()
+            try:
+                job()
+            except Exception:  # noqa: BLE001 — a bad file must not kill the worker
+                # An exception escaping a job used to end this thread: every
+                # later show_photo() restarted a fresh one, but the photo that
+                # raised never emitted `loaded`, so `loading` stayed True and
+                # the viewer painted "loading…" forever (and a scripted
+                # --open/--screenshot run waited until its timeout).
+                log.exception("viewer decode job failed; worker continues")
 
     def quiesce(self, timeout: float = 5.0) -> None:
         """Retire the decode worker BEFORE this widget is destroyed: bump
@@ -883,7 +894,11 @@ class ViewerPage(QWidget):
             # decode, and the emit is guarded against Qt teardown.
             if serial != self._serial:
                 return
-            img, orientation = load_original_oriented(path, rotate, crop)
+            try:
+                img, orientation = load_original_oriented(path, rotate, crop)
+            except Exception:  # noqa: BLE001 — decoder raised: null image, never a stuck "loading…"
+                log.exception("viewer: decoding %s raised", path)
+                img, orientation = QImage(), 1
             if serial != self._serial:
                 return
             try:

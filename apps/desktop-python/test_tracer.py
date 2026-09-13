@@ -1844,6 +1844,57 @@ def test_viewer_preview_reads_larger_v2_level(tmp_path: Path) -> None:
     assert min_edge >= 512 and level == 0 and max(w0, h0) == 512
 
 
+def test_viewer_decode_job_that_raises_clears_loading(tmp_path: Path,
+                                                      monkeypatch) -> None:
+    """A decoder that RAISES (not just returns null) must leave the viewer
+    in the 'could not decode' state, not stuck on 'loading…': the persistent
+    decode thread survives the exception and a null image is still emitted.
+    Before the guard, the exception killed the worker thread silently and
+    `loading` stayed True forever — a scripted --open/--screenshot run then
+    sat on `viewer.loading` until its timeout (seen on CI's native leg)."""
+    import time as _time
+
+    import viewer as viewermod
+    from viewer import ViewerPage
+
+    app = _offscreen_app()
+    root = tmp_path / "lib"
+    _big_library(root)
+    cat, cache = _bound_cache(tmp_path, root)
+    view = ViewerPage(cat, cache)
+    view.resize(400, 300)
+
+    calls = {"n": 0}
+    real = viewermod.load_original_oriented
+
+    def boom(path, rotate, crop):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("decoder exploded")
+        return real(path, rotate, crop)
+
+    monkeypatch.setattr(viewermod, "load_original_oriented", boom)
+    view.show_photo(list(range(cache.count)), 0)
+    assert view.loading
+    deadline = _time.monotonic() + 5.0
+    while view.loading and _time.monotonic() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    assert not view.loading, "loading never cleared after a raising decode"
+    assert view.image is None                      # honest failure state
+    assert view._decoder is not None and view._decoder.is_alive()
+
+    # The same worker keeps serving: the next photo decodes normally.
+    view.show_photo(list(range(cache.count)), 1)
+    deadline = _time.monotonic() + 5.0
+    while view.loading and _time.monotonic() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    assert not view.loading and view.image is not None
+    assert calls["n"] == 2
+    view.quiesce()
+
+
 def test_viewer_preview_v1_falls_back_to_256(tmp_path: Path) -> None:
     """A single-level v1 cache has only 256; the viewer still shows an instant
     256 preview rather than a blank window (graceful, no v2 required)."""
