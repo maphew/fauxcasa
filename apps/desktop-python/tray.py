@@ -34,7 +34,7 @@ never the originals (N4).
 from __future__ import annotations
 
 from PySide6.QtCore import QRect, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QTransform
+from PySide6.QtGui import QImage, QPainter, QTransform
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -44,17 +44,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import theme
 from catalog import Catalog
 from thumbcache import ThumbCache
 
 TRAY_H = 56   # strip height (logical px)
 THUMB = 44    # held-thumb box edge
 PAD = 6
-BACKGROUND = QColor(30, 30, 30)
-PLACEHOLDER = QColor(60, 60, 60)   # cache not built yet
-ERROR_TILE = QColor(96, 40, 40)    # cached error entry / unreadable blob
-HINT_FG = QColor(120, 120, 120)
-MORE_FG = QColor(200, 200, 200)
+# Colors are theme.py's named constants (fauxcasa-ez2.4) — a raised panel
+# below the grid, so BACKGROUND takes theme.SURFACE rather than its own
+# near-duplicate gray.
+BACKGROUND = theme.SURFACE
+PLACEHOLDER = theme.PLACEHOLDER    # cache not built yet
+ERROR_TILE = theme.ERROR_TILE      # cached error entry / unreadable blob
+HINT_FG = theme.HINT_FG
+MORE_FG = theme.HEADER_FG
 
 
 class SelectionTray(QWidget):
