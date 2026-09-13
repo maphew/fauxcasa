@@ -347,7 +347,7 @@ def save_sort_modes(state_dir: Path | None, modes: dict[str, str]) -> None:
     torn-proof via temp-sibling + os.replace. Merges into the existing config
     doc so other view prefs (folder_view_flat) survive the write."""
     if state_dir is None:
-        return  # no cache dir (tests, degraded runs): session-only modes
+        return  # no state dir (tests, degraded runs): session-only modes
     keep = {rel: mode for rel, mode in sorted(modes.items())
             if mode in SORT_MODES and mode != DEFAULT_SORT_MODE}
     doc = _read_library_config(state_dir)
@@ -396,27 +396,57 @@ def library_state_dir(library_key: str, cache_root: Path) -> Path:
 
 def _migrate_library_state(cache_dir: Path | None,
                            state_dir: Path | None) -> None:
-    """One-time lift of user state from a VARIANT cache dir into the
-    variant-free state dir (fauxcasa-6vk finding 2), so testers who
-    starred photos while running with a File-Types/scan-size variant keep
-    those stars. Copy, never move: the old file stays where an older
-    build would still find it. Best-effort — state is a convenience."""
+    """Adopt user state left in a VARIANT cache dir into the variant-free
+    state dir (fauxcasa-6vk finding 2), so testers who starred photos
+    while running with a File-Types/scan-size variant keep those stars.
+
+    A MERGE, not a one-shot copy (Codex cross-vendor review): a tester who
+    starred photos on the default walk AND more photos under a variant has
+    state in BOTH places, so "skip if the base file already exists" would
+    silently drop every variant-only choice. Every key the base does not
+    have is adopted; every key it does have WINS, because the base dir is
+    where this build has been writing. Per-photo for stars and per-folder
+    for sort modes — the granularity the user actually chose at.
+
+    Idempotent (a second launch finds nothing left to adopt and writes
+    nothing), copy-never-move (the variant file stays where an older build
+    would still find it), and best-effort: state is a convenience."""
     if state_dir is None or cache_dir is None or state_dir == cache_dir:
         return
     try:
-        if (not (state_dir / STAR_OVERRIDES_NAME).exists()
-                and (cache_dir / STAR_OVERRIDES_NAME).exists()):
-            overrides = load_star_overrides(cache_dir)
-            if overrides:
-                save_star_overrides(state_dir, overrides)
-                log.info("migrated %d star choices into %s",
-                         len(overrides), state_dir)
-        if (not _library_config_path(state_dir).exists()
-                and _library_config_path(cache_dir).exists()):
-            doc = _read_library_config(cache_dir)
-            if doc:
-                _write_library_config(state_dir, doc)
-                log.info("migrated library view prefs into %s", state_dir)
+        variant_stars = load_star_overrides(cache_dir)
+        if variant_stars:
+            stars = load_star_overrides(state_dir)
+            adopted = {k: v for k, v in variant_stars.items()
+                       if k not in stars}
+            if adopted:
+                stars.update(adopted)
+                save_star_overrides(state_dir, stars)
+                log.info("adopted %d star choice(s) from %s",
+                         len(adopted), cache_dir)
+        variant_cfg = _read_library_config(cache_dir)
+        if variant_cfg:
+            doc = _read_library_config(state_dir)
+            merged = dict(doc)
+            changed = False
+            for key, value in variant_cfg.items():
+                if key not in merged:
+                    merged[key] = value           # e.g. folder_view_flat
+                    changed = True
+                elif (key == "sort_modes" and isinstance(value, dict)
+                        and isinstance(merged[key], dict)):
+                    # Per-FOLDER merge: the sort-mode analogue of the
+                    # per-photo star merge above — a folder sorted only
+                    # under the variant must not be lost just because some
+                    # OTHER folder was sorted on the base walk.
+                    extra = {rel: mode for rel, mode in value.items()
+                             if rel not in merged[key]}
+                    if extra:
+                        merged[key] = {**merged[key], **extra}
+                        changed = True
+            if changed:
+                _write_library_config(state_dir, merged)
+                log.info("adopted library view prefs from %s", cache_dir)
     except OSError as e:
         log.warning("could not migrate library state: %s", e)
 
@@ -1391,6 +1421,10 @@ class MainWindow(QMainWindow):
         activity_lay = QHBoxLayout(self.activity_row)
         activity_lay.setContentsMargins(12, 6, 12, 6)
         self.activity_label = QLabel()
+        # Carries the library root's folder NAME ("Scanning <root>…"):
+        # user-authored text, so never let AutoText read it as markup
+        # (fauxcasa-6vk finding 7).
+        self.activity_label.setTextFormat(Qt.TextFormat.PlainText)
         self.activity_label.setStyleSheet("font-weight: 600; border: none;")
         self.activity_progress = QProgressBar()
         self.activity_progress.setTextVisible(True)

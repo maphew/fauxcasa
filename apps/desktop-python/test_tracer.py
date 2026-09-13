@@ -15493,6 +15493,66 @@ def test_library_state_migrates_out_of_a_variant_cache_dir(
     assert win2 is not None
 
 
+def test_library_state_migration_merges_variant_only_choices(
+        library: Path, tmp_path: Path) -> None:
+    """Finding 2, Codex cross-vendor follow-up: a tester with state in BOTH
+    the base dir and a variant dir must keep the variant-only choices.
+    Base keys win on conflict (that is where this build has been
+    writing); keys only the variant has are adopted, per photo for stars
+    and per folder for sort modes. A second open adopts nothing more."""
+    import main as mainmod
+    import starstore
+    from main import MainWindow, load_sort_modes
+    from starstore import STAR_OVERRIDES_NAME
+
+    _offscreen_app()
+    cache_root = tmp_path / "cache"
+    key = str(library.resolve())
+    state_dir = mainmod.library_state_dir(key, cache_root)
+    variant_dir = thumbcache.cache_dir_for(key, cache_root, "exts:no=.png")
+    cat = scan_library(library)
+    idx_c = next(i for i, p in enumerate(cat.photos) if p.name == "c.jpg")
+    idx_o = next(i for i, p in enumerate(cat.photos) if p.name != "c.jpg")
+    key_c = starstore.photo_key(cat.photos[idx_c])
+    key_o = starstore.photo_key(cat.photos[idx_o])
+    # Base: c starred once; folder Picnic sorted by date. (The DEFAULT
+    # mode, name, is never persisted — save_sort_modes drops it — so a
+    # base folder left at the default cannot "win" over a variant choice;
+    # only an explicit non-default base choice can.)
+    starstore.save_star_overrides(state_dir, {key_c: 1})
+    mainmod.save_sort_modes(state_dir, {"2021-05-05 Picnic": "date"})
+    # Variant: c starred DIFFERENTLY (must lose) plus a photo and a folder
+    # the base never saw (must be adopted).
+    starstore.save_star_overrides(variant_dir, {key_c: 3, key_o: 2})
+    mainmod.save_sort_modes(
+        variant_dir, {"2021-05-05 Picnic": "size", "2020-01-01 Other": "date"})
+
+    win = MainWindow(cat, None, cache_dir=variant_dir, build_dir=None,
+                     state_dir=state_dir)
+    assert cat.photos[idx_c].star == 1          # base wins the conflict
+    assert cat.photos[idx_o].star == 2          # variant-only star adopted
+    assert starstore.load_star_overrides(state_dir) == {key_c: 1, key_o: 2}
+    assert load_sort_modes(state_dir) == {
+        "2021-05-05 Picnic": "date",             # base wins
+        "2020-01-01 Other": "date",              # variant-only adopted
+    }
+    assert win.grid.sort_modes == load_sort_modes(state_dir)
+    # Copy, never move: the variant file is untouched.
+    assert starstore.load_star_overrides(variant_dir) == {key_c: 3, key_o: 2}
+
+    # Idempotent: a second open finds nothing left to adopt and rewrites
+    # neither state file.
+    stars_path = state_dir / STAR_OVERRIDES_NAME
+    cfg_path = mainmod._library_config_path(state_dir)
+    before = (stars_path.read_bytes(), cfg_path.read_bytes())
+    fresh = scan_library(library)
+    win2 = MainWindow(fresh, None, cache_dir=variant_dir, build_dir=None,
+                      state_dir=state_dir)
+    assert (stars_path.read_bytes(), cfg_path.read_bytes()) == before
+    assert fresh.photos[idx_o].star == 2
+    assert win2 is not None
+
+
 def test_reload_data_retires_the_viewer_gallery_action(library: Path,
                                                        tmp_path: Path) -> None:
     """Finding 4: a reconcile swap forces the page back to the browser, so
