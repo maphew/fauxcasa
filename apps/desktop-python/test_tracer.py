@@ -3392,6 +3392,11 @@ def test_main_run_logs_and_keeps_stdout_protocol(
     # §7 machine protocol: on stdout, unchanged.
     assert "READY" in proc.stdout
     assert '"event": "ready"' in proc.stdout
+    ready_line = next(
+        line for line in proc.stdout.splitlines()
+        if '"event": "ready"' in line)
+    ready_json = json.loads(ready_line)
+    assert ready_json["version"] == "0.1.0"   # rel-0.1 identity (__version__)
 
     # Human diagnostics: in the log file beside the per-library caches.
     log_path = cache_root / "fauxcasa.log"

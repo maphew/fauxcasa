@@ -25,10 +25,10 @@
 #     directly fails §7's cold-start anchor.
 #   * TWO variants from one Analysis (fauxcasa-pqw) — one analysis/PYZ, an
 #     extra cheap COLLECT copy, no second pyinstaller run:
-#       - dist/fauxcasa-tracer/      console=True  — the CI/smoke build. It
+#       - dist/fauxcasa-console/     console=True  — the CI/smoke build. It
 #         prints READY/JSON to stdout (the offscreen headless gate parses it)
 #         and its stderr carries the diagnostics bundle.yml greps.
-#       - dist/fauxcasa-tracer-gui/  console=False — the shipping, double-
+#       - dist/fauxcasa/             console=False — the shipping, double-
 #         clickable build: no black console window. A windowed PyInstaller
 #         process has sys.stdout/sys.stderr == None, so the §7 stdout prints
 #         become harmless no-ops and the human diagnostics + Qt messages +
