@@ -93,6 +93,17 @@ jobs:
             exit 1
           fi
           echo "OK: source run's decode sandbox hellos (state=sandboxed)"
+      - name: Decode-sandbox e2e (Windows, wired call sites, real AppContainer)
+        # fauxcasa-ez2.9 Stage 2 review P2-5: the source run above proves
+        # the sandbox STARTS on this runner; this proves thumbcache.
+        # _index_one and viewer.load_original_oriented actually ROUTE
+        # through it (parity + hostile-file taxonomy) against a real
+        # worker, not a stub -- the one suite that was previously wired
+        # into nothing (test_sandbox_e2e.py module docstring).
+        if: runner.os == 'Windows'
+        run: uv run apps/desktop-python/test_sandbox_e2e.py -q
+        env:
+          QT_QPA_PLATFORM: offscreen
       - uses: actions/upload-artifact@v4
         with:
           name: tracer-screenshot-${{ matrix.os }}

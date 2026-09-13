@@ -171,6 +171,7 @@ uv run scripts/test_picasa_db.py -q
 uv run scripts/check-ingest-parity.py
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q
+QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_sandbox_e2e.py -q   # Windows-only (real AppContainer)
 
 # local-only gate (not a CI job): no beads-jsonl pollution —
 # .beads/issues.jsonl must stay untracked, so this command must FAIL

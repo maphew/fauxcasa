@@ -22,6 +22,10 @@ Checks (derived from .github/workflows/tests.yml and tracer.yml):
     (skipped with --fast; on Windows this spawns real AppContainer sandbox
     workers -- the i92.3 escape gates; elsewhere only the trusted-side
     protocol fuzz runs)
+  - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_sandbox_e2e.py -q
+    (skipped with --fast; Windows-only -- exercises the real thumbcache/
+    viewer call-site wiring onto decodefacade against a real AppContainer
+    worker, fauxcasa-ez2.9 Stage 2)
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodefacade.py -q
     (skipped with --fast; fauxcasa-ez2.9 Stage 1 facade state machine)
   - git ls-files --error-unmatch -- .beads/issues.jsonl must FAIL            (the one bd preflight
@@ -101,6 +105,16 @@ def checks(root: Path, fast: bool) -> list[dict]:
             "command": ["uv", "run", "apps/desktop-python/test_decodesvc_win.py", "-q"],
             "cwd": root,
             "env": {"QT_QPA_PLATFORM": "offscreen"},
+        })
+        result.append({
+            "name": "decode-sandbox e2e (call-site wiring)",
+            "command": ["uv", "run", "apps/desktop-python/test_sandbox_e2e.py", "-q"],
+            "cwd": root,
+            "env": {"QT_QPA_PLATFORM": "offscreen"},
+            # Windows-only: the module skips every test off win32 (real
+            # AppContainer sandbox worker required), so this always exits
+            # 0 elsewhere -- listed here anyway so the gate is uniform and
+            # rots loudly on Windows dev machines and CI's Windows leg.
         })
         result.append({
             "name": "decode-facade suite",
