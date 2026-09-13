@@ -15791,7 +15791,6 @@ def test_import_note_markup_renders_literally(tmp_path: Path) -> None:
 
     tip = win.notes_label.toolTip()
     assert "<b>Best Of</b>" in _tooltip_literal(tip)
-||||||| 6090f37
 # ---------- application icon (rel-0.1) ----------
 
 
