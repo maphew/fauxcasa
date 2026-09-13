@@ -1529,7 +1529,11 @@ class MainWindow(QMainWindow):
         self.activity_label.setTextFormat(Qt.TextFormat.PlainText)
         self.activity_label.setStyleSheet("font-weight: 600; border: none;")
         self.activity_progress = QProgressBar()
-        self.activity_progress.setTextVisible(True)
+        # The count/percent live in activity_label instead (fauxcasa-ez2.6):
+        # the windows11 style painted setFormat's text through the bar's own
+        # thin 4px fill, unreadable at this width — folding it into the
+        # label alongside is both readable and one less thing duplicated.
+        self.activity_progress.setTextVisible(False)
         self.activity_progress.setMinimumWidth(280)
         self.activity_progress.setMaximumWidth(320)
         activity_lay.addWidget(self.activity_label, 1)
@@ -3364,9 +3368,11 @@ class MainWindow(QMainWindow):
         self.grid.scroll_to_fraction(frac)   # best-effort scroll restore
 
     def _build_progress(self, done: int, total: int) -> None:
-        self.progress_label.setText(f"   indexing {done}/{total}…")
+        # No progress_label duplicate here (fauxcasa-ez2.6 §7): the activity
+        # row is already visible and carries the same count + percent.
+        pct = round(100 * done / total) if total else 0
         self._show_activity(
-            f"Indexing thumbnails — {done:,} of {total:,} ready",
+            f"Indexing thumbnails — {done:,} of {total:,} ready ({pct}%)",
             done, total)
 
     def _show_activity(self, text: str, done: int | None = None,

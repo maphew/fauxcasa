@@ -2060,10 +2060,14 @@ def test_index_activity_row_is_prominent_and_determinate(
     win._build_progress(37, 100)
     assert not win.activity_row.isHidden()
     assert win.activity_label.text() == \
-        "Indexing thumbnails — 37 of 100 ready"
+        "Indexing thumbnails — 37 of 100 ready (37%)"
     assert win.activity_progress.maximum() == 100
     assert win.activity_progress.value() == 37
-    assert win.progress_label.text() == "   indexing 37/100…"
+    assert win.activity_progress.isTextVisible() is False  # count lives in
+                                                            # activity_label
+    # No progress_label duplicate (fauxcasa-ez2.6 §7): the activity row
+    # already carries the same count/percent while it's visible.
+    assert win.progress_label.text() == ""
     win._on_index_finished(None, win.catalog, False)
     assert win.activity_row.isHidden()
 
