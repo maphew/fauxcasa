@@ -145,8 +145,29 @@ import applog  # noqa: E402
 log = applog.log
 
 # Single source of truth for the (provisional) product name — nothing
-# else may hard-code it.
+# else may hard-code it. Every user-visible name (window title, --version,
+# the cache dir, the log file, the bundled exe) derives from these three
+# (rel-0.1 identity, fauxcasa-ez2.3): APP_NAME for prose, APP_SLUG for
+# paths/filenames, __version__ for the release stamp.
 APP_NAME = "Fauxcasa"
+__version__ = "0.1.0"
+APP_SLUG = APP_NAME.lower()
+
+# Optional build stamp. The release workflow generates _buildinfo.py next to
+# this file (git sha + build date) and PyInstaller collects it; a source
+# checkout has none, and an empty sha simply drops the "(sha)" suffix from
+# --version / the READY line rather than lying about provenance.
+try:
+    from _buildinfo import BUILD_DATE, GIT_SHA  # type: ignore[import-not-found]
+except ImportError:
+    GIT_SHA = BUILD_DATE = ""
+
+
+def version_string() -> str:
+    """The release identity users and bug reports quote: "Fauxcasa 0.1.0",
+    with the build's git sha appended when one was stamped in. One
+    formatter for --version, the READY JSON and the startup log line."""
+    return f"{APP_NAME} {__version__}" + (f" ({GIT_SHA})" if GIT_SHA else "")
 
 # "Recently Updated" auto-collection (fauxcasa-q6l.7). DECISION (2026-07-02):
 # in a read-only app "updated" means FILE MTIME — the honest proxy until the
@@ -457,6 +478,7 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
 
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(__version__)
     app.setWindowIcon(app_icon())  # the picker dialog is our first window
     # Backstop: an in-process headless platform (e.g. forced offscreen with a
     # DISPLAY present) still can't show a modal — keep this post-construction
@@ -1196,7 +1218,10 @@ class MainWindow(QMainWindow):
         self._search_pairs: list[tuple[int, str]] = []
         self._search_pairs_vis: list[tuple[int, str]] = []
         self._rebuild_search_index()
-        self.setWindowTitle(f"{APP_NAME} tracer — {catalog.root.name}")
+        # Library first, product second (rel-0.1 identity): the title bar /
+        # taskbar tooltip answers "which library am I in?" before it repeats
+        # the app name, and carries no internal codename.
+        self.setWindowTitle(f"{catalog.root.name} — {APP_NAME}")
         self.setWindowIcon(app_icon())
         self.resize(1280, 800)
 
@@ -3246,9 +3271,22 @@ def main() -> int:
     # picker (_prompt_for_library) may construct one long before the
     # main window's own creation below.
     _set_windows_app_user_model_id()
+    # --help is USER-facing: what the app is, the read-only promise, and
+    # where its two writable artifacts live. The module docstring above
+    # stays the developer's map (bead ids, repo-relative commands) and is
+    # deliberately not reused here (rel-0.1 identity, fauxcasa-ez2.3).
     ap = argparse.ArgumentParser(
-        description=__doc__,
+        prog=APP_SLUG,
+        description=(
+            f"{APP_NAME} {__version__} — browse your photo library: folders, "
+            "albums, people, stars, search, slideshow.\n"
+            "Read-only: your photos, Picasa sidecars and database are never "
+            "modified. The only things written are a rebuildable catalog + "
+            "thumbnail cache and a log file, both under the cache directory "
+            "(--cache-root shows/overrides where that is)."),
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=version_string(),
+                    help="print the version and exit")
     ap.add_argument("library", nargs="?", default=None,
                     help="library root to browse (read-only). Default: the "
                          "bundled synthetic library in a source checkout; in "
@@ -3596,6 +3634,7 @@ def main() -> int:
     # A frozen first-run picker may already have created the app.
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(__version__)
     # App-wide default: every top-level (message boxes, the File Types
     # dialog, ...) inherits it; MainWindow/slideshow/peek also set it
     # explicitly so a window built outside main() (tests) carries it too.
@@ -3697,8 +3736,14 @@ def main() -> int:
             # settled — 0 on a still-scanning NAS-scale library (honest:
             # the walk isn't done yet), the real counts when the walk
             # already landed by then (small/warm-adjacent libraries).
+            # "version" (+ "git_sha" only on a stamped build) rides the
+            # existing keys so a perf/CI record says WHICH build produced
+            # the numbers (rel-0.1 identity). Consumers read keys by name
+            # (scripts/perf-canary.py), so an added key is additive.
             print(json.dumps({
                 "event": "ready",
+                "version": __version__,
+                **({"git_sha": GIT_SHA} if GIT_SHA else {}),
                 "cold_start_ms": round(cold_ms),
                 "prep_ms": round(prep_ms),
                 "warm": warm,

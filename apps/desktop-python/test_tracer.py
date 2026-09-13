@@ -2016,6 +2016,29 @@ def test_mainwindow_wires_viewer_cache_on_build_and_reconcile(
     assert win.viewer.catalog is cat2 and win.viewer.thumbs is cache2
 
 
+def test_mainwindow_title_is_library_then_product(tmp_path: Path) -> None:
+    """The title answers which library is open before naming Fauxcasa."""
+    _offscreen_app()
+    import main
+
+    root = tmp_path / "Family photos"
+    _big_library(root)
+    win = main.MainWindow(scan_library(root), None,
+                          cache_dir=None, build_dir=None)
+    assert win.windowTitle() == "Family photos — Fauxcasa"
+
+
+def test_main_version_cli(monkeypatch, capsys) -> None:
+    """--version is a script-friendly product release identity."""
+    import main
+
+    monkeypatch.setattr(sys, "argv", ["fauxcasa", "--version"])
+    with pytest.raises(SystemExit) as exc:
+        main.main()
+    assert exc.value.code == 0
+    assert capsys.readouterr().out == "Fauxcasa 0.1.0\n"
+
+
 def test_index_priority_is_stable_complete_and_filters_bad_indices() -> None:
     """Gallery-first scheduling changes submission order only: duplicates
     and nonsense are ignored and every cache index still appears once."""
