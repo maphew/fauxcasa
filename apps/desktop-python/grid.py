@@ -499,6 +499,12 @@ class GridView(QAbstractScrollArea):
     # asks; MainWindow owns the toolbar action's checked state and the
     # splitter panel's visibility (both views share one InspectorPanel).
     info_toggle_requested = Signal()
+    # Ctrl+F / '/' — jump to the search box (fauxcasa-ez2.6). Only wired
+    # from the grid's keyPressEvent (not a window-level QAction shortcut)
+    # so a bare '/' typed while the search box ALREADY has focus never
+    # reaches here — Qt routes the key event to the focused widget, and
+    # a literal '/' in a search query keeps inserting normally.
+    search_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1643,6 +1649,9 @@ class GridView(QAbstractScrollArea):
             # grid.invert's exact Ctrl+I check above — Ctrl+I stays
             # Picasa's invert-selection, never the panel toggle.
             self.info_toggle_requested.emit()
+            return
+        if keymap.matches(event, "app.search"):
+            self.search_requested.emit()
             return
         if keymap.matches(event, "grid.locate"):
             # Ctrl+Enter: Picasa's Locate on Disk — reveal the CURRENT item

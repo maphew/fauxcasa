@@ -2060,12 +2060,37 @@ def test_index_activity_row_is_prominent_and_determinate(
     win._build_progress(37, 100)
     assert not win.activity_row.isHidden()
     assert win.activity_label.text() == \
-        "Indexing thumbnails — 37 of 100 ready"
+        "Indexing thumbnails — 37 of 100 ready (37%)"
     assert win.activity_progress.maximum() == 100
     assert win.activity_progress.value() == 37
-    assert win.progress_label.text() == "   indexing 37/100…"
+    assert win.activity_progress.isTextVisible() is False  # count lives in
+                                                            # activity_label
+    # No progress_label duplicate (fauxcasa-ez2.6 §7): the activity row
+    # already carries the same count/percent while it's visible.
+    assert win.progress_label.text() == ""
     win._on_index_finished(None, win.catalog, False)
     assert win.activity_row.isHidden()
+
+
+def test_index_finished_status_reads_library_ready(
+        library: Path, tmp_path: Path) -> None:
+    """fauxcasa-ez2.6 §7: the completion status bar message is a plain
+    "Library ready — N photos" verdict, not an indexing-rate number
+    nobody but a dev cares about. The machine-readable JSON "indexed"
+    event (§7 protocol) keeps rate_per_s untouched — only the human
+    status-bar wording changed."""
+    import thumbcache
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    assert result is not None and result.photos == len(cat.photos)
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._on_index_finished(result, cat, False)
+    assert win.statusBar().currentMessage() == \
+        f"Library ready — {len(cat.photos):,} photos"
 
 
 def test_grid_stop_retires_decode_workers() -> None:
@@ -2362,6 +2387,122 @@ def test_sidebar_rebuild_survives_repeated_toggles(reveal_library: Path) -> None
     assert win.grid.filter_label == "Starred"
     assert item_for(win, "starred", "") is not None
     assert win.tree.currentItem() is item_for(win, "starred", "")
+
+
+def test_empty_text_search_no_match(library: Path) -> None:
+    """A search with zero hits sets the grid's painted placeholder to the
+    query-specific wording (fauxcasa-ez2.6 empty states); a match clears it
+    again rather than leaving stale copy under real tiles."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    win.search.setText("nonesuch")
+    assert win.grid.display == []
+    assert win.grid.empty_text == 'No photos match "nonesuch"'
+
+    win.search.setText("beach")
+    assert win.grid.display
+    assert win.grid.empty_text == ""
+
+
+def test_empty_text_folder_with_no_photos(tmp_path: Path) -> None:
+    """The "folder" kind gets the gentler folder-specific wording rather
+    than the terminal "empty library" one, distinguished purely by the
+    active sidebar selection — folders with zero photos never actually
+    appear as sidebar items (see _build_sidebar's fcount(folder) > 0
+    filter), so this drives _apply_view("folder", ...) directly the same
+    way _sidebar_clicked would, against a bare empty catalog, to pin the
+    wording _update_empty_text picks for that kind."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItem
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "empty-lib"
+    root.mkdir()
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    item = QTreeWidgetItem(win.tree, ["Empty Folder"])
+    item.setData(0, Qt.ItemDataRole.UserRole, ("folder", "Empty Folder"))
+    win.tree.setCurrentItem(item)
+    win._apply_view("folder", "Empty Folder")
+    assert win.grid.display == []
+    assert win.grid.empty_text == "This folder has no photos"
+
+
+def test_empty_text_empty_library(tmp_path: Path) -> None:
+    """A library with no photos at all names the root and points at
+    Library… — distinct copy from a merely-empty search or folder."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "empty-lib"
+    root.mkdir()
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    assert win.grid.display == []
+    assert win.grid.empty_text == (
+        f"No photos found under {cat.root.name} — use Library… "
+        "to pick another folder")
+
+
+def test_empty_text_cold_scan_pending_preempts_empty_library(
+        tmp_path: Path) -> None:
+    """While a deferred cold scan is in flight the grid is genuinely empty
+    (the placeholder catalog), but the library isn't confirmed empty yet —
+    the scanning wording must win over the terminal "no photos" one, and
+    landing the walk clears it back to real content."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow
+    from catalog import Catalog
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cfg = libmod.legacy_config(root)
+    empty = Catalog(root=cfg.roots[0].path, photos=[], folders={},
+                    albums={}, roots=list(cfg.roots),
+                    library_id=cfg.library_id)
+    cache_dir = tmp_path / "cachedir"
+    win = MainWindow(empty, None, cache_dir=cache_dir, build_dir=None,
+                     cfg=cfg)
+    assert win.grid.empty_text.startswith("No photos found under")
+
+    win._start_cold_scan(cache_dir)
+    assert win.grid.empty_text == f"Scanning {empty.root.name}…"
+
+    import time as _time
+    deadline = _time.time() + 5.0
+    while win._cold_scan_pending and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    app.processEvents()
+    assert not win._cold_scan_pending
+    assert win.grid.empty_text == ""       # the real, non-empty catalog landed
+    win.shutdown()
 
 
 def test_reveal_preserves_search_view(library: Path) -> None:
@@ -10021,6 +10162,102 @@ def test_sort_modes_persistence_roundtrip(tmp_path: Path) -> None:
     assert load_sort_modes(tmp_path) == {"a": "date"}    # bad values drop
 
 
+def test_window_geometry_persistence_roundtrip(tmp_path: Path) -> None:
+    """save/load round-trip for the persisted window geometry
+    (fauxcasa-ez2.6 §6): a real QByteArray survives base64 in
+    config.json, merged alongside sort_modes, and every degraded input
+    (no state dir, missing file, garbage, non-string value, empty
+    string) reads as None — view prefs are a convenience, never a gate."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QByteArray
+    from PySide6.QtWidgets import QApplication
+    from main import (
+        load_sort_modes,
+        load_window_geometry,
+        save_sort_modes,
+        save_window_geometry,
+    )
+
+    QApplication.instance() or QApplication([])
+    blob = QByteArray(b"\x00\x01\xffnot-real-geometry-but-real-bytes")
+    save_window_geometry(tmp_path, blob)
+    loaded = load_window_geometry(tmp_path)
+    assert loaded is not None and bytes(loaded) == bytes(blob)
+
+    # Merges into the existing doc: an already-persisted sort mode survives.
+    save_sort_modes(tmp_path, {"a": "date"})
+    save_window_geometry(tmp_path, blob)
+    assert load_sort_modes(tmp_path) == {"a": "date"}
+    assert bytes(load_window_geometry(tmp_path)) == bytes(blob)
+
+    assert load_window_geometry(None) is None                    # no dir
+    assert load_window_geometry(tmp_path / "nowhere") is None    # missing
+    cfg = tmp_path / "config.json"
+    cfg.write_text("{not json")
+    assert load_window_geometry(tmp_path) is None                # garbage
+    cfg.write_text('{"window_geometry": 42}')
+    assert load_window_geometry(tmp_path) is None                # non-str
+    cfg.write_text('{"window_geometry": ""}')
+    assert load_window_geometry(tmp_path) is None                # empty
+
+
+def test_default_window_size_scales_to_small_screen(monkeypatch) -> None:
+    """_default_window_size scales the 1280x800 v1 baseline down to
+    min(1280, 0.9*avail.width) x min(800, 0.9*avail.height) instead of
+    spilling off a small display (fauxcasa-ez2.6 §6); a roomy screen
+    still gets the plain 1280x800 baseline unscaled."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QRect
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    screen = app.primaryScreen()
+    assert screen is not None, "offscreen platform still reports a screen"
+
+    monkeypatch.setattr(
+        type(screen), "availableGeometry",
+        lambda self: QRect(0, 0, 1000, 700))
+    assert main._default_window_size() == (900, 630)
+
+    monkeypatch.setattr(
+        type(screen), "availableGeometry",
+        lambda self: QRect(0, 0, 3840, 2160))
+    assert main._default_window_size() == (1280, 800)
+
+
+def test_mainwindow_restores_persisted_geometry_and_saves_on_close(
+        tmp_path: Path) -> None:
+    """MainWindow.__init__ restores a persisted window rect when it's
+    still on-screen, and closeEvent persists whatever's current — an
+    end-to-end round trip through two constructions (fauxcasa-ez2.6 §6)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow, load_window_geometry
+
+    QApplication.instance() or QApplication([])
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cat = scan_library(root)
+    state_dir = tmp_path / "state"
+
+    # A modest size, well within the tiny virtual screen the offscreen
+    # platform reports (Qt's own restoreGeometry clamps to the available
+    # screen rect, same as a real WM would for an oversized saved rect).
+    win1 = MainWindow(cat, None, cache_dir=None, build_dir=None,
+                      state_dir=state_dir)
+    win1.resize(500, 400)
+    win1.close()   # closeEvent persists the current geometry
+    assert load_window_geometry(state_dir) is not None
+
+    win2 = MainWindow(cat, None, cache_dir=None, build_dir=None,
+                      state_dir=state_dir)
+    assert win2.size().width() == 500 and win2.size().height() == 400
+
+
 def test_sort_folder_items_date_mixed_and_pre1903() -> None:
     """Date mode over the three data classes at once: canonical date_taken
     strings (an UNBOUNDED pre-1903 year included — §6 footgun 16) sort
@@ -11098,6 +11335,221 @@ def test_play_tooltip_derives_from_keymap(library: Path) -> None:
     for seq in keymap.shortcuts("app.play"):
         assert seq.toString() in tip, (
             f"{seq.toString()!r} missing from play tooltip: {tip!r}")
+
+
+def test_menu_bar_has_file_view_help_reusing_toolbar_actions(
+        library: Path) -> None:
+    """fauxcasa-ez2.6 §5: File/View/Help menus exist alongside the
+    existing Tools menu, and every item that already has a toolbar
+    QAction (Library…, Info, Play) is the SAME action object in the
+    menu — never a second one with its own state."""
+    from PySide6.QtWidgets import QMenu
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    menus = {m.title().replace("&", ""): m
+            for m in win.menuBar().findChildren(QMenu)}
+    assert {"File", "View", "Help", "Tools"} <= set(menus)
+
+    file_actions = menus["File"].actions()
+    assert win.open_action in file_actions        # reused, not duplicated
+    assert win.open_action.text() == "Library…"    # renamed from "Open..."
+
+    view_actions = menus["View"].actions()
+    assert win.info_action in view_actions
+    assert win.play_action in view_actions
+
+
+def test_view_menu_zoom_in_out_steps_the_slider(library: Path) -> None:
+    """Zoom In/Out (View menu) step the SAME slider the toolbar drags,
+    clamped to its range — one source of truth for tile size."""
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    start = win.zoom.value()
+    win._step_zoom(16)
+    assert win.zoom.value() == start + 16
+    win._step_zoom(-16)
+    assert win.zoom.value() == start
+
+    win.zoom.setValue(win.zoom.maximum())
+    win._step_zoom(16)
+    assert win.zoom.value() == win.zoom.maximum()   # clamped, no overshoot
+    win.zoom.setValue(win.zoom.minimum())
+    win._step_zoom(-16)
+    assert win.zoom.value() == win.zoom.minimum()
+
+
+def test_view_menu_show_hidden_and_flat_folders_sync_checkboxes(
+        library: Path) -> None:
+    """The View menu's Show Hidden / Flat Folders checkable actions stay
+    in lockstep with the toolbar/sidebar QCheckBoxes that actually own
+    the state — driving either one moves the other, and the underlying
+    view behavior (reveal_box's own handler) still fires."""
+    from PySide6.QtWidgets import QMenu
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    view_menu = next(m for m in win.menuBar().findChildren(QMenu)
+                     if m.title().replace("&", "") == "View")
+    show_hidden = next(a for a in view_menu.actions()
+                       if a.text().replace("&", "") == "Show Hidden")
+    flat_folders = next(a for a in view_menu.actions()
+                        if a.text().replace("&", "") == "Flat Folders")
+
+    assert show_hidden.isChecked() == win.reveal_box.isChecked() is False
+    show_hidden.trigger()
+    assert win.reveal_box.isChecked() is True       # action -> checkbox
+    win.reveal_box.setChecked(False)
+    assert show_hidden.isChecked() is False          # checkbox -> action
+
+    assert flat_folders.isChecked() == win._flat_check.isChecked() is False
+    flat_folders.trigger()
+    assert win._flat_check.isChecked() is True
+    win._flat_check.setChecked(False)
+    assert flat_folders.isChecked() is False
+
+
+def test_help_keyboard_shortcuts_dialog_lists_every_action(
+        library: Path) -> None:
+    """Help > Keyboard shortcuts… builds its table at runtime from
+    keymap.DEFAULT_SCHEME + ACTION_LABELS (fauxcasa-ez2.6 §5): every
+    action's plain-English label appears exactly once."""
+    import keymap
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    captured = {}
+
+    def fake_exec(dlg):
+        table = dlg.findChildren(__import__(
+            "PySide6.QtWidgets", fromlist=["QTableWidget"]).QTableWidget)[0]
+        captured["labels"] = [table.item(r, 0).text()
+                              for r in range(table.rowCount())]
+        return 0
+
+    import PySide6.QtWidgets as qtw
+    orig = qtw.QDialog.exec
+    qtw.QDialog.exec = lambda self: fake_exec(self)
+    try:
+        win._show_shortcuts_dialog()
+    finally:
+        qtw.QDialog.exec = orig
+
+    labels = captured["labels"]
+    assert len(labels) == len(keymap.DEFAULT_SCHEME)
+    for action in keymap.DEFAULT_SCHEME:
+        assert keymap.ACTION_LABELS[action] in labels
+
+
+def test_help_about_shows_icon_version_and_license(library: Path) -> None:
+    """Help > About: app icon, version_string() (release identity — same
+    formatter as --version/READY), the tagline, AGPL license, and the
+    project URL, via a real QMessageBox so the icon reliably shows
+    (about()'s convenience function leaves that to the platform)."""
+    import main as mainmod
+    _offscreen_app()
+    from main import MainWindow
+
+    cat = scan_library(library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    captured = {}
+
+    def fake_exec(self):
+        captured["icon"] = self.iconPixmap()
+        captured["text"] = self.text()
+        return 0
+
+    import PySide6.QtWidgets as qtw
+    orig = qtw.QMessageBox.exec
+    qtw.QMessageBox.exec = fake_exec
+    try:
+        win._show_about()
+    finally:
+        qtw.QMessageBox.exec = orig
+
+    assert not captured["icon"].isNull()
+    assert mainmod.version_string() in captured["text"]
+    assert "AGPL-3.0-or-later" in captured["text"]
+    assert "github.com/maphew/fauxcasa" in captured["text"]
+
+
+def test_action_labels_cover_every_scheme_entry() -> None:
+    """keymap.ACTION_LABELS is the single source Help > Keyboard shortcuts…
+    reads (fauxcasa-ez2.6) — a scheme entry with no label would silently
+    drop out of that dialog, so pin 1:1 coverage both ways."""
+    import keymap
+
+    assert set(keymap.ACTION_LABELS) == set(keymap.DEFAULT_SCHEME)
+
+
+def test_keymap_app_search_focuses_and_selects_search_box(
+        tmp_path: Path) -> None:
+    """Ctrl+F or '/' on the grid (keymap.app.search) jumps focus to the
+    search box and selects any existing text, ready to be replaced by
+    typing (fauxcasa-ez2.6)."""
+    from PySide6.QtCore import Qt
+    app = _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.show()
+    win.activateWindow()               # offscreen platform: hasFocus()
+    app.processEvents()                # needs an active window (Qt quirk)
+    win.search.setText("stale")
+    win.grid.setFocus()
+
+    _key(win.grid, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+    assert win.search.hasFocus()
+    assert win.search.selectedText() == "stale"
+
+    win.search.clearFocus()
+    win.grid.setFocus()
+    _key(win.grid, Qt.Key.Key_Slash)
+    assert win.search.hasFocus()
+
+
+def test_grid_has_focus_after_construction_so_space_stars_not_types(
+        tmp_path: Path) -> None:
+    """MainWindow.__init__ lands keyboard focus on the grid (fauxcasa-
+    ez2.6) — without it Qt's default tab order can leave the search box
+    focused at launch, so a Space keystroke meant for star_toggle would
+    instead type a literal space into the query. Drive the actual
+    keyPressEvent through the grid (the same path a real keystroke takes
+    once focus is correct) and confirm the star flipped, the search box
+    stayed empty, and it is indeed the grid holding focus."""
+    from PySide6.QtCore import Qt
+    app = _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.show()
+    win.activateWindow()               # offscreen platform: hasFocus()
+    app.processEvents()                # needs an active window (Qt quirk)
+    assert win.grid.hasFocus()
+
+    win.grid._select(0)
+    assert not cat.photos[0].star
+    _key(win.grid, Qt.Key.Key_Space)
+    assert cat.photos[0].star
+    assert win.search.text() == ""
 
 
 def test_grid_jk_navigate_next_prev(tmp_path: Path) -> None:

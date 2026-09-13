@@ -134,6 +134,16 @@ DEFAULT_SCHEME: dict[str, Binding] = {
         ("F11", "Ctrl+4"),
         note="Slideshow of the current view (q6l.3). Repurposes Picasa's "
              "F11 full-screen; Ctrl+4 is Picasa's own slideshow chord (ed5.12)."),
+    "app.search": Binding(
+        ("Ctrl+F", "/"),
+        note="Focus the search box and select its text (ez2.6 main-window "
+             "polish) — Ctrl+F is the conventional find accelerator, '/' "
+             "is the common browser/mail quick-search key. Dispatched from "
+             "the grid's keyPressEvent (not a window-level QAction "
+             "shortcut) so a bare '/' typed while the search box ALREADY "
+             "has focus keeps inserting the character instead of re-"
+             "triggering; Space still reaches grid.star_toggle at launch "
+             "since neither chord is Space."),
     "app.info": Binding(
         ("I",), key_only=True,
         note="Toggle the metadata inspector panel (q6l.25) — this app's "
@@ -272,6 +282,50 @@ DEFAULT_SCHEME: dict[str, Binding] = {
         ("Left", "K"), key_only=True, note="As the viewer."),
     "slideshow.exit": Binding(
         ("Esc", "Backspace"), key_only=True, note="Exit to the grid."),
+}
+
+# Plain-English labels for every DEFAULT_SCHEME action (fauxcasa-ez2.6):
+# the single source Help > Keyboard shortcuts… reads to build its runtime
+# table, so the on-screen list and this module's own docs never drift
+# apart the way a second, hand-maintained copy would.
+ACTION_LABELS: dict[str, str] = {
+    "app.play": "Start slideshow of the current view",
+    "app.search": "Jump to search",
+    "app.info": "Toggle info panel",
+    "grid.select_all": "Select all",
+    "grid.hold": "Hold selection in tray",
+    "grid.star_toggle": "Add / remove star",
+    "grid.deselect": "Deselect",
+    "grid.invert": "Invert selection",
+    "grid.locate": "Locate on disk",
+    "grid.open": "Open photo",
+    "grid.clear": "Clear selection",
+    "grid.next": "Next photo",
+    "grid.prev": "Previous photo",
+    "grid.row_down": "Move down one row",
+    "grid.row_up": "Move up one row",
+    "grid.first": "Jump to first photo",
+    "grid.last": "Jump to last photo",
+    "peek.dismiss": "Dismiss full-screen peek",
+    "viewer.close": "Close viewer",
+    "viewer.zoom_toggle": "Toggle 100% zoom",
+    "viewer.hold": "Hold photo in tray",
+    "viewer.locate": "Locate on disk",
+    "viewer.faces": "Toggle face overlay",
+    "viewer.pan_left": "Pan left (while zoomed)",
+    "viewer.pan_right": "Pan right (while zoomed)",
+    "viewer.pan_up": "Pan up (while zoomed)",
+    "viewer.pan_down": "Pan down (while zoomed)",
+    "viewer.star_toggle": "Add / remove star",
+    "viewer.next": "Next photo",
+    "viewer.prev": "Previous photo",
+    "viewer.play_pause": "Play / pause video",
+    "viewer.seek_back": "Skip back 5s (video)",
+    "viewer.seek_fwd": "Skip forward 5s (video)",
+    "slideshow.pause": "Pause / resume slideshow",
+    "slideshow.next": "Next photo",
+    "slideshow.prev": "Previous photo",
+    "slideshow.exit": "Exit slideshow",
 }
 
 # M2 reservations (spec §5): the star-set digits and the reject key. No

@@ -48,8 +48,16 @@ from pathlib import Path
 
 T0 = time.perf_counter()
 
-from PySide6.QtCore import QObject, QProcess, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QActionGroup, QIcon, QPalette
+from PySide6.QtCore import (
+    QByteArray,
+    QObject,
+    QProcess,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QActionGroup, QIcon, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -58,6 +66,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QProgressBar,
     QSlider,
     QSplitter,
@@ -129,6 +138,7 @@ from thumbcache import (  # noqa: E402
 )
 from peek import PeekPage  # noqa: E402
 from slideshow import SlideshowPage  # noqa: E402
+import theme  # noqa: E402
 from starstore import (  # noqa: E402
     STAR_OVERRIDES_NAME,
     apply_star_overrides,
@@ -472,6 +482,47 @@ def save_folder_view(state_dir: Path | None, flat: bool) -> None:
     _write_library_config(state_dir, doc)
 
 
+def _default_window_size() -> tuple[int, int]:
+    """min(1280, 0.9 * available width) x min(800, 0.9 * available height)
+    (fauxcasa-ez2.6 §6): the v1 baseline 1280x800 fit fine on a normal
+    monitor but spilled off-screen on a small laptop display — this scales
+    down to the actual screen instead. Falls back to the bare 1280x800
+    baseline when no primary screen is reported (rare; some CI/offscreen
+    setups)."""
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        return 1280, 800
+    avail = screen.availableGeometry()
+    return (min(1280, round(avail.width() * 0.9)),
+            min(800, round(avail.height() * 0.9)))
+
+
+def load_window_geometry(state_dir: Path | None) -> QByteArray | None:
+    """The persisted QWidget.saveGeometry() blob (base64 in config.json),
+    decoded back to a QByteArray, or None if absent/garbage. View prefs
+    are a convenience, never a gate — QByteArray.fromBase64 never raises
+    (invalid input just decodes to something restoreGeometry() rejects),
+    but an empty/near-empty result is treated as absent so the caller
+    falls straight to the freshly computed default size."""
+    if state_dir is None:
+        return None
+    b64 = _read_library_config(state_dir).get("window_geometry")
+    if not isinstance(b64, str) or not b64:
+        return None
+    data = QByteArray.fromBase64(b64.encode("ascii"))
+    return data if data.size() > 0 else None
+
+
+def save_window_geometry(state_dir: Path | None, geometry: QByteArray) -> None:
+    """Persist QWidget.saveGeometry() as base64, merged into the existing
+    config doc so sort_modes/folder_view_flat survive the write."""
+    if state_dir is None:
+        return
+    doc = _read_library_config(state_dir)
+    doc["window_geometry"] = bytes(geometry.toBase64()).decode("ascii")
+    _write_library_config(state_dir, doc)
+
+
 def library_state_dir(library_key: str, cache_root: Path) -> Path:
     """The VARIANT-FREE per-library directory that holds user CHOICES —
     stars.json and the view-prefs config.json (fauxcasa-6vk finding 2).
@@ -577,6 +628,8 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
+    app.setStyle("Fusion")
+    app.setPalette(theme.dark_palette())
     app.setWindowIcon(app_icon())  # the picker dialog is our first window
     # Backstop: an in-process headless platform (e.g. forced offscreen with a
     # DISPLAY present) still can't show a modal — keep this post-construction
@@ -1357,7 +1410,21 @@ class MainWindow(QMainWindow):
         # the app name, and carries no internal codename.
         self.setWindowTitle(f"{catalog.root.name} — {APP_NAME}")
         self.setWindowIcon(app_icon())
-        self.resize(1280, 800)
+        # Initial geometry (fauxcasa-ez2.6 §6): size to the actual screen
+        # first (min(1280, 800) baseline, scaled down on a small display),
+        # then let a persisted saveGeometry() from a previous run override
+        # it — but only when that saved rect is still reachable on THIS
+        # screen setup (a monitor unplugged since the last run must not
+        # strand the window off-screen).
+        self.resize(*_default_window_size())
+        saved = load_window_geometry(self.state_dir)
+        if saved is not None and self.restoreGeometry(saved):
+            screens = QApplication.screens()
+            on_screen = any(
+                s.availableGeometry().intersects(self.geometry())
+                for s in screens)
+            if not on_screen:
+                self.resize(*_default_window_size())
 
         self.grid = GridView()
         # Per-folder sort modes (fauxcasa-q6l.11), loaded BEFORE the first
@@ -1410,7 +1477,7 @@ class MainWindow(QMainWindow):
         bar = QToolBar()
         bar.setMovable(False)
         self.addToolBar(bar)
-        self.open_action = bar.addAction("Open...")
+        self.open_action = bar.addAction("Library…")
         self.open_action.setToolTip("Choose a different photo library folder")
         self.open_action.triggered.connect(self._change_library)
         self.back_action = bar.addAction("← Gallery  (Esc)")
@@ -1443,7 +1510,8 @@ class MainWindow(QMainWindow):
         self.search.setMaximumWidth(360)
         self.search.textChanged.connect(self._search_changed)
         bar.addWidget(self.search)
-        bar.addWidget(QLabel("  zoom "))
+        bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
+        bar.addWidget(QLabel("Zoom"))
         self.zoom = QSlider(Qt.Orientation.Horizontal)
         self.zoom.setRange(64, 256)
         self.zoom.setValue(160)
@@ -1458,7 +1526,8 @@ class MainWindow(QMainWindow):
         self.zoom.valueChanged.connect(
             lambda _v: self._zoom_timer.start())
         bar.addWidget(self.zoom)
-        self.reveal_box = QCheckBox("  Show hidden")
+        bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
+        self.reveal_box = QCheckBox("Show hidden")
         self.reveal_box.setToolTip(
             "Reveal hidden=yes photos, stash-folder files, and folders in the "
             "Hidden Folders category (shown veiled)")
@@ -1478,6 +1547,8 @@ class MainWindow(QMainWindow):
                                   for s in keymap.shortcuts("app.info"))
         self.info_action.setToolTip(f"Show photo info ({_info_chords})")
         self.info_action.toggled.connect(self._toggle_inspector)
+
+        self._build_menus()
 
         # --- pages ---
         browser = QWidget()
@@ -1526,7 +1597,11 @@ class MainWindow(QMainWindow):
         self.activity_label.setTextFormat(Qt.TextFormat.PlainText)
         self.activity_label.setStyleSheet("font-weight: 600; border: none;")
         self.activity_progress = QProgressBar()
-        self.activity_progress.setTextVisible(True)
+        # The count/percent live in activity_label instead (fauxcasa-ez2.6):
+        # the windows11 style painted setFormat's text through the bar's own
+        # thin 4px fill, unreadable at this width — folding it into the
+        # label alongside is both readable and one less thing duplicated.
+        self.activity_progress.setTextVisible(False)
         self.activity_progress.setMinimumWidth(280)
         self.activity_progress.setMaximumWidth(320)
         activity_lay.addWidget(self.activity_label, 1)
@@ -1604,6 +1679,7 @@ class MainWindow(QMainWindow):
         # truth for panel visibility (fauxcasa-q6l.25).
         self.grid.info_toggle_requested.connect(self.info_action.toggle)
         self.viewer.info_toggle_requested.connect(self.info_action.toggle)
+        self.grid.search_requested.connect(self._focus_search)
         # Selection-tray wiring (fauxcasa-q6l.2). The readout also listens
         # to selection_changed and the search box directly — SEPARATE
         # connections, so the status-bar dual mode (_selection_changed)
@@ -1696,6 +1772,135 @@ class MainWindow(QMainWindow):
         elif warm and cache_dir is not None:
             self._start_reconcile()
 
+        # Land keyboard focus on the grid (fauxcasa-ez2.6): the browser's
+        # main surface, and the one Space/J/K/arrows/star_toggle etc. are
+        # bound against — without this, Qt's default first-focusable-widget
+        # tab order can leave the search box focused at launch, so Space
+        # types a literal space into a query instead of starring the
+        # current photo. main() calls it again after win.show() since
+        # focus can only really land on a mapped, visible window.
+        self.grid.setFocus()
+
+    # ---------- menu bar: File / View / Help (fauxcasa-ez2.6) ----------
+
+    def _build_menus(self) -> None:
+        """File / View / Help — added alongside the existing Tools menu
+        (v46.4). Every item that already exists as a toolbar QAction
+        (open_action/play_action/info_action, and the reveal/flat
+        checkboxes) is REUSED here rather than duplicated: a menu click
+        and a toolbar click end up on the exact same QAction (or, for the
+        two plain QCheckBoxes, a thin checkable QAction kept in lockstep
+        with the checkbox so there is still only one place — the
+        checkbox — that owns the actual boolean)."""
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("&File")
+        file_menu.addAction(self.open_action)   # toolbar's "Library…" action
+        file_menu.addSeparator()
+        exit_action = file_menu.addAction("E&xit")
+        exit_action.triggered.connect(self.close)
+
+        view_menu = menubar.addMenu("&View")
+        zoom_in = view_menu.addAction("Zoom &In")
+        zoom_in.setShortcut(QKeySequence.StandardKey.ZoomIn)
+        zoom_in.triggered.connect(lambda: self._step_zoom(16))
+        zoom_out = view_menu.addAction("Zoom &Out")
+        zoom_out.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        zoom_out.triggered.connect(lambda: self._step_zoom(-16))
+        view_menu.addSeparator()
+
+        # reveal_box/_flat_check are plain QCheckBoxes (toolbar/sidebar),
+        # not QActions — a checkable QAction here mirrors each one's
+        # state both ways so the checkbox stays the single source of
+        # truth (its own toggled handler is what actually applies the
+        # view change; the action's toggled just forwards to setChecked,
+        # guarded against the checkbox's own echo back).
+        show_hidden_action = view_menu.addAction("Show &Hidden")
+        show_hidden_action.setCheckable(True)
+        show_hidden_action.setChecked(self.reveal_box.isChecked())
+        show_hidden_action.toggled.connect(self.reveal_box.setChecked)
+        self.reveal_box.toggled.connect(show_hidden_action.setChecked)
+
+        view_menu.addAction(self.info_action)   # toolbar's "Info" action
+
+        flat_folders_action = view_menu.addAction("&Flat Folders")
+        flat_folders_action.setCheckable(True)
+        flat_folders_action.setChecked(self._flat_check.isChecked())
+        flat_folders_action.toggled.connect(self._flat_check.setChecked)
+        self._flat_check.toggled.connect(flat_folders_action.setChecked)
+
+        view_menu.addSeparator()
+        view_menu.addAction(self.play_action)   # toolbar's "▶ Play" action
+
+        help_menu = menubar.addMenu("&Help")
+        shortcuts_action = help_menu.addAction("&Keyboard Shortcuts…")
+        shortcuts_action.triggered.connect(self._show_shortcuts_dialog)
+        help_menu.addSeparator()
+        about_action = help_menu.addAction(f"&About {APP_NAME}")
+        about_action.triggered.connect(self._show_about)
+
+    def _step_zoom(self, delta: int) -> None:
+        """Zoom In/Out menu actions step the SAME slider the toolbar
+        drags — one source of truth for the current tile size, clamped
+        to the slider's own range."""
+        self.zoom.setValue(
+            max(self.zoom.minimum(),
+                min(self.zoom.maximum(), self.zoom.value() + delta)))
+
+    def _show_shortcuts_dialog(self) -> None:
+        """Help > Keyboard shortcuts…: a read-only table built at runtime
+        from keymap.DEFAULT_SCHEME + keymap.ACTION_LABELS — one source
+        of truth, so a chord added/changed in the keymap module shows up
+        here without a second hand-maintained copy."""
+        from PySide6.QtWidgets import (
+            QDialog,
+            QHeaderView,
+            QTableWidget,
+            QTableWidgetItem,
+            QVBoxLayout as _QVBoxLayout,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{APP_NAME} — Keyboard Shortcuts")
+        dlg.resize(520, 480)
+        lay = _QVBoxLayout(dlg)
+        table = QTableWidget(0, 2, dlg)
+        table.setHorizontalHeaderLabels(["Action", "Shortcut"])
+        table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        for action in sorted(keymap.DEFAULT_SCHEME):
+            label = keymap.ACTION_LABELS.get(action, action)
+            chords = " / ".join(
+                s.toString() for s in keymap.shortcuts(action))
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(label))
+            table.setItem(row, 1, QTableWidgetItem(chords))
+        lay.addWidget(table)
+        dlg.exec()
+
+    def _show_about(self) -> None:
+        """Help > About: app icon, name, version (release identity — same
+        formatter as --version/READY), a one-line description, license,
+        and the project URL. Built on QMessageBox (not the about()
+        convenience function) so the app icon is guaranteed to show —
+        about() leaves icon choice to the platform and Windows shows
+        none at all."""
+        box = QMessageBox(self)
+        box.setWindowTitle(f"About {APP_NAME}")
+        box.setIconPixmap(app_icon().pixmap(64, 64))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            f"<h3>{version_string()}</h3>"
+            "<p>Read-only photo browser in the spirit of Picasa.</p>"
+            "<p>License: AGPL-3.0-or-later</p>"
+            "<p><a href=\"https://github.com/maphew/fauxcasa\">"
+            "https://github.com/maphew/fauxcasa</a></p>")
+        box.exec()
+
     # ---------- background index jobs ----------
 
     def _start_cold_scan(self, cache_dir: Path) -> None:
@@ -1715,6 +1920,9 @@ class MainWindow(QMainWindow):
         self._scan_build_dir = cache_dir
         self._scan_t0 = time.perf_counter()
         self._show_activity(f"Scanning {self.catalog.root.name}…")
+        self._update_empty_text()  # grid placeholder: cold scan preempts
+                                    # the "empty library" verdict below it
+        self.grid.viewport().update()  # nothing else repaints the grid here
         bridge = self._bridge
         cfg, scan_filter = self.cfg, self.scan_filter
         contacts, pal_dir, exts, db3_dir = (
@@ -2158,8 +2366,11 @@ class MainWindow(QMainWindow):
                 self._toggle_inspector(True)
         else:
             self.reload_data(catalog, cache)   # reconcile: swap in the new
+        # User-facing wording (fauxcasa-ez2.6 §7): plain "ready" status, not
+        # an indexing-rate number nobody but a dev cares about. The JSON
+        # "indexed" event above (machine protocol, §7) keeps rate_per_s.
         self.statusBar().showMessage(
-            f"indexed {result.photos} photos at {result.rate:.0f}/s", 8000)
+            f"Library ready — {result.photos:,} photos", 8000)
 
     def reload_data(self, catalog: Catalog, thumbs: ThumbCache) -> None:
         """Atomically swap the whole catalog after a reconcile rebuild:
@@ -2306,6 +2517,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.build_cancel.set()
+        save_window_geometry(self.state_dir, self.saveGeometry())
         super().closeEvent(event)
 
     # ---------- reveal (show hidden) ----------
@@ -2904,6 +3116,13 @@ class MainWindow(QMainWindow):
         log.info("search index: %d haystacks in %.0f ms",
                  len(pairs), (time.perf_counter() - t0) * 1000.0)
 
+    def _focus_search(self) -> None:
+        """Ctrl+F / '/' from the grid (fauxcasa-ez2.6, keymap.app.search):
+        jump to the search box and select any existing text, so typing
+        immediately replaces a stale query instead of appending to it."""
+        self.search.setFocus()
+        self.search.selectAll()
+
     @staticmethod
     def _parse_query(text: str) -> tuple[list[str], list[str]]:
         """Whitespace-tokenized query -> (positive, negative) lowercase
@@ -3082,10 +3301,55 @@ class MainWindow(QMainWindow):
 
     # ---------- status ----------
 
+    def _update_empty_text(self) -> None:
+        """Central empty-state wording for the grid's painted placeholder
+        (grid.empty_text, fauxcasa-ez2.4's "an empty view painted nothing"
+        finding). Called after every place the grid's display set can
+        change (_apply_view/_search_changed/_show_counts all flow here;
+        _start_cold_scan/_on_scan_done call it too since they flip
+        _cold_scan_pending WITHOUT going through _show_counts) — reads
+        live state instead of taking a kind/count argument, so it can
+        never drift out of sync with what _apply_view/_search_changed
+        actually left on screen. A non-empty display always wins (no
+        text competes with real tiles). Priority once empty: an active
+        search names the query; a folder view (never the true "no
+        library" case — folders never exist without photos) gets the
+        gentler "this folder" wording; a cold scan in flight preempts
+        the "empty library" verdict below it since the walk hasn't
+        landed yet and the library may not be empty at all; only once
+        neither applies does an empty All-photos view get the terminal
+        "no photos anywhere" copy. Every other empty view (starred,
+        recent, an album, a person) is left wordless by design — those
+        are ordinary "nothing here yet" states, not the three the audit
+        called out."""
+        if self.grid.display:
+            self.grid.empty_text = ""
+            return
+        query = self.search.text().strip()
+        if query:
+            self.grid.empty_text = f'No photos match "{query}"'
+            return
+        kind, _key = self._selected_view()
+        if kind == "folder":
+            self.grid.empty_text = "This folder has no photos"
+            return
+        if getattr(self, "_cold_scan_pending", False):
+            # getattr guard: __init__ calls _show_counts (line ~1583)
+            # before _cold_scan_pending itself is first set (line ~1652).
+            self.grid.empty_text = f"Scanning {self.catalog.root.name}…"
+            return
+        if kind == "all" and self._shown_count() == 0:
+            self.grid.empty_text = (
+                f"No photos found under {self.catalog.root.name} — "
+                "use Library… to pick another folder")
+            return
+        self.grid.empty_text = ""
+
     def _show_counts(self, label: str, n: int) -> None:
         reveal = self.grid.reveal
         folders = sum(1 for f in self.catalog.folders.values()
                       if (f.total_count if reveal else f.photo_count))
+        self._update_empty_text()
         self.counts_label.setText(
             f"  {label}: {n} photos · {folders} folders"
             f" · {len(self.catalog.albums)} albums")
@@ -3296,9 +3560,11 @@ class MainWindow(QMainWindow):
         self.grid.scroll_to_fraction(frac)   # best-effort scroll restore
 
     def _build_progress(self, done: int, total: int) -> None:
-        self.progress_label.setText(f"   indexing {done}/{total}…")
+        # No progress_label duplicate here (fauxcasa-ez2.6 §7): the activity
+        # row is already visible and carries the same count + percent.
+        pct = round(100 * done / total) if total else 0
         self._show_activity(
-            f"Indexing thumbnails — {done:,} of {total:,} ready",
+            f"Indexing thumbnails — {done:,} of {total:,} ready ({pct}%)",
             done, total)
 
     def _show_activity(self, text: str, done: int | None = None,
@@ -3853,6 +4119,8 @@ def main() -> int:
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
+    app.setStyle("Fusion")
+    app.setPalette(theme.dark_palette())
     # App-wide default: every top-level (message boxes, the File Types
     # dialog, ...) inherits it; MainWindow/slideshow/peek also set it
     # explicitly so a window built outside main() (tests) carries it too.
@@ -3868,6 +4136,7 @@ def main() -> int:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
     win.show()
+    win.grid.setFocus()  # only really lands once the window is mapped
     if cold_scan_needed:
         # Non-blocking first run (fauxcasa-q6l.13): the window is already
         # painted (empty) — start the deferred walk now, off the startup
