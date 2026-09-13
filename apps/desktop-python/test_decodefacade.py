@@ -651,5 +651,34 @@ def test_index_and_poster_are_always_in_process(monkeypatch, synthetic_png):
     assert img.width() == 2 and img.height() == 2
 
 
+def test_winsandboxtransport_decode_returns_null_qimage_for_missing_pixels_bytes():
+    """decodesvc.DecodeResult.pixels_bytes is Optional (defaults to None
+    for back-compat construction) -- WinSandboxTransport.decode() must
+    guard that instead of handing None to QImage(), which would raise.
+    Uses a fake pool/transport so this does not depend on a real sandbox
+    worker or win32."""
+    from decodesvc import DecodeResult, PixelBuffer, PixelFormat
+
+    class _FakePool:
+        def decode(self, path, edge=0):
+            return DecodeResult(
+                pixels=PixelBuffer(w=2, h=2, stride=8,
+                                    pixfmt=PixelFormat.RGBA8, off=0, len=0),
+                source_w=2, source_h=2, pixels_bytes=None)
+
+    class _FakePoolSet:
+        def lease(self, lane, timeout=30):
+            return _FakePool()
+
+        def release(self, pool):
+            pass
+
+    transport = object.__new__(df.WinSandboxTransport)
+    transport._dw = None
+    transport._pool_set = _FakePoolSet()
+    img = transport.decode("does-not-matter.jpg", route="still", edge=0)
+    assert img.isNull(), "pixels_bytes=None must yield a null QImage, not a crash"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__] + (sys.argv[1:] or ["-v"])))

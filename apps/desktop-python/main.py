@@ -2008,13 +2008,17 @@ class MainWindow(QMainWindow):
         checkbox — that owns the actual boolean)."""
         menubar = self.menuBar()
 
-        file_menu = menubar.addMenu("&File")
+        # Kept as attributes (like tools_menu) so the window — and tests —
+        # hold a durable reference to each menu instead of re-discovering
+        # them through transient findChildren()/QAction.menu() wrappers,
+        # which proved timing-sensitive under the script runner.
+        file_menu = self.file_menu = menubar.addMenu("&File")
         file_menu.addAction(self.open_action)   # toolbar's "Library…" action
         file_menu.addSeparator()
         exit_action = file_menu.addAction("E&xit")
         exit_action.triggered.connect(self.close)
 
-        view_menu = menubar.addMenu("&View")
+        view_menu = self.view_menu = menubar.addMenu("&View")
         zoom_in = view_menu.addAction("Zoom &In")
         zoom_in.setShortcut(QKeySequence.StandardKey.ZoomIn)
         zoom_in.triggered.connect(lambda: self._step_zoom(16))
@@ -2046,7 +2050,7 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         view_menu.addAction(self.play_action)   # toolbar's "Play" action
 
-        help_menu = menubar.addMenu("&Help")
+        help_menu = self.help_menu = menubar.addMenu("&Help")
         # fauxcasa-ez2.9: Tools was created first (v46.4, __init__, before
         # this method runs) so it landed leftmost in the bar; reposition it
         # between View and Help so the bar reads File, View, Tools, Help.

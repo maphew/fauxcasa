@@ -286,13 +286,13 @@ jobs:
 
       # --- Decode-sandbox go/no-go (fauxcasa-ez2.9 Stage 2) -----------------
       # Mirrors bundle.yml's go/no-go step exactly -- see that file's
-      # comment for the rationale. Windows-only; continue-on-error so a
-      # sandbox that cannot hello degrades the RELEASE artifact to
-      # in-process + banner rather than blocking a release.
+      # comment for the rationale. Windows-only. HARD GATE: PR 131's CI
+      # proved the frozen artifact spawns a sandboxed worker on
+      # windows-latest, so a failure here is a real regression in the
+      # RELEASE artifact, not an expected degrade -- fail the build.
       - name: Decode-sandbox go/no-go (frozen artifact, real AppContainer)
         if: runner.os == 'Windows'
         shell: bash
-        continue-on-error: true
         run: |
           EXE="dist/fauxcasa-console/fauxcasa-console.exe"
           set +e
@@ -304,15 +304,14 @@ jobs:
           echo "exit=$RC"
           if ! printf '%s\n' "$OUT" | grep '"event": "decode-sandbox"' \
               | grep -q '"state": "sandboxed"'; then
-            echo "::warning::frozen release artifact could not hello the AppContainer decode sandbox (go/no-go NOT met) -- exit $RC, see output above. Shipping with the sandbox unavailable degrades to in-process decode + the status-bar banner (N7), not a build failure."
-            exit 0
+            echo "::error::frozen release artifact could not hello the AppContainer decode sandbox (go/no-go NOT met) -- exit $RC, see output above. Shipping with the sandbox unavailable degrades to in-process decode + the status-bar banner (N7), not a build failure."
+            exit 1
           fi
           echo "OK: frozen release artifact's decode sandbox hellos (state=sandboxed)"
 
       - name: Decode-sandbox indexes real JPEG tiles in the frozen artifact
         if: runner.os == 'Windows'
         shell: bash
-        continue-on-error: true
         run: |
           EXE="dist/fauxcasa-console/fauxcasa-console.exe"
           set +e
@@ -322,15 +321,14 @@ jobs:
           set -e
           echo "exit=$RC"
           if [ "$RC" -ne 0 ] || [ ! -s sandboxed-ci.png ]; then
-            echo "::warning::frozen release artifact's --require-sandbox indexed run did not produce a screenshot (exit $RC) -- go/no-go not met, see the prior hello step"
-            exit 0
+            echo "::error::frozen release artifact's --require-sandbox indexed run did not produce a screenshot (exit $RC) -- go/no-go not met, see the prior hello step"
+            exit 1
           fi
           echo "sandboxed_screenshot_ok=1" >> "$GITHUB_ENV"
 
       - name: Assert the sandboxed screenshot is non-blank (stills decoded through the sandbox)
         if: runner.os == 'Windows' && env.sandboxed_screenshot_ok == '1'
         shell: bash
-        continue-on-error: true
         run: |
           uv run --with "${{ env.PYSIDE6 }}" python - <<'EOF'
           import sys
