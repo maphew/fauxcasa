@@ -167,6 +167,51 @@ jobs:
           print("OK: frozen artifact decodes JPEG thumbnails")
           EOF
 
+      - name: Smoke-run the FROZEN artifact's viewer (--open, the DNG)
+        # --open N opens the viewer on the Nth item of the default "All
+        # photos" display order (main.py --help). That order is the walk
+        # order (grid.py DEFAULT_SORT_MODE = "name" = catalog/walk order,
+        # folders grouped in first-seen order): "2019-03-02 Hike"'s 6 JPEGs
+        # (photo00..05.jpg) sort before "synthetic.dng" (p < s) and before
+        # "2022-11-20 Birthday" ("2019" < "2022"), so index 6 is
+        # 2019-03-02 Hike/synthetic.dng — the pre-committed RAW fixture.
+        # main.py has no --open-name flag (not edited here per scope), so
+        # this smoke keys on that computed index instead.
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXE="dist/fauxcasa-console/fauxcasa-console.exe"
+          else
+            EXE="dist/fauxcasa-console/fauxcasa-console"
+          fi
+          "$EXE" ci-library --cache-root ./open-cache --finish-build \
+            --open 6 --screenshot frozen-open.png
+
+      - name: Assert the viewer screenshot is non-blank (DNG decoded to pixels)
+        shell: bash
+        run: |
+          uv run --with "${{ env.PYSIDE6 }}" python - <<'EOF'
+          import sys
+          from collections import Counter
+          from PySide6.QtGui import QImage
+          img = QImage("frozen-open.png")
+          if img.isNull():
+              sys.exit("viewer screenshot did not load")
+          c = Counter()
+          for y in range(0, img.height(), 5):
+              for x in range(0, img.width(), 5):
+                  p = img.pixelColor(x, y)
+                  c[(p.red() // 32 * 32, p.green() // 32 * 32, p.blue() // 32 * 32)] += 1
+          # Same blue-dominant palette check as the grid assertion above: the
+          # synthetic DNG's embedded preview is blue, so a decoded viewer
+          # frame has many b>=128, b>g samples.
+          blue = sum(n for (r, g, b), n in c.items() if b >= 128 and b > g and g >= 64)
+          print(f"blue-photo samples: {blue}")
+          if blue < 50:
+              sys.exit("BLANK viewer — DNG did not decode (rawpy missing?)")
+          print("OK: frozen artifact's viewer decodes the DNG")
+          EOF
+
       - name: Assert DNG thumbnail decoded in frozen artifact (rawpy gated)
         # Mirrors the JPEG tile assertion above but keys on the fcache directly
         # rather than the screenshot: checks that the synthetic.dng entry has a
@@ -352,5 +397,6 @@ jobs:
           name: fauxcasa-console-${{ matrix.os }}-screenshot
           path: |
             frozen-ci.png
+            frozen-open.png
             gui-ci.png
           retention-days: 14
