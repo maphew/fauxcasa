@@ -260,12 +260,27 @@ def _remember_library(cache_root: Path, library: Path) -> None:
     reopens it. Best-effort: a write failure must never abort the launch.
     Writes via a per-process temp sibling + os.replace so a second frozen
     instance launching concurrently can never read a half-written (torn)
-    config — it sees either the old file or the whole new one."""
+    config — it sees either the old file or the whole new one.
+
+    Reads the existing doc first and only overwrites the 'library' key —
+    filetypes.save_excluded_exts persists per-library File Types
+    exclusions in this same config.json (see filetypes.py's
+    preserved-keys contract), and a blind overwrite here would wipe them
+    on every library switch. Fail-soft on a garbage/missing file: keep
+    whatever raw keys survive parsing, same posture as
+    _remembered_library and save_excluded_exts."""
     cfg = _config_path(cache_root)
     tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
     try:
+        data = json.loads(cfg.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["library"] = str(library)
+    try:
         cache_root.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps({"library": str(library)}))
+        tmp.write_text(json.dumps(data))
         os.replace(tmp, cfg)
     except OSError as e:
         log.warning("could not remember library choice: %s", e)

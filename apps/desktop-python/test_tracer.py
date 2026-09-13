@@ -2964,6 +2964,32 @@ def test_remember_library_atomic_leaves_no_temp(tmp_path: Path) -> None:
     assert main._remembered_library(cache_root) == lib
 
 
+def test_remember_library_preserves_filetypes_exclusions(tmp_path: Path) -> None:
+    """main._remember_library (fauxcasa-ez2.12 finding 1) used to overwrite
+    the WHOLE cache-root config.json with just {"library": ...}, wiping
+    every library's File Types exclusions that filetypes.save_excluded_exts
+    stores in the same file (filetypes.py's preserved-keys contract).
+    Saving exclusions and then remembering a library must leave the
+    exclusions readable afterward."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import filetypes
+    import main
+
+    cache_root = tmp_path / "cr"
+    lib = tmp_path / "lib"
+    lib.mkdir()
+
+    excluded = {".bmp"}
+    assert filetypes.save_excluded_exts(cache_root, lib, excluded)
+    assert filetypes.load_excluded_exts(cache_root, lib) == excluded
+
+    main._remember_library(cache_root, lib)
+
+    assert main._remembered_library(cache_root) == lib
+    assert filetypes.load_excluded_exts(cache_root, lib) == excluded
+
+
 def test_remember_library_oserror_is_soft(tmp_path: Path, capsys) -> None:
     """_remember_library (fauxcasa-7e5) is best-effort: an unwritable cache
     root — here its parent is a regular file, so mkdir raises NotADirectoryError
