@@ -415,6 +415,62 @@ def test_crop_aware_edge_preserves_resolution_on_sandboxed_path(
 
 
 # ---------------------------------------------------------------------------
+# Tight-crop arena clamp (fauxcasa release-0.1 review P0-1): a crop tight
+# enough that the P2-4 boosted edge above would exceed what the BATCH
+# lane's 8 MiB arena (DecodePoolSet.BATCH_ARENA_BYTES) can return must
+# still produce a non-empty tile -- not a permanent zero-length blob from
+# an unclamped TOO_LARGE. Numbers below reproduce the reviewer's repro
+# exactly: 6000x4000 source, crop keeping ~6% of the long edge (360x240
+# box) -- pre-fix this crop yields blob length 0 (TOO_LARGE at the
+# unclamped boosted edge of ~4267px); post-fix the request is clamped to
+# the arena-derived edge (~1448px), so the crop sub-rect still decodes,
+# just below the full `top` resolution (the arena is the hard limit on
+# this lane -- trading crop resolution for a non-empty tile is the
+# intended fix, not a regression of P2-4's resolution goal).
+
+@_WINDOWS_ONLY
+def test_tight_crop_does_not_exceed_batch_arena(tmp_path, monkeypatch):
+    from PySide6.QtGui import QColor, QImage
+    import decodesvc_win as dw
+
+    root = tmp_path / "lib"
+    (root / "f").mkdir(parents=True)
+    w, h = 6000, 4000
+    img = QImage(w, h, QImage.Format.Format_RGB32)
+    img.fill(QColor(90, 140, 200))
+    assert img.save(str(root / "f" / "tight.jpg"), "JPEG", 90)
+
+    # ~6% of the long edge kept on both axes -- 360x240 box on 6000x4000.
+    keep = 0.06
+    rect_hex = _rect64_hex(0.0, 0.0, keep, keep)
+    (root / "f" / ".picasa.ini").write_text(
+        f"[tight.jpg]\r\ncrop=rect64({rect_hex})\r\n")
+
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+    df.reset_service()
+    svc = df.get_service()
+    svc.ensure_started()
+    assert svc.state == df.STATE_SANDBOXED, f"sandbox failed: {svc.reason}"
+
+    cat = scan_library(root)
+    ci = next(i for i, p in enumerate(cat.photos) if p.name == "tight.jpg")
+
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    cache = thumbcache.load_cache(result.path)
+    _offset, length, w_out, h_out = cache.entries[ci]
+
+    assert length > 0, (
+        "tight crop must not be a permanent zero-length error tile "
+        "(unclamped boosted edge exceeded the batch arena)")
+    assert w_out > 0 and h_out > 0
+
+    # The clamped edge must actually respect the arena: max output edge
+    # is bounded by the largest square RGBA8 edge the arena can hold.
+    arena_edge = int((dw.DecodePoolSet.BATCH_ARENA_BYTES / 4) ** 0.5)
+    assert max(w_out, h_out) <= arena_edge
+
+
+# ---------------------------------------------------------------------------
 # (c) hostile files through the wired index path, sandbox=1
 
 @_WINDOWS_ONLY
