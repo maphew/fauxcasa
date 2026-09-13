@@ -93,12 +93,16 @@ jobs:
       - name: Assert tag matches __version__
         shell: bash
         run: |
-          if ! grep -q "^__version__ = \"${VER}\"\$" apps/desktop-python/main.py; then
-            echo "::error::tag ${TAG} (version ${VER}) does not match __version__ in apps/desktop-python/main.py"
+          # A pre-release suffix (v0.1.0-rc1, v0.1.0-beta2) is allowed for
+          # dry runs and release candidates: only the part before the
+          # first '-' must equal __version__. Archives keep the full VER.
+          BASE="${VER%%-*}"
+          if ! grep -q "^__version__ = \"${BASE}\"\$" apps/desktop-python/main.py; then
+            echo "::error::tag ${TAG} (version ${BASE}) does not match __version__ in apps/desktop-python/main.py"
             grep -n "^__version__" apps/desktop-python/main.py || true
             exit 1
           fi
-          echo "OK: tag ${TAG} matches __version__ = \"${VER}\""
+          echo "OK: tag ${TAG} matches __version__ = \"${BASE}\""
 
       - name: Write build stamp (_buildinfo.py)
         shell: bash
