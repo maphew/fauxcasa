@@ -17,14 +17,16 @@ follow-up (main.py is out of this bead's scope).
 ACCENT decision: the app icon (assets/icon.svg — "lens horizon") is a
 teal tile (#1E7A82) with a cream lens, a warm orange sun (#F0592E), and a
 green hill (#3F9B6E). Selection/current-item chrome takes the sun orange
-rather than the old generic UI blue (64,140,255) — checked against
-photos with warm (orange/yellow) content in the polish scratch driver:
-the selection outline and its translucent gutter fill sit mostly OFF the
-photo itself (in the PAD gutter between tiles, over the dark WINDOW
-background), where orange keeps strong contrast regardless of what the
-adjacent thumbnail shows. PLAY stays a plain green — it names an action
-(playback), not brand identity, and doesn't compete with ACCENT since
-the two are never adjacent chrome on the same element.
+rather than the old generic UI blue (64,140,255) — checked in the polish
+scratch driver against warm (orange/yellow) photo content specifically,
+the risk case for a warm accent: ACCENT_SOFT's translucent wash covers
+the whole tile (not just the PAD gutter — grid.py's SELECT_MARGIN only
+adds a few px beyond the tile edge), yet the outline and star-badge
+contrast both hold up — the ACCENT outline reads as a crisper, more
+saturated edge than the photo's own warm fill, and the star keeps its
+own 1px dark outline regardless. PLAY stays a plain green — it names an
+action (playback), not brand identity, and doesn't compete with ACCENT
+since the two are never adjacent chrome on the same element.
 """
 
 from __future__ import annotations
