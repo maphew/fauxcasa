@@ -274,16 +274,12 @@ jobs:
       # path (frozen --decode-worker dispatch, _MEIPASS ACL grants) can be
       # proven — every other leg above runs `python.exe -c`, which Stage 1
       # explicitly does NOT cover. Windows-only (no AppContainer on Linux).
-      # GO/NO-GO: if the frozen worker cannot hello here, that is real
-      # evidence the bundle ships with the sandbox unavailable -- report it
-      # loudly (::warning) but do NOT fail the build over it (continue-on-
-      # error: true): the app is designed to degrade to in-process +
-      # honest banner (N7) rather than refuse to run, and 0.1 may ship with
-      # the sandbox off in the bundle per the epic's own go/no-go clause.
+      # HARD GATE: PR 131's CI proved the frozen artifact spawns a
+      # sandboxed worker on windows-latest, so a failure here is a real
+      # regression, not an expected degrade — fail the build.
       - name: Decode-sandbox go/no-go (frozen artifact, real AppContainer)
         if: runner.os == 'Windows'
         shell: bash
-        continue-on-error: true
         run: |
           EXE="dist/fauxcasa-console/fauxcasa-console.exe"
           set +e
@@ -295,15 +291,14 @@ jobs:
           echo "exit=$RC"
           if ! printf '%s\n' "$OUT" | grep '"event": "decode-sandbox"' \
               | grep -q '"state": "sandboxed"'; then
-            echo "::warning::frozen artifact could not hello the AppContainer decode sandbox (go/no-go NOT met) -- exit $RC, see output above. Shipping this artifact with the sandbox unavailable degrades to in-process decode + the status-bar banner (N7), which is the documented fallback, not a build failure."
-            exit 0
+            echo "::error::frozen artifact could not hello the AppContainer decode sandbox (go/no-go NOT met) -- exit $RC, see output above. Shipping this artifact with the sandbox unavailable degrades to in-process decode + the status-bar banner (N7), which is the documented fallback, not a build failure."
+            exit 1
           fi
           echo "OK: frozen artifact's decode sandbox hellos (state=sandboxed)"
 
       - name: Decode-sandbox indexes real JPEG tiles in the frozen artifact
         if: runner.os == 'Windows'
         shell: bash
-        continue-on-error: true
         run: |
           EXE="dist/fauxcasa-console/fauxcasa-console.exe"
           set +e
@@ -313,15 +308,14 @@ jobs:
           set -e
           echo "exit=$RC"
           if [ "$RC" -ne 0 ] || [ ! -s sandboxed-ci.png ]; then
-            echo "::warning::frozen artifact's --require-sandbox indexed run did not produce a screenshot (exit $RC) -- go/no-go not met, see the prior hello step"
-            exit 0
+            echo "::error::frozen artifact's --require-sandbox indexed run did not produce a screenshot (exit $RC) -- go/no-go not met, see the prior hello step"
+            exit 1
           fi
           echo "sandboxed_screenshot_ok=1" >> "$GITHUB_ENV"
 
       - name: Assert the sandboxed screenshot is non-blank (stills decoded through the sandbox)
         if: runner.os == 'Windows' && env.sandboxed_screenshot_ok == '1'
         shell: bash
-        continue-on-error: true
         run: |
           uv run --with "${{ env.PYSIDE6 }}" python - <<'EOF'
           import sys
