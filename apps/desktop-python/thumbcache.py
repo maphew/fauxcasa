@@ -655,10 +655,14 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
             # in decodesvc_worker_win.py).
             edge = top
             if crop is not None and data:
-                _hdr_buf = QBuffer()
-                _hdr_buf.setData(data)
-                _hdr_buf.open(QIODevice.OpenModeFlag.ReadOnly)
-                _hdr_sz = QImageReader(_hdr_buf).size()  # header-only
+                # Header-only size read via a PATH-constructed reader (C++
+                # QFile device) -- never a Python QBuffer from this worker
+                # thread: the format-probe loop holds the image-plugin
+                # factory mutex while reading the device, and a shiboken
+                # device needs the GIL per read() (bd memory
+                # qt-decode-gil-mutex-deadlock: that pairing deadlocked
+                # the pool, fauxcasa-5dk). Same form the clip path uses.
+                _hdr_sz = QImageReader(str(src)).size()  # header-only
                 if _hdr_sz.isValid() and _hdr_sz.width() > 0 and _hdr_sz.height() > 0:
                     _box = crop_pixel_box(crop, _hdr_sz.width(), _hdr_sz.height())
                     if _box is not None and _box[2] > 0 and _box[3] > 0:
