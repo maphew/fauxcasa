@@ -3560,7 +3560,8 @@ def test_slideshow_prefetch_makes_advance_a_pure_swap(tmp_path: Path) -> None:
     def prefetched_next() -> bool:
         with show._prefetch_lock:
             got = show._prefetched
-        return got is not None and got[0] == display[1] and got[1] is not None
+        key = (id(show.catalog), display[1])
+        return got is not None and got[0] == key and got[1] is not None
 
     assert _spin(app, prefetched_next)
     _press(show, Qt.Key.Key_Right)
@@ -3589,11 +3590,70 @@ def test_slideshow_prefetch_failure_falls_back_to_async(
     show = SlideshowPage(cat, None, delay_ms=60_000)
     show.start(display, 0)
     assert _spin(app, lambda: show._prefetched is not None)
-    assert show._prefetched == (display[1], None)      # tried, failed
+    key = (id(show.catalog), display[1])
+    assert show._prefetched == (key, None)              # tried, failed
     _press(show, Qt.Key.Key_Right)
     assert show.pos == 1 and show.image is None        # async path taken
     assert _spin(app, lambda: not show.loading)        # decode fails soft
     assert show.image is None                          # "could not decode"
+
+
+def test_slideshow_prefetch_ignored_after_catalog_swap(
+        tmp_path: Path) -> None:
+    """slideshow._prefetched (fauxcasa-ez2.12 finding 4): a reconcile
+    catalog swap must not let a stale decoded image from the OLD catalog
+    be served for an index in the NEW catalog. Prefetch for index 1, swap
+    self.catalog to a new Catalog object, and confirm _take_prefetched no
+    longer serves the pre-swap decode."""
+    import copy
+    app = _offscreen_app()
+    from slideshow import SlideshowPage
+    cat = scan_library(_show_library(tmp_path))
+    show = SlideshowPage(cat, None, delay_ms=60_000)
+    display = list(range(len(cat.photos)))
+    show.start(display, 0)
+
+    def prefetched_next() -> bool:
+        with show._prefetch_lock:
+            got = show._prefetched
+        key = (id(show.catalog), display[1])
+        return got is not None and got[0] == key and got[1] is not None
+
+    assert _spin(app, prefetched_next)
+
+    # Simulate a reconcile swap: a new Catalog object, same indices.
+    show.catalog = copy.copy(cat)
+
+    assert show._take_prefetched(display[1]) is None
+
+
+def test_slideshow_start_and_exit_clear_stale_prefetch(
+        tmp_path: Path) -> None:
+    """start() and _exit() drop any leftover _prefetched entry (and age out
+    an in-flight job via the serial) so a decode queued before a catalog
+    swap can never land in the fresh session."""
+    app = _offscreen_app()
+    from slideshow import SlideshowPage
+    cat = scan_library(_show_library(tmp_path))
+    show = SlideshowPage(cat, None, delay_ms=60_000)
+    display = list(range(len(cat.photos)))
+
+    with show._prefetch_lock:
+        show._prefetched = ((id(cat), display[1]), None)
+    show.start(display, 0)
+    with show._prefetch_lock:
+        assert show._prefetched is None
+
+    def prefetched_next() -> bool:
+        with show._prefetch_lock:
+            got = show._prefetched
+        key = (id(show.catalog), display[1])
+        return got is not None and got[0] == key and got[1] is not None
+
+    assert _spin(app, prefetched_next)
+    show._exit()
+    with show._prefetch_lock:
+        assert show._prefetched is None
 
 
 def test_mainwindow_play_action_plays_current_view_and_esc_restores(

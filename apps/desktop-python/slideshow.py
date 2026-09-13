@@ -83,7 +83,12 @@ class SlideshowPage(ViewerPage):
         # out jobs superseded by a newer kick (same pattern as the
         # viewer's own stale-load guard).
         self._prefetch_lock = threading.Lock()
-        self._prefetched: tuple[int, QImage | None] | None = None
+        # Keyed by (id(self.catalog), catalog idx), not bare idx: a
+        # reconcile can swap self.catalog out for a new Catalog object
+        # whose indices renumber, so a bare-idx key could hand a stale
+        # decoded image for a DIFFERENT photo to _take_prefetched after
+        # the swap (fauxcasa-ez2.12 finding 4).
+        self._prefetched: tuple[tuple[int, int], QImage | None] | None = None
         self._prefetch_serial = 0
 
     def quiesce(self, timeout: float = 5.0) -> None:
@@ -99,6 +104,9 @@ class SlideshowPage(ViewerPage):
         """Go full-screen and play `display` from `pos` (the ViewerPage
         show_photo contract: catalog indices in display order)."""
         self.paused = False
+        with self._prefetch_lock:
+            self._prefetch_serial += 1  # age out any in-flight prior job
+            self._prefetched = None     # drop any stale (pre-swap) prefetch
         self._hint_visible = True
         self._hint_timer.start()
         self.showFullScreen()
@@ -109,6 +117,9 @@ class SlideshowPage(ViewerPage):
 
     def _exit(self) -> None:
         self._timer.stop()
+        with self._prefetch_lock:
+            self._prefetch_serial += 1  # age out any in-flight job
+            self._prefetched = None
         self.hide()
         self.closed.emit(self.current_index())
 
@@ -177,8 +188,9 @@ class SlideshowPage(ViewerPage):
         if len(self.display) < 2:
             return
         nxt = self.display[(self.pos + 1) % len(self.display)]
+        key = (id(self.catalog), nxt)
         with self._prefetch_lock:
-            if self._prefetched is not None and self._prefetched[0] == nxt:
+            if self._prefetched is not None and self._prefetched[0] == key:
                 return                 # already decoded (or decode failed)
             self._prefetch_serial += 1
             serial = self._prefetch_serial
@@ -202,14 +214,15 @@ class SlideshowPage(ViewerPage):
             with self._prefetch_lock:
                 if serial != self._prefetch_serial:
                     return             # superseded by a newer kick
-                self._prefetched = (nxt, None if img.isNull() else img)
+                self._prefetched = (key, None if img.isNull() else img)
 
         self._submit(work)
 
     def _take_prefetched(self, idx: int) -> QImage | None:
+        key = (id(self.catalog), idx)
         with self._prefetch_lock:
             got = self._prefetched
-            if got is not None and got[0] == idx and got[1] is not None:
+            if got is not None and got[0] == key and got[1] is not None:
                 self._prefetched = None
                 return got[1]
         return None
