@@ -15626,3 +15626,108 @@ def test_inspector_rederives_after_metadata_backfill(library: Path) -> None:
     text = _inspector_text(win.inspector)
     assert "backfilled caption" in text
     assert "the beach" not in text
+
+
+def _tooltip_literal(tip: str) -> str:
+    """The text a tooltip actually SHOWS. QToolTip has no plain-text mode
+    — it renders the string as HTML whenever Qt thinks it might be rich
+    text — so a tooltip is only safe if HTML-rendering it still yields the
+    original characters. That is exactly what this returns."""
+    from PySide6.QtGui import QTextDocument
+
+    doc = QTextDocument()
+    doc.setHtml(tip)
+    return doc.toPlainText()
+
+
+def test_plain_tooltip_passes_plain_text_through_and_escapes_markup() -> None:
+    """Finding 7 unit: _plain_tooltip leaves ordinary text (every
+    path-only tooltip) byte-identical, and renders anything Qt could
+    mistake for markup as explicit, escaped HTML."""
+    import main
+
+    plain = "C:/photos/2020 Trip\nSummer holiday"
+    assert main._plain_tooltip(plain) is plain          # untouched
+
+    risky = "C:/photos/2020 Trip\n<img src=http://x/y>"
+    out = main._plain_tooltip(risky)
+    assert out.startswith("<html>") and "&lt;img" in out
+    assert _tooltip_literal(out) == risky               # shown verbatim
+    # The pre-fix string would have lost the tag entirely.
+    assert "<img" not in _tooltip_literal(risky)
+
+
+def test_catalog_markup_renders_literally(tmp_path: Path) -> None:
+    """Finding 7: user-authored catalog text — a caption, a folder
+    description, an album description — must be SHOWN, never interpreted,
+    in the inspector, the status-bar readout and the sidebar tooltips."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QLabel, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    _offscreen_app()
+    uid = "abcdabcdabcdabcd" * 2
+    root = tmp_path / "lib"
+    make_jpeg(root / "trip" / "a.jpg")
+    (root / "trip" / ".picasa.ini").write_text(
+        "[Picasa]\r\nname=Trip\r\ndescription=<img src=http://evil/x>\r\n"
+        "[a.jpg]\r\ncaption=<b>beach</b>\r\n"
+        f"albums={uid}\r\n"
+        f"[.album:{uid}]\r\n"
+        "name=Best Of\r\n"
+        "description=<i>favourites</i>\r\n"
+        f"token=]album:{uid}\r\n")
+    cat = scan_library(root)
+    assert cat.folders["trip"].description == "<img src=http://evil/x>"
+    assert cat.albums[uid].description == "<i>favourites</i>"
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.info_action.setChecked(True)
+    idx = next(i for i, p in enumerate(cat.photos) if p.name == "a.jpg")
+    win.grid._select(idx)
+
+    # Status-bar readout and the view counts are plain-text sinks.
+    assert "<b>beach</b>" in win.meta_label.text()
+    assert win.meta_label.textFormat() == Qt.TextFormat.PlainText
+    assert win.counts_label.textFormat() == Qt.TextFormat.PlainText
+
+    # Inspector: the VALUE label carrying the caption renders it literally.
+    caption_label = next(
+        lbl for lbl in win.inspector.findChildren(QLabel)
+        if lbl.text() == "<b>beach</b>")
+    assert caption_label.textFormat() == Qt.TextFormat.PlainText
+
+    # Sidebar tooltips: folder description and album description.
+    def item_for(kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    folder_tip = item_for("folder", "trip").toolTip(0)
+    assert "<img src=http://evil/x>" in _tooltip_literal(folder_tip)
+    assert str(root / "trip") in _tooltip_literal(folder_tip)
+
+    album_tip = item_for("album", uid).toolTip(0)
+    assert "<i>favourites</i>" in _tooltip_literal(album_tip)
+
+
+def test_import_note_markup_renders_literally(tmp_path: Path) -> None:
+    """Finding 7, the import-notes tooltip: report details quote album and
+    file names straight from the library, so they are user-authored too."""
+    from main import MainWindow
+    from catalog import ReportEntry
+
+    _offscreen_app()
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cat = scan_library(root)
+    cat.report.entries.append(ReportEntry(
+        source="ini", kind="unknown_album", subject="<b>Best Of</b>",
+        detail="<b>Best Of</b> is referenced but never defined"))
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    tip = win.notes_label.toolTip()
+    assert "<b>Best Of</b>" in _tooltip_literal(tip)

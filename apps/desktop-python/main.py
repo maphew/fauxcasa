@@ -35,6 +35,7 @@ scripts/make-thumbcache.py and adopt via --thumbs.
 from __future__ import annotations
 
 import argparse
+import html
 import importlib
 import json
 import os
@@ -864,6 +865,29 @@ def _reconcile_online_roots(
     return total, labels
 
 
+def _plain_tooltip(text: str) -> str:
+    """Tooltip text that renders LITERALLY (fauxcasa-6vk finding 7).
+
+    QToolTip has no plain-text mode: it hands the string to a QLabel in
+    AutoText, so Qt::mightBeRichText decides — and every tooltip below
+    carries user-authored catalog text (folder/album descriptions, album
+    names, on-disk paths, import-note details). A description of
+    "<img src=http://…>" would be INTERPRETED: the markup swallowed, a
+    broken-image icon shown, an external URL fetched on hover.
+
+    Escaping alone is not the fix: mightBeRichText only notices "&lt;"
+    BEFORE the first newline, and these tooltips are multi-line, so an
+    escaped description on line 2 would show its raw entities instead.
+    Emit explicit HTML with <br> breaks — unambiguously rich text, so
+    every escaped character renders as itself. A string with neither
+    '<' nor '&' can never trip mightBeRichText, so it passes through
+    untouched (the common case: every path-only tooltip)."""
+    if "<" not in text and "&" not in text:
+        return text
+    return "<html>" + "<br>".join(
+        html.escape(line) for line in text.split("\n")) + "</html>"
+
+
 def _folder_tooltip(path, description: str | None) -> str:
     """Sidebar folder-item tooltip text (fauxcasa-cam.14): the on-disk path
     (path on demand, per q6l.10) followed by the folder's .picasa.ini
@@ -873,7 +897,7 @@ def _folder_tooltip(path, description: str | None) -> str:
     tip = str(path)
     if description:
         tip += "\n" + description
-    return tip
+    return _plain_tooltip(tip)
 
 
 def _offline_root_labels(catalog: Catalog) -> list[str]:
@@ -1401,13 +1425,21 @@ class MainWindow(QMainWindow):
 
         # --- status bar ---
         self.setStatusBar(QStatusBar())
+        # PlainText wherever a catalog string lands (fauxcasa-6vk finding
+        # 7): counts_label carries album and people names, meta_label the
+        # caption/keywords/path readout. A QLabel left in the default
+        # AutoText format INTERPRETS a caption of "<b>beach</b>".
         self.counts_label = QLabel()
+        self.counts_label.setTextFormat(Qt.TextFormat.PlainText)
         self.progress_label = QLabel()
+        self.progress_label.setTextFormat(Qt.TextFormat.PlainText)
         self.meta_label = QLabel()
+        self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
         # Import-report count (fauxcasa-cam.13): "N import notes" with the
         # first few entries in the tooltip — deliberately lean; the full
         # inspector surface is N7/M2 work.
         self.notes_label = QLabel()
+        self.notes_label.setTextFormat(Qt.TextFormat.PlainText)
         self.statusBar().addWidget(self.counts_label)
         self.statusBar().addWidget(self.progress_label)
         self.statusBar().addPermanentWidget(self.notes_label)
@@ -2320,7 +2352,7 @@ class MainWindow(QMainWindow):
                     parent = node_for(parent_rel)
                     item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
-                    item.setToolTip(0, str(root_path / rel))
+                    item.setToolTip(0, _plain_tooltip(str(root_path / rel)))
                     nodes[rel] = item
                     return item
 
@@ -2395,7 +2427,7 @@ class MainWindow(QMainWindow):
                         label += " (offline)"
                     item = QTreeWidgetItem(folders_root, [label])
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-                    item.setToolTip(0, str(root.path))
+                    item.setToolTip(0, _plain_tooltip(str(root.path)))
                     if root.id in cat.offline_ids:
                         font = item.font(0)
                         font.setItalic(True)
@@ -2415,7 +2447,9 @@ class MainWindow(QMainWindow):
                     item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
                     key = folder_key(cat, root_id, rel)
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
-                    item.setToolTip(0, str(roots_by_id[root_id].path / rel))
+                    item.setToolTip(
+                        0,
+                        _plain_tooltip(str(roots_by_id[root_id].path / rel)))
                     nodes2[ident] = item
                     return item
 
@@ -2485,7 +2519,8 @@ class MainWindow(QMainWindow):
                     if album.description:
                         tip_parts.append(album.description)
                     if tip_parts:
-                        item.setToolTip(0, "\n".join(tip_parts))
+                        item.setToolTip(
+                            0, _plain_tooltip("\n".join(tip_parts)))
             albums_root.setExpanded(True)
 
         # People (read-only v1 slice, fauxcasa-cam.3): named people with
@@ -2939,7 +2974,7 @@ class MainWindow(QMainWindow):
         shown = [f"[{e.source}] {e.kind}: {e.detail}" for e in entries[:6]]
         if n > len(shown):
             shown.append(f"… and {n - len(shown)} more (see {REPORT_NAME})")
-        self.notes_label.setToolTip("\n".join(shown))
+        self.notes_label.setToolTip(_plain_tooltip("\n".join(shown)))
         self.notes_label.setVisible(True)
 
     def _selection_changed(self, selection: set) -> None:

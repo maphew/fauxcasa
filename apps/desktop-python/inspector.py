@@ -160,6 +160,7 @@ class InspectorPanel(QWidget):
         # Empty/multi state text (set_none / set_many) — a single label,
         # shown instead of the row form.
         self._state_label = QLabel("No photo selected")
+        self._state_label.setTextFormat(Qt.TextFormat.PlainText)
         self._state_label.setStyleSheet(_STATE_STYLE)
         self._state_label.setWordWrap(True)
         body_lay.addWidget(self._state_label)
@@ -207,6 +208,11 @@ class InspectorPanel(QWidget):
             name_label = QLabel(name)
             name_label.setStyleSheet(_NAME_STYLE)
             value_label = QLabel(value)
+            # Catalog values are USER-AUTHORED (captions, keywords, people
+            # and album names, file/folder names): a QLabel in the default
+            # AutoText format renders "<b>beach</b>" as markup instead of
+            # as the caption the user typed (fauxcasa-6vk finding 7).
+            value_label.setTextFormat(Qt.TextFormat.PlainText)
             value_label.setWordWrap(True)
             value_label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse)
