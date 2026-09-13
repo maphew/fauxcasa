@@ -9,6 +9,39 @@ GitHub release tags, not a semantic-versioning contract.
 ## [Unreleased]
 
 Changes since the `tracer-test-v1` preview (2026-08-10, commit `553d31a`).
+The `v0.1.0-rc2` release candidate (2026-09-13) contains everything in
+this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
+
+### Added (0.1 release push, 2026-09-13)
+
+- Still images decode inside a Windows AppContainer sandbox for thumbnails
+  and the viewer, on by default (PRs 129, 131, 132, 135).
+- App icon, taskbar identity, version identity and product names for the
+  cache directory, log and executables (PRs 114, 116).
+- Dark theme, toolbar and sidebar icons, selection/hover feedback, group
+  headers with descriptions, empty states, menus with a generated
+  shortcuts dialog and About box, remembered geometry, first-run welcome
+  with Picasa's watched folders, viewer chevrons (PRs 121, 124, 134).
+- Import-notes dialog; rescue of another library's Picasa database no
+  longer runs for unrelated folders (PR 130).
+- Release workflow with checksums, build-provenance attestation and a
+  draft release; native Windows CI rendering check; third-party notices,
+  SECURITY.md and a bug-report form (PRs 117, 120, 122, 123, 126).
+
+### Fixed (0.1 release push, 2026-09-13)
+
+- Seven post-merge review findings: Starred-view desync, stars keyed on
+  the cache variant, malformed stars.json, stale Gallery action, stuck
+  activity spinner, stale inspector, rich-text rendering of catalog
+  strings (PR 115).
+- Reconcile rebuild now lands on Windows while thumbnails are open; a
+  library switch no longer wipes File Types; XMP rating overflow; slideshow
+  prefetch after a catalog swap (PR 118).
+- A raising decoder no longer wedges the viewer; scripted runs no longer
+  stall when the build finishes after the viewer opens (PRs 127, 128).
+- Minimum-zoom scrolling on high-DPI displays reads a smaller thumbnail
+  level (PR 125).
+
 
 ### Added
 
