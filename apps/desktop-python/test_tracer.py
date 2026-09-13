@@ -16624,14 +16624,14 @@ def test_unstar_inside_starred_view_drops_the_photo(library: Path) -> None:
     assert cat.photos[idx_c].star == 1
     _sidebar_click(win, "starred", "")
     assert sorted(win.grid.display) == sorted([idx_a, idx_c])
-    assert _sidebar_text(win, "starred", "") == "★ Starred  (2)"
+    assert _sidebar_text(win, "starred", "") == "Starred  (2)"
 
     win.grid._select(idx_a)
     _press(win.grid, Qt.Key.Key_Space)                  # unstar from inside
     assert cat.photos[idx_a].star == 0
     assert idx_a not in win.grid.display_pos
     assert win.grid.display == [idx_c]
-    assert _sidebar_text(win, "starred", "") == "★ Starred  (1)"
+    assert _sidebar_text(win, "starred", "") == "Starred  (1)"
     assert win.grid.current == idx_c                    # sensible landing spot
     assert "Starred: 1 photos" in win.counts_label.text()
 

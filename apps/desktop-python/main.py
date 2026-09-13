@@ -1668,7 +1668,7 @@ class MainWindow(QMainWindow):
         self.open_action.setToolTip("Choose a different photo library folder")
         self.open_action.triggered.connect(self._change_library)
         self.back_action = bar.addAction(
-            icons.make_icon("back", theme.TEXT), "← Gallery  (Esc)")
+            icons.make_icon("back", theme.TEXT), "Gallery  (Esc)")
         self.back_action.setToolTip(
             "Return to the gallery and folder tree (Esc)")
         self.back_action.triggered.connect(
@@ -1679,7 +1679,7 @@ class MainWindow(QMainWindow):
         # one toolbar affordance acting on the CURRENT view; F11 is the
         # Picasa-heritage shortcut (fauxcasa-q6l.3).
         self.play_action = bar.addAction(
-            icons.make_icon("play", theme.PLAY), "▶ Play")
+            icons.make_icon("play", theme.PLAY), "Play")
         # Chord text is derived from the keymap so the tooltip stays current
         # when chords are added or changed (ed5.12); never hard-code "F11".
         _play_chords = " / ".join(s.toString()
@@ -2044,7 +2044,7 @@ class MainWindow(QMainWindow):
         self._flat_check.toggled.connect(flat_folders_action.setChecked)
 
         view_menu.addSeparator()
-        view_menu.addAction(self.play_action)   # toolbar's "▶ Play" action
+        view_menu.addAction(self.play_action)   # toolbar's "Play" action
 
         help_menu = menubar.addMenu("&Help")
         # fauxcasa-ez2.9: Tools was created first (v46.4, __init__, before
@@ -2857,7 +2857,7 @@ class MainWindow(QMainWindow):
         all_item.setData(0, Qt.ItemDataRole.UserRole, ("all", ""))
         starred = sum(
             1 for p in cat.photos if (p.visible or reveal) and p.star)
-        star_item = QTreeWidgetItem(t, [f"★ Starred  ({starred})"])
+        star_item = QTreeWidgetItem(t, [f"Starred  ({starred})"])
         star_item.setData(0, Qt.ItemDataRole.UserRole, ("starred", ""))
         star_item.setIcon(0, icons.make_icon("star", theme.STAR))
         # Recently Updated auto-collection (fauxcasa-q6l.7): mtime recency,
@@ -3152,8 +3152,8 @@ class MainWindow(QMainWindow):
         (or immediately, if some already-backfilled photos qualify)."""
         n = len(self._recent_indices())
         if n == 0 and self.catalog.backfill_state != BACKFILL_COMPLETE:
-            return "↻ Recently Updated  (indexing metadata…)"
-        return f"↻ Recently Updated  ({n})"
+            return "Recently Updated  (indexing metadata…)"
+        return f"Recently Updated  ({n})"
 
     def _refresh_recent_count(self) -> None:
         """A COLD build fills Photo.mtime in-place only after the sidebar was
@@ -3804,7 +3804,7 @@ class MainWindow(QMainWindow):
         it = QTreeWidgetItemIterator(self.tree)
         while it.value():
             if it.value().data(0, Qt.ItemDataRole.UserRole) == ("starred", ""):
-                it.value().setText(0, f"★ Starred  ({n})")
+                it.value().setText(0, f"Starred  ({n})")
                 return
             it += 1
 
