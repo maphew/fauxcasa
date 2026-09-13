@@ -48,6 +48,7 @@ import base64
 import ctypes
 import io
 import os
+import queue
 import socket
 import struct
 import subprocess
@@ -2460,12 +2461,18 @@ def test_decodepoolset_interactive_lease_prefers_reserved_instance(monkeypatch):
     assert leased is pool_set._interactive
 
 
-def test_decodepoolset_interactive_lease_borrows_idle_batch_when_interactive_busy(monkeypatch):
+def test_decodepoolset_interactive_lease_never_borrows_batch_member(monkeypatch):
+    """P2 finding "arena lanes": an interactive (edge=0, full-resolution)
+    lease must never borrow an 8 MiB batch member -- decoding full-res
+    into that arena fails TOO_LARGE. Forbidding cross-lane borrowing
+    means a lease() call while the reserved instance is busy blocks/times
+    out instead of silently handing back a too-small batch member."""
     pool_set = _make_pool_set(1, monkeypatch)
     held_interactive = pool_set.lease("interactive", timeout=1)  # takes the reserved one
     assert held_interactive is pool_set._interactive
-    borrowed = pool_set.lease("interactive", timeout=1)  # must borrow the idle batch member
-    assert borrowed is pool_set._batch[0]
+    with pytest.raises(queue.Empty):
+        pool_set.lease("interactive", timeout=0.2)
+    assert pool_set._batch_free.qsize() == 1, "the idle batch member must stay untouched"
 
 
 def test_decodepoolset_release_returns_to_correct_free_queue(monkeypatch):
@@ -2476,6 +2483,18 @@ def test_decodepoolset_release_returns_to_correct_free_queue(monkeypatch):
     i = pool_set.lease("interactive", timeout=1)
     pool_set.release(i)
     assert pool_set._interactive_free.get_nowait() is i
+
+
+def test_decodepoolset_release_ignores_double_release(monkeypatch, caplog):
+    """P3 finding: a double release() (or releasing a member not
+    currently leased) must not silently re-add a duplicate to the free
+    queue -- validated via an in-use set, logged, and ignored."""
+    pool_set = _make_pool_set(1, monkeypatch)
+    b = pool_set.lease("batch", timeout=1)
+    pool_set.release(b)
+    assert pool_set._batch_free.qsize() == 1
+    pool_set.release(b)  # double release -- must be ignored, not duplicated
+    assert pool_set._batch_free.qsize() == 1
 
 
 def test_decodepoolset_warm_spawns_every_member(monkeypatch):

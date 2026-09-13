@@ -2540,11 +2540,15 @@ class WinDecodePool:
 class DecodePoolSet:
     """Lease N batch WinDecodePool instances + 1 interactive one via
     queue.LifoQueue, keyed by `lane`. A batch lease (`lane="batch"`) can
-    never take the interactive instance. An interactive lease
-    (`lane="interactive"`) prefers the reserved interactive instance but
-    may borrow an idle batch instance rather than block (the reverse --
-    a batch job stealing the interactive slot -- never happens). Spawn is
-    LAZY: no worker process exists until the first lease() call actually
+    never take the interactive instance, and (P2 finding "arena lanes")
+    an interactive lease (`lane="interactive"`) can never borrow a batch
+    instance either -- batch members carry an 8 MiB arena
+    (BATCH_ARENA_BYTES), far too small for the interactive lane's
+    always-full-resolution (edge=0) decodes, so cross-lane borrowing used
+    to fail those decodes TOO_LARGE whenever the reserved worker was
+    busy. An interactive lease blocks/waits for the reserved instance
+    instead. Spawn is LAZY: no worker process exists until the first
+    lease() call actually
     needs one (inside `_ensure_worker`, called from the leasing thread) or
     until `warm()` is called explicitly to pre-spawn everything in
     parallel. Tolerates fewer batch workers than requested -- a spawn
@@ -2578,6 +2582,13 @@ class DecodePoolSet:
         self._interactive_free: "queue.LifoQueue[WinDecodePool]" = queue.LifoQueue()
         self._interactive_free.put(self._interactive)
         self._closed = False
+        # P3 finding "release() doesn't validate membership": a double
+        # release (or releasing a member warm() already dropped) used to
+        # silently re-add a duplicate/dead pool to the free queue --
+        # _job_lock prevented actual corruption but hid the bug. Tracked
+        # by id() (WinDecodePool has no __eq__/__hash__ override, but id()
+        # is unambiguous and avoids relying on that).
+        self._in_use: set[int] = set()
 
     @property
     def batch_size(self) -> int:
@@ -2622,30 +2633,54 @@ class DecodePoolSet:
                           "(dropped: %s)", len(surviving), len(self._batch),
                           {i: str(e) for i, e in errors.items() if i != interactive_idx})
                 self._batch = surviving
-                self._batch_free = queue.LifoQueue()
-                for p in self._batch:
-                    self._batch_free.put(p)
+                # P3 finding "warm() reassigns self._batch_free under the
+                # lock while lease() reads it unlocked": a lease() call
+                # already blocked on the OLD queue object would never wake
+                # if warm() replaced self._batch_free outright. Drain and
+                # refill the EXISTING queue in place instead.
+                surviving_set = set(surviving)
+                drained = []
+                try:
+                    while True:
+                        drained.append(self._batch_free.get_nowait())
+                except queue.Empty:
+                    pass
+                for p in drained:
+                    if p in surviving_set:
+                        self._batch_free.put(p)
             return len(self._batch)
 
     def lease(self, lane: str = "batch", timeout: float | None = None) -> WinDecodePool:
         if lane not in ("batch", "interactive"):
             raise ValueError(f"unknown lane {lane!r}")
         if lane == "batch":
-            return self._batch_free.get(timeout=timeout)
-        # interactive: prefer the reserved instance; borrow an idle batch
-        # instance rather than block if it's busy (design doc sec 1's
-        # "reserved interactive worker" -- the reservation is one-directional).
-        try:
-            return self._interactive_free.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            return self._batch_free.get_nowait()
-        except queue.Empty:
-            pass
-        return self._interactive_free.get(timeout=timeout)
+            pool = self._batch_free.get(timeout=timeout)
+        else:
+            # interactive: ONLY the reserved instance (P2 finding "arena
+            # lanes"). This lane is always edge=0/full-resolution
+            # (decodefacade routes edge==0 here); a batch member's arena
+            # is only BATCH_ARENA_BYTES (8 MiB), far too small for a
+            # full-res decode -- borrowing across lanes used to make an
+            # interactive decode fail TOO_LARGE, intermittently and
+            # non-deterministically, whenever the reserved worker was
+            # busy. Never borrow; block/wait for the reserved instance.
+            pool = self._interactive_free.get(timeout=timeout)
+        with self._lock:
+            self._in_use.add(id(pool))
+        return pool
 
     def release(self, pool: WinDecodePool) -> None:
+        # P3 finding "release() doesn't validate membership": a double
+        # release or a release of a member warm() already dropped from
+        # the pool must not silently re-add a duplicate/dead pool to the
+        # free queue -- log loudly and ignore instead.
+        with self._lock:
+            if id(pool) not in self._in_use:
+                _log.error("DecodePoolSet.release: %r is not a currently "
+                           "leased member (double release, or a member "
+                           "warm() already dropped) -- ignoring", pool)
+                return
+            self._in_use.discard(id(pool))
         if pool is self._interactive:
             self._interactive_free.put(pool)
         else:
