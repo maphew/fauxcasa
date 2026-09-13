@@ -93,12 +93,16 @@ jobs:
       - name: Assert tag matches __version__
         shell: bash
         run: |
-          if ! grep -q "^__version__ = \"${VER}\"\$" apps/desktop-python/main.py; then
-            echo "::error::tag ${TAG} (version ${VER}) does not match __version__ in apps/desktop-python/main.py"
+          # A pre-release suffix (v0.1.0-rc1, v0.1.0-beta2) is allowed for
+          # dry runs and release candidates: only the part before the
+          # first '-' must equal __version__. Archives keep the full VER.
+          BASE="${VER%%-*}"
+          if ! grep -q "^__version__ = \"${BASE}\"\$" apps/desktop-python/main.py; then
+            echo "::error::tag ${TAG} (version ${BASE}) does not match __version__ in apps/desktop-python/main.py"
             grep -n "^__version__" apps/desktop-python/main.py || true
             exit 1
           fi
-          echo "OK: tag ${TAG} matches __version__ = \"${VER}\""
+          echo "OK: tag ${TAG} matches __version__ = \"${BASE}\""
 
       - name: Write build stamp (_buildinfo.py)
         shell: bash
@@ -188,6 +192,41 @@ jobs:
           if blue < 50:
               sys.exit("BLANK grid — JPEG tiles did not decode (qjpeg missing?)")
           print("OK: frozen artifact decodes JPEG thumbnails")
+          EOF
+
+      - name: Smoke-run the FROZEN artifact's viewer (--open, the DNG)
+        # SAME leg as bundle.yml's "Smoke-run the FROZEN artifact's viewer"
+        # step — see that comment for why --open 6 is the synthetic DNG.
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXE="dist/fauxcasa-console/fauxcasa-console.exe"
+          else
+            EXE="dist/fauxcasa-console/fauxcasa-console"
+          fi
+          "$EXE" ci-library --cache-root ./open-cache --finish-build \
+            --open 6 --screenshot frozen-open.png
+
+      - name: Assert the viewer screenshot is non-blank (DNG decoded to pixels)
+        shell: bash
+        run: |
+          uv run --with "${{ env.PYSIDE6 }}" python - <<'EOF'
+          import sys
+          from collections import Counter
+          from PySide6.QtGui import QImage
+          img = QImage("frozen-open.png")
+          if img.isNull():
+              sys.exit("viewer screenshot did not load")
+          c = Counter()
+          for y in range(0, img.height(), 5):
+              for x in range(0, img.width(), 5):
+                  p = img.pixelColor(x, y)
+                  c[(p.red() // 32 * 32, p.green() // 32 * 32, p.blue() // 32 * 32)] += 1
+          blue = sum(n for (r, g, b), n in c.items() if b >= 128 and b > g and g >= 64)
+          print(f"blue-photo samples: {blue}")
+          if blue < 50:
+              sys.exit("BLANK viewer — DNG did not decode (rawpy missing?)")
+          print("OK: frozen artifact's viewer decodes the DNG")
           EOF
 
       - name: Assert DNG thumbnail decoded in frozen artifact (rawpy gated)

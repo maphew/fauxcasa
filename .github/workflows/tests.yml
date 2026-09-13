@@ -38,6 +38,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv run scripts/test_picasa_db.py -q
+      - run: uv run scripts/test_confirm_archive.py -q
 
   ingest-parity:
     strategy:

@@ -228,11 +228,16 @@ def test_containment_gate_denied(shared_worker, probe_secret_file, tmp_path, att
 
 def _lan_ip():
     """The machine's primary LAN IPv4 (no packet sent; connect() on a UDP
-    socket just selects the outbound interface)."""
+    socket just selects the outbound interface). A runner with no routable
+    interface (e.g. a locked-down CI network namespace) raises OSError here
+    -- that's an environment gap, not a sandbox regression, so it's a skip,
+    not a failure."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
+    except OSError:
+        pytest.skip("no routable interface")
     finally:
         s.close()
 
@@ -820,14 +825,15 @@ def test_hello_wrong_proto_refused_loudly():
         "sys.stdout.buffer.write(struct.pack('<I', len(msg)) + msg)\n"
         "sys.stdout.buffer.flush()\n"
     ) % (PROTO + 1, SMALL_ARENA_BYTES)
-    proc = subprocess.Popen([sys.executable, "-c", stub_code], stdout=subprocess.PIPE)
-    try:
-        hello_msg, _noise = dw._read_hello_frame_tolerant(proc.stdout)
-        with pytest.raises(ProtocolViolation, match="proto mismatch"):
-            dw.parse_hello(hello_msg, expected_arena_bytes=SMALL_ARENA_BYTES)
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
+    with subprocess.Popen([sys.executable, "-c", stub_code],
+                          stdout=subprocess.PIPE) as proc:
+        try:
+            hello_msg, _noise = dw._read_hello_frame_tolerant(proc.stdout)
+            with pytest.raises(ProtocolViolation, match="proto mismatch"):
+                dw.parse_hello(hello_msg, expected_arena_bytes=SMALL_ARENA_BYTES)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
 
 
 def test_framed_non_hello_first_message_raises_promptly():
@@ -844,19 +850,20 @@ def test_framed_non_hello_first_message_raises_promptly():
         "import time\n"
         "time.sleep(30)\n"  # if the broker hangs, this keeps the pipe open
     )
-    proc = subprocess.Popen([sys.executable, "-c", stub_code], stdout=subprocess.PIPE)
-    try:
-        t0 = time.perf_counter()
-        with pytest.raises(ProtocolViolation, match="not a hello handshake"):
-            dw._read_hello_frame_tolerant(proc.stdout)
-        elapsed = time.perf_counter() - t0
-        assert elapsed < 2.0, (
-            f"_read_hello_frame_tolerant took {elapsed:.2f}s on a framed "
-            f"non-hello first message, expected < 2s (must raise promptly, "
-            f"not hang resyncing on a newline that will never arrive)")
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
+    with subprocess.Popen([sys.executable, "-c", stub_code],
+                          stdout=subprocess.PIPE) as proc:
+        try:
+            t0 = time.perf_counter()
+            with pytest.raises(ProtocolViolation, match="not a hello handshake"):
+                dw._read_hello_frame_tolerant(proc.stdout)
+            elapsed = time.perf_counter() - t0
+            assert elapsed < 2.0, (
+                f"_read_hello_frame_tolerant took {elapsed:.2f}s on a framed "
+                f"non-hello first message, expected < 2s (must raise promptly, "
+                f"not hang resyncing on a newline that will never arrive)")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
 
 
 @pytest.mark.parametrize("payload_expr, match", [
@@ -893,19 +900,20 @@ def test_framed_malformed_first_message_raises_promptly(payload_expr, match):
         "import time\n"
         "time.sleep(30)\n"  # if the broker resyncs, this keeps the pipe open
     )
-    proc = subprocess.Popen([sys.executable, "-c", stub_code], stdout=subprocess.PIPE)
-    try:
-        t0 = time.perf_counter()
-        with pytest.raises(ProtocolViolation, match=match):
-            dw._read_hello_frame_tolerant(proc.stdout)
-        elapsed = time.perf_counter() - t0
-        assert elapsed < 2.0, (
-            f"_read_hello_frame_tolerant took {elapsed:.2f}s on a framed "
-            f"malformed first message, expected < 2s (must raise promptly, "
-            f"not block resyncing on a newline that will never arrive)")
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
+    with subprocess.Popen([sys.executable, "-c", stub_code],
+                          stdout=subprocess.PIPE) as proc:
+        try:
+            t0 = time.perf_counter()
+            with pytest.raises(ProtocolViolation, match=match):
+                dw._read_hello_frame_tolerant(proc.stdout)
+            elapsed = time.perf_counter() - t0
+            assert elapsed < 2.0, (
+                f"_read_hello_frame_tolerant took {elapsed:.2f}s on a framed "
+                f"malformed first message, expected < 2s (must raise promptly, "
+                f"not block resyncing on a newline that will never arrive)")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
 
 
 def test_lockdown_sequencing_guard_no_job_before_locked():
