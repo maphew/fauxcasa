@@ -15389,3 +15389,194 @@ def test_windows_app_user_model_id_is_noop_elsewhere(monkeypatch) -> None:
 
     monkeypatch.setattr(sys, "platform", "linux")
     main._set_windows_app_user_model_id()
+
+
+# ---------- visual polish (fauxcasa-ez2.4) ----------
+
+
+def test_theme_dark_palette_sets_expected_roles() -> None:
+    """dark_palette() sets every role the audit's screenshots exercise —
+    Window/WindowText/Base/AlternateBase/Text/Button/ButtonText/Highlight/
+    HighlightedText/Link/ToolTipBase/ToolTipText — plus the Disabled
+    group, all sourced from theme's own named constants, so a
+    Fusion-styled QApplication reads as part of the same app as the
+    custom-painted grid/viewer/tray."""
+    _offscreen_app()
+    from PySide6.QtGui import QPalette
+
+    import theme
+
+    pal = theme.dark_palette()
+    R = QPalette.ColorRole
+    assert pal.color(R.Window) == theme.WINDOW
+    assert pal.color(R.WindowText) == theme.TEXT
+    assert pal.color(R.Base) == theme.BASE
+    assert pal.color(R.AlternateBase) == theme.ALT_BASE
+    assert pal.color(R.Text) == theme.TEXT
+    assert pal.color(R.Button) == theme.SURFACE
+    assert pal.color(R.ButtonText) == theme.TEXT
+    assert pal.color(R.Highlight) == theme.ACCENT
+    assert pal.color(R.HighlightedText) == theme.WINDOW
+    assert pal.color(R.Link) == theme.TEAL
+    assert pal.color(R.ToolTipBase) == theme.SURFACE
+    assert pal.color(R.ToolTipText) == theme.TEXT
+    disabled = QPalette.ColorGroup.Disabled
+    for role in (R.WindowText, R.Text, R.ButtonText):
+        assert pal.color(disabled, role) == theme.TEXT_MUTED
+
+
+def test_grid_empty_text_paints_only_when_set(tmp_path: Path) -> None:
+    """An empty display paints nothing extra when empty_text is unset
+    (the default — main.py picks per-view copy) and the given text,
+    centered in TEXT_MUTED, once it is set (fauxcasa-ez2.4 UX audit: an
+    empty grid used to paint literally nothing at all)."""
+    _offscreen_app()
+    from PySide6.QtGui import QImage
+    from grid import BACKGROUND, GridView
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    cat = scan_library(root)          # no photos: an empty catalog
+    g = GridView()
+    g.resize(300, 200)
+    g.show()
+    g.set_data(cat, None)
+    assert g.display == [] and g.empty_text == ""
+
+    shot = g.viewport().grab().toImage().convertToFormat(
+        QImage.Format.Format_RGB32)
+    assert all(shot.pixelColor(x, y) == BACKGROUND
+              for x in (0, shot.width() // 2, shot.width() - 1)
+              for y in (0, shot.height() // 2, shot.height() - 1))
+
+    g.empty_text = "No photos here"
+    g.viewport().update()
+    shot2 = g.viewport().grab().toImage().convertToFormat(
+        QImage.Format.Format_RGB32)
+    cy = shot2.height() // 2
+    found_text = any(shot2.pixelColor(x, y) != BACKGROUND
+                     for x in range(0, shot2.width(), 2)
+                     for y in range(max(0, cy - 8), cy + 8))
+    assert found_text
+
+
+def test_grid_tooltip_shows_name_caption_date_html_escaped(
+        tmp_path: Path, monkeypatch) -> None:
+    """viewportEvent(QEvent.ToolTip) hit-tests the item under the cursor
+    and shows name/caption/date; a caption containing markup renders
+    LITERALLY (html.escape'd) rather than being interpreted, and hovering
+    empty background falls back to the existing Ctrl+Alt peek hint
+    (fauxcasa-ez2.4 UX audit: one static grid-wide tooltip used to hide
+    every per-photo name)."""
+    import html as html_mod
+
+    from PySide6.QtCore import QEvent, QPoint
+    from PySide6.QtGui import QHelpEvent
+
+    import grid
+
+    g = _selection_grid(tmp_path)
+    d = g.display
+    cat = g.catalog
+    photo = cat.photos[d[0]]
+    photo.caption = "<b>hi</b>"
+    photo.date_taken = "2020-01-02T03:04:05"
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(grid.QToolTip, "showText",
+                        lambda *a, **kw: calls.append((a, kw)))
+
+    gi, n = g.loc[d[0]]
+    r = g._item_rect(g.groups[gi], n)
+    center = r.center() - QPoint(0, g.verticalScrollBar().value())
+    ev = QHelpEvent(QEvent.Type.ToolTip, center,
+                    g.viewport().mapToGlobal(center))
+    assert g.viewportEvent(ev) is True
+    assert len(calls) == 1
+    text = calls[0][0][1]
+    assert html_mod.escape(photo.name) in text
+    assert "&lt;b&gt;hi&lt;/b&gt;" in text
+    assert "<b>hi</b>" not in text
+    assert "2020-01-02 03:04:05" in text
+
+    calls.clear()
+    off_pos = QPoint(2, 2)   # header band, no photo
+    ev2 = QHelpEvent(QEvent.Type.ToolTip, off_pos,
+                     g.viewport().mapToGlobal(off_pos))
+    assert g.viewportEvent(ev2) is True
+    assert calls[0][0][1] == g.toolTip()   # peek-hint fallback
+
+
+def test_grid_header_elides_long_and_empty_descriptions(
+        tmp_path: Path) -> None:
+    """_elide (group-header description) truncates text too wide for its
+    budget and returns "" for an empty/absent one; Folder.description
+    (catalog.py's .picasa.ini [Picasa] description= parse) reaches
+    _Group.description end to end, and the header paints without
+    incident for both a described and a bare folder (fauxcasa-ez2.4 UX
+    audit: headers used to show only "title · N" and silently drop the
+    description)."""
+    _offscreen_app()
+    from PySide6.QtGui import QFont, QFontMetrics
+
+    from grid import GridView, _elide
+
+    fm = QFontMetrics(QFont())
+    assert _elide(fm, "", 200) == ""
+    assert _elide(fm, "short", 0) == ""
+    assert _elide(fm, "short", 200) == "short"
+    long_text = "a very long folder description " * 10
+    elided = _elide(fm, long_text, 60)
+    assert elided != long_text and elided != ""
+    assert fm.horizontalAdvance(elided) <= 60
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "described" / "a.jpg")
+    make_jpeg(root / "bare" / "b.jpg")
+    (root / "described" / ".picasa.ini").write_text(
+        "[Picasa]\r\ndescription=" + long_text + "\r\n")
+    cat = scan_library(root)
+    g = GridView()
+    g.resize(400, 300)
+    g.show()
+    g.set_data(cat, None)
+    by_folder = {grp.folder: grp for grp in g.groups}
+    assert by_folder["described"].description == long_text
+    assert by_folder["bare"].description is None
+    assert not g.grab().isNull()      # paints both without incident
+
+
+def test_viewer_fit_rect_excludes_caption_bar(tmp_path: Path) -> None:
+    """paintEvent fits the photo into `height - CAPTION_H` whenever the
+    caption bar is visible, so the bar never covers the bottom of the
+    image (fauxcasa-ez2.4 UX audit: the fit rect used to use the FULL
+    widget height — a native-capped original centered in that too-tall
+    box left a slice of the photo under the semi-transparent bar instead
+    of leaving that slice to the bar alone)."""
+    _offscreen_app()
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QImage
+
+    from viewer import CAPTION_H, ViewerPage
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cat = scan_library(root)
+    v = ViewerPage(cat, None)
+    v.resize(400, 300)
+    v.show()
+    assert v._caption_visible() and v._caption_h() == CAPTION_H
+
+    # A tall, narrow ORIGINAL exactly `height - CAPTION_H` px tall caps at
+    # native size (cap=True): flush to the top in the FIXED box; 15px down
+    # (letterboxed under the bar) in the old, too-tall one.
+    orig = QImage(100, 270, QImage.Format.Format_RGB32)
+    orig.fill(0xFFFFFF)
+    fit = v._shown_rect(v.width(), v.height() - v._caption_h(), orig)
+    assert fit == QRect(150, 0, 100, 270)
+
+    v.show_photo(list(range(len(cat.photos))), 0)
+    v._on_loaded(v._serial, orig)
+    shot = v.grab().toImage().convertToFormat(QImage.Format.Format_RGB32)
+    assert shot.pixelColor(200, 5).red() > 200     # photo, not letterboxed
+    v.quiesce()
