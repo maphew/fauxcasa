@@ -2151,17 +2151,26 @@ def test_default_cache_root_frozen_vs_checkout(monkeypatch, tmp_path: Path) -> N
     import main
 
     monkeypatch.setattr(main, "FROZEN", False)
-    assert main._default_cache_root() == main.REPO / "cache" / "tracer-cache"
+    assert main._default_cache_root() == main.REPO / "cache" / "fauxcasa-cache"
 
     monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
-    assert main._default_cache_root() == tmp_path / "xdg" / "fauxcasa-tracer"
+    assert main._default_cache_root() == tmp_path / "xdg" / "fauxcasa"
 
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setattr(main.Path, "home",
                         classmethod(lambda cls: tmp_path / "home"))
     assert (main._default_cache_root()
-            == tmp_path / "home" / ".cache" / "fauxcasa-tracer")
+            == tmp_path / "home" / ".cache" / "fauxcasa")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    assert main._default_cache_root() == tmp_path / "local" / "Fauxcasa" / "cache"
+
+    monkeypatch.delenv("LOCALAPPDATA")
+    assert (main._default_cache_root()
+            == tmp_path / "home" / ".cache" / "fauxcasa")
 
 
 def test_reveal_total_count_and_filter(library: Path, tmp_path: Path) -> None:
@@ -3317,8 +3326,8 @@ def test_applog_writes_logfile_and_mirrors_stderr(tmp_path: Path, capsys) -> Non
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     import applog
 
-    log_path = applog.setup(tmp_path / "cr")
-    assert log_path == tmp_path / "cr" / "fauxcasa-tracer.log"
+    log_path = applog.setup(tmp_path / "cr", "test-slug")
+    assert log_path == tmp_path / "cr" / "test-slug.log"
 
     applog.log.warning("marker-7f3 happened")
     assert "marker-7f3 happened" in capsys.readouterr().err   # stderr mirror
@@ -3385,7 +3394,7 @@ def test_main_run_logs_and_keeps_stdout_protocol(
     assert '"event": "ready"' in proc.stdout
 
     # Human diagnostics: in the log file beside the per-library caches.
-    log_path = cache_root / "fauxcasa-tracer.log"
+    log_path = cache_root / "fauxcasa.log"
     assert log_path.is_file()
     log_text = log_path.read_text()
     assert "photos," in log_text and "folders," in log_text   # startup line

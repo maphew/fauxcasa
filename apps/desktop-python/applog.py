@@ -168,7 +168,7 @@ def _install_qt_handler() -> None:
     qInstallMessageHandler(handler)
 
 
-def setup(cache_root: Path) -> Path | None:
+def setup(cache_root: Path, app_slug: str = "fauxcasa") -> Path | None:
     """Add the rotating log file under ``cache_root`` and install the Qt
     message handler + the exception hooks. Idempotent — tests (and a cache-root
     change) re-invoke it, so any prior file handler is repointed, never
@@ -192,7 +192,7 @@ def setup(cache_root: Path) -> Path | None:
     log_path: Path | None = None
     try:
         cache_root.mkdir(parents=True, exist_ok=True)
-        log_path = cache_root / "fauxcasa-tracer.log"
+        log_path = cache_root / f"{app_slug}.log"
         fh = logging.handlers.RotatingFileHandler(
             log_path, maxBytes=_LOG_BYTES, backupCount=_LOG_BACKUPS,
             delay=True, encoding="utf-8")

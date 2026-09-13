@@ -38,6 +38,7 @@ import argparse
 import importlib
 import json
 import os
+import platform
 import sys
 import threading
 import time
@@ -264,10 +265,14 @@ def _default_cache_root() -> Path:
     """REPO-relative in a source checkout; a per-user writable dir when
     frozen — REPO then points inside the read-only PyInstaller bundle, so
     the app's own disposable cache must go somewhere writable instead."""
-    if FROZEN:
-        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-        return Path(base) / "fauxcasa-tracer"
-    return REPO / "cache" / "tracer-cache"
+    if not FROZEN:
+        return REPO / "cache" / f"{APP_SLUG}-cache"
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / APP_NAME / "cache"
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / APP_SLUG
 
 
 def _default_library() -> Path | None:
@@ -3297,7 +3302,7 @@ def main() -> int:
                          "one (e.g. cache/benchmark-thumbs.fcache)")
     ap.add_argument("--cache-root", type=Path, default=None,
                     help="where the app keeps its own disposable caches "
-                         "(default: <repo>/cache/tracer-cache in a checkout, "
+                         "(default: <repo>/cache/fauxcasa-cache in a checkout, "
                          "a per-user cache dir when run as a frozen bundle)")
     ap.add_argument("--rebuild", action="store_true",
                     help="ignore any existing tracer cache and rebuild")
@@ -3386,7 +3391,8 @@ def main() -> int:
     # lives beside the per-library caches (top-level, like config.json), so a
     # console=False build still has a record of warnings, Qt messages, and
     # uncaught tracebacks (fauxcasa-pqw).
-    applog.setup(args.cache_root)
+    applog.setup(args.cache_root, APP_SLUG)
+    log.info("%s starting on %s", version_string(), platform.platform())
 
     # Multi-root management actions (bead .d, design §10): each is a
     # standalone on-disk operation, never the normal open — see the
