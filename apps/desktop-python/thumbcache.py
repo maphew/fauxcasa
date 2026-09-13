@@ -667,11 +667,38 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
                     _box = crop_pixel_box(crop, _hdr_sz.width(), _hdr_sz.height())
                     if _box is not None and _box[2] > 0 and _box[3] > 0:
                         from decodesvc import MAX_EDGE
-                        edge = min(MAX_EDGE, round(
+                        # Also clamp to what the BATCH lane's arena can
+                        # actually return (fauxcasa release-0.1 review
+                        # P0-1): DecodePoolSet.BATCH_ARENA_BYTES is 8 MiB,
+                        # far smaller than MAX_EDGE would allow, and the
+                        # worker answers TOO_LARGE -> null QImage -> a
+                        # permanent zero-length tile for any crop tight
+                        # enough to push the boosted edge past the arena
+                        # (roughly a crop keeping less than ~14% of the
+                        # long edge). arena_edge is the largest square
+                        # RGBA8 (4 bytes/px) edge that fits in the arena.
+                        from decodesvc_win import DecodePoolSet
+                        arena_edge = int(
+                            (DecodePoolSet.BATCH_ARENA_BYTES / 4) ** 0.5)
+                        edge = min(MAX_EDGE, arena_edge, round(
                             top * max(_hdr_sz.width(), _hdr_sz.height())
                             / max(_box[2], _box[3])))
             img = decodefacade.get_service().decode(
                 str(src), route="still", edge=edge)
+            if edge != top and (img is None or img.isNull()):
+                # The boosted (crop-aware) edge request can still be
+                # refused (e.g. TOO_LARGE from a source large enough that
+                # even the arena-clamped edge exceeds the worker's caps,
+                # or any other transient sandboxed decode failure). Retry
+                # ONCE at edge=top -- still routed through the sandbox, no
+                # in-process fallback, and only when `edge` was actually
+                # boosted above `top` (an unboosted request failing again
+                # at the same edge would just waste a sandboxed decode) --
+                # rather than permanently baking a zero-length error tile
+                # for a crop the plain (uncropped) decode could have
+                # served fine (fauxcasa release-0.1 review P0-1).
+                img = decodefacade.get_service().decode(
+                    str(src), route="still", edge=top)
             clip_applied = False
             # Facade contract: null on ANY failure (open error, CORRUPT/
             # UNSUPPORTED DecodeServiceError, ProtocolViolation, spawn-

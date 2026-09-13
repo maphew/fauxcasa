@@ -739,6 +739,13 @@ class ViewerPage(QWidget):
         # Instant low-res stand-in from the thumb cache, painted while the
         # full original decodes off-thread (loupe preview, fauxcasa-9pp).
         self.preview: QImage | None = None
+        # Short honest note (release-0.1 review P2-6) for the warm-run case
+        # where the full-resolution decode came back null (e.g. a
+        # sandboxed TOO_LARGE panorama) but a preview is already showing:
+        # without this, self.image just stays None forever and the info
+        # bar says nothing — a >64 MP photo looks blurry with no
+        # indication why. Set in _on_loaded, cleared in _load_current.
+        self._decode_note: str | None = None
         self.loading = False
         self._serial = 0
         # Explicit 1:1 zoom state (fauxcasa-q6l.4). The pan is a FRACTIONAL
@@ -892,6 +899,7 @@ class ViewerPage(QWidget):
         self._stop_video()
         self._video_note = None
         self._video_duration_us = None
+        self._decode_note = None
         # Zoom state resets to fit on EVERY photo change (Picasa behavior) —
         # this is the one funnel all changes pass through: show_photo, the
         # viewer's _step, the slideshow's wrap _step and timed advance.
@@ -1034,10 +1042,17 @@ class ViewerPage(QWidget):
         self.loading = False
         if img.isNull():
             self.image = None     # keep painting the preview, if we have one
+            if self.preview is not None:
+                # release-0.1 review P2-6: a preview is already on screen,
+                # so paintEvent's "could not decode this file" branch never
+                # runs (shown = preview, not None) -- without this note the
+                # photo just looks permanently blurry with no explanation.
+                self._decode_note = "full-resolution decode unavailable"
         else:
             self.image = img
             self.preview = None   # the full original supersedes the preview
             self._orientation = orientation  # arrives WITH its image
+            self._decode_note = None
         self.update()
 
     # ---------- video playback (fauxcasa-v46.3) ----------
@@ -1592,6 +1607,8 @@ class ViewerPage(QWidget):
         """The info-bar line for `photo` under the current position/zoom
         state (extracted from paintEvent so tests can assert the text)."""
         parts = [f"{self.pos + 1}/{len(self.display)}", photo.rel]
+        if self._decode_note:
+            parts.append(self._decode_note)
         if photo.media == "video":
             # Video chip (fauxcasa-v46.3): position/duration while a
             # playback session is live, the probed duration + play hint
