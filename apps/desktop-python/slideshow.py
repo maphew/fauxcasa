@@ -28,10 +28,10 @@ from __future__ import annotations
 import threading
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QImage, QPainter
+from PySide6.QtGui import QImage, QPainter
 
 import keymap
-from viewer import CAPTION_BG, ViewerPage, load_original
+from viewer import CAPTION_BG, CAPTION_FG, CAPTION_H, ViewerPage, load_original
 
 # Dwell per slide. 4 s follows the one delay default the Picasa corpus
 # records — Movie Maker's "Slide Duration: 4.0s" (picasa-video-notes §1.6).
@@ -216,18 +216,26 @@ class SlideshowPage(ViewerPage):
 
     # ---------- hint strip ----------
 
+    def _caption_visible(self) -> bool:
+        """Ties the bottom caption/info bar to the same auto-hiding state
+        as the top hint strip below (fauxcasa-ez2.4 UX audit: the bar used
+        to stay up for the whole show regardless of the hint) — up for the
+        initial HINT_MS window or whenever paused, hidden otherwise, so a
+        playing show is chrome-free between dwells."""
+        return self.paused or self._hint_visible
+
     def _hide_hint(self) -> None:
         self._hint_visible = False
         self.update()
 
     def paintEvent(self, event) -> None:
-        super().paintEvent(event)      # photo + caption bar, unchanged
+        super().paintEvent(event)  # photo + caption bar (per _caption_visible)
         if not (self.paused or self._hint_visible):
             return
         painter = QPainter(self)
-        painter.fillRect(0, 0, self.width(), 30, CAPTION_BG)
-        painter.setPen(QColor(220, 220, 220))
-        painter.drawText(0, 0, self.width(), 30,
+        painter.fillRect(0, 0, self.width(), CAPTION_H, CAPTION_BG)
+        painter.setPen(CAPTION_FG)
+        painter.drawText(0, 0, self.width(), CAPTION_H,
                          Qt.AlignmentFlag.AlignCenter,
                          PAUSED_TEXT if self.paused else HINT_TEXT)
         painter.end()
