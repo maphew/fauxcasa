@@ -6,30 +6,36 @@ loss of vendor, maintainer, or business model.
 
 It is under active development and not ready for regular use.
 
-## Windows preview
+## Download
 
-A read-only preview for Windows 10/11 x64 is available for trusted testers:
+Fauxcasa is a read-only Picasa-library browser for Windows 10/11 x64 and
+Linux x64.
 
-1. Download
-   [`fauxcasa-tracer-tracer-test-v1-windows-x64.zip`](https://github.com/maphew/fauxcasa/releases/download/tracer-test-v1/fauxcasa-tracer-tracer-test-v1-windows-x64.zip).
-2. Use **Extract All**. The app is not a one-file executable; keep the
-   extracted folder together.
-3. Open `fauxcasa` and run `fauxcasa.exe`.
-4. Choose the top-level folder containing the photos you want to browse.
+1. Get the current build from the
+   [latest release](https://github.com/maphew/fauxcasa/releases/latest).
+2. Windows: use **Extract All**. The app is not a one-file executable; keep
+   the extracted folder together, then open the folder and run
+   `fauxcasa.exe`. Linux: extract the `tar.gz` and run the `fauxcasa`
+   binary, or run from source (see Installation/Usage below).
+3. Choose the top-level folder containing the photos you want to browse.
 
-The preview scans photos in place but does **not** modify photos, Picasa
-sidecars, or the Picasa database. It writes only a rebuildable catalog and
-thumbnail cache under your user cache directory. A checksum is published next
-to the download.
+Fauxcasa scans photos in place but does **not** modify photos, Picasa
+sidecars, or the Picasa database — it never writes into your library. It
+writes only a rebuildable catalog and thumbnail cache under your user cache
+directory: `%LOCALAPPDATA%\Fauxcasa\cache` on Windows, or
+`$XDG_CACHE_HOME/fauxcasa` (`~/.cache/fauxcasa` if unset) elsewhere. That
+cache directory also holds `config.json` (remembered library and
+preferences), `library.json` (known multi-root libraries), and
+`fauxcasa.log` (a rotating diagnostic log — include a redacted copy when
+filing a bug).
 
-This is an unsigned alpha, so Windows SmartScreen may show an unknown-publisher
-warning. The initial folder scan happens before the window appears and can take
-time for a large or network-hosted library. Video files have poster images but
-do not play yet; editing, tagging, exporting, and other write operations are
-not implemented. Original-media decoding is not sandboxed yet, so use only a
-library whose files you trust. See the
-[preview release notes](https://github.com/maphew/fauxcasa/releases/tag/tracer-test-v1)
-for the complete scope and report problems through
+This is an unsigned build, so Windows SmartScreen may show an
+unknown-publisher warning: right-click the zip, open Properties, and click
+Unblock before Extract All, or click "More info" then "Run anyway" at
+launch. Original-media decoding runs in-process and is not sandboxed yet on
+any platform, so use only a library whose files you trust. See the
+[release notes](https://github.com/maphew/fauxcasa/releases/latest) for the
+complete scope and report problems through
 [GitHub Issues](https://github.com/maphew/fauxcasa/issues).
 
 ## Installation
