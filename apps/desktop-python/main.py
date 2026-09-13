@@ -129,6 +129,7 @@ from thumbcache import (  # noqa: E402
 )
 from peek import PeekPage  # noqa: E402
 from slideshow import SlideshowPage  # noqa: E402
+import theme  # noqa: E402
 from starstore import (  # noqa: E402
     STAR_OVERRIDES_NAME,
     apply_star_overrides,
@@ -577,6 +578,8 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
+    app.setStyle("Fusion")
+    app.setPalette(theme.dark_palette())
     app.setWindowIcon(app_icon())  # the picker dialog is our first window
     # Backstop: an in-process headless platform (e.g. forced offscreen with a
     # DISPLAY present) still can't show a modal — keep this post-construction
@@ -3853,6 +3856,8 @@ def main() -> int:
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
+    app.setStyle("Fusion")
+    app.setPalette(theme.dark_palette())
     # App-wide default: every top-level (message boxes, the File Types
     # dialog, ...) inherits it; MainWindow/slideshow/peek also set it
     # explicitly so a window built outside main() (tests) carries it too.
