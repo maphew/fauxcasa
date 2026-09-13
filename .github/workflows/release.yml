@@ -47,6 +47,13 @@ jobs:
     timeout-minutes: 40
     env:
       QT_QPA_PLATFORM: offscreen
+      # Interpreter pin: without it `uv run` takes the runner's default
+      # CPython, which differs per image (ubuntu-22.04 ships 3.10 and the
+      # av==18 wheel needs >=3.11, so the first dry run failed to resolve;
+      # windows-2022 happened to use 3.12). 3.12 is what the passing
+      # Windows leg built with. Bump deliberately, in lockstep with
+      # bundle.yml.
+      UV_PYTHON: "3.12"
       # Pins copied VERBATIM from .github/workflows/bundle.yml — bundle.yml
       # is the source of truth; if these drift out of sync the release
       # artifact and the CI-gated artifact stop being the same build.

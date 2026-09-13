@@ -34,6 +34,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       QT_QPA_PLATFORM: offscreen
+      # Interpreter pin (release.yml carries the same): the gated artifact
+      # must not change interpreter when a runner image bumps its default
+      # Python. Keep in lockstep with release.yml.
+      UV_PYTHON: "3.12"
       # pinned so a new PySide6/PyInstaller release can't silently change
       # the gated artifact under us (graduate to a lockfile for a release gate)
       PYSIDE6: "PySide6-Essentials==6.11.1"
