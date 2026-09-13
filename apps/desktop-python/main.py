@@ -4199,7 +4199,17 @@ def main() -> int:
         # and responsive), same as the pre-existing "wait for visible
         # tiles to decode" gate this joins for the async BUILD that
         # follows.
-        if win._cold_scan_pending or not win.grid.all_visible_decoded():
+        # The "visible tiles decoded" gate is about the GRID page. Once a
+        # scripted --open has switched to the viewer, the grid is hidden and
+        # never paints, so it never requests decodes; if the cold build
+        # lands AFTER the viewer opened (READY can fire before "indexed"),
+        # set_thumbs() makes every visible tile undecoded again and this
+        # gate would hold the poll forever (a bare TIMEOUT, seen ~1 in 5
+        # runs locally and on CI's native-smoke leg). Apply it only while
+        # the grid page is current.
+        grid_current = win.pages.currentWidget() is not win.viewer
+        if win._cold_scan_pending or (
+                grid_current and not win.grid.all_visible_decoded()):
             return
         if not win.ready_reported:
             win.ready_reported = True
