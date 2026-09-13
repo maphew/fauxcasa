@@ -48,7 +48,11 @@ from pathlib import Path
 
 T0 = time.perf_counter()
 
-if "--decode-worker" in sys.argv[1:]:
+# P3 finding: an exact-match check (not "in") -- the broker fully
+# controls this cmdline, but a substring/membership check would also
+# fire for a file literally named "--decode-worker" opened via
+# drag-drop/file association, turning the GUI into a pipe-reading worker.
+if sys.argv[1:] == ["--decode-worker"]:
     # Windows AppContainer decode worker re-entry (fauxcasa-ez2.9 Stage 1,
     # frozen-bundle P0 finding): a FROZEN bundle spawns its OWN exe as
     # [sys.executable, "--decode-worker"] (decodesvc_win.resolve_worker_
@@ -3887,6 +3891,18 @@ def main() -> int:
     args = ap.parse_args()
     if args.require_sandbox:
         os.environ["FAUXCASA_DECODE_SANDBOX"] = "require"
+    # P3 finding: validate FAUXCASA_DECODE_SANDBOX here, at startup -- a
+    # bad value must be a clear error, never fail-open. decodefacade.
+    # sandbox_mode() raises ValueError for a bad value; previously that
+    # only surfaced from inside DecodeService.ensure_started()'s first
+    # call, AFTER it had already marked itself started, so every later
+    # call silently returned in-process with no error at all.
+    import decodefacade
+    try:
+        decodefacade.sandbox_mode()
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if args.bundle_self_check:
         failures = _bundle_dependency_failures()
         print(json.dumps({
@@ -4190,6 +4206,27 @@ def main() -> int:
               f"start: {e}", file=sys.stderr)
         return 1
 
+    # P3 finding: a MID-SESSION degrade (decodefacade.DecodeService.
+    # decode() flips state -> "degraded" on a per-file spawn/OSError/
+    # queue.Empty failure, well after the READY-time snapshot below) must
+    # still update the status-bar label -- N7 "never silent" applies for
+    # the whole session, not just at startup. check_ready's scripted
+    # `poll` timer is stopped once an interactive run's instrumentation is
+    # done, so this uses its OWN long-lived timer instead.
+    def _sync_decode_sandbox_label() -> None:
+        if decode_svc.state == "degraded" and not win.decode_sandbox_label.isVisible():
+            log.error("decode sandbox degraded: %s", decode_svc.reason)
+            win.decode_sandbox_label.setText(
+                f"Decoding is not sandboxed on this machine: "
+                f"{decode_svc.reason}  ")
+            win.decode_sandbox_label.setToolTip(decode_svc.reason)
+            win.decode_sandbox_label.setVisible(True)
+
+    decode_sandbox_poll = QTimer(win)
+    decode_sandbox_poll.setInterval(1000)
+    decode_sandbox_poll.timeout.connect(_sync_decode_sandbox_label)
+    decode_sandbox_poll.start()
+
     if cold_scan_needed:
         # Non-blocking first run (fauxcasa-q6l.13): the window is already
         # painted (empty) — start the deferred walk now, off the startup
@@ -4277,12 +4314,7 @@ def main() -> int:
                               "state": decode_svc.state,
                               "reason": decode_svc.reason}), flush=True)
             if decode_svc.state == "degraded":
-                log.error("decode sandbox degraded: %s", decode_svc.reason)
-                win.decode_sandbox_label.setText(
-                    f"Decoding is not sandboxed on this machine: "
-                    f"{decode_svc.reason}  ")
-                win.decode_sandbox_label.setToolTip(decode_svc.reason)
-                win.decode_sandbox_label.setVisible(True)
+                _sync_decode_sandbox_label()
             elif decode_svc.state == "in-process":
                 log.info("decode sandbox: in-process (%s)", decode_svc.reason)
             else:
