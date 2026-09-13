@@ -1,0 +1,85 @@
+name: Bug report
+description: Report a problem with Fauxcasa
+title: "[bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Before attaching anything, see the
+        privacy checkbox below — do not attach real private photos or
+        Picasa data.
+  - type: input
+    id: version
+    attributes:
+      label: Fauxcasa version
+      description: >-
+        Output of `--version`, or the exact archive/release name you
+        downloaded (for example `fauxcasa-tracer-tracer-test-v1-windows-x64.zip`).
+      placeholder: e.g. tracer-test-v1
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and display scaling
+      description: OS version/build and your display scaling setting (e.g. 100%, 150%, multi-monitor with mixed scaling).
+      placeholder: e.g. Windows 11 24H2, 150% scaling, two monitors
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Steps in order, as specific as you can make them.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: library-location
+    attributes:
+      label: Is your photo library local or on a NAS/network share?
+      options:
+        - Local disk
+        - NAS / network share
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Redacted log excerpt
+      description: >-
+        Paste the relevant lines from the app log, with any private
+        details (file paths, names, captions) removed or replaced.
+        Log location for 0.1 releases: Windows
+        `%LOCALAPPDATA%\Fauxcasa\cache\fauxcasa.log`, Linux
+        `~/.cache/fauxcasa/fauxcasa.log`. Older preview builds used
+        `~/.cache/fauxcasa-tracer/`.
+      render: text
+  - type: checkboxes
+    id: privacy-check
+    attributes:
+      label: Privacy check
+      options:
+        - label: >-
+            I have not attached private photos, Picasa databases, names,
+            captions, or paths.
+          required: true
