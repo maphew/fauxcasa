@@ -1,0 +1,320 @@
+"""Decode service facade (fauxcasa-ez2.9 Stage 1 -- plumbing only, no
+call-site migration yet; thumbcache._index_one and viewer.
+load_original_oriented keep decoding directly until Stage 2 wires them
+onto this module).
+
+`get_service()` returns a process-wide `DecodeService` singleton exposing
+the call-site-facing shape from docs/design/decode-service.md sec 5:
+
+    svc.state    -> "sandboxed" | "in-process" | "degraded"
+    svc.reason   -> str (why -- empty string when state == "sandboxed")
+    svc.decode(path, route="still", edge=0)                    -> QImage
+    svc.index(path, top, crop=None, orientation=1, route="still") -> QImage
+    svc.poster(path, edge=512)                                 -> QImage
+
+Every call returns a null QImage on ANY failure (open error, decode
+error, sandbox unavailable) so callers keep their existing fail-soft
+shape -- exactly like today's rawload/videoload/pillowload/QImageReader
+call sites.
+
+Two transports:
+
+- `InProcessTransport` -- today's decode code paths, duplicated (per the
+  lens plan's "duplicate the minimal calls" instruction, NOT moved: the
+  real call sites migrate in Stage 2). Always available, every platform.
+- `WinSandboxTransport` (win32 only) -- backed by
+  `decodesvc_win.DecodePoolSet`. Stage 1 scope: only `decode()` for
+  route="still" goes through the sandbox (the worker's `ops` list is
+  `["decode"]` only, decodesvc_worker_win.py); `index()`, `poster()`, and
+  every non-"still" `decode()` route ALWAYS fall back to InProcess in
+  this stage, regardless of sandbox availability -- there is no sandboxed
+  "index"/"poster" op yet to route them to.
+
+Selection: `FAUXCASA_DECODE_SANDBOX=0|1|require` (env), default "1" on
+win32 outside pytest, "0" everywhere else (`test_tracer.py` additionally
+pins "0" via an autouse fixture, belt-and-suspenders with this default,
+so its 86 build_cache / 29 load_original call sites never spawn a real
+worker once Stage 2 wires them here). `require` means: a failed sandbox
+startup is FATAL (raises `DecodeSandboxRequiredError` so `main()` can
+exit non-zero with a clear message) -- see `main.py --require-sandbox`.
+
+Error mapping (design doc sec migration plan item 2, "Error mapping"):
+    OSError (file open)                -> null, no log (today's contract)
+    DecodeServiceError (CORRUPT/...)   -> null + log.info (permanent, honest)
+    ProtocolViolation                  -> null + log.error, and the sandbox
+                                           transport marks the FILE permanently
+                                           failed for the sandboxed path --
+                                           it is NEVER retried in-process
+                                           (that is the exact escape the
+                                           threat model closes)
+    RuntimeError from spawn            -> SESSION-level: state flips to
+                                           "degraded", never a per-file
+                                           fallback for files already routed
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import threading
+from pathlib import Path
+from typing import Any
+
+log = logging.getLogger("fauxcasa.decodefacade")
+
+STATE_SANDBOXED = "sandboxed"
+STATE_IN_PROCESS = "in-process"
+STATE_DEGRADED = "degraded"
+
+
+class DecodeSandboxRequiredError(RuntimeError):
+    """Raised by ensure_started() when FAUXCASA_DECODE_SANDBOX=require and
+    the sandbox failed to start -- main() should catch this, print a clear
+    message, and exit non-zero (never silently degrade under require)."""
+
+
+def under_pytest() -> bool:
+    return "pytest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def sandbox_mode() -> str:
+    """FAUXCASA_DECODE_SANDBOX=0|1|require. Default: "1" on win32 outside
+    pytest, "0" otherwise."""
+    env = os.environ.get("FAUXCASA_DECODE_SANDBOX")
+    if env is not None:
+        env = env.strip().lower()
+        if env in ("0", "1", "require"):
+            return env
+        raise ValueError(f"FAUXCASA_DECODE_SANDBOX must be 0|1|require, got {env!r}")
+    if sys.platform == "win32" and not under_pytest():
+        return "1"
+    return "0"
+
+
+# ---------------------------------------------------------------------------
+# Transports
+
+class Transport:
+    def decode(self, path: str, route: str = "still", edge: int = 0) -> Any:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class InProcessTransport(Transport):
+    """Today's decode code paths, duplicated (fauxcasa-ez2.9 Stage 1 scope
+    note: NOT moved -- thumbcache.py/viewer.py keep their own copies until
+    Stage 2). Mirrors viewer.load_original_oriented's still/raw/tiff16/
+    video routing and thumbcache._index_one's scaled-decode call, minus
+    the crop/orientation/downscale/JPEG-encode steps that stay in the
+    (not-yet-migrated) call sites themselves."""
+
+    def decode(self, path: str, route: str = "still", edge: int = 0):
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QImage
+
+        path = str(path)
+        if route == "video":
+            from videoload import poster_qimage
+            img = poster_qimage(path)
+        else:
+            try:
+                data = Path(path).read_bytes()
+            except OSError:
+                return QImage()
+            if route == "raw":
+                from rawload import load_raw_qimage
+                img = load_raw_qimage(data)
+            elif route == "tiff16":
+                from pillowload import pillow_qimage
+                img = pillow_qimage(data)
+            else:  # "still" (default) -- QImageReader-class formats first
+                img = QImage.fromData(data)
+                if img.isNull():
+                    from pillowload import pillow_qimage
+                    img = pillow_qimage(data)
+        if img is None:
+            from PySide6.QtGui import QImage as _QImage
+            img = _QImage()
+        if edge and not img.isNull() and max(img.width(), img.height()) > edge:
+            img = img.scaled(edge, edge, Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+        return img
+
+
+class NotSandboxed(Exception):
+    """Raised by a sandbox transport's decode() for a route it does not
+    implement yet (Stage 1: only route="still"); a MODULE-level exception
+    (not nested in WinSandboxTransport) so DecodeService.decode()'s except
+    clause still works when a test monkeypatches df.WinSandboxTransport to
+    a stub class -- the stub raises decodefacade.NotSandboxed directly."""
+
+
+class WinSandboxTransport(Transport):
+    """decode() for route="still" only (Stage 1 scope), backed by a
+    decodesvc_win.DecodePoolSet. Any other route raises NotSandboxed so
+    the caller (DecodeService) falls back to InProcessTransport."""
+
+    def __init__(self, n_batch: int) -> None:
+        import decodesvc_win as dw
+
+        self._dw = dw
+        self._pool_set = dw.DecodePoolSet(n_batch=n_batch)
+
+    def start(self) -> None:
+        """Spawn the interactive worker (and warm the batch pool) --
+        raises RuntimeError/DecodeServiceError on failure, same taxonomy
+        as WinSandboxWorker.spawn()."""
+        self._pool_set.warm()
+
+    def decode(self, path: str, route: str = "still", edge: int = 0):
+        if route != "still":
+            raise NotSandboxed(f"route {route!r} has no sandboxed op yet")
+        dw = self._dw
+        lane = "interactive" if edge == 0 else "batch"
+        pool = self._pool_set.lease(lane, timeout=30)
+        try:
+            result = pool.decode(Path(path), edge=edge)
+        finally:
+            self._pool_set.release(pool)
+        from PySide6.QtGui import QImage
+        buf = result.pixels
+        return QImage(result.pixels_bytes, buf.w, buf.h, buf.stride,
+                      QImage.Format.Format_RGBA8888).copy()
+
+    def close(self) -> None:
+        self._pool_set.close()
+
+
+# ---------------------------------------------------------------------------
+# DecodeService facade
+
+class DecodeService:
+    def __init__(self) -> None:
+        self.state = STATE_IN_PROCESS
+        self.reason = ""
+        self._in_process = InProcessTransport()
+        self._sandbox: WinSandboxTransport | None = None
+        self._lock = threading.Lock()
+        self._started = False
+
+    def ensure_started(self) -> None:
+        """Idempotent session-start decision (design doc sec "Fallback
+        policy"): try one interactive sandboxed worker; on failure set
+        state="degraded" with the reason (or raise under require). Never
+        called again after the first successful/failed attempt -- a later
+        per-file sandbox failure is handled by decode()'s error mapping,
+        never by re-running this."""
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            mode = sandbox_mode()
+            if mode == "0" or sys.platform != "win32":
+                self.state = STATE_IN_PROCESS
+                self.reason = (
+                    "FAUXCASA_DECODE_SANDBOX=0" if mode == "0" else
+                    f"no sandbox transport on {sys.platform!r}")
+                return
+            try:
+                from thumbcache import INDEX_WORKERS
+            except Exception:
+                INDEX_WORKERS = 4
+            try:
+                sandbox = WinSandboxTransport(n_batch=INDEX_WORKERS)
+                sandbox.start()
+            except Exception as e:
+                self.reason = f"{type(e).__name__}: {e}"
+                if mode == "require":
+                    log.error("decode sandbox required but failed to start: %s", self.reason)
+                    raise DecodeSandboxRequiredError(self.reason) from e
+                log.error("decode sandbox failed to start, degrading to in-process: %s",
+                          self.reason)
+                self.state = STATE_DEGRADED
+                return
+            self._sandbox = sandbox
+            self.state = STATE_SANDBOXED
+            self.reason = ""
+
+    def decode(self, path: str, route: str = "still", edge: int = 0):
+        self.ensure_started()
+        from decodesvc import DecodeServiceError, ProtocolViolation
+
+        if self._sandbox is not None:
+            try:
+                return self._sandbox.decode(path, route=route, edge=edge)
+            except NotSandboxed:
+                pass  # route not sandboxed in Stage 1 -- fall through
+            except ProtocolViolation as e:
+                # Evidence of compromise: null + loud log, NEVER re-decode
+                # this file in-process (design doc sec migration item 2).
+                log.error("decode(%r): ProtocolViolation, refusing in-process "
+                          "re-decode: %s", path, e)
+                from PySide6.QtGui import QImage
+                return QImage()
+            except DecodeServiceError as e:
+                log.info("decode(%r): %s", path, e)
+                from PySide6.QtGui import QImage
+                return QImage()
+            except RuntimeError as e:
+                # Spawn-class failure: SESSION-level degrade, not per-file.
+                log.error("decode sandbox spawn failure, degrading to "
+                          "in-process for the rest of the session: %s", e)
+                self.state = STATE_DEGRADED
+                self.reason = f"{type(e).__name__}: {e}"
+                try:
+                    self._sandbox.close()
+                except Exception:
+                    pass
+                self._sandbox = None
+        try:
+            return self._in_process.decode(path, route=route, edge=edge)
+        except OSError:
+            from PySide6.QtGui import QImage
+            return QImage()
+
+    def index(self, path: str, top: int, crop=None, orientation: int = 1,
+              route: str = "still"):
+        """Stage 1: always InProcess (no sandboxed "index" op yet, design
+        doc migration plan item 1 -- lands with call-site migration)."""
+        img = self._in_process.decode(path, route=route, edge=top)
+        if crop is not None and not img.isNull():
+            try:
+                from cropmap import crop_qimage_upright
+                img = crop_qimage_upright(img, crop, orientation)
+            except Exception:
+                pass
+        return img
+
+    def poster(self, path: str, edge: int = 512):
+        """Stage 1: always InProcess (no sandboxed "poster" op yet)."""
+        return self._in_process.decode(path, route="video", edge=edge)
+
+    def close(self) -> None:
+        if self._sandbox is not None:
+            self._sandbox.close()
+            self._sandbox = None
+
+
+_service: DecodeService | None = None
+_service_lock = threading.Lock()
+
+
+def get_service() -> DecodeService:
+    global _service
+    with _service_lock:
+        if _service is None:
+            _service = DecodeService()
+        return _service
+
+
+def reset_service() -> None:
+    """Test-only: drop the singleton (and close its sandbox transport, if
+    any) so the next get_service() re-runs ensure_started() from scratch."""
+    global _service
+    with _service_lock:
+        if _service is not None:
+            _service.close()
+        _service = None

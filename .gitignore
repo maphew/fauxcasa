@@ -30,3 +30,8 @@ __pycache__/
 /gui-cache/
 /frozen-ci.png
 /gui-ci.png
+
+# fauxcasa-ez2.9 Stage 1: one-time-per-(AppContainer SID, dir) ACL grant
+# markers (decodesvc_win.grant_read_execute_once) -- written beside the
+# worker script dir on every real sandboxed spawn from a source checkout.
+.fauxcasa-acl-*
