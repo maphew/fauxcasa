@@ -93,7 +93,14 @@ _hidden = ["catalog", "grid", "thumbcache", "viewer", "slideshow", "peek",
            # is ALSO in main.BUNDLE_RUNTIME_MODULES so --bundle-self-check
            # fails loudly on a build without PySide6-Addons.
            "videostream", "decodesvc", "PySide6.QtMultimedia",
-           "zstandard"]
+           "zstandard",
+           # _buildinfo (rel-0.1 release workflow, fauxcasa-ez2.7): the
+           # release job writes apps/desktop-python/_buildinfo.py (git sha +
+           # build date) before this spec runs; main.py imports it guarded by
+           # ImportError, so a plain source checkout (no _buildinfo.py) still
+           # builds — PyInstaller only WARNS on a missing hidden import, it
+           # does not fail the build.
+           "_buildinfo"]
 
 # Qt modules the tracer never touches (QtCore/QtGui/QtWidgets only). Mostly
 # no-ops under PySide6-Essentials, but they make the build self-documenting
