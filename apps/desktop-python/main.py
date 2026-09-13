@@ -48,7 +48,15 @@ from pathlib import Path
 
 T0 = time.perf_counter()
 
-from PySide6.QtCore import QObject, QProcess, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QObject,
+    QProcess,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QActionGroup, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -470,6 +478,47 @@ def save_folder_view(state_dir: Path | None, flat: bool) -> None:
         doc["folder_view_flat"] = True
     else:
         doc.pop("folder_view_flat", None)
+    _write_library_config(state_dir, doc)
+
+
+def _default_window_size() -> tuple[int, int]:
+    """min(1280, 0.9 * available width) x min(800, 0.9 * available height)
+    (fauxcasa-ez2.6 §6): the v1 baseline 1280x800 fit fine on a normal
+    monitor but spilled off-screen on a small laptop display — this scales
+    down to the actual screen instead. Falls back to the bare 1280x800
+    baseline when no primary screen is reported (rare; some CI/offscreen
+    setups)."""
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        return 1280, 800
+    avail = screen.availableGeometry()
+    return (min(1280, round(avail.width() * 0.9)),
+            min(800, round(avail.height() * 0.9)))
+
+
+def load_window_geometry(state_dir: Path | None) -> QByteArray | None:
+    """The persisted QWidget.saveGeometry() blob (base64 in config.json),
+    decoded back to a QByteArray, or None if absent/garbage. View prefs
+    are a convenience, never a gate — QByteArray.fromBase64 never raises
+    (invalid input just decodes to something restoreGeometry() rejects),
+    but an empty/near-empty result is treated as absent so the caller
+    falls straight to the freshly computed default size."""
+    if state_dir is None:
+        return None
+    b64 = _read_library_config(state_dir).get("window_geometry")
+    if not isinstance(b64, str) or not b64:
+        return None
+    data = QByteArray.fromBase64(b64.encode("ascii"))
+    return data if data.size() > 0 else None
+
+
+def save_window_geometry(state_dir: Path | None, geometry: QByteArray) -> None:
+    """Persist QWidget.saveGeometry() as base64, merged into the existing
+    config doc so sort_modes/folder_view_flat survive the write."""
+    if state_dir is None:
+        return
+    doc = _read_library_config(state_dir)
+    doc["window_geometry"] = bytes(geometry.toBase64()).decode("ascii")
     _write_library_config(state_dir, doc)
 
 
@@ -1360,7 +1409,21 @@ class MainWindow(QMainWindow):
         # the app name, and carries no internal codename.
         self.setWindowTitle(f"{catalog.root.name} — {APP_NAME}")
         self.setWindowIcon(app_icon())
-        self.resize(1280, 800)
+        # Initial geometry (fauxcasa-ez2.6 §6): size to the actual screen
+        # first (min(1280, 800) baseline, scaled down on a small display),
+        # then let a persisted saveGeometry() from a previous run override
+        # it — but only when that saved rect is still reachable on THIS
+        # screen setup (a monitor unplugged since the last run must not
+        # strand the window off-screen).
+        self.resize(*_default_window_size())
+        saved = load_window_geometry(self.state_dir)
+        if saved is not None and self.restoreGeometry(saved):
+            screens = QApplication.screens()
+            on_screen = any(
+                s.availableGeometry().intersects(self.geometry())
+                for s in screens)
+            if not on_screen:
+                self.resize(*_default_window_size())
 
         self.grid = GridView()
         # Per-folder sort modes (fauxcasa-q6l.11), loaded BEFORE the first
@@ -2329,6 +2392,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.build_cancel.set()
+        save_window_geometry(self.state_dir, self.saveGeometry())
         super().closeEvent(event)
 
     # ---------- reveal (show hidden) ----------

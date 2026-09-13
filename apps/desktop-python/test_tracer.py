@@ -10162,6 +10162,102 @@ def test_sort_modes_persistence_roundtrip(tmp_path: Path) -> None:
     assert load_sort_modes(tmp_path) == {"a": "date"}    # bad values drop
 
 
+def test_window_geometry_persistence_roundtrip(tmp_path: Path) -> None:
+    """save/load round-trip for the persisted window geometry
+    (fauxcasa-ez2.6 §6): a real QByteArray survives base64 in
+    config.json, merged alongside sort_modes, and every degraded input
+    (no state dir, missing file, garbage, non-string value, empty
+    string) reads as None — view prefs are a convenience, never a gate."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QByteArray
+    from PySide6.QtWidgets import QApplication
+    from main import (
+        load_sort_modes,
+        load_window_geometry,
+        save_sort_modes,
+        save_window_geometry,
+    )
+
+    QApplication.instance() or QApplication([])
+    blob = QByteArray(b"\x00\x01\xffnot-real-geometry-but-real-bytes")
+    save_window_geometry(tmp_path, blob)
+    loaded = load_window_geometry(tmp_path)
+    assert loaded is not None and bytes(loaded) == bytes(blob)
+
+    # Merges into the existing doc: an already-persisted sort mode survives.
+    save_sort_modes(tmp_path, {"a": "date"})
+    save_window_geometry(tmp_path, blob)
+    assert load_sort_modes(tmp_path) == {"a": "date"}
+    assert bytes(load_window_geometry(tmp_path)) == bytes(blob)
+
+    assert load_window_geometry(None) is None                    # no dir
+    assert load_window_geometry(tmp_path / "nowhere") is None    # missing
+    cfg = tmp_path / "config.json"
+    cfg.write_text("{not json")
+    assert load_window_geometry(tmp_path) is None                # garbage
+    cfg.write_text('{"window_geometry": 42}')
+    assert load_window_geometry(tmp_path) is None                # non-str
+    cfg.write_text('{"window_geometry": ""}')
+    assert load_window_geometry(tmp_path) is None                # empty
+
+
+def test_default_window_size_scales_to_small_screen(monkeypatch) -> None:
+    """_default_window_size scales the 1280x800 v1 baseline down to
+    min(1280, 0.9*avail.width) x min(800, 0.9*avail.height) instead of
+    spilling off a small display (fauxcasa-ez2.6 §6); a roomy screen
+    still gets the plain 1280x800 baseline unscaled."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QRect
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    screen = app.primaryScreen()
+    assert screen is not None, "offscreen platform still reports a screen"
+
+    monkeypatch.setattr(
+        type(screen), "availableGeometry",
+        lambda self: QRect(0, 0, 1000, 700))
+    assert main._default_window_size() == (900, 630)
+
+    monkeypatch.setattr(
+        type(screen), "availableGeometry",
+        lambda self: QRect(0, 0, 3840, 2160))
+    assert main._default_window_size() == (1280, 800)
+
+
+def test_mainwindow_restores_persisted_geometry_and_saves_on_close(
+        tmp_path: Path) -> None:
+    """MainWindow.__init__ restores a persisted window rect when it's
+    still on-screen, and closeEvent persists whatever's current — an
+    end-to-end round trip through two constructions (fauxcasa-ez2.6 §6)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from main import MainWindow, load_window_geometry
+
+    QApplication.instance() or QApplication([])
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    cat = scan_library(root)
+    state_dir = tmp_path / "state"
+
+    # A modest size, well within the tiny virtual screen the offscreen
+    # platform reports (Qt's own restoreGeometry clamps to the available
+    # screen rect, same as a real WM would for an oversized saved rect).
+    win1 = MainWindow(cat, None, cache_dir=None, build_dir=None,
+                      state_dir=state_dir)
+    win1.resize(500, 400)
+    win1.close()   # closeEvent persists the current geometry
+    assert load_window_geometry(state_dir) is not None
+
+    win2 = MainWindow(cat, None, cache_dir=None, build_dir=None,
+                      state_dir=state_dir)
+    assert win2.size().width() == 500 and win2.size().height() == 400
+
+
 def test_sort_folder_items_date_mixed_and_pre1903() -> None:
     """Date mode over the three data classes at once: canonical date_taken
     strings (an UNBOUNDED pre-1903 year included — §6 footgun 16) sort
