@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/maphew/fauxcasa/blob/main/SECURITY.md
+    about: >-
+      Please do not report security vulnerabilities through public issues.
+      See SECURITY.md for the private reporting channel.
