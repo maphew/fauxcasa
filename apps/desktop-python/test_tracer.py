@@ -10860,8 +10860,10 @@ def test_folder_view_flat_listing(tmp_path: Path) -> None:
         if d is not None and d[0] == "folder":
             parent_data = it2.value().parent().data(
                 0, Qt.ItemDataRole.UserRole)
-            # Parent carries no UserRole data (it is the unselectable root).
-            assert parent_data is None, (
+            # Parent is the unselectable root — it carries ("folders_root",
+            # "") (ez2.14: lets the right-click menu find it), not a
+            # ("folder", rel) tuple of its own.
+            assert parent_data == ("folders_root", ""), (
                 f"folder item {d[1]!r} has parent with data {parent_data!r}")
         it2 += 1
 
@@ -10902,12 +10904,14 @@ def test_folder_view_flat_root_rel_photos(tmp_path: Path) -> None:
     assert root_item.toolTip(0) == str(cat.root)
 
     # Tree mode: the stand-in root node (the "Folders" header, which carries
-    # no ("folder", rel) item data) keeps the path-on-demand tooltip.
+    # ("folders_root", "") item data — ez2.14 — not a ("folder", rel) tuple
+    # of its own) keeps the path-on-demand tooltip.
     win._flat_check.setChecked(False)
     headers = [win.tree.topLevelItem(i)
                for i in range(win.tree.topLevelItemCount())]
-    folders_header = [h for h in headers
-                      if h.data(0, Qt.ItemDataRole.UserRole) is None]
+    folders_header = [
+        h for h in headers
+        if h.data(0, Qt.ItemDataRole.UserRole) == ("folders_root", "")]
     assert folders_header, "Folders header not found"
     assert folders_header[0].toolTip(0) == str(cat.root)
 
@@ -17132,3 +17136,163 @@ def test_viewer_fit_rect_excludes_caption_bar(tmp_path: Path) -> None:
     shot = v.grab().toImage().convertToFormat(QImage.Format.Format_RGB32)
     assert shot.pixelColor(200, 5).red() > 200     # photo, not letterboxed
     v.quiesce()
+
+
+# ---------- polish day 2 (fauxcasa-ez2.14): icons, welcome dialog, chevrons ----------
+
+
+def test_icons_make_icon_every_glyph_has_1x_and_2x() -> None:
+    """make_icon() paints a real (non-null) pixmap at both 16px (1x) and
+    32px (2x) for every glyph name the toolbar/sidebar use, and raises
+    KeyError — loud, not a blank tile — on an unknown name."""
+    _offscreen_app()
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QColor
+
+    import icons
+
+    for name in ("library", "back", "play", "info", "folder", "album",
+                "person", "star", "clock", "zoom_small", "zoom_large"):
+        icon = icons.make_icon(name, QColor(220, 220, 220))
+        sizes = set(icon.availableSizes())
+        assert QSize(16, 16) in sizes and QSize(32, 32) in sizes, name
+        pm = icon.pixmap(16, 16)
+        assert not pm.isNull()
+        # The real content check is that SOME pixel carries alpha — proof
+        # the glyph actually painted something onto the transparent ground.
+        img = pm.toImage()
+        painted = any(
+            img.pixelColor(x, y).alpha() > 0
+            for x in range(16) for y in range(16))
+        assert painted, f"{name}: pixmap is fully transparent"
+
+    with pytest.raises(KeyError):
+        icons.make_icon("not-a-glyph", QColor(0, 0, 0))
+
+
+def test_toolbar_actions_carry_icons(tmp_path: Path) -> None:
+    """The Library/Gallery/Play/Info toolbar actions (ez2.14) each carry a
+    non-null QIcon, and text labels stay (ToolButtonTextBesideIcon) —
+    icons are a scan aid, not a replacement for the label."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+    for action in (win.open_action, win.back_action, win.play_action,
+                  win.info_action):
+        assert not action.icon().isNull(), action.text()
+        assert action.text()   # label kept
+
+
+def test_sidebar_items_carry_icons(tmp_path: Path) -> None:
+    """Starred/Recently-Updated/Folders/Albums/People root rows and their
+    Folder/Album/Person children all carry a non-null icon (ez2.14)."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "Animals" / "cat.jpg")
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    kinds_seen = set()
+    it = QTreeWidgetItemIterator(win.tree)
+    while it.value():
+        item = it.value()
+        d = item.data(0, Qt.ItemDataRole.UserRole)
+        if d is not None and d[0] in ("starred", "recent", "folders_root",
+                                      "folder"):
+            assert not item.icon(0).isNull(), d
+            kinds_seen.add(d[0])
+        it += 1
+    assert {"starred", "recent", "folders_root", "folder"} <= kinds_seen
+
+
+def test_flat_checkbox_removed_from_sidebar_panel(tmp_path: Path) -> None:
+    """The bare 'Flat' QCheckBox no longer sits above the tree (ez2.14) —
+    only the tree fills the sidebar panel; the View menu's Flat Folders
+    action and the Folders-root context menu are the two surfaces left."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+
+    layout = win._sidebar_panel.layout()
+    widgets = [layout.itemAt(i).widget() for i in range(layout.count())]
+    assert win._flat_check not in widgets
+    assert win.tree in widgets
+    # The state holder still exists and still drives _build_sidebar/menus.
+    assert win._flat_check.isChecked() is False
+
+
+def test_folders_root_context_menu_toggles_flat_and_stays_in_sync(
+        tmp_path: Path) -> None:
+    """Right-clicking the Folders root (ez2.14) gets a checkable 'Flat
+    Folders' action mirroring the View menu's identical action — both
+    read/write the same self._flat_check state, so toggling either one
+    rebuilds the sidebar and leaves the other in sync."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "Animals" / "cat.jpg")
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+
+    menu = win._folders_root_menu()
+    acts = [a for a in menu.actions() if a.isCheckable()]
+    assert len(acts) == 1 and acts[0].text() == "Flat Folders"
+    assert not acts[0].isChecked()
+
+    acts[0].trigger()   # toggles ON via the context-menu action
+    assert win._flat_check.isChecked() is True
+
+    # The View menu action was built from the same _flat_check and stays
+    # in sync going the other way too.
+    win._flat_check.setChecked(False)
+    remenu = win._folders_root_menu()
+    assert not remenu.actions()[0].isChecked()
+
+
+def test_sidebar_menu_ignores_folders_root_click_for_view_selection(
+        tmp_path: Path) -> None:
+    """Clicking (not right-clicking) the Folders header must not reset the
+    active grid view to All photos — only real folder/album/etc rows do
+    that (regression guard for ez2.14's header now carrying UserRole
+    data so the context menu can find it)."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "Animals" / "cat.jpg")
+    make_jpeg(root / "Zebra" / "z.jpg")
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+
+    # Select a specific folder first, so we can detect an unwanted reset.
+    it = QTreeWidgetItemIterator(win.tree)
+    folder_item = None
+    while it.value():
+        d = it.value().data(0, Qt.ItemDataRole.UserRole)
+        if d is not None and d == ("folder", "Zebra"):
+            folder_item = it.value()
+            break
+        it += 1
+    assert folder_item is not None
+    win._sidebar_clicked(folder_item, 0)
+    before = list(win.grid.display)
+
+    headers = [win.tree.topLevelItem(i)
+               for i in range(win.tree.topLevelItemCount())]
+    folders_header = next(
+        h for h in headers
+        if h.data(0, Qt.ItemDataRole.UserRole) == ("folders_root", ""))
+    win._sidebar_clicked(folders_header, 0)
+    assert win.grid.display == before

@@ -142,6 +142,7 @@ from grid import (  # noqa: E402
     GridView,
     folder_key,
 )
+import icons  # noqa: E402
 from inspector import InspectorPanel  # noqa: E402
 import keymap  # noqa: E402
 import library  # noqa: E402
@@ -1511,6 +1512,13 @@ class MainWindow(QMainWindow):
         # Flat/tree toggle (fauxcasa-q6l.10): small checkbox above the tree;
         # load the persisted choice before _build_sidebar reads it.
         self.tree = self._new_sidebar_tree()
+        # Flat/tree state lives on this QCheckBox (ez2.14: no longer shown
+        # above the tree — the View menu's "Flat Folders" action and the
+        # Folders-root right-click menu are the two visible affordances now,
+        # both wired to stay in sync with this same checkbox below/in
+        # _build_menus). Kept as a plain, un-parented state holder so every
+        # reader of "is flat mode on" (_build_sidebar, _toggle_folder_view)
+        # stays unchanged.
         self._flat_check = QCheckBox("Flat")
         self._flat_check.setToolTip(
             "List folders alphabetically instead of as a tree")
@@ -1537,11 +1545,20 @@ class MainWindow(QMainWindow):
         # --- toolbar: search + zoom ---
         bar = QToolBar()
         bar.setMovable(False)
+        # Icons + text together (ez2.14) — the glyph is a scan aid, never
+        # a replacement for the label every toolbar action already has.
+        bar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(bar)
-        self.open_action = bar.addAction("Library…")
+        # 16px runtime-painted glyphs (fauxcasa-ez2.14: no binary assets,
+        # icons.py follows theme.TEXT so a future palette swap repaints for
+        # free); text labels stay (ToolButtonTextBesideIcon, set below the
+        # bar setup) so the icons are a scan aid, not the only affordance.
+        self.open_action = bar.addAction(
+            icons.make_icon("library", theme.TEXT), "Library…")
         self.open_action.setToolTip("Choose a different photo library folder")
         self.open_action.triggered.connect(self._change_library)
-        self.back_action = bar.addAction("← Gallery  (Esc)")
+        self.back_action = bar.addAction(
+            icons.make_icon("back", theme.TEXT), "← Gallery  (Esc)")
         self.back_action.setToolTip(
             "Return to the gallery and folder tree (Esc)")
         self.back_action.triggered.connect(
@@ -1551,7 +1568,8 @@ class MainWindow(QMainWindow):
         # Picasa's green Play (folder/album headers + toolbar) distilled to
         # one toolbar affordance acting on the CURRENT view; F11 is the
         # Picasa-heritage shortcut (fauxcasa-q6l.3).
-        self.play_action = bar.addAction("▶ Play")
+        self.play_action = bar.addAction(
+            icons.make_icon("play", theme.PLAY), "▶ Play")
         # Chord text is derived from the keymap so the tooltip stays current
         # when chords are added or changed (ed5.12); never hard-code "F11".
         _play_chords = " / ".join(s.toString()
@@ -1573,6 +1591,12 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.search)
         bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
         bar.addWidget(QLabel("Zoom"))
+        # Small/large picture glyphs bracket the slider (ez2.14) — a
+        # non-interactive visual cue, like the "Zoom" label beside them.
+        zoom_small = QLabel()
+        zoom_small.setPixmap(
+            icons.make_icon("zoom_small", theme.TEXT_MUTED).pixmap(12, 12))
+        bar.addWidget(zoom_small)
         self.zoom = QSlider(Qt.Orientation.Horizontal)
         self.zoom.setRange(64, 256)
         self.zoom.setValue(160)
@@ -1587,6 +1611,10 @@ class MainWindow(QMainWindow):
         self.zoom.valueChanged.connect(
             lambda _v: self._zoom_timer.start())
         bar.addWidget(self.zoom)
+        zoom_large = QLabel()
+        zoom_large.setPixmap(
+            icons.make_icon("zoom_large", theme.TEXT_MUTED).pixmap(16, 16))
+        bar.addWidget(zoom_large)
         bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
         self.reveal_box = QCheckBox("Show hidden")
         self.reveal_box.setToolTip(
@@ -1600,7 +1628,8 @@ class MainWindow(QMainWindow):
         # above. The bare-I key is handled per-surface instead (grid.py /
         # viewer.py keyPressEvent -> info_toggle_requested -> toggle()
         # below), so this action's checked state stays truthful either way.
-        self.info_action = bar.addAction("Info")
+        self.info_action = bar.addAction(
+            icons.make_icon("info", theme.TEXT), "Info")
         self.info_action.setCheckable(True)
         # Chord text derived from the keymap, same rule as play_action
         # above (ed5.12) — never hard-code the key.
@@ -1622,7 +1651,8 @@ class MainWindow(QMainWindow):
         _spanel_lay = QVBoxLayout(self._sidebar_panel)
         _spanel_lay.setContentsMargins(0, 2, 0, 0)
         _spanel_lay.setSpacing(2)
-        _spanel_lay.addWidget(self._flat_check)
+        # _flat_check itself is no longer added here (ez2.14 removed the
+        # bare checkbox above the tree) — only self.tree fills the panel.
         _spanel_lay.addWidget(self.tree)
         split.addWidget(self._sidebar_panel)
         split.addWidget(self.grid)
@@ -2719,15 +2749,22 @@ class MainWindow(QMainWindow):
             1 for p in cat.photos if (p.visible or reveal) and p.star)
         star_item = QTreeWidgetItem(t, [f"★ Starred  ({starred})"])
         star_item.setData(0, Qt.ItemDataRole.UserRole, ("starred", ""))
+        star_item.setIcon(0, icons.make_icon("star", theme.STAR))
         # Recently Updated auto-collection (fauxcasa-q6l.7): mtime recency,
         # semantics in recent_indices(). Live count like Starred — rebuilt
         # with the sidebar, plus a cold-build refresh once mtimes exist.
         recent_item = QTreeWidgetItem(t, [self._recent_label()])
         recent_item.setData(0, Qt.ItemDataRole.UserRole, ("recent", ""))
+        recent_item.setIcon(0, icons.make_icon("clock", theme.TEXT_MUTED))
 
         folders_root = QTreeWidgetItem(t, ["Folders"])
         folders_root.setFlags(
             folders_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        folders_root.setIcon(0, icons.make_icon("folder", theme.TEXT))
+        # Right-click affordance for the flat/tree toggle (ez2.14: replaces
+        # the bare checkbox that used to sit above the tree); data marks
+        # this item so _sidebar_menu can tell it apart from a real folder.
+        folders_root.setData(0, Qt.ItemDataRole.UserRole, ("folders_root", ""))
         # Flat/tree toggle (fauxcasa-q6l.10): both branches below grow a flat
         # mode alongside their existing tree mode, and both modes now carry
         # a full on-disk-path tooltip (path on demand) on every folder item.
@@ -2765,6 +2802,7 @@ class MainWindow(QMainWindow):
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
                     item.setToolTip(
                         0, _folder_tooltip(root_path / rel, folder.description))
+                    item.setIcon(0, icons.make_icon("folder", theme.TEXT_MUTED))
             else:
                 # Tree mode (default): hierarchical, with full-path tooltips.
                 nodes: dict[str, QTreeWidgetItem] = {"": folders_root}
@@ -2777,6 +2815,7 @@ class MainWindow(QMainWindow):
                     item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
                     item.setToolTip(0, _plain_tooltip(str(root_path / rel)))
+                    item.setIcon(0, icons.make_icon("folder", theme.TEXT_MUTED))
                     nodes[rel] = item
                     return item
 
@@ -2833,6 +2872,7 @@ class MainWindow(QMainWindow):
                     item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
                     item.setToolTip(0, _folder_tooltip(
                         root.path / folder.rel, folder.description))
+                    item.setIcon(0, icons.make_icon("folder", theme.TEXT_MUTED))
                     if folder.root_id in cat.offline_ids:
                         font = item.font(0)
                         font.setItalic(True)
@@ -2852,6 +2892,7 @@ class MainWindow(QMainWindow):
                     item = QTreeWidgetItem(folders_root, [label])
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
                     item.setToolTip(0, _plain_tooltip(str(root.path)))
+                    item.setIcon(0, icons.make_icon("folder", theme.TEXT))
                     if root.id in cat.offline_ids:
                         font = item.font(0)
                         font.setItalic(True)
@@ -2874,6 +2915,7 @@ class MainWindow(QMainWindow):
                     item.setToolTip(
                         0,
                         _plain_tooltip(str(roots_by_id[root_id].path / rel)))
+                    item.setIcon(0, icons.make_icon("folder", theme.TEXT_MUTED))
                     nodes2[ident] = item
                     return item
 
@@ -2911,6 +2953,7 @@ class MainWindow(QMainWindow):
             albums_root = QTreeWidgetItem(t, ["Albums"])
             albums_root.setFlags(
                 albums_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            albums_root.setIcon(0, icons.make_icon("album", theme.TEXT))
             for uid, album in cat.albums.items():
                 # §3: a placeholder (albums= uid with no definition) is
                 # never dropped — shown dimmed/italic with a "?" suffix so
@@ -2922,6 +2965,7 @@ class MainWindow(QMainWindow):
                     albums_root,
                     [f"{album.name}{suffix}  ({len(album.members)})"])
                 item.setData(0, Qt.ItemDataRole.UserRole, ("album", uid))
+                item.setIcon(0, icons.make_icon("album", theme.TEXT_MUTED))
                 if album.placeholder:
                     f = item.font(0)
                     f.setItalic(True)
@@ -2968,10 +3012,12 @@ class MainWindow(QMainWindow):
             people_root = QTreeWidgetItem(t, ["People"])
             people_root.setFlags(
                 people_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            people_root.setIcon(0, icons.make_icon("person", theme.TEXT))
             for person in sorted(people, key=str.lower):
                 item = QTreeWidgetItem(
                     people_root, [f"{person}  ({people[person]})"])
                 item.setData(0, Qt.ItemDataRole.UserRole, ("person", person))
+                item.setIcon(0, icons.make_icon("person", theme.TEXT_MUTED))
                 if person in db3_names:
                     item.setToolTip(
                         0, "Name rescued from the Picasa db3 database — "
@@ -3041,6 +3087,12 @@ class MainWindow(QMainWindow):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if data is None:
             return
+        if data[0] == "folders_root":
+            # Header row (ez2.14: now carries data so the right-click menu
+            # can find it) — unselectable, and a click on it must not reset
+            # the active view to All photos the way a bare "unknown kind"
+            # would via _apply_view's else branch.
+            return
         # Track the active view so a Show-hidden toggle can preserve it
         # (fauxcasa-x1l). On a real click Qt has already made this the
         # current item; set it explicitly so a programmatic call agrees.
@@ -3099,17 +3151,40 @@ class MainWindow(QMainWindow):
     def _sidebar_menu(self, point) -> None:
         """Right-click on the sidebar: FOLDER items get the sort-mode menu
         (spec §5 per-folder sort; the manual mode is blocked on the db3
-        oracle fixture and absent). Every other item kind — albums keep
-        membership order, auto-collections keep catalog order — has no
-        menu, which is the folder-scoped contract made visible."""
+        oracle fixture and absent). The Folders root gets the flat/tree
+        toggle (ez2.14: moved off the bare checkbox that used to sit above
+        the tree; the View menu's "Flat Folders" action is the other,
+        kept in sync via the shared _flat_check state). Every other item
+        kind — albums keep membership order, auto-collections keep catalog
+        order — has no menu, which is the folder-scoped contract made
+        visible."""
         item = self.tree.itemAt(point)
         if item is None:
             return
         data = item.data(0, Qt.ItemDataRole.UserRole)
-        if not data or data[0] != "folder":
+        if not data:
+            return
+        if data[0] == "folders_root":
+            menu = self._folders_root_menu()
+            menu.exec(self.tree.viewport().mapToGlobal(point))
+            return
+        if data[0] != "folder":
             return
         menu = self._folder_sort_menu(data[1])
         menu.exec(self.tree.viewport().mapToGlobal(point))
+
+    def _folders_root_menu(self) -> QMenu:
+        """Build (without exec'ing — mirrors _folder_sort_menu's seam) the
+        Folders-root context menu: one checkable Flat Folders action, kept
+        in sync with the View menu's identical action via the shared
+        self._flat_check state (both toggling it fires _toggle_folder_view
+        exactly once each way)."""
+        menu = QMenu(self.tree)
+        act = menu.addAction("Flat Folders")
+        act.setCheckable(True)
+        act.setChecked(self._flat_check.isChecked())
+        act.toggled.connect(self._flat_check.setChecked)
+        return menu
 
     def _folder_sort_menu(self, rel: str) -> QMenu:
         """Build (without exec'ing — the seam tests drive) the context menu
