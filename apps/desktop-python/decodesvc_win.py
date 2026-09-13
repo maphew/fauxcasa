@@ -56,15 +56,20 @@ requires Windows and raises RuntimeError otherwise.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
+import logging
 import math
 import os
+import queue
 import struct
 import subprocess
 import sys
 import threading
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger("fauxcasa.decodesvc_win")
 
 from decodesvc import (
     ARENA_BYTES,
@@ -979,6 +984,57 @@ if sys.platform == "win32":
         except OSError:
             pass
 
+    # fauxcasa-ez2.9 (Stage 1, P1 finding "spawn ~720ms": grant_read_execute
+    # on base_dir + site-packages measured 264ms + 119ms EVERY spawn) and
+    # (P1 finding "ACL grant failure is fatal even where access already
+    # exists"): grant_read_execute_once() makes the grant idempotent per
+    # (container SID, directory) two ways -- an in-process set (fast path
+    # for repeated spawns in one session) and an on-disk marker file (fast
+    # path across broker restarts within the same profile) -- and makes a
+    # failed grant BEST-EFFORT: the hello handshake (a worker that hellos
+    # can read its own runtime) is the actual readability proof, not the
+    # SetNamedSecurityInfoW return code, so a failure here is logged at
+    # info and swallowed rather than raised. Marker writes are themselves
+    # best-effort (a read-only target dir just means paying the ACL cost
+    # again next spawn, not a functional failure).
+    _acl_granted_this_process: set[tuple[str, str]] = set()
+
+    def _acl_marker_path(directory: str, sid_str: str) -> Path:
+        digest = hashlib.sha256(sid_str.encode("utf-8")).hexdigest()[:16]
+        return Path(directory) / f".fauxcasa-acl-{digest}"
+
+    def grant_read_execute_once(path: str, sid: LPVOID) -> str | None:
+        """Grant read+execute for `sid` on `path`, skipping the OS call
+        entirely once already granted this process or a prior process
+        (marker file present). Returns None on success/skip, or a string
+        error detail on a (non-fatal) grant failure."""
+        sid_str = sid_to_string(sid)
+        key = (sid_str, path)
+        if key in _acl_granted_this_process:
+            return None
+        marker = _acl_marker_path(path, sid_str)
+        try:
+            if marker.exists():
+                _acl_granted_this_process.add(key)
+                return None
+        except OSError:
+            pass
+        try:
+            grant_read_execute(path, sid)
+        except OSError as e:
+            # Best-effort (P1 finding): do NOT raise -- the hello
+            # handshake below is the real readability proof, and a
+            # Program-Files-class install where ALL APPLICATION PACKAGES
+            # already has RX must still be able to spawn.
+            _log.info("ACL grant best-effort failure on %r for %r: %s", path, sid_str, e)
+            return str(e)
+        _acl_granted_this_process.add(key)
+        try:
+            marker.write_text("granted\n", encoding="utf-8")
+        except OSError:
+            pass  # non-fatal: next spawn just re-grants (cheap once cached in-process)
+        return None
+
     # -- Job object --------------------------------------------------------
 
     def make_job(mem_limit_bytes: int) -> wintypes.HANDLE:
@@ -1089,7 +1145,18 @@ if sys.platform == "win32":
             raise ctypes.WinError(ctypes.get_last_error())
         return int(target.value or 0)
 
-    def resolve_worker_python() -> tuple[str, str]:
+    # fauxcasa-ez2.9 (Stage 1, P1 finding "spawn ~720ms not 31ms"): the
+    # interpreter probe is a ~110ms subprocess round-trip that resolve_
+    # worker_python() previously paid on EVERY spawn(); it depends only on
+    # sys.executable and FAUXCASA_WORKER_PYTHON, both fixed for the life of
+    # the process, so a module-level cache keyed on the env override makes
+    # every spawn after the first pay nothing for resolution. Cleared only
+    # by the env changing (different key) -- there is no cross-process
+    # invalidation because the resolved paths are themselves per-process
+    # facts (this interpreter's own base_prefix/PySide6 site-packages).
+    _resolve_cache: dict[str | None, tuple[str, str | None]] = {}
+
+    def resolve_worker_python() -> tuple[str, str | None]:
         """Return (worker_python_exe, worker_pythonpath). Resolved by
         probing the CURRENT interpreter (must have PySide6 importable --
         declared as a PEP 723 dependency of the caller's uv env): its
@@ -1103,8 +1170,26 @@ if sys.platform == "win32":
         gotcha 1 applies to an override venv/uv interpreter exactly as it
         does to sys.executable (Codex review PR110 P2 -- returning the
         trampoline directly would die under the job's no-child rule
-        before ever reaching the hello handshake)."""
+        before ever reaching the hello handshake).
+
+        Frozen bundle branch (fauxcasa-ez2.9 Stage 1, P0 finding): a
+        PyInstaller onedir's sys.executable IS the app -- there is no
+        python.exe to probe with `-c`, and there never will be one in
+        _internal/ (only python3xx.dll). When frozen, the worker is the
+        SAME exe re-invoked as `<exe> --decode-worker` (main.py dispatches
+        that flag to decodesvc_worker_win.main() before its own argparse,
+        mirroring the existing videostream `--worker` re-entry pattern);
+        no PYTHONPATH is needed (everything is already on the bundle's own
+        import path), so this returns (sys.executable, None) with NO
+        subprocess probe at all -- onefile is out of scope (its bootloader
+        spawns a child, which ActiveProcessLimit=1/child-restricted block,
+        docs/design/decode-service.md sec "Frozen bundle" note)."""
+        if getattr(sys, "frozen", False):
+            return sys.executable, None
         env_py = os.environ.get("FAUXCASA_WORKER_PYTHON")
+        cached = _resolve_cache.get(env_py)
+        if cached is not None:
+            return cached
         probe_interp = env_py or sys.executable
         code = (
             "import sys, json, os\n"
@@ -1123,7 +1208,9 @@ if sys.platform == "win32":
         if "site" not in dirs:
             raise RuntimeError(f"PySide6 not importable from {probe_interp}: {dirs.get('err')}")
         worker_python = os.path.join(dirs["base_prefix"], "python.exe")
-        return worker_python, dirs["site"]
+        result = (worker_python, dirs["site"])
+        _resolve_cache[env_py] = result
+        return result
 
     def is_appcontainer(token_handle=None) -> bool | str:
         """Query TokenIsAppContainer on the current process's token (used
@@ -1199,7 +1286,7 @@ if sys.platform == "win32":
                 return False
             return kernel32.WaitForSingleObject(self.pi.hProcess, 0) == WAIT_TIMEOUT
 
-    def _spawn_appcontainer(worker_python: str, worker_script: str, sid: LPVOID,
+    def _spawn_appcontainer(worker_python: str, worker_args: list[str], sid: LPVOID,
                              pythonpath: str | None, extra_env: dict[str, str],
                              mem_limit_bytes: int) -> "_ChildProcess":
         """Full-lockdown spawn: AppContainer SID + child-process-restricted
@@ -1233,7 +1320,10 @@ if sys.platform == "win32":
 
         extra_env = {**extra_env, "FAUXCASA_DECODESVC_NUL_HANDLE": str(int(nul_h))}
         env_block = _build_env_block(pythonpath, extra_env)
-        cmdline = f'"{worker_python}" "{worker_script}"'
+        # Frozen dispatch: worker_args == ["--decode-worker"] (no script
+        # path -- the exe re-invokes itself, main.py dispatches the flag
+        # before argparse). Source dispatch: worker_args == [worker_script].
+        cmdline = " ".join(f'"{a}"' for a in [worker_python, *worker_args])
         cmd_buf = ctypes.create_unicode_buffer(cmdline)
 
         job = make_job(mem_limit_bytes)
@@ -1399,6 +1489,10 @@ class WinSandboxWorker:
         self._arena_handle = None
         self._arena_addr: int | None = None
         self._winsta_grant: dict | None = None
+        # fauxcasa-ez2.9 Stage 1: best-effort ACL grant failures from the
+        # most recent spawn() (dir -> error detail string), diagnostic only
+        # -- spawn() no longer raises on these (P1 finding).
+        self.grant_errors: dict[str, str] = {}
         # FIX 7 (should-fix, review fix pass): per-session protocol-
         # violation counter (design doc sec 1/sec 7 gate 3). Full
         # counter-assertion contract is fauxcasa-i92.3.2; this is just the
@@ -1418,9 +1512,30 @@ class WinSandboxWorker:
             raise RuntimeError("already spawned; call close() first")
 
         worker_python, worker_pythonpath = resolve_worker_python()
-        worker_script = str(Path(__file__).resolve().with_name("decodesvc_worker_win.py"))
-        worker_dir = str(Path(worker_script).parent)
-        base_dir = str(Path(worker_python).parent)
+        frozen = getattr(sys, "frozen", False)
+        if frozen:
+            # fauxcasa-ez2.9 Stage 1 (P0 finding): the worker is THIS SAME
+            # exe re-invoked as `<exe> --decode-worker` -- main.py dispatches
+            # that flag to decodesvc_worker_win.main() before its own
+            # argparse (mirrors the existing videostream `--worker` pattern).
+            # No worker-script path, no PYTHONPATH. ACL grant targets are
+            # sys._MEIPASS (the extracted onedir _internal payload) and the
+            # exe's own directory -- best-effort (see grant_read_execute_once).
+            worker_args = ["--decode-worker"]
+            meipass = getattr(sys, "_MEIPASS", None)
+            grant_targets = []
+            for d in (meipass, str(Path(sys.executable).resolve().parent)):
+                if d and d not in grant_targets:
+                    grant_targets.append(d)
+        else:
+            worker_script = str(Path(__file__).resolve().with_name("decodesvc_worker_win.py"))
+            worker_dir = str(Path(worker_script).parent)
+            base_dir = str(Path(worker_python).parent)
+            worker_args = [worker_script]
+            grant_targets = []
+            for d in (base_dir, worker_pythonpath, worker_dir):
+                if d and d not in grant_targets:
+                    grant_targets.append(d)
 
         sid = create_or_derive_profile(self.profile_name)
         self._sid = sid
@@ -1432,20 +1547,16 @@ class WinSandboxWorker:
         # created -- or a retried spawn() overwrites and leaks them
         # (Codex review PR110 rounds 4+5).
         try:
-            grant_targets = []
-            for d in (base_dir, worker_pythonpath, worker_dir):
-                if d and d not in grant_targets:
-                    grant_targets.append(d)
-            grant_errors = {}
+            # fauxcasa-ez2.9 Stage 1: best-effort, one-time-per-(SID,dir)
+            # grants (see grant_read_execute_once) -- NOT raised on failure.
+            # The hello handshake below is the actual readability proof; a
+            # Program-Files-class install where ALL APPLICATION PACKAGES
+            # already has RX must still spawn even if WRITE_DAC is denied.
+            self.grant_errors = {}
             for d in grant_targets:
-                try:
-                    grant_read_execute(d, sid)
-                except OSError as e:
-                    grant_errors[d] = str(e)
-            if grant_errors:
-                raise RuntimeError(
-                    f"ACL grant(s) failed, refusing to spawn a worker that cannot "
-                    f"read its own runtime (gotcha 3): {grant_errors}")
+                err = grant_read_execute_once(d, sid)
+                if err is not None:
+                    self.grant_errors[d] = err
 
             winsta_result = grant_winsta_desktop(sid)
             self._winsta_grant = winsta_result
@@ -1460,7 +1571,7 @@ class WinSandboxWorker:
             if self._probe_enabled:
                 extra_env["FAUXCASA_DECODESVC_PROBE"] = "1"
 
-            child = _spawn_appcontainer(worker_python, worker_script, sid,
+            child = _spawn_appcontainer(worker_python, worker_args, sid,
                                          worker_pythonpath, extra_env, self.mem_limit_bytes)
         except Exception:
             self.close()
@@ -2268,6 +2379,142 @@ class WinDecodePool:
             if self._worker is not None:
                 self._worker.close()
                 self._worker = None
+
+
+# ---------------------------------------------------------------------------
+# DecodePoolSet: the multi-worker lease pool (fauxcasa-ez2.9 Stage 1, P1
+# finding "WinDecodePool is single-slot..."). Composes N independent
+# WinDecodePool instances for BATCH work (small 8 MiB arenas -- index-time
+# decodes only need a 512px level, design doc sec 6) plus one reserved
+# INTERACTIVE instance (a full 256 MiB arena, for the viewer/slideshow's
+# full-resolution decode) -- see design doc sec 1 "plus one reserved
+# interactive worker" and the lens finding recommending exactly this
+# composition instead of widening WinDecodePool itself (which stays a
+# single-slot class with its existing 12 tests untouched).
+
+class DecodePoolSet:
+    """Lease N batch WinDecodePool instances + 1 interactive one via
+    queue.LifoQueue, keyed by `lane`. A batch lease (`lane="batch"`) can
+    never take the interactive instance. An interactive lease
+    (`lane="interactive"`) prefers the reserved interactive instance but
+    may borrow an idle batch instance rather than block (the reverse --
+    a batch job stealing the interactive slot -- never happens). Spawn is
+    LAZY: no worker process exists until the first lease() call actually
+    needs one (inside `_ensure_worker`, called from the leasing thread) or
+    until `warm()` is called explicitly to pre-spawn everything in
+    parallel. Tolerates fewer batch workers than requested -- a spawn
+    failure on one batch member (e.g. ERROR_COMMITMENT_LIMIT on an 8 MiB
+    arena, unlikely, or any other spawn error) during warm() just drops
+    that member from the pool rather than failing the whole set; an
+    interactive-instance warm failure is NOT swallowed (see warm())."""
+
+    BATCH_ARENA_BYTES = 8 * 2**20       # 8 MiB (design doc sec 6)
+    INTERACTIVE_ARENA_BYTES = ARENA_DEFAULT_BYTES  # 256 MiB
+
+    def __init__(self, n_batch: int, probe: bool = False,
+                 profile_name: str = PROFILE_NAME,
+                 mem_limit_bytes: int = DEFAULT_MEM_LIMIT_BYTES,
+                 spawn_deadline_ms: int | None = DEFAULT_SPAWN_DEADLINE_MS) -> None:
+        n_batch = max(1, n_batch)
+        self._lock = threading.Lock()
+        self._batch: list[WinDecodePool] = [
+            WinDecodePool(arena_bytes=self.BATCH_ARENA_BYTES, probe=probe,
+                          profile_name=profile_name, mem_limit_bytes=mem_limit_bytes,
+                          spawn_deadline_ms=spawn_deadline_ms)
+            for _ in range(n_batch)
+        ]
+        self._interactive = WinDecodePool(
+            arena_bytes=self.INTERACTIVE_ARENA_BYTES, probe=probe,
+            profile_name=profile_name, mem_limit_bytes=mem_limit_bytes,
+            spawn_deadline_ms=spawn_deadline_ms)
+        self._batch_free: "queue.LifoQueue[WinDecodePool]" = queue.LifoQueue()
+        for p in self._batch:
+            self._batch_free.put(p)
+        self._interactive_free: "queue.LifoQueue[WinDecodePool]" = queue.LifoQueue()
+        self._interactive_free.put(self._interactive)
+        self._closed = False
+
+    @property
+    def batch_size(self) -> int:
+        """Current batch pool member count (may shrink after warm())."""
+        with self._lock:
+            return len(self._batch)
+
+    def warm(self) -> int:
+        """Spawn every pool member's first worker in parallel threads
+        (module helper for the "spawn N workers in parallel" perf item --
+        module-level resolve() caching + one-time ACL grants make every
+        spawn AFTER the first cheap). A batch member that fails to spawn
+        is dropped from the pool (tolerate fewer workers than requested);
+        the interactive member failing is re-raised -- the facade (not
+        this class) decides what a failed interactive spawn means for
+        session state (degraded). Returns the surviving batch size."""
+        members = list(self._batch) + [self._interactive]
+        errors: dict[int, BaseException] = {}
+
+        def _warm_one(i: int, pool: WinDecodePool) -> None:
+            try:
+                with pool._job_lock:
+                    pool._ensure_worker()
+            except BaseException as e:  # noqa: BLE001 -- best-effort warm, collected below
+                errors[i] = e
+
+        threads = [threading.Thread(target=_warm_one, args=(i, p), daemon=True)
+                   for i, p in enumerate(members)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        interactive_idx = len(members) - 1
+        if interactive_idx in errors:
+            raise errors[interactive_idx]
+
+        with self._lock:
+            surviving = [p for i, p in enumerate(self._batch) if i not in errors]
+            if len(surviving) != len(self._batch):
+                _log.info("DecodePoolSet.warm: %d/%d batch workers spawned "
+                          "(dropped: %s)", len(surviving), len(self._batch),
+                          {i: str(e) for i, e in errors.items() if i != interactive_idx})
+                self._batch = surviving
+                self._batch_free = queue.LifoQueue()
+                for p in self._batch:
+                    self._batch_free.put(p)
+            return len(self._batch)
+
+    def lease(self, lane: str = "batch", timeout: float | None = None) -> WinDecodePool:
+        if lane not in ("batch", "interactive"):
+            raise ValueError(f"unknown lane {lane!r}")
+        if lane == "batch":
+            return self._batch_free.get(timeout=timeout)
+        # interactive: prefer the reserved instance; borrow an idle batch
+        # instance rather than block if it's busy (design doc sec 1's
+        # "reserved interactive worker" -- the reservation is one-directional).
+        try:
+            return self._interactive_free.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            return self._batch_free.get_nowait()
+        except queue.Empty:
+            pass
+        return self._interactive_free.get(timeout=timeout)
+
+    def release(self, pool: WinDecodePool) -> None:
+        if pool is self._interactive:
+            self._interactive_free.put(pool)
+        else:
+            self._batch_free.put(pool)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            batch = list(self._batch)
+        for p in batch:
+            p.close()
+        self._interactive.close()
 
 
 def spawn_worker(arena_bytes: int = ARENA_DEFAULT_BYTES, probe: bool = False,
