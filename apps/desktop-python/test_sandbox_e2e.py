@@ -267,6 +267,61 @@ def test_psd_indexes_and_views_with_sandbox_on(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Crop-aware edge on the sandboxed index path (fauxcasa-ez2.9 Stage 2
+# review P2-4): a tight crop= recipe on a large source must not smear --
+# the sandboxed path must request a LARGER edge from the worker so the
+# kept crop sub-rect (not the whole frame) ends up close to `top` px.
+
+def _rect64_hex(left: float, top: float, right: float, bottom: float) -> str:
+    return "".join(format(round(v * 65536), "04x")
+                   for v in (left, top, right, bottom))
+
+
+@_WINDOWS_ONLY
+def test_crop_aware_edge_preserves_resolution_on_sandboxed_path(
+        tmp_path, monkeypatch):
+    from PySide6.QtGui import QColor, QImage
+
+    root = tmp_path / "lib"
+    (root / "f").mkdir(parents=True)
+    w, h = 4000, 3000
+    img = QImage(w, h, QImage.Format.Format_RGB32)
+    img.fill(QColor(90, 140, 200))
+    assert img.save(str(root / "f" / "big.jpg"), "JPEG", 90)
+
+    # 5%-area crop: 0.25 x 0.20 of the stored frame -> box 1000x600 px on
+    # the 4000x3000 source.
+    rect_hex = _rect64_hex(0.0, 0.0, 0.25, 0.20)
+    (root / "f" / ".picasa.ini").write_text(
+        f"[big.jpg]\r\ncrop=rect64({rect_hex})\r\n")
+
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+    df.reset_service()
+    svc = df.get_service()
+    svc.ensure_started()
+    assert svc.state == df.STATE_SANDBOXED, f"sandbox failed: {svc.reason}"
+
+    cat = scan_library(root)
+    ci = next(i for i, p in enumerate(cat.photos) if p.name == "big.jpg")
+    crop = cat.photos[ci].crop
+    assert crop[:3] == (0.0, 0.0, 0.25) and abs(crop[3] - 0.2) < 0.001
+
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    cache = thumbcache.load_cache(result.path)
+    _offset, length, w_out, h_out = cache.entries[ci]
+    assert length > 0
+
+    top = thumbcache.THUMB_EDGE  # 256, the default top level
+    # Without the P2-4 fix (edge=top always), the whole 4000x3000 frame
+    # scales to fit 256 first (256x192), THEN the 5%-area crop is cut out
+    # of that -- a ~64x38 smear. With the fix, the worker is asked for a
+    # larger edge so the KEPT sub-rect itself lands near `top`.
+    assert max(w_out, h_out) >= top * 0.8, (
+        f"crop tile {w_out}x{h_out} is far below the top level {top} -- "
+        "looks like a pre-fix smear, not a crop-aware decode")
+
+
+# ---------------------------------------------------------------------------
 # (c) hostile files through the wired index path, sandbox=1
 
 @_WINDOWS_ONLY

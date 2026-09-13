@@ -632,18 +632,42 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
             # below (which maps the STORED-frame rect through the read
             # orientation) applies unchanged.
             #
-            # Resolution note: the facade's decode(edge=top) op has no
+            # Resolution note: the facade's decode(edge=...) op has no
             # ROI/clip parameter (decodesvc_worker_win._handle_decode
             # takes only a handle + edge), so the setClipRect optimisation
             # above (decode only the crop sub-rect at higher resolution)
-            # is NOT available here -- the full frame is decoded and
-            # scaled to `top`, then cropped afterward like any other
-            # non-optimised path. A tight crop on a very large sandboxed
-            # source therefore yields a lower-resolution thumbnail than
-            # the in-process path would for the same file; documented,
-            # not silently regressed.
+            # is NOT available here -- the worker always scales the WHOLE
+            # frame to fit `edge` on its long axis, then the crop-bake
+            # step below crops out the sub-rect. Left at edge=top, a tight
+            # crop= recipe on a large source would throw away most of the
+            # thumbnail's resolution before the crop ever ran (fauxcasa-
+            # ez2.9 Stage 2 review P2-4). Compensate by requesting a
+            # LARGER edge so that after the worker's whole-frame scale-
+            # down, the KEPT crop sub-rect (not the whole frame) is the
+            # one that ends up ~`top` px: with box = crop_pixel_box(crop,
+            # w, h) in STORED-frame (header) pixels, scaling the whole
+            # frame by s = edge / max(w, h) scales the box by the same s
+            # (an isotropic scale, so this ratio is orientation-agnostic),
+            # so solving max(box_w, box_h) * s == top gives
+            # edge = top * max(w, h) / max(box_w, box_h). Capped at
+            # MAX_EDGE so this can never request a decode the worker
+            # itself would refuse as TOO_LARGE (decodesvc.MAX_EDGE, mirrored
+            # in decodesvc_worker_win.py).
+            edge = top
+            if crop is not None and data:
+                _hdr_buf = QBuffer()
+                _hdr_buf.setData(data)
+                _hdr_buf.open(QIODevice.OpenModeFlag.ReadOnly)
+                _hdr_sz = QImageReader(_hdr_buf).size()  # header-only
+                if _hdr_sz.isValid() and _hdr_sz.width() > 0 and _hdr_sz.height() > 0:
+                    _box = crop_pixel_box(crop, _hdr_sz.width(), _hdr_sz.height())
+                    if _box is not None and _box[2] > 0 and _box[3] > 0:
+                        from decodesvc import MAX_EDGE
+                        edge = min(MAX_EDGE, round(
+                            top * max(_hdr_sz.width(), _hdr_sz.height())
+                            / max(_box[2], _box[3])))
             img = decodefacade.get_service().decode(
-                str(src), route="still", edge=top)
+                str(src), route="still", edge=edge)
             clip_applied = False
             # Facade contract: null on ANY failure (open error, CORRUPT/
             # UNSUPPORTED DecodeServiceError, ProtocolViolation, spawn-
