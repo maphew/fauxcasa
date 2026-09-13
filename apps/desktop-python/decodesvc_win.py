@@ -66,6 +66,8 @@ import struct
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -1015,29 +1017,107 @@ if sys.platform == "win32":
                             inherit: int = SUB_CONTAINERS_AND_OBJECTS_INHERIT) -> None:
         _set_file_dacl(path, sid, GRANT_ACCESS, inherit=inherit)
 
+    class _GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_ulong),
+            ("Data2", ctypes.c_ushort),
+            ("Data3", ctypes.c_ushort),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    def _guid_from_str(guid_str: str) -> "_GUID":
+        b = uuid.UUID(guid_str).bytes  # big-endian; matches GUID's wire layout
+        g = _GUID()
+        g.Data1 = int.from_bytes(b[0:4], "big")
+        g.Data2 = int.from_bytes(b[4:6], "big")
+        g.Data3 = int.from_bytes(b[6:8], "big")
+        g.Data4 = (ctypes.c_ubyte * 8)(*b[8:16])
+        return g
+
+    # Re-review residual (item 4): FOLDERID_* GUIDs (shlobj_core.h) for the
+    # known folders is_known_user_folder() must refuse a recursive grant
+    # on. SHGetKnownFolderPath (unlike a %USERPROFILE%\\<name> guess)
+    # correctly resolves OneDrive-redirected and localized folder names.
+    KNOWN_FOLDER_GUIDS: dict[str, str] = {
+        "Profile": "{5E6C858F-0E22-4760-9AFE-EA3317B67173}",
+        "Desktop": "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+        "Documents": "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+        "Downloads": "{374DE290-123F-4565-9164-39C4925E467B}",
+        "Pictures": "{33E28130-4E1E-4676-835A-98395C3BC3BB}",
+    }
+    # %USERPROFILE%\\<suffix> fallback used only when the API call for that
+    # specific folder fails; "" means the profile root itself.
+    _KNOWN_FOLDER_FALLBACK_SUFFIX: dict[str, str] = {
+        "Profile": "", "Desktop": "Desktop", "Documents": "Documents",
+        "Downloads": "Downloads", "Pictures": "Pictures",
+    }
+
+    _shell32 = ctypes.windll.shell32
+    _ole32 = ctypes.windll.ole32
+    _shell32.SHGetKnownFolderPath.argtypes = [
+        ctypes.POINTER(_GUID), wintypes.DWORD, wintypes.HANDLE,
+        ctypes.POINTER(ctypes.c_wchar_p)]
+    _shell32.SHGetKnownFolderPath.restype = ctypes.c_long  # HRESULT
+    _ole32.CoTaskMemFree.argtypes = [LPVOID]
+    _ole32.CoTaskMemFree.restype = None
+
+    def _sh_get_known_folder_path(name: str) -> str | None:
+        """SHGetKnownFolderPath for KNOWN_FOLDER_GUIDS[name]. Returns None
+        on any failure (unsupported OS, restricted account, ...) -- a thin
+        seam so tests can monkeypatch per-folder results (e.g. a
+        OneDrive-redirected Desktop) without touching the real registry/
+        shell state."""
+        guid = _guid_from_str(KNOWN_FOLDER_GUIDS[name])
+        out = ctypes.c_wchar_p()
+        try:
+            hr = _shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(out))
+        except OSError:
+            return None
+        if hr != 0 or not out.value:
+            return None
+        path = out.value
+        try:
+            _ole32.CoTaskMemFree(out)
+        except Exception:
+            pass
+        return path
+
+    def _known_user_folder_targets() -> list[str]:
+        """Normalized (case-folded) realpaths of the user's known folders
+        -- SHGetKnownFolderPath per folder, falling back to the
+        %USERPROFILE%\\<name> heuristic ONLY for a folder whose API call
+        failed."""
+        home = os.environ.get("USERPROFILE")
+        out: list[str] = []
+        for name in KNOWN_FOLDER_GUIDS:
+            path = _sh_get_known_folder_path(name)
+            if not path and home:
+                suffix = _KNOWN_FOLDER_FALLBACK_SUFFIX[name]
+                path = os.path.join(home, suffix) if suffix else home
+            if not path:
+                continue
+            try:
+                out.append(os.path.normcase(os.path.realpath(path)))
+            except OSError:
+                pass
+        return out
+
     def is_known_user_folder(path: str) -> bool:
         """True when `path` resolves to the user's profile root or one of
-        its Desktop/Downloads/Documents/Pictures folders (P2 finding
-        "frozen grant scope"): granting a recursive, inheritable RX ACL
-        there would defeat the "user files are denied" property the
-        threat model relies on -- a portable exe dropped in Downloads (or
-        the profile root itself) must never widen the AppContainer's read
-        to the rest of the user's files."""
+        its Desktop/Downloads/Documents/Pictures folders -- including
+        OneDrive-redirected and localized names, via SHGetKnownFolderPath
+        (P2 finding "frozen grant scope"; re-review residual item 4):
+        granting a recursive, inheritable RX ACL there would defeat the
+        "user files are denied" property the threat model relies on -- a
+        portable exe dropped in Downloads (or the profile root itself)
+        must never widen the AppContainer's read to the rest of the
+        user's files. Compared case-insensitively on normalized real
+        paths so a differently-cased or symlinked path still matches."""
         try:
-            p = Path(path).resolve()
+            target = os.path.normcase(os.path.realpath(path))
         except OSError:
             return False
-        home = os.environ.get("USERPROFILE")
-        if not home:
-            return False
-        try:
-            home_p = Path(home).resolve()
-        except OSError:
-            return False
-        candidates = {home_p}
-        candidates.update(home_p / name for name in
-                           ("Desktop", "Downloads", "Documents", "Pictures"))
-        return p in candidates
+        return target in _known_user_folder_targets()
 
     def revoke(path: str, sid: LPVOID) -> None:
         try:
@@ -1068,32 +1148,90 @@ if sys.platform == "win32":
     # case it was built for).
     _acl_grant_lock = threading.Lock()
 
-    def _acl_marker_root() -> Path:
+    ACL_MARKER_MAX_AGE_SECONDS = 30 * 24 * 3600  # 30 days
+
+    _acl_marker_root_pruned = False
+
+    def _prune_acl_markers(root: Path, sid_str: str) -> None:
+        """Re-review residual (item 5): drop markers older than 30 days,
+        or not matching the CURRENT profile SID -- the profile SID
+        changes across a profile re-creation, and stale markers
+        (particularly from an old scheme, e.g. one that embedded a
+        directory mtime, see _acl_marker_path below) would otherwise
+        accumulate forever, one-per-mtime-change, since dropping mtime
+        from the key means the self-heal invalidation is now the ONLY
+        thing that removes a marker mid-session. Best-effort, run once
+        per process the first time the marker root is opened."""
+        try:
+            cutoff = time.time() - ACL_MARKER_MAX_AGE_SECONDS
+            for entry in root.iterdir():
+                if not entry.name.startswith("acl-"):
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                if st.st_mtime < cutoff:
+                    entry.unlink(missing_ok=True)
+                    continue
+                # Markers from the OLD (sid|directory|mtime) key scheme
+                # (or any marker for a different/stale SID) can't be
+                # matched by content cheaply -- but they are also never
+                # looked up again under the new (sid, directory)-only
+                # scheme (different digest), so they are pure disk
+                # litter. Prune anything not freshly written by an
+                # in-process grant this run (best-effort: read its
+                # recorded SID if present, else age it out above).
+                try:
+                    recorded_sid = entry.read_text(encoding="utf-8").strip()
+                except OSError:
+                    continue
+                if recorded_sid and recorded_sid != sid_str and sid_str:
+                    entry.unlink(missing_ok=True)
+        except OSError:
+            pass  # best-effort: a locked/unreadable marker root is not fatal
+
+    def _acl_marker_root(sid_str: str = "") -> Path:
         """Marker storage root -- %LOCALAPPDATA%\\Fauxcasa\\cache\\acl-markers
         (P3 finding: the old per-directory marker lived inside the
         interpreter/site-packages/repo trees it was granting access to --
         user-writable AND, for the repo case, a one-file sandbox
         off-switch any same-user process could plant). Falls back to TEMP
         or the home dir when LOCALAPPDATA is unset, matching the
-        catalog.py/db3rescue.py LOCALAPPDATA pattern."""
+        catalog.py/db3rescue.py LOCALAPPDATA pattern. Prunes markers
+        older than 30 days (or for a stale SID) once per process, the
+        first time the root is opened (re-review residual item 5)."""
+        global _acl_marker_root_pruned
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
         root = Path(base) / "Fauxcasa" / "cache" / "acl-markers"
         root.mkdir(parents=True, exist_ok=True)
+        if not _acl_marker_root_pruned:
+            _acl_marker_root_pruned = True
+            _prune_acl_markers(root, sid_str)
         return root
 
     def _acl_marker_path(directory: str, sid_str: str) -> Path:
-        # Keyed by (SID, directory path, directory mtime) -- P2/P3
-        # findings: including mtime means an ACL reset (icacls /reset),
-        # install move/repair, or profile re-creation that touches the
-        # directory invalidates the marker automatically instead of
-        # requiring a manual delete.
+        # Re-review residual (item 5): keyed on (SID, NORMALIZED directory
+        # path) ONLY -- dropping the directory mtime that used to be part
+        # of this key. The mtime churns on every __pycache__ write inside
+        # a granted directory (observed: 13 orphaned marker files after
+        # one day of normal use, each holding a grant that was never
+        # invalidated, just abandoned under a new digest), so it defeated
+        # the marker's own purpose (skip the OS call on repeat spawns).
+        # A directory whose ACL genuinely changed underneath a stale
+        # marker (icacls /reset, install move/repair, profile
+        # re-creation) is caught by the EXISTING self-heal path instead:
+        # invalidate_acl_grant() is called on a pre-hello spawn death
+        # (worker can't read its own runtime -> the grant clearly isn't
+        # actually in effect), which deletes the marker and forces a
+        # real re-grant on the next spawn.
         try:
-            mtime = int(Path(directory).stat().st_mtime)
+            norm_dir = os.path.normcase(os.path.realpath(directory))
         except OSError:
-            mtime = 0
-        key = f"{sid_str}|{directory}|{mtime}"
+            norm_dir = directory
+        key = f"{sid_str}|{norm_dir}"
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-        return _acl_marker_root() / f"acl-{digest}"
+        return _acl_marker_root(sid_str) / f"acl-{digest}"
 
     def invalidate_acl_grant(path: str, sid: LPVOID) -> None:
         """Drop the in-process + on-disk cache entries for (sid, path) so
@@ -1141,7 +1279,10 @@ if sys.platform == "win32":
                 return str(e)
             _acl_granted_this_process.add(key)
             try:
-                marker.write_text("granted\n", encoding="utf-8")
+                # Record the SID this marker was granted for -- read back
+                # by _prune_acl_markers() to drop markers for a stale/
+                # different SID (item 5).
+                marker.write_text(f"{sid_str}\n", encoding="utf-8")
             except OSError:
                 pass  # non-fatal: next spawn just re-grants (cheap once cached in-process)
             return None
@@ -1634,19 +1775,27 @@ class WinSandboxWorker:
             # P2 finding "frozen grant scope": ACL grant targets are
             # sys._MEIPASS (the extracted onedir _internal payload,
             # RECURSIVE grant) and the exe FILE ITSELF (NO_INHERITANCE --
-            # never the exe's directory: a directory-recursive grant on a
-            # portable exe dropped in a user folder, e.g.
-            # %USERPROFILE%\Downloads, would give the AppContainer
-            # recursive read on the user's own files, defeating the
-            # threat model's "user files are denied" property). Refuse to
-            # grant -- fail startup with a clear reason instead of
-            # silently widening access -- when either target is inside a
-            # known user folder.
+            # a single-file grant that cannot widen read to sibling
+            # files). Refuse to grant -- fail startup with a clear reason
+            # instead of silently widening access -- when a target that
+            # actually receives a RECURSIVE grant is a known user folder.
+            #
+            # Re-review residual (item 4): the refusal now applies ONLY
+            # to the actual grant targets, not to the exe's directory in
+            # general -- checking exe_dir unconditionally (as this used
+            # to) refused a perfectly safe layout, e.g. a onedir build's
+            # exe sitting in Downloads next to its OWN `_internal`
+            # subfolder (that subfolder, not Downloads itself, is what
+            # gets the recursive grant; Downloads' other files are never
+            # touched). exe_dir only matters when it IS the recursive
+            # grant target, i.e. sys._MEIPASS == exe_dir (an "extract in
+            # place" layout with no distinct payload subfolder) -- and
+            # that case is already covered by checking meipass itself.
             worker_args = ["--decode-worker"]
             meipass = getattr(sys, "_MEIPASS", None)
             exe_path = str(Path(sys.executable).resolve())
-            exe_dir = str(Path(exe_path).parent)
-            for target_dir in (d for d in (meipass, exe_dir) if d):
+            recursive_grant_dirs = [meipass] if meipass else []
+            for target_dir in recursive_grant_dirs:
                 if is_known_user_folder(target_dir):
                     raise RuntimeError(
                         f"refusing to grant AppContainer read+execute: "

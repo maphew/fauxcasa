@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import io
 import os
 import queue
@@ -2317,6 +2318,60 @@ def test_grant_read_execute_once_skips_after_marker(tmp_path, monkeypatch):
 
 
 @_WINDOWS_ONLY
+def test_acl_marker_key_stable_across_directory_mtime_change(tmp_path):
+    """Re-review residual (item 5): the marker path must be STABLE across
+    a directory mtime change (e.g. a __pycache__ write inside a granted
+    directory) -- the old (sid|directory|mtime) key orphaned a new marker
+    file on every touch (observed: 13 files after one day of normal
+    use), defeating the marker's purpose."""
+    target_dir = tmp_path / "granted"
+    target_dir.mkdir()
+    sid = dw.create_or_derive_profile(dw.PROFILE_NAME)
+    sid_str = dw.sid_to_string(sid)
+
+    path_before = dw._acl_marker_path(str(target_dir), sid_str)
+    os.utime(target_dir, None)  # bump mtime, simulating a __pycache__ write
+    path_after = dw._acl_marker_path(str(target_dir), sid_str)
+
+    assert path_before == path_after
+
+
+@_WINDOWS_ONLY
+def test_acl_marker_old_scheme_marker_is_ignored_and_pruned(tmp_path, monkeypatch):
+    """Re-review residual (item 5): a marker written under the OLD
+    (sid|directory|mtime) key scheme must not satisfy the NEW
+    (sid, directory)-only lookup -- grant_read_execute_once() must still
+    issue a real grant for a directory whose only marker is old-scheme.
+    The stale marker is also pruned (aged past 30 days) the next time
+    _prune_acl_markers() runs."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    sid = dw.create_or_derive_profile(dw.PROFILE_NAME)
+    sid_str = dw.sid_to_string(sid)
+    target_dir = tmp_path / "granted"
+    target_dir.mkdir()
+    target = str(target_dir)
+
+    root = dw._acl_marker_root(sid_str)
+    mtime = int(target_dir.stat().st_mtime)
+    old_key = f"{sid_str}|{target}|{mtime}"
+    old_digest = hashlib.sha256(old_key.encode("utf-8")).hexdigest()[:16]
+    old_marker = root / f"acl-{old_digest}"
+    old_marker.write_text("granted\n", encoding="utf-8")
+    old_ts = time.time() - dw.ACL_MARKER_MAX_AGE_SECONDS - 3600
+    os.utime(old_marker, (old_ts, old_ts))
+
+    calls = []
+    monkeypatch.setattr(dw, "grant_read_execute",
+                         lambda path, s, inherit=None: calls.append(path))
+    err = dw.grant_read_execute_once(target, sid)
+    assert err is None
+    assert calls == [target], "an old-scheme marker must not skip the real grant"
+
+    dw._prune_acl_markers(root, sid_str)
+    assert not old_marker.exists(), "an aged-out old-scheme marker must be pruned"
+
+
+@_WINDOWS_ONLY
 def test_grant_read_execute_once_best_effort_on_failure(tmp_path, monkeypatch):
     """P1 finding: a grant OSError must be BEST-EFFORT (logged, returned
     as a detail string) -- never raised. This is the trusted-side half of
@@ -2334,20 +2389,28 @@ def test_grant_read_execute_once_best_effort_on_failure(tmp_path, monkeypatch):
 
 @_WINDOWS_ONLY
 def test_spawn_refuses_frozen_grant_on_known_user_folder(monkeypatch, tmp_path):
-    """P2 finding "frozen grant scope": a frozen build's exe directory
-    must never receive a recursive ACL grant when it sits inside a known
-    user folder (profile root/Desktop/Downloads/Documents/Pictures) --
-    spawn() must refuse (fail startup, no grant issued) instead of
-    widening the AppContainer's read to the rest of the user's files."""
+    """P2 finding "frozen grant scope" / re-review residual (item 4): a
+    frozen build must never receive a RECURSIVE ACL grant (sys._MEIPASS)
+    when that grant target sits inside a known user folder (profile
+    root/Desktop/Downloads/Documents/Pictures) -- spawn() must refuse
+    (fail startup, no grant issued) instead of widening the
+    AppContainer's read to the rest of the user's files. Here
+    sys._MEIPASS == the exe's own directory (an "extract in place"
+    layout with no distinct payload subfolder), exercising both the
+    plain "meipass is a known folder" case and the "exe dir when
+    _MEIPASS == exe dir" case named in the fix. SHGetKnownFolderPath is
+    monkeypatched to fail for every folder so the %USERPROFILE% fallback
+    heuristic is what actually catches it."""
     fake_home = tmp_path / "home"
-    fake_downloads = fake_home / "Downloads"
-    fake_downloads.mkdir(parents=True)
-    fake_exe = fake_downloads / "fauxcasa.exe"
+    fake_desktop = fake_home / "Desktop"
+    fake_desktop.mkdir(parents=True)
+    fake_exe = fake_desktop / "fauxcasa.exe"
     fake_exe.write_bytes(b"")
     monkeypatch.setenv("USERPROFILE", str(fake_home))
     monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "_MEIPASS", str(fake_downloads / "_internal"), raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(fake_desktop), raising=False)
     monkeypatch.setattr(sys, "executable", str(fake_exe))
+    monkeypatch.setattr(dw, "_sh_get_known_folder_path", lambda name: None)
     called = []
     monkeypatch.setattr(dw, "grant_read_execute_once",
                          lambda *a, **k: called.append((a, k)))
@@ -2355,6 +2418,94 @@ def test_spawn_refuses_frozen_grant_on_known_user_folder(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="known user folder"):
         worker.spawn()
     assert called == [], "no grant may be issued once the refusal fires"
+
+
+@_WINDOWS_ONLY
+def test_spawn_allows_frozen_build_in_known_folder_with_scoped_meipass(monkeypatch, tmp_path):
+    """Re-review residual (item 4): the refusal applies ONLY to the
+    actual recursive grant target (sys._MEIPASS), not to the exe's
+    directory in general. A frozen build whose exe sits inside a known
+    user folder (Downloads) but whose _MEIPASS payload is scoped to its
+    OWN `_internal` subfolder (the normal onedir layout) must be allowed
+    to spawn -- the recursive grant never touches Downloads itself, only
+    the app's own subfolder, and the exe FILE grant is NO_INHERITANCE
+    (non-recursive, single file). Checking exe_dir unconditionally (the
+    pre-fix behaviour) wrongly refused this safe layout."""
+    fake_home = tmp_path / "home"
+    fake_downloads = fake_home / "Downloads"
+    fake_internal = fake_downloads / "_internal"
+    fake_internal.mkdir(parents=True)
+    fake_exe = fake_downloads / "fauxcasa.exe"
+    fake_exe.write_bytes(b"")
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(fake_internal), raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    monkeypatch.setattr(dw, "_sh_get_known_folder_path", lambda name: None)
+    seen = []
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda path, sid, inherit=dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT:
+                         seen.append((path, inherit)) or None)
+
+    def _boom_winsta(sid):
+        raise RuntimeError("stop before an actual CreateProcess (test scope)")
+
+    monkeypatch.setattr(dw, "grant_winsta_desktop", _boom_winsta)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    with pytest.raises(RuntimeError, match="stop before"):
+        worker.spawn()  # must NOT raise "known user folder"
+    assert seen, "grants must have been issued -- the refusal must not fire"
+
+
+@_WINDOWS_ONLY
+def test_is_known_user_folder_onedrive_redirected_desktop(monkeypatch, tmp_path):
+    """Re-review residual (item 4): SHGetKnownFolderPath is the source of
+    truth, not a %USERPROFILE%\\Desktop name guess -- a OneDrive-
+    redirected Desktop (a real folder elsewhere on disk) must still be
+    caught."""
+    onedrive_desktop = tmp_path / "OneDrive" / "Desktop"
+    onedrive_desktop.mkdir(parents=True)
+
+    def _fake_sh(name):
+        return str(onedrive_desktop) if name == "Desktop" else None
+
+    monkeypatch.setattr(dw, "_sh_get_known_folder_path", _fake_sh)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+
+    assert dw.is_known_user_folder(str(onedrive_desktop)) is True
+    assert dw.is_known_user_folder(str(onedrive_desktop) + "-not-it") is False
+
+
+@_WINDOWS_ONLY
+def test_is_known_user_folder_case_insensitive(monkeypatch, tmp_path):
+    """Re-review residual (item 4): comparison is case-insensitive on
+    normalized real paths."""
+    folder = tmp_path / "Pics"
+    folder.mkdir()
+
+    def _fake_sh(name):
+        return str(folder) if name == "Pictures" else None
+
+    monkeypatch.setattr(dw, "_sh_get_known_folder_path", _fake_sh)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+
+    assert dw.is_known_user_folder(str(folder).upper()) is True
+    assert dw.is_known_user_folder(str(folder).lower()) is True
+
+
+@_WINDOWS_ONLY
+def test_is_known_user_folder_falls_back_to_userprofile_heuristic(monkeypatch, tmp_path):
+    """Re-review residual (item 4): when SHGetKnownFolderPath fails for a
+    given folder, the %USERPROFILE%\\<name> heuristic still catches it."""
+    fake_home = tmp_path / "home"
+    fake_docs = fake_home / "Documents"
+    fake_docs.mkdir(parents=True)
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setattr(dw, "_sh_get_known_folder_path", lambda name: None)
+
+    assert dw.is_known_user_folder(str(fake_docs)) is True
+    assert dw.is_known_user_folder(str(fake_home)) is True
+    assert dw.is_known_user_folder(str(fake_home / "not-a-known-folder")) is False
 
 
 @_WINDOWS_ONLY
