@@ -46,8 +46,8 @@ from pathlib import Path
 
 T0 = time.perf_counter()
 
-from PySide6.QtCore import QObject, QProcess, Qt, QTimer, Signal
-from PySide6.QtGui import QActionGroup, QPalette
+from PySide6.QtCore import QObject, QProcess, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QActionGroup, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -185,6 +185,58 @@ def recent_indices(catalog: Catalog, reveal: bool,
 APP_DIR = Path(__file__).resolve().parent
 REPO = APP_DIR.parents[1]
 FROZEN = getattr(sys, "frozen", False)
+
+# Application icon (rel-0.1). Wordless on purpose: APP_NAME is provisional,
+# so the mark must never bake the name into pixels. Source of truth is
+# assets/icon.svg; assets/make-icons.py rasterizes the PNG set + .ico that
+# the runtime (app_icon) and the PyInstaller spec (EXE icon=, datas)
+# consume. Keep in lockstep with make-icons.SIZES.
+ICON_SIZES = (16, 32, 48, 64, 128, 256)
+
+
+def asset_path(name: str) -> Path:
+    """apps/desktop-python/assets/<name> in a source checkout, or the same
+    file inside the frozen bundle: the spec's datas entries copy assets/
+    to sys._MEIPASS/assets, so both layouts resolve through this one seam
+    (the _default_cache_root pattern — APP_DIR/REPO point into the
+    read-only bundle when frozen, and _MEIPASS is PyInstaller's documented
+    contract for where datas land)."""
+    base = Path(getattr(sys, "_MEIPASS", APP_DIR)) if FROZEN else APP_DIR
+    return base / "assets" / name
+
+
+def app_icon() -> QIcon:
+    """The window/taskbar icon, assembled from the pre-rendered PNG set so
+    Qt hands each surface the size rasterized FOR it (16 title bar, 32
+    taskbar, 48+ Alt-Tab, 256 hi-DPI) instead of a downscale — and needs
+    no QtSvg at runtime (the bundle excludes it). A missing file drops
+    that size only; an all-missing set yields a null icon and Qt's
+    generic fallback, never a crash."""
+    icon = QIcon()
+    for px in ICON_SIZES:
+        path = asset_path("icon.png" if px == 256 else f"icon-{px}.png")
+        if path.is_file():
+            icon.addFile(str(path), QSize(px, px))
+    return icon
+
+
+def _set_windows_app_user_model_id() -> None:
+    """Windows taskbar identity. Without an explicit AppUserModelID the
+    shell groups our windows under the HOST process (python.exe from
+    source, the PyInstaller bootloader when frozen) and pins/jump lists
+    carry that exe's icon, not ours. Must run BEFORE the first
+    QApplication exists — Qt registers the window class at construction.
+    Derived from APP_NAME so a rename changes it in exactly one place; a
+    no-op off Windows."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            f"{APP_NAME}.Desktop")
+    except (AttributeError, OSError) as exc:  # no shell32 (Wine, odd hosts)
+        log.debug("AppUserModelID not set: %s", exc)
 
 
 def _default_cache_root() -> Path:
@@ -405,6 +457,7 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
 
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
+    app.setWindowIcon(app_icon())  # the picker dialog is our first window
     # Backstop: an in-process headless platform (e.g. forced offscreen with a
     # DISPLAY present) still can't show a modal — keep this post-construction
     # guard too.
@@ -1144,6 +1197,7 @@ class MainWindow(QMainWindow):
         self._search_pairs_vis: list[tuple[int, str]] = []
         self._rebuild_search_index()
         self.setWindowTitle(f"{APP_NAME} tracer — {catalog.root.name}")
+        self.setWindowIcon(app_icon())
         self.resize(1280, 800)
 
         self.grid = GridView()
@@ -3060,6 +3114,7 @@ class MainWindow(QMainWindow):
         pos = self.grid.display_pos.get(current, 0)
         if self._slideshow is None:
             self._slideshow = SlideshowPage(self.catalog, self.grid.thumbs)
+            self._slideshow.setWindowIcon(self.windowIcon())  # own top-level
             self._slideshow.closed.connect(self._slideshow_closed)
         else:
             # Reused surface: re-point at the live catalog/cache pair (a
@@ -3089,6 +3144,7 @@ class MainWindow(QMainWindow):
         display = list(group.items)
         if self._slideshow is None:
             self._slideshow = SlideshowPage(self.catalog, self.grid.thumbs)
+            self._slideshow.setWindowIcon(self.windowIcon())  # own top-level
             self._slideshow.closed.connect(self._slideshow_closed)
         else:
             self._slideshow.catalog = self.catalog
@@ -3105,6 +3161,7 @@ class MainWindow(QMainWindow):
         undo on dismissal."""
         if self._peek_page is None:
             self._peek_page = PeekPage(self.catalog, self.grid.thumbs)
+            self._peek_page.setWindowIcon(self.windowIcon())  # own top-level
         else:
             # Reused surface: re-point at the live catalog/cache pair (the
             # slideshow discipline — a reconcile may have swapped both).
@@ -3185,6 +3242,10 @@ def main() -> int:
         import videostream
 
         return videostream._worker_main(sys.argv[1:])
+    # Taskbar identity before ANY QApplication — the frozen first-run
+    # picker (_prompt_for_library) may construct one long before the
+    # main window's own creation below.
+    _set_windows_app_user_model_id()
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3535,6 +3596,10 @@ def main() -> int:
     # A frozen first-run picker may already have created the app.
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
+    # App-wide default: every top-level (message boxes, the File Types
+    # dialog, ...) inherits it; MainWindow/slideshow/peek also set it
+    # explicitly so a window built outside main() (tests) carries it too.
+    app.setWindowIcon(app_icon())
     win = MainWindow(catalog, thumbs, cache_dir, build_dir, scan_filter,
                      warm=warm, adopt=adopt, cache_root=args.cache_root,
                      contacts=contacts, pal_dir=pal_dir,
