@@ -48,6 +48,22 @@ from pathlib import Path
 
 T0 = time.perf_counter()
 
+if "--decode-worker" in sys.argv[1:]:
+    # Windows AppContainer decode worker re-entry (fauxcasa-ez2.9 Stage 1,
+    # frozen-bundle P0 finding): a FROZEN bundle spawns its OWN exe as
+    # [sys.executable, "--decode-worker"] (decodesvc_win.resolve_worker_
+    # python()'s frozen branch + WinSandboxWorker.spawn()) -- sys.executable
+    # IS this app, so dispatch to the worker entrypoint BEFORE the heavy
+    # app-layer imports below (~200ms wall per the audit measurement) and
+    # before argparse could reject the flag. Mirrors the existing
+    # videostream `--worker` re-entry pattern. decodesvc_worker_win imports
+    # only PySide6.QtCore/QtGui itself (the ~72ms QtGui-offscreen cost the
+    # design doc's spawn budget assumes) -- never the rest of this module.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import decodesvc_worker_win
+
+    sys.exit(decodesvc_worker_win.worker_entrypoint())
+
 from PySide6.QtCore import (
     QByteArray,
     QObject,

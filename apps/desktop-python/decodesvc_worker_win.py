@@ -824,7 +824,13 @@ def _report_fatal(obj: dict) -> None:
         pass
 
 
-if __name__ == "__main__":
+def worker_entrypoint() -> int:
+    """main() + the fatal-report wrapper, as a reusable (int exit code)
+    entry point. Used by `if __name__ == "__main__":` below (source-run
+    spawn: `<base_interpreter> decodesvc_worker_win.py`) AND by main.py's
+    `--decode-worker` dispatch (frozen spawn: `<exe> --decode-worker`,
+    fauxcasa-ez2.9 Stage 1) -- one body, so the frozen path gets the exact
+    same fatal-reporting behavior as source runs, not a re-implementation."""
     try:
         main()
     except Exception as e:
@@ -837,4 +843,9 @@ if __name__ == "__main__":
         import traceback
         _report_fatal({"fatal": "worker-main", "error": repr(e),
                        "traceback": traceback.format_exc()[-4000:]})
-        sys.exit(1)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(worker_entrypoint())

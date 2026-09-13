@@ -2243,5 +2243,261 @@ def test_meta_unnamed_face_is_honest(face):
     assert v.protocol_violations == 0
 
 
+# ---------------------------------------------------------------------------
+# 5. fauxcasa-ez2.9 Stage 1: frozen-worker resolution, spawn-cost caching,
+# best-effort ACL grants, and the DecodePoolSet lease pool.
+
+@_WINDOWS_ONLY
+def test_resolve_worker_python_frozen_no_probe_subprocess(monkeypatch):
+    """P0 finding: a PyInstaller onedir has no python.exe to probe with
+    `-c`. The frozen branch must short-circuit BEFORE any subprocess.run
+    call and return (sys.executable, None) -- argv shape for _spawn_
+    appcontainer's cmdline builder is [worker_python] + ["--decode-worker"]."""
+    called = []
+    monkeypatch.setattr(dw.subprocess, "run",
+                         lambda *a, **k: called.append((a, k)) or (_ for _ in ()).throw(
+                             AssertionError("probe subprocess must not run when frozen")))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", r"C:\fake\bundle\_internal", raising=False)
+    try:
+        exe, pythonpath = dw.resolve_worker_python()
+    finally:
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    assert exe == sys.executable
+    assert pythonpath is None
+    assert called == [], "frozen resolution must never spawn a probe subprocess"
+
+
+@_WINDOWS_ONLY
+def test_resolve_worker_python_caches_result(monkeypatch):
+    """P1 finding: resolve_worker_python() previously ran the ~110ms
+    subprocess probe on EVERY call/spawn; it is now cached per process,
+    keyed on FAUXCASA_WORKER_PYTHON. A second call with the same env must
+    not re-invoke subprocess.run."""
+    dw._resolve_cache.clear()
+    real_run = dw.subprocess.run
+    calls = []
+
+    def counting_run(*a, **k):
+        calls.append((a, k))
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(dw.subprocess, "run", counting_run)
+    monkeypatch.delenv("FAUXCASA_WORKER_PYTHON", raising=False)
+    first = dw.resolve_worker_python()
+    second = dw.resolve_worker_python()
+    assert first == second
+    assert len(calls) == 1, f"expected exactly one probe subprocess, got {len(calls)}"
+    dw._resolve_cache.clear()
+
+
+@_WINDOWS_ONLY
+def test_grant_read_execute_once_skips_after_marker(tmp_path, monkeypatch):
+    """P1 finding: one-time-per-(SID,dir) ACL grant via an in-process set
+    AND an on-disk marker file -- a second call for the same (sid, dir)
+    (even a FRESH process, simulated here by clearing the in-process set)
+    must not re-invoke the underlying SetNamedSecurityInfoW grant."""
+    sid = dw.create_or_derive_profile(dw.PROFILE_NAME)
+    target = str(tmp_path)
+    calls = []
+    monkeypatch.setattr(dw, "grant_read_execute",
+                         lambda path, s: calls.append(path))
+
+    err1 = dw.grant_read_execute_once(target, sid)
+    assert err1 is None
+    assert calls == [target]
+
+    # Simulate a fresh process: clear the in-process set, keep the marker.
+    dw._acl_granted_this_process.clear()
+    err2 = dw.grant_read_execute_once(target, sid)
+    assert err2 is None
+    assert calls == [target], "marker file did not prevent a second real grant call"
+
+
+@_WINDOWS_ONLY
+def test_grant_read_execute_once_best_effort_on_failure(tmp_path, monkeypatch):
+    """P1 finding: a grant OSError must be BEST-EFFORT (logged, returned
+    as a detail string) -- never raised. This is the trusted-side half of
+    'ACL grant failure is fatal even where access already exists'."""
+    sid = dw.create_or_derive_profile(dw.PROFILE_NAME)
+    target = str(tmp_path / "denied")
+
+    def boom(path, s):
+        raise OSError("simulated WRITE_DAC denial")
+
+    monkeypatch.setattr(dw, "grant_read_execute", boom)
+    err = dw.grant_read_execute_once(target, sid)
+    assert err is not None and "simulated WRITE_DAC denial" in err
+
+
+@_WINDOWS_ONLY
+def test_spawn_survives_denied_acl_grant(monkeypatch, synthetic_png):
+    """P1 finding: a grant failure on a directory the container can
+    already read (e.g. a Program-Files-class install) must not block
+    spawn() -- the hello handshake is the real readability proof. Forces
+    EVERY grant_read_execute_once call to report a (fake) failure and
+    confirms a real worker still spawns, hellos, and decodes."""
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda path, sid: "simulated denial (access already exists)")
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    worker.spawn()
+    try:
+        assert worker.grant_errors, "expected grant_errors to be populated"
+        result = worker.decode(synthetic_png)
+        assert result.source_w == 2
+        assert result.source_h == 2
+    finally:
+        worker.close()
+
+
+class _FakeWinDecodePool:
+    """Stand-in for decodesvc_win.WinDecodePool used to test DecodePoolSet's
+    lease/borrow semantics WITHOUT spawning any real worker -- runs on
+    every platform (DecodePoolSet composition itself is not Windows-only;
+    only a real WinSandboxWorker.spawn() is)."""
+
+    def __init__(self, arena_bytes=0, **kw):
+        self.arena_bytes = arena_bytes
+        self.spawned = False
+        self.closed = False
+
+    def _ensure_worker(self):
+        self.spawned = True
+        return self
+
+    def close(self):
+        self.closed = True
+
+
+def _make_pool_set(n_batch: int, monkeypatch, fail_indices: frozenset[int] = frozenset()):
+    """A DecodePoolSet whose batch/interactive members are _FakeWinDecodePool
+    instances (via monkeypatched WinDecodePool), with a job_lock stand-in
+    since warm() takes pool._job_lock."""
+    import threading as _threading
+
+    monkeypatch.setattr(dw, "WinDecodePool", _FakeWinDecodePool)
+    pool_set = dw.DecodePoolSet(n_batch=n_batch)
+    for p in list(pool_set._batch) + [pool_set._interactive]:
+        p._job_lock = _threading.Lock()
+    return pool_set
+
+
+def test_decodepoolset_batch_lease_never_takes_interactive(monkeypatch):
+    pool_set = _make_pool_set(2, monkeypatch)
+    a = pool_set.lease("batch", timeout=1)
+    b = pool_set.lease("batch", timeout=1)
+    assert a is not b
+    assert a is not pool_set._interactive
+    assert b is not pool_set._interactive
+    with pytest.raises(Exception):
+        # batch pool exhausted (2 leased, none free) -- must NOT silently
+        # hand back the interactive instance.
+        pool_set._batch_free.get_nowait()
+
+
+def test_decodepoolset_interactive_lease_prefers_reserved_instance(monkeypatch):
+    pool_set = _make_pool_set(2, monkeypatch)
+    leased = pool_set.lease("interactive", timeout=1)
+    assert leased is pool_set._interactive
+
+
+def test_decodepoolset_interactive_lease_borrows_idle_batch_when_interactive_busy(monkeypatch):
+    pool_set = _make_pool_set(1, monkeypatch)
+    held_interactive = pool_set.lease("interactive", timeout=1)  # takes the reserved one
+    assert held_interactive is pool_set._interactive
+    borrowed = pool_set.lease("interactive", timeout=1)  # must borrow the idle batch member
+    assert borrowed is pool_set._batch[0]
+
+
+def test_decodepoolset_release_returns_to_correct_free_queue(monkeypatch):
+    pool_set = _make_pool_set(1, monkeypatch)
+    b = pool_set.lease("batch", timeout=1)
+    pool_set.release(b)
+    assert pool_set._batch_free.get_nowait() is b
+    i = pool_set.lease("interactive", timeout=1)
+    pool_set.release(i)
+    assert pool_set._interactive_free.get_nowait() is i
+
+
+def test_decodepoolset_warm_spawns_every_member(monkeypatch):
+    pool_set = _make_pool_set(3, monkeypatch)
+    surviving = pool_set.warm()
+    assert surviving == 3
+    for p in pool_set._batch:
+        assert p.spawned
+    assert pool_set._interactive.spawned
+
+
+def test_decodepoolset_warm_drops_failing_batch_member(monkeypatch):
+    import threading as _threading
+
+    monkeypatch.setattr(dw, "WinDecodePool", _FakeWinDecodePool)
+    pool_set = dw.DecodePoolSet(n_batch=3)
+    members = list(pool_set._batch) + [pool_set._interactive]
+    for p in members:
+        p._job_lock = _threading.Lock()
+    # Make the SECOND batch member's spawn fail (commitment-limit style).
+    failing = pool_set._batch[1]
+
+    def _boom():
+        raise RuntimeError("ERROR_COMMITMENT_LIMIT (simulated)")
+
+    failing._ensure_worker = _boom
+    surviving = pool_set.warm()
+    assert surviving == 2
+    assert failing not in pool_set._batch
+    assert pool_set._interactive.spawned
+
+
+def test_decodepoolset_warm_reraises_interactive_failure(monkeypatch):
+    import threading as _threading
+
+    monkeypatch.setattr(dw, "WinDecodePool", _FakeWinDecodePool)
+    pool_set = dw.DecodePoolSet(n_batch=2)
+    for p in list(pool_set._batch):
+        p._job_lock = _threading.Lock()
+    pool_set._interactive._job_lock = _threading.Lock()
+
+    def _boom():
+        raise RuntimeError("interactive spawn failed (simulated)")
+
+    pool_set._interactive._ensure_worker = _boom
+    with pytest.raises(RuntimeError, match="interactive spawn failed"):
+        pool_set.warm()
+    # Batch members should still have been attempted/spawned.
+    assert all(p.spawned for p in pool_set._batch)
+
+
+def test_decodepoolset_close_closes_every_member(monkeypatch):
+    pool_set = _make_pool_set(2, monkeypatch)
+    members = list(pool_set._batch) + [pool_set._interactive]
+    pool_set.close()
+    assert all(p.closed for p in members)
+
+
+@_WINDOWS_ONLY
+def test_decodepoolset_real_lease_two_batch_one_interactive_decode(synthetic_png):
+    """One REAL end-to-end test (no fakes): two batch WinDecodePool
+    instances (8 MiB arenas) + one interactive instance (256 MiB), each
+    leased and used to decode a synthetic JPEG/PNG through decode()."""
+    pool_set = dw.DecodePoolSet(n_batch=2)
+    try:
+        b1 = pool_set.lease("batch", timeout=30)
+        b2 = pool_set.lease("batch", timeout=30)
+        interactive = pool_set.lease("interactive", timeout=30)
+        try:
+            for pool in (b1, b2, interactive):
+                result = pool.decode(synthetic_png)
+                assert result.source_w == 2
+                assert result.source_h == 2
+        finally:
+            pool_set.release(b1)
+            pool_set.release(b2)
+            pool_set.release(interactive)
+    finally:
+        pool_set.close()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__] + (sys.argv[1:] or ["-v"])))
