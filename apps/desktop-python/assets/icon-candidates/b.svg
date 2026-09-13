@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Candidate B: "Lens horizon". A deep-teal rounded tile holds a cream
+     lens/porthole; through it, a warm sun over a green hill. Reads as
+     both a camera lens and a landscape photo. Four flat colours, no
+     strokes, no gradients. The hill overflows the lens and is masked
+     back by the even-odd ring overlay (QtSvg has no clipPath). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- tile -->
+  <rect x="0" y="0" width="256" height="256" rx="52" fill="#1F6E78"/>
+  <!-- lens -->
+  <circle cx="128" cy="128" r="96" fill="#FFF7E8"/>
+  <!-- sun -->
+  <circle cx="158" cy="98" r="28" fill="#F0592E"/>
+  <!-- hill (overflows the lens on purpose) -->
+  <path d="M24,240 V186 C64,128 112,120 150,158 C174,182 204,186 232,172 V240 Z" fill="#3F9B6E"/>
+  <!-- ring overlay: tile minus lens, masks the hill overflow -->
+  <path fill="#1F6E78" fill-rule="evenodd"
+        d="M52,0 H204 A52,52 0 0 1 256,52 V204 A52,52 0 0 1 204,256 H52 A52,52 0 0 1 0,204 V52 A52,52 0 0 1 52,0 Z
+           M32,128 A96,96 0 1 0 224,128 A96,96 0 1 0 32,128 Z"/>
+</svg>

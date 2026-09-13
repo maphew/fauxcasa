@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Candidate C: "Snapshot stack". Two prints fanned on a terracotta
+     tile; the front one shows an amber sun over a teal hill inside a
+     cream mat. Five flat colours, no strokes, no gradients. The hill is
+     inset by the card's corner radius so it never pokes past the
+     rounded corners (no clipPath needed). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- tile -->
+  <rect x="0" y="0" width="256" height="256" rx="52" fill="#D95A3C"/>
+  <!-- back print -->
+  <g transform="translate(128 128) rotate(9) translate(-128 -128)">
+    <rect x="52" y="52" width="152" height="152" rx="10" fill="#F6C89A"/>
+  </g>
+  <!-- front print -->
+  <g transform="translate(128 128) rotate(-7) translate(-128 -128)">
+    <rect x="44" y="44" width="168" height="168" rx="10" fill="#FFF7E8"/>
+    <circle cx="150" cy="100" r="26" fill="#F2A33A"/>
+    <path d="M54,202 V160 C90,110 130,104 160,150 C178,176 192,180 202,172 V202 Z" fill="#2B7A6A"/>
+  </g>
+</svg>

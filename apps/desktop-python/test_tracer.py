@@ -15791,3 +15791,87 @@ def test_import_note_markup_renders_literally(tmp_path: Path) -> None:
 
     tip = win.notes_label.toolTip()
     assert "<b>Best Of</b>" in _tooltip_literal(tip)
+||||||| 6090f37
+# ---------- application icon (rel-0.1) ----------
+
+
+def test_asset_path_resolves_committed_icon_set() -> None:
+    """The runtime icon is assembled from the committed output of
+    assets/make-icons.py: every size app_icon() consumes, plus the SVG
+    source and the .ico the PyInstaller spec embeds, must exist in a
+    source checkout — a missing raster would silently drop that size."""
+    import main
+
+    for px in main.ICON_SIZES:
+        p = main.asset_path("icon.png" if px == 256 else f"icon-{px}.png")
+        assert p.is_file(), p
+    assert main.asset_path("icon.svg").is_file()
+    assert main.asset_path("icon.ico").is_file()
+
+
+def test_asset_path_resolves_inside_bundle_when_frozen(
+        monkeypatch, tmp_path: Path) -> None:
+    """Frozen: the spec's datas land under sys._MEIPASS/assets, so the
+    resolver must switch its base there (PyInstaller's documented contract)
+    rather than trust APP_DIR, which only coincides by __file__ convention."""
+    import main
+
+    monkeypatch.setattr(main, "FROZEN", True)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert main.asset_path("icon.png") == tmp_path / "assets" / "icon.png"
+    monkeypatch.setattr(main, "FROZEN", False)
+    assert main.asset_path("icon.png") == main.APP_DIR / "assets" / "icon.png"
+
+
+def test_app_icon_carries_every_size_and_windows_get_it(library: Path) -> None:
+    """app_icon() is non-null, offers each pre-rendered size as its own
+    pixmap (no downscale at the taskbar's 16/32), and MainWindow — plus the
+    separate top-level slideshow and peek surfaces it creates lazily —
+    carry it after construction (offscreen-safe: nothing needs a display)."""
+    _offscreen_app()
+    from PySide6.QtCore import QSize, Qt
+    import main
+
+    icon = main.app_icon()
+    assert not icon.isNull()
+    sizes = {(s.width(), s.height()) for s in icon.availableSizes()}
+    assert sizes >= {(px, px) for px in main.ICON_SIZES}
+    assert not icon.pixmap(QSize(16, 16)).isNull()   # decodes, not just listed
+
+    cat = scan_library(library)
+    win = main.MainWindow(cat, None, cache_dir=None, build_dir=None)
+    assert not win.windowIcon().isNull()
+    win.grid.peek_requested.emit(0)                   # lazily creates the peek
+    assert win._peek_page is not None
+    assert not win._peek_page.windowIcon().isNull()
+    win._hide_peek()
+    win._play_group(win.grid.groups[0].folder)        # lazily creates the show
+    assert win._slideshow is not None
+    assert not win._slideshow.windowIcon().isNull()
+    _press(win._slideshow, Qt.Key.Key_Escape)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows shell API only")
+def test_windows_app_user_model_id_derives_from_app_name(monkeypatch) -> None:
+    """The taskbar identity string is built from APP_NAME (the provisional
+    name's single source of truth), never a second hard-coded copy, and
+    obeys the AppUserModelID rules (no spaces, at most 128 chars)."""
+    import ctypes
+    import main
+
+    seen: list[str] = []
+    monkeypatch.setattr(ctypes.windll.shell32,
+                        "SetCurrentProcessExplicitAppUserModelID",
+                        lambda s: seen.append(s) or 0)
+    main._set_windows_app_user_model_id()
+    assert seen == [f"{main.APP_NAME}.Desktop"]
+    assert " " not in seen[0] and len(seen[0]) <= 128
+
+
+def test_windows_app_user_model_id_is_noop_elsewhere(monkeypatch) -> None:
+    """Off Windows the helper must return without touching ctypes.windll
+    (which does not exist there) — never raise."""
+    import main
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    main._set_windows_app_user_model_id()

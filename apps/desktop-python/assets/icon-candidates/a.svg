@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Candidate A: "Sunlit frame". An amber rounded tile is the photo's
+     frame; inside, a cream print with a setting sun over a teal hill.
+     Four flat colours, no strokes, no gradients. Geometry sits on a
+     16-unit grid (1 px at 16x16). The hill overflows the print and is
+     then masked back by the even-odd frame overlay (QtSvg has no
+     clipPath). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- tile -->
+  <rect x="0" y="0" width="256" height="256" rx="52" fill="#F2A33A"/>
+  <!-- print -->
+  <rect x="32" y="32" width="192" height="192" rx="20" fill="#FFF7E8"/>
+  <!-- sun -->
+  <circle cx="164" cy="92" r="30" fill="#EF5A2B"/>
+  <!-- hill (overflows the print on purpose) -->
+  <path d="M20,236 V184 C64,124 112,116 152,156 C176,180 204,184 236,168 V236 Z" fill="#2B7A6A"/>
+  <!-- frame overlay: tile minus print, masks the hill overflow -->
+  <path fill="#F2A33A" fill-rule="evenodd"
+        d="M52,0 H204 A52,52 0 0 1 256,52 V204 A52,52 0 0 1 204,256 H52 A52,52 0 0 1 0,204 V52 A52,52 0 0 1 52,0 Z
+           M52,32 H204 A20,20 0 0 1 224,52 V204 A20,20 0 0 1 204,224 H52 A20,20 0 0 1 32,204 V52 A20,20 0 0 1 52,32 Z"/>
+</svg>

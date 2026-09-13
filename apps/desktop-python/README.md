@@ -162,6 +162,13 @@ no-arg launch opens the library you last picked (remembered in
 a library path to override. A headless frozen launch with no library
 exits cleanly rather than blocking on a dialog nobody can answer.
 
+**Icon**: the window/taskbar/Explorer mark lives under `assets/` —
+`icon.svg` is the source (a wordless "lens horizon": the name is
+provisional, so no letters), and `uv run apps/desktop-python/assets/make-icons.py`
+regenerates the committed PNG set + `icon.ico` that `main.app_icon()`,
+the tests and the PyInstaller spec consume; re-run it after editing the
+SVG. The rejected candidates stay in `assets/icon-candidates/`.
+
 Tests: `uv run apps/desktop-python/test_tracer.py`
 
 ## EXIF orientation
