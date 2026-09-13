@@ -93,6 +93,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QToolBar,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QTreeWidgetItemIterator,
@@ -740,6 +741,41 @@ def _explain_not_a_library(root: Path) -> None:
 def _explain_filesystem_root(root: Path) -> None:
     log.error("refusing to scan filesystem root as a photo library: %s; "
               "choose a folder inside it", root)
+
+
+def _paths_related(a: Path, b: Path) -> bool:
+    """True when `a` and `b` are the same folder, or one contains the
+    other — case-insensitive and normalized (fauxcasa-ez2.13), since a
+    Windows watched-folder path from the registry and an opened library
+    root can differ only in case or trailing separator."""
+    def _norm(p: Path) -> str:
+        return str(p.resolve()).rstrip("\\/").lower()
+    a_n, b_n = _norm(a), _norm(b)
+    return (a_n == b_n or a_n.startswith(b_n + os.sep)
+            or b_n.startswith(a_n + os.sep))
+
+
+def _db3_rescue_enabled(root: Path, explicit: bool) -> tuple[bool, str]:
+    """Whether to run the db3/.pal machine-local rescue import for the
+    opened `root` (fauxcasa-ez2.13). --db3/--pal-dir default to THIS
+    machine's Picasa2 AppData regardless of which library is open, so
+    without a gate, opening any folder on a machine that once ran Picasa
+    yields a report full of db3_path_unresolved noise about some other
+    library entirely. An explicit --db3/--pal-dir always wins (the
+    PicasaStarter-relocation case); otherwise the rescue only runs when
+    `root` equals, contains, or is contained by one of Picasa's own
+    watched roots (registry, Windows-only, fail-soft when absent/
+    unsupported). Returns (enabled, reason) — the caller logs the reason
+    either way."""
+    if explicit:
+        return True, "explicit --db3/--pal-dir"
+    try:
+        watched = library.picasa_watched_from_registry()
+    except RuntimeError:
+        return False, "no Picasa watched-folders registry entry found"
+    if any(_paths_related(root, w) for w in watched):
+        return True, "root overlaps a Picasa watched folder"
+    return False, f"{root} does not overlap any Picasa watched folder"
 
 
 def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
@@ -1668,11 +1704,15 @@ class MainWindow(QMainWindow):
         self.progress_label.setTextFormat(Qt.TextFormat.PlainText)
         self.meta_label = QLabel()
         self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
-        # Import-report count (fauxcasa-cam.13): "N import notes" with the
-        # first few entries in the tooltip — deliberately lean; the full
-        # inspector surface is N7/M2 work.
-        self.notes_label = QLabel()
-        self.notes_label.setTextFormat(Qt.TextFormat.PlainText)
+        # Import-report count (fauxcasa-cam.13; button fauxcasa-ez2.13): a
+        # flat QToolButton (not a QLabel) reading "N import notes" that
+        # opens a read-only dialog listing the report entries — deliberately
+        # lean chrome; the full inspector surface is N7/M2 work.
+        self.notes_label = QToolButton()
+        self.notes_label.setAutoRaise(True)
+        self.notes_label.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.notes_label.clicked.connect(self._show_import_notes_dialog)
         # Decode-sandbox degrade banner (fauxcasa-ez2.9 Stage 1, item 6):
         # a SEPARATE permanent label from notes_label above -- notes_label
         # is the import-report count (_update_import_notes), a different
@@ -3394,24 +3434,83 @@ class MainWindow(QMainWindow):
             f" · {len(self.catalog.albums)} albums")
 
     def _update_import_notes(self) -> None:
-        """The lean import-report surface (fauxcasa-cam.13): a permanent
-        status-bar count when the catalog's report has entries, with the
-        first few in the tooltip. Hidden entirely at zero — most libraries
-        have no notes and deserve no chrome. The full inspector is N7/M2."""
-        entries = self.catalog.report.entries
-        if not entries:
+        """The lean import-report surface (fauxcasa-cam.13, button
+        fauxcasa-ez2.13): a permanent status-bar button reading "N import
+        notes" when the catalog's report has entries worth surfacing,
+        opening a read-only dialog on click. Hidden entirely at zero —
+        most libraries have no notes and deserve no chrome. status_count()
+        excludes db3_path_unresolved (machine residue about whatever
+        Picasa library last ran on THIS machine, not a conflict inside the
+        opened library) — a library with only that kind of note shows
+        zero import notes, matching fauxcasa-ez2.13."""
+        n = self.catalog.report.status_count()
+        if n == 0:
             self.notes_label.setVisible(False)
             self.notes_label.setText("")
             self.notes_label.setToolTip("")
             return
-        n = len(entries)
         self.notes_label.setText(
             f"{n} import note{'s' if n != 1 else ''}  ")
-        shown = [f"[{e.source}] {e.kind}: {e.detail}" for e in entries[:6]]
+        visible_entries = [e for e in self.catalog.report.entries
+                          if e.kind != "db3_path_unresolved"]
+        shown = [f"[{e.source}] {e.kind}: {e.detail}"
+                for e in visible_entries[:6]]
         if n > len(shown):
-            shown.append(f"… and {n - len(shown)} more (see {REPORT_NAME})")
+            shown.append(f"… and {n - len(shown)} more — click for details")
         self.notes_label.setToolTip(_plain_tooltip("\n".join(shown)))
         self.notes_label.setVisible(True)
+
+    def _show_import_notes_dialog(self) -> None:
+        """Click target for the status-bar import-notes button
+        (fauxcasa-ez2.13): a small read-only dialog listing every report
+        row (kind, count, up to 20 example rels/subjects) plus a "Reveal
+        report file" button that locates import-report.json on disk."""
+        from PySide6.QtWidgets import (
+            QDialog,
+            QDialogButtonBox,
+            QHeaderView,
+            QPushButton,
+            QTableWidget,
+            QTableWidgetItem,
+            QVBoxLayout as _QVBoxLayout,
+        )
+
+        import locate
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{APP_NAME} — Import Notes")
+        dlg.resize(640, 420)
+        lay = _QVBoxLayout(dlg)
+        rows = self.catalog.report.grouped_entries()
+        table = QTableWidget(0, 3, dlg)
+        table.setHorizontalHeaderLabels(["Kind", "Count", "Examples"])
+        table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        for source, kind, count, examples in rows:
+            r = table.rowCount()
+            table.insertRow(r)
+            table.setItem(r, 0, QTableWidgetItem(f"[{source}] {kind}"))
+            table.setItem(r, 1, QTableWidgetItem(str(count)))
+            table.setItem(r, 2, QTableWidgetItem(", ".join(examples[:20])))
+        lay.addWidget(table)
+
+        report_path = (self.cache_dir / REPORT_NAME
+                      if self.cache_dir is not None else None)
+        reveal_btn = QPushButton("Reveal report file")
+        reveal_btn.setEnabled(report_path is not None and report_path.is_file())
+        if report_path is not None:
+            reveal_btn.clicked.connect(
+                lambda: locate.reveal_in_file_manager(report_path))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.addButton(reveal_btn, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.rejected.connect(dlg.reject)
+        buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(
+            dlg.accept)
+        lay.addWidget(buttons)
+        dlg.exec()
 
     def _selection_changed(self, selection: set) -> None:
         """Grid multi-select -> status label (spec §5 dual mode): exactly
@@ -3993,11 +4092,22 @@ def main() -> int:
         elif args.contacts is not None:
             log.warning("no contacts loaded from %s", contacts_path)
 
-    # Picasa2Albums .pal files (fauxcasa-cam.8): an explicit --pal-dir wins,
-    # else the machine-local Picasa2Albums default when present. Same
-    # read-only-enrichment posture as contacts.xml — but an explicitly
-    # named directory that doesn't exist earns a warning, not silence.
-    pal_dir = args.pal_dir or default_pal_dir()
+    # Picasa2Albums .pal files (fauxcasa-cam.8) / db3 rescue import
+    # (fauxcasa-cam.6/.7): an explicit --pal-dir/--db3 wins (the
+    # PicasaStarter-relocation case), else the machine-local default when
+    # present AND the opened root actually relates to Picasa's own
+    # library (fauxcasa-ez2.13) — the machine-local default is keyed on
+    # THIS machine, not the opened library, so without this gate opening
+    # any folder on a machine that once ran Picasa floods the import
+    # report with db3_path_unresolved noise about some other library.
+    # Read-only enrichment either way: absence is never fatal, an
+    # explicitly named directory that doesn't exist earns a warning.
+    rescue_explicit = args.pal_dir is not None or args.db3 is not None
+    rescue_enabled, rescue_reason = _db3_rescue_enabled(root, rescue_explicit)
+    log.info("db3/pal rescue: %s (%s)",
+             "enabled" if rescue_enabled else "skipped", rescue_reason)
+
+    pal_dir = args.pal_dir or (default_pal_dir() if rescue_enabled else None)
     if pal_dir is not None and not pal_dir.is_dir():
         if args.pal_dir is not None:
             log.warning("--pal-dir %s is not a directory; ignored", pal_dir)
@@ -4005,12 +4115,7 @@ def main() -> int:
     if pal_dir is not None:
         log.info("albums: merging .pal files from %s", pal_dir)
 
-    # db3 rescue import (fauxcasa-cam.6/.7): an explicit --db3 wins (the
-    # PicasaStarter-relocation case), else the machine-local db3 default
-    # when present. Same read-only-enrichment posture as contacts.xml /
-    # --pal-dir: absence is never fatal, an explicitly named directory
-    # that doesn't exist earns a warning, not silence.
-    db3_dir = args.db3 or default_db3_dir()
+    db3_dir = args.db3 or (default_db3_dir() if rescue_enabled else None)
     if db3_dir is not None and not db3_dir.is_dir():
         if args.db3 is not None:
             log.warning("--db3 %s is not a directory; ignored", db3_dir)
