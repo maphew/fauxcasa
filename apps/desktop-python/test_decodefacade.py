@@ -16,6 +16,7 @@ literal byte string, not any real image.
 from __future__ import annotations
 
 import base64
+import queue
 import sys
 from pathlib import Path
 
@@ -134,11 +135,14 @@ def test_ensure_started_require_mode_raises(monkeypatch):
         svc.ensure_started()
 
 
-def test_decode_falls_back_to_in_process_after_session_degrade(monkeypatch, synthetic_png):
-    """A per-file decode() call that hits a RuntimeError from the sandbox
-    (spawn-class failure surfacing later) must flip state to degraded and
-    still return a real decoded image via the in-process fallback --
-    never raise out to the caller."""
+def test_decode_returns_null_for_crashed_file_then_in_process_for_next(
+        monkeypatch, synthetic_png, tmp_path):
+    """P1 finding "facade escape": a RuntimeError from the sandbox
+    (spawn-class failure -- e.g. a malicious file that crashed/killed the
+    sandbox worker) must flip state to degraded and return a NULL QImage
+    for the file that triggered it -- that file must NEVER fall through
+    to in-process decode. Only a SUBSEQUENT call, with a different path,
+    may use the in-process fallback."""
     monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
 
     class _RaisingSandbox:
@@ -159,9 +163,77 @@ def test_decode_falls_back_to_in_process_after_session_degrade(monkeypatch, synt
         pytest.skip("sandboxed decode path only reached on win32")
     svc = df.get_service()
     img = svc.decode(synthetic_png, route="still", edge=0)
-    assert not img.isNull()
-    assert img.width() == 2 and img.height() == 2
+    assert img.isNull(), (
+        "the file that crashed/killed the sandbox worker must never be "
+        "decoded in-process")
     assert svc.state == df.STATE_DEGRADED
+
+    other_png = tmp_path / "other.png"
+    other_png.write_bytes(SYNTHETIC_PNG_2X2_RED)
+    img2 = svc.decode(other_png, route="still", edge=0)
+    assert not img2.isNull(), (
+        "a later call with a DIFFERENT path must fall back to in-process")
+    assert img2.width() == 2 and img2.height() == 2
+
+
+@pytest.mark.parametrize("exc", [
+    OSError("simulated CreateProcess/profile failure"),
+    queue.Empty(),
+])
+def test_decode_oserror_and_queue_empty_degrade_to_null(monkeypatch, synthetic_png, exc):
+    """P2 finding: OSError (create_or_derive_profile/CreateProcess
+    failures) and queue.Empty (WinSandboxTransport.decode's 30s lease
+    timeout) must NOT escape the "null QImage on ANY failure" contract --
+    both map to the same session-level degrade + null-for-this-file
+    behaviour as RuntimeError."""
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+
+    class _RaisingSandbox:
+        def __init__(self, n_batch):
+            pass
+
+        def start(self):
+            pass
+
+        def decode(self, path, route="still", edge=0):
+            raise exc
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(df, "WinSandboxTransport", _RaisingSandbox)
+    if sys.platform != "win32":
+        pytest.skip("sandboxed decode path only reached on win32")
+    svc = df.get_service()
+    img = svc.decode(synthetic_png, route="still", edge=0)
+    assert img.isNull()
+    assert svc.state == df.STATE_DEGRADED
+
+
+def test_ensure_started_closes_transport_on_start_failure(monkeypatch):
+    """P3 finding: a warm()/start() failure must close() the transport --
+    otherwise any worker processes it spawned before the failing member
+    leak for the rest of the session."""
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+    closed = []
+
+    class _BoomTransport:
+        def __init__(self, n_batch):
+            pass
+
+        def start(self):
+            raise RuntimeError("simulated spawn failure")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(df, "WinSandboxTransport", _BoomTransport)
+    if sys.platform != "win32":
+        pytest.skip("degrade path is only reached when sys.platform == 'win32'")
+    svc = df.get_service()
+    svc.ensure_started()
+    assert svc.state == df.STATE_DEGRADED
+    assert closed == [True], "a failed start() must still close() the transport"
 
 
 def test_decode_protocol_violation_never_falls_back_in_process(monkeypatch, synthetic_png):
@@ -247,6 +319,36 @@ def test_decode_real_sandbox_still(monkeypatch, synthetic_png):
     assert svc.state == df.STATE_SANDBOXED
     assert not img.isNull()
     assert img.width() == 2 and img.height() == 2
+
+
+@_WINDOWS_ONLY
+def test_decode_real_sandbox_warms_full_pool_three_times_in_a_row(monkeypatch):
+    """P1 finding "Profile/SID race": DecodePoolSet(n_batch=INDEX_WORKERS)
+    .warm() used to race CreateAppContainerProfile across every one of
+    its parallel spawn threads (observed 0x80070020 SHARING_VIOLATION,
+    0x80070005 ACCESS_DENIED, 0x800703FA ERROR_KEY_DELETED, and a
+    "successful" warm that silently spawned fewer members than
+    requested). This is the actual PRODUCTION path -- ensure_started()
+    -> WinSandboxTransport(n_batch=INDEX_WORKERS).start() ->
+    DecodePoolSet.warm() -- which the 180-test decodesvc_win suite never
+    exercised (it spawns serially or at most 3 in parallel). Three
+    consecutive warms through the real facade must each reach the full
+    min(8, cpu_count())+1 member count and state == sandboxed."""
+    from thumbcache import INDEX_WORKERS
+
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+    expected = INDEX_WORKERS + 1  # batch members + the reserved interactive
+    for trial in range(3):
+        df.reset_service()
+        svc = df.get_service()
+        svc.ensure_started()
+        assert svc.state == df.STATE_SANDBOXED, (
+            f"trial {trial}: state={svc.state!r} reason={svc.reason!r}")
+        pool_set = svc._sandbox._pool_set
+        surviving = pool_set.batch_size + 1  # +1 for the reserved interactive
+        assert surviving == expected, (
+            f"trial {trial}: surviving={surviving}, expected {expected}")
+    df.reset_service()
 
 
 def test_index_and_poster_are_always_in_process(monkeypatch, synthetic_png):

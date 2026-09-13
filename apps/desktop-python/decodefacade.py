@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import sys
 import threading
 from pathlib import Path
@@ -210,9 +211,17 @@ class DecodeService:
         with self._lock:
             if self._started:
                 return
-            self._started = True
+            # P3 finding: `_started` is only set True after a VALID
+            # decision below -- previously it was set here, before
+            # sandbox_mode() could raise ValueError on a bad env value,
+            # so the first call raised and every later call silently
+            # returned (fail-open on a typo, `_started` already True with
+            # `self.state` still its in-process default). main() now
+            # validates the env var at startup too (belt-and-suspenders),
+            # but this method must never fail open either way.
             mode = sandbox_mode()
             if mode == "0" or sys.platform != "win32":
+                self._started = True
                 self.state = STATE_IN_PROCESS
                 self.reason = (
                     "FAUXCASA_DECODE_SANDBOX=0" if mode == "0" else
@@ -222,11 +231,21 @@ class DecodeService:
                 from thumbcache import INDEX_WORKERS
             except Exception:
                 INDEX_WORKERS = 4
+            sandbox = WinSandboxTransport(n_batch=INDEX_WORKERS)
             try:
-                sandbox = WinSandboxTransport(n_batch=INDEX_WORKERS)
                 sandbox.start()
             except Exception as e:
+                self._started = True
                 self.reason = f"{type(e).__name__}: {e}"
+                # P3 finding: a warm()/start() failure can leave up to
+                # N-1 live AppContainer worker processes spawned before
+                # the one that failed -- close() the transport instead of
+                # just dropping the reference, or those processes leak
+                # for the rest of the session.
+                try:
+                    sandbox.close()
+                except Exception:
+                    pass
                 if mode == "require":
                     log.error("decode sandbox required but failed to start: %s", self.reason)
                     raise DecodeSandboxRequiredError(self.reason) from e
@@ -234,6 +253,7 @@ class DecodeService:
                           self.reason)
                 self.state = STATE_DEGRADED
                 return
+            self._started = True
             self._sandbox = sandbox
             self.state = STATE_SANDBOXED
             self.reason = ""
@@ -258,17 +278,28 @@ class DecodeService:
                 log.info("decode(%r): %s", path, e)
                 from PySide6.QtGui import QImage
                 return QImage()
-            except RuntimeError as e:
-                # Spawn-class failure: SESSION-level degrade, not per-file.
-                log.error("decode sandbox spawn failure, degrading to "
+            except (RuntimeError, OSError, queue.Empty) as e:
+                # Spawn-class failure (RuntimeError), a raw OSError from
+                # create_or_derive_profile/CreateProcess, or a lease
+                # timeout (queue.Empty, WinSandboxTransport.decode's 30s
+                # lease wait) -- P1/P2 findings: SESSION-level degrade,
+                # never per-file. Critically (P1 finding "facade escape"),
+                # THIS call returns a null QImage for the CURRENT path --
+                # a file that crashed/killed the sandbox worker must never
+                # be decoded in-process; only SUBSEQUENT calls (after the
+                # degrade below) may fall through to InProcessTransport.
+                log.error("decode sandbox failure, degrading to "
                           "in-process for the rest of the session: %s", e)
-                self.state = STATE_DEGRADED
-                self.reason = f"{type(e).__name__}: {e}"
+                with self._lock:
+                    self.state = STATE_DEGRADED
+                    self.reason = f"{type(e).__name__}: {e}"
+                    sandbox, self._sandbox = self._sandbox, None
                 try:
-                    self._sandbox.close()
+                    sandbox.close()
                 except Exception:
                     pass
-                self._sandbox = None
+                from PySide6.QtGui import QImage
+                return QImage()
         try:
             return self._in_process.decode(path, route=route, edge=edge)
         except OSError:
