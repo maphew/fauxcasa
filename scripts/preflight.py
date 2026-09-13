@@ -15,6 +15,7 @@ same checks CI runs, locally, before you push.
 Checks (derived from .github/workflows/tests.yml and tracer.yml):
   - uv run scripts/test_delegation_report.py -q
   - uv run scripts/test_picasa_db.py -q
+  - uv run scripts/test_confirm_archive.py -q
   - uv run scripts/check-ingest-parity.py
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q   (skipped with --fast)
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q
@@ -70,6 +71,12 @@ def checks(root: Path, fast: bool) -> list[dict]:
         {
             "name": "picasa_db tests",
             "command": ["uv", "run", "scripts/test_picasa_db.py", "-q"],
+            "cwd": root,
+            "env": None,
+        },
+        {
+            "name": "confirm-archive tests",
+            "command": ["uv", "run", "scripts/test_confirm_archive.py", "-q"],
             "cwd": root,
             "env": None,
         },
