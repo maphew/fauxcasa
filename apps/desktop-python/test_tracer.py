@@ -15381,3 +15381,38 @@ def test_unstar_in_viewer_keeps_its_frozen_display_list(library: Path) -> None:
     assert win.viewer.display == display                # untouched
     assert win.grid.display == display                  # grid left alone too
     win.viewer.quiesce()
+
+
+@pytest.mark.parametrize("bad", ["null", "3", '"x"', '{"a": 1}'])
+def test_star_overrides_survive_a_non_list_stars_field(tmp_path: Path,
+                                                       bad: str) -> None:
+    """Finding 3: load_star_overrides is a fail-soft loader, so a
+    hand-edited stars.json whose "stars" is not a list must read as "no
+    overrides" — not raise TypeError out of MainWindow.__init__."""
+    import starstore
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / starstore.STAR_OVERRIDES_NAME).write_text(
+        '{"version": 1, "stars": %s}' % bad)
+    assert starstore.load_star_overrides(cache_dir) == {}
+
+
+def test_star_overrides_skip_bad_rows_but_keep_good_ones(
+        tmp_path: Path) -> None:
+    """Finding 3 boundary: a LIST with junk entries keeps its valid rows
+    — the per-row validation is unchanged by the type guard above."""
+    import starstore
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / starstore.STAR_OVERRIDES_NAME).write_text(json.dumps({
+        "version": 1,
+        "stars": [
+            "not a dict",
+            {"root_id": "", "rel": "a.jpg", "star": 1},
+            {"root_id": "", "rel": "b.jpg", "star": 9},     # out of range
+            {"root_id": "", "rel": "c.jpg", "star": True},  # bool is not int
+        ],
+    }))
+    assert starstore.load_star_overrides(cache_dir) == {("", "a.jpg"): 1}

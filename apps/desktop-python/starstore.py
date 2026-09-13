@@ -32,8 +32,14 @@ def load_star_overrides(cache_dir: Path | None) -> dict[StarKey, int]:
         return {}
     if not isinstance(data, dict) or data.get("version") != 1:
         return {}
+    rows = data.get("stars")
+    if not isinstance(rows, list):
+        # A hand-edited or truncated file can carry "stars": null / 3 /
+        # {...}; iterating that raises TypeError out of a fail-soft
+        # loader and takes the whole launch down (fauxcasa-6vk finding 3).
+        return {}
     result: dict[StarKey, int] = {}
-    for row in data.get("stars", []):
+    for row in rows:
         if not isinstance(row, dict):
             continue
         root_id = row.get("root_id")
