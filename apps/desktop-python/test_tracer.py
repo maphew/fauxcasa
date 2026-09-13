@@ -15515,3 +15515,65 @@ def test_reload_data_retires_the_viewer_gallery_action(library: Path,
     assert win.pages.currentWidget() is win.pages.widget(0)
     assert not win.back_action.isVisible()
     win.viewer.quiesce()
+
+
+def test_terminal_notice_takes_the_activity_spinner_down(library: Path) -> None:
+    """Finding 5: a TERMINAL reconcile notice must not leave the busy
+    indicator running. `status` keeps meaning "still working" and raises
+    it; `notice` means "nothing more is coming" and lowers it while still
+    reporting the text."""
+    from main import MainWindow
+
+    _offscreen_app()
+    win = MainWindow(scan_library(library), None,
+                     cache_dir=None, build_dir=None)
+    win._on_status("reindexing…")                  # genuine progress
+    assert not win.activity_row.isHidden()
+    assert win.activity_progress.maximum() == 0    # indeterminate
+
+    win._on_notice("library unchanged — offline, skipped: Archive")
+    assert win.activity_row.isHidden()
+    assert win.progress_label.text() == \
+        "   library unchanged — offline, skipped: Archive"
+    assert win.statusBar().currentMessage() == \
+        "library unchanged — offline, skipped: Archive"
+
+
+def test_offline_only_reconcile_leaves_no_spinner_running(
+        tmp_path: Path) -> None:
+    """Finding 5 end-to-end: a warm start whose online root is unchanged
+    but whose second root is offline reports that and STOPS — the reconcile
+    thread emits nothing else, so the activity row must not be up when it
+    exits."""
+    import time as _time
+
+    from main import MainWindow
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    root_a = tmp_path / "root-a"
+    make_jpeg(root_a / "a.jpg")
+    cat = scan_library(root_a)
+    # A second root whose directory does not exist -> offline (the
+    # test_multiroot_flat_folder_listing fixture pattern).
+    cat.roots = [libmod.LibraryRoot(id=cat.roots[0].id if cat.roots else "",
+                                    path=root_a, label="A"),
+                 libmod.LibraryRoot(id="bbbbbbbb", path=tmp_path / "root-b",
+                                    label="Archive")]
+    cat.refresh_offline_ids()
+    assert cat.offline_ids == {"bbbbbbbb"}
+
+    win = MainWindow(cat, None, cache_dir=tmp_path / "cachedir",
+                     build_dir=None, warm=True)
+    win._start_reconcile()
+    assert win._reconcile_thread is not None
+    deadline = _time.time() + 20
+    while win._reconcile_thread.is_alive() and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.01)
+    assert not win._reconcile_thread.is_alive()
+    app.processEvents()                       # deliver the queued signal
+
+    assert "offline, skipped: Archive" in win.progress_label.text()
+    assert win.activity_row.isHidden()        # the spinner never started
+    win.shutdown()

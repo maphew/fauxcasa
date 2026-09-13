@@ -1101,6 +1101,11 @@ def _offline_root_cache(catalog, root_id: str, levels: list[int],
 class _BuildBridge(QObject):
     progress = Signal(int, int)            # done, total (cold build live feed)
     status = Signal(str)                   # inline status text (reconcile)
+    # A TERMINAL notice: the worker has already stopped and this is all
+    # there is to say (fauxcasa-6vk finding 5). Routed separately from
+    # `status` because `status` means "still working" and therefore raises
+    # the activity row's busy indicator, which only `finished` takes down.
+    notice = Signal(str)                   # terminal notice (no more work)
     finished = Signal(object, object, bool)  # (IndexResult|None, Catalog, is_reconcile)
     backfill_done = Signal(bool)           # adopt-mode backfill: completed?
     # Non-blocking first run (fauxcasa-q6l.13): the background library WALK
@@ -1505,6 +1510,7 @@ class MainWindow(QMainWindow):
         self._bridge = _BuildBridge()
         self._bridge.progress.connect(self._build_progress)
         self._bridge.status.connect(self._on_status)
+        self._bridge.notice.connect(self._on_notice)
         self._bridge.finished.connect(self._on_index_finished)
         self._bridge.backfill_done.connect(self._on_backfill_done)
         self._bridge.scan_done.connect(self._on_scan_done)
@@ -1770,7 +1776,7 @@ class MainWindow(QMainWindow):
                     # Nothing changed on the online roots, but the offline
                     # ones are still worth a mention — the user may not
                     # know a drive is unreachable this session.
-                    _emit(bridge.status, f"library unchanged{offline_note}")
+                    _emit(bridge.notice, f"library unchanged{offline_note}")
                 return  # nothing else to do
             multiroot = len(old.roots) > 1
             if self.adopt or multiroot:
@@ -1785,7 +1791,7 @@ class MainWindow(QMainWindow):
                 # per-root rescan-and-merge (option (a)) — safe index
                 # contiguity under a merge needs the per-root
                 # reindex/backfill wiring bead .d lands, not present here.
-                _emit(bridge.status,
+                _emit(bridge.notice,
                       f"library changed since this cache was built "
                       f"({drift.summary()}){offline_note} — showing the "
                       f"indexed snapshot")
@@ -1895,11 +1901,27 @@ class MainWindow(QMainWindow):
             self._start_reconcile()
 
     def _on_status(self, text: str) -> None:
+        """PROGRESS text: a worker is still running, so a non-empty message
+        raises the activity row's busy indicator (an empty one lowers it).
+        A worker whose last act is to explain why it stopped must use
+        `notice` instead — see _on_notice (fauxcasa-6vk finding 5)."""
         self.progress_label.setText(("   " + text) if text else "")
         if text:
             self._show_activity(text)
         else:
             self._hide_activity()
+
+    def _on_notice(self, text: str) -> None:
+        """A worker's TERMINAL notice: the job is over and nothing further
+        will be emitted for it (fauxcasa-6vk finding 5). Reconcile's
+        "library unchanged — offline, skipped: …" and adopt/multiroot
+        "showing the indexed snapshot" branches return right after saying
+        this, so routing them through _on_status left an indeterminate
+        spinner running with no job behind it until the next background
+        job happened to finish."""
+        self.progress_label.setText(("   " + text) if text else "")
+        self.statusBar().showMessage(text, 10000)
+        self._hide_activity()
 
     def _on_index_finished(self, result, catalog, is_reconcile: bool) -> None:
         self.progress_label.setText("")
