@@ -8147,6 +8147,235 @@ def test_db3_people_sidebar_not_flagged_when_name_shared_with_ini_contact(
 
 
 # ---------------------------------------------------------------------------
+# db3/.pal rescue gating (fauxcasa-ez2.13): --db3/--pal-dir default to
+# THIS machine's Picasa2 AppData regardless of which library is opened, so
+# without a gate, opening any folder on a machine that once ran Picasa
+# floods the import report with db3_path_unresolved noise about some
+# other library. The rescue now only auto-runs when the opened root
+# overlaps one of Picasa's own watched roots (registry); an explicit
+# --db3/--pal-dir always forces it on.
+# ---------------------------------------------------------------------------
+
+
+def test_paths_related_normalizes_case_and_containment(tmp_path: Path) -> None:
+    import main as mainmod
+
+    root = tmp_path / "Lib" / "Sub"
+    root.mkdir(parents=True)
+    watched = tmp_path / "lib"                       # same tree, diff case
+    assert mainmod._paths_related(root, watched)
+    assert mainmod._paths_related(watched, root)
+    assert mainmod._paths_related(root, root)         # equal
+    unrelated = tmp_path / "elsewhere"
+    unrelated.mkdir()
+    assert not mainmod._paths_related(root, unrelated)
+
+
+def test_db3_rescue_enabled_explicit_flag_always_wins(
+        tmp_path: Path, monkeypatch) -> None:
+    """An explicit --db3/--pal-dir forces the rescue on even when the
+    registry says nothing about this root (or raises)."""
+    import main as mainmod
+
+    def boom():
+        raise RuntimeError("no registry on this box")
+
+    monkeypatch.setattr(mainmod.library, "picasa_watched_from_registry", boom)
+    enabled, reason = mainmod._db3_rescue_enabled(tmp_path, explicit=True)
+    assert enabled
+    assert "explicit" in reason
+
+
+def test_db3_rescue_enabled_gates_on_watched_roots(
+        tmp_path: Path, monkeypatch) -> None:
+    import main as mainmod
+
+    watched_root = tmp_path / "Watched" / "Trip"
+    watched_root.mkdir(parents=True)
+    other_root = tmp_path / "unrelated"
+    other_root.mkdir()
+
+    monkeypatch.setattr(
+        mainmod.library, "picasa_watched_from_registry",
+        lambda: [tmp_path / "watched"])              # case-diff on purpose
+
+    enabled, reason = mainmod._db3_rescue_enabled(watched_root, explicit=False)
+    assert enabled
+    assert "overlaps" in reason
+
+    enabled, reason = mainmod._db3_rescue_enabled(other_root, explicit=False)
+    assert not enabled
+    assert "does not overlap" in reason
+
+
+def test_db3_rescue_disabled_when_registry_absent(
+        tmp_path: Path, monkeypatch) -> None:
+    import main as mainmod
+
+    def boom():
+        raise RuntimeError("Picasa watched-folders registry value not found")
+
+    monkeypatch.setattr(mainmod.library, "picasa_watched_from_registry", boom)
+    enabled, reason = mainmod._db3_rescue_enabled(tmp_path, explicit=False)
+    assert not enabled
+    assert "registry" in reason
+
+
+def test_import_report_status_count_excludes_and_collapses_db3_unresolved() -> None:
+    """catalog.ImportReport: status_count() drops every db3_path_unresolved
+    entry (machine residue, not a library conflict); grouped_entries()
+    still surfaces them, collapsed into ONE row per source with a count
+    instead of N rows, while every other kind stays one row per entry."""
+    from catalog import ImportReport
+
+    report = ImportReport()
+    for i in range(5):
+        report.add("db3", "db3_path_unresolved", f"path{i}.jpg", "unjoined")
+    report.add("ini", "unknown_album", "UID1", "referenced but undefined")
+    report.add("contacts", "contact_name_conflict", "cid1", "name diverges")
+
+    assert report.status_count() == 2               # the 5 unresolved excluded
+
+    rows = report.grouped_entries()
+    unresolved_rows = [r for r in rows if r[1] == "db3_path_unresolved"]
+    assert len(unresolved_rows) == 1                 # collapsed to one row
+    source, kind, count, examples = unresolved_rows[0]
+    assert source == "db3" and count == 5
+    assert examples == [f"path{i}.jpg" for i in range(5)]
+    other_rows = [r for r in rows if r[1] != "db3_path_unresolved"]
+    assert len(other_rows) == 2                      # untouched, one each
+    assert all(r[2] == 1 for r in other_rows)
+
+
+def test_import_report_grouped_entries_caps_examples_at_20() -> None:
+    from catalog import ImportReport
+
+    report = ImportReport()
+    for i in range(25):
+        report.add("db3", "db3_path_unresolved", f"path{i}.jpg", "unjoined")
+    rows = report.grouped_entries()
+    assert len(rows) == 1
+    _source, _kind, count, examples = rows[0]
+    assert count == 25
+    assert len(examples) == 20
+
+
+def test_import_notes_dialog_lists_grouped_entries(library: Path) -> None:
+    """The status-bar button's dialog (fauxcasa-ez2.13) lists (kind,
+    count, examples) rows via ImportReport.grouped_entries() and offers a
+    'Reveal report file' button."""
+    _offscreen_app()
+    from main import MainWindow
+    from catalog import ReportEntry
+
+    cat = scan_library(library)
+    for i in range(3):
+        cat.report.entries.append(ReportEntry(
+            "db3", "db3_path_unresolved", f"p{i}.jpg", "unjoined"))
+    cat.report.entries.append(ReportEntry(
+        "ini", "unknown_album", "UID1", "referenced but undefined"))
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    captured = {}
+
+    def fake_exec(dlg):
+        from PySide6.QtWidgets import QTableWidget, QPushButton
+        table = dlg.findChildren(QTableWidget)[0]
+        captured["rows"] = [
+            (table.item(r, 0).text(), table.item(r, 1).text(),
+             table.item(r, 2).text())
+            for r in range(table.rowCount())]
+        captured["reveal"] = [b for b in dlg.findChildren(QPushButton)
+                              if b.text() == "Reveal report file"]
+        return 0
+
+    import PySide6.QtWidgets as qtw
+    orig = qtw.QDialog.exec
+    qtw.QDialog.exec = lambda self: fake_exec(self)
+    try:
+        win._show_import_notes_dialog()
+    finally:
+        qtw.QDialog.exec = orig
+
+    rows = captured["rows"]
+    assert ("[db3] db3_path_unresolved", "3", "p0.jpg, p1.jpg, p2.jpg") in rows
+    assert ("[ini] unknown_album", "1", "UID1") in rows
+    assert len(captured["reveal"]) == 1
+
+
+def test_db3_rescue_skipped_for_unrelated_root_shows_zero_import_notes(
+        tmp_path: Path, monkeypatch) -> None:
+    """End-to-end (fauxcasa-ez2.13): opening a non-Picasa root with a db3
+    dir present, on a machine whose Picasa watched roots don't overlap
+    it, runs no rescue at all — the import report stays empty rather than
+    filling with db3_path_unresolved noise about some other library."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    import main as mainmod
+    from catalog import REPORT_NAME, load_report
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    db3 = _make_person_db3(tmp_path / "db3", "Q:\\somewhere\\else",
+                           ["a.jpg"], face_parent=1)
+
+    monkeypatch.setattr(mainmod, "default_db3_dir", lambda: db3)
+    monkeypatch.setattr(mainmod, "default_pal_dir", lambda: None)
+    monkeypatch.setattr(
+        mainmod.library, "picasa_watched_from_registry",
+        lambda: [tmp_path / "totally-unrelated-library"])
+
+    cache_root = tmp_path / "cr"
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(root), "--cache-root", str(cache_root),
+        "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    rc = mainmod.main()
+    assert rc == 0
+
+    cache_dir = thumbcache.cache_dir_for(str(root.resolve()), cache_root, "")
+    report = load_report(cache_dir / REPORT_NAME)
+    assert report.entries == []
+
+
+def test_explicit_db3_flag_forces_rescue_for_unrelated_root(
+        tmp_path: Path, monkeypatch) -> None:
+    """An explicit --db3 always forces the rescue on (the
+    PicasaStarter-relocation case), even for a root the registry's
+    watched folders say nothing about."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    import main as mainmod
+    from catalog import REPORT_NAME, load_report
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "a.jpg")
+    db3 = _make_person_db3(tmp_path / "db3", "Q:\\somewhere\\else",
+                           ["a.jpg"], face_parent=1)
+
+    monkeypatch.setattr(
+        mainmod.library, "picasa_watched_from_registry",
+        lambda: [tmp_path / "totally-unrelated-library"])
+
+    cache_root = tmp_path / "cr"
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(root), "--cache-root", str(cache_root),
+        "--db3", str(db3),
+        "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    rc = mainmod.main()
+    assert rc == 0
+
+    cache_dir = thumbcache.cache_dir_for(str(root.resolve()), cache_root, "")
+    report = load_report(cache_dir / REPORT_NAME)
+    assert any(e.kind == "db3_path_unresolved" for e in report.entries)
+
+
+# ---------------------------------------------------------------------------
 # Selection tray (fauxcasa-q6l.2): persistent CROSS-FOLDER Hold/Clear +
 # typed readout (spec §5). Decisions under test (tray.py module doc):
 # identity by REL PATH (survives reconcile index remaps), HOLD ORDER

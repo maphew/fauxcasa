@@ -360,6 +360,35 @@ class ImportReport:
         n = len(self.entries)
         return f"{n} import note{'s' if n != 1 else ''} ({parts})"
 
+    def status_count(self) -> int:
+        """Entry count for the status-bar 'N import notes' badge
+        (fauxcasa-ez2.13). db3_path_unresolved is machine-local residue —
+        a db3 rescue row that doesn't join to a photo in the OPENED
+        library, keyed on whatever Picasa library last ran on THIS
+        machine — never a conflict inside the opened library itself, so
+        it never contributes to the count; grouped_entries() still
+        surfaces it, collapsed to one row, for anyone who opens the
+        details dialog."""
+        return sum(1 for e in self.entries if e.kind != "db3_path_unresolved")
+
+    def grouped_entries(self) -> list[tuple[str, str, int, list[str]]]:
+        """Dialog-ready rows: (source, kind, count, example subjects, up
+        to 20). Every db3_path_unresolved entry collapses into ONE row
+        per source with a count instead of N separate rows
+        (fauxcasa-ez2.13, machine residue is not worth a row each); every
+        other kind stays one row per entry (count=1), in report order."""
+        rows: list[tuple[str, str, int, list[str]]] = []
+        collapsed: dict[str, list[str]] = {}
+        for e in self.entries:
+            if e.kind == "db3_path_unresolved":
+                collapsed.setdefault(e.source, []).append(e.subject)
+            else:
+                rows.append((e.source, e.kind, 1, [e.subject]))
+        for source, subjects in collapsed.items():
+            rows.append((source, "db3_path_unresolved", len(subjects),
+                        subjects[:20]))
+        return rows
+
 
 @dataclass
 class Catalog:
