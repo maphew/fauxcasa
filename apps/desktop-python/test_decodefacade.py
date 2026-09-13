@@ -148,6 +148,46 @@ def test_ensure_started_degrades_on_spawn_failure(monkeypatch):
     assert "simulated spawn failure" in svc.reason
 
 
+@_WINDOWS_ONLY
+def test_winsandboxtransport_start_raises_when_batch_pool_empty(monkeypatch):
+    """fauxcasa-ez2.9 Stage 2 review P2-3: warm() tolerates individual
+    batch-member spawn failures and can legitimately return 0 while the
+    interactive member still succeeds -- WinSandboxTransport.start() must
+    not silently accept that. Left unchecked, `state` becomes sandboxed
+    with an empty batch pool: every index thread would then block the
+    full 30s lease() timeout on the "batch" lane before getting a
+    per-file null, with no session degrade (N7 "never silent")."""
+    from thumbcache import INDEX_WORKERS
+
+    sandbox = df.WinSandboxTransport(n_batch=INDEX_WORKERS)
+    monkeypatch.setattr(sandbox._pool_set, "warm", lambda: 0)
+    try:
+        with pytest.raises(RuntimeError, match="no batch decode workers"):
+            sandbox.start()
+    finally:
+        sandbox.close()
+
+
+@_WINDOWS_ONLY
+def test_ensure_started_degrades_when_batch_pool_fully_empty(monkeypatch):
+    """Same as test_winsandboxtransport_start_raises_when_batch_pool_empty
+    but through the production call path (ensure_started()): the session
+    must degrade honestly (state=degraded, reason set) rather than
+    reporting sandboxed with a dead batch lane."""
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+
+    class _ZeroBatchTransport(df.WinSandboxTransport):
+        def start(self):
+            self._pool_set.warm = lambda: 0
+            super().start()
+
+    monkeypatch.setattr(df, "WinSandboxTransport", _ZeroBatchTransport)
+    svc = df.get_service()
+    svc.ensure_started()
+    assert svc.state == df.STATE_DEGRADED
+    assert "no batch decode workers" in svc.reason
+
+
 def test_ensure_started_require_mode_raises(monkeypatch):
     monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "require")
 

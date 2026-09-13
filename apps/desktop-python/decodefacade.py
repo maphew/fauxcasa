@@ -193,8 +193,20 @@ class WinSandboxTransport(Transport):
     def start(self) -> None:
         """Spawn the interactive worker (and warm the batch pool) --
         raises RuntimeError/DecodeServiceError on failure, same taxonomy
-        as WinSandboxWorker.spawn()."""
-        self._pool_set.warm()
+        as WinSandboxWorker.spawn().
+
+        fauxcasa-ez2.9 Stage 2 review P2-3: warm() tolerates individual
+        batch-member spawn failures and can legitimately return 0 while
+        the interactive member still succeeds -- if left unchecked here,
+        `state` becomes STATE_SANDBOXED with an empty batch pool, and
+        every index thread then blocks the full 30s lease() timeout on
+        the "batch" lane before getting a per-file null with no session
+        degrade (N7 "never silent"). Treat a fully-empty batch pool the
+        same as any other startup failure: raise so ensure_started()
+        degrades the session honestly."""
+        n_batch = self._pool_set.warm()
+        if n_batch == 0:
+            raise RuntimeError("no batch decode workers spawned")
 
     def decode(self, path: str, route: str = "still", edge: int = 0):
         if route != "still":
