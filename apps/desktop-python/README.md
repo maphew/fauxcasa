@@ -98,24 +98,34 @@ untrusted bytes unsandboxed.
   scaled decode is ~30× cheaper and lets threads scale: **139 photos/s**
   in-app on realistic 3.3 MB / 8 MP photos (8 workers), vs the §7 ≥ 30/s
   budget. ✅ No multiprocessing or extra deps needed.
-- **v2 multi-resolution cache (512/256/128):** the product cache is now
-  multi-res. Storage is **~4× the v1 256-only cache** (100k benchmark:
-  377 MB → 1.5 GB) — the 512 hi-DPI level dominates, the 128 level is
-  cheap; this is *not* the "~30 %" a single small added level would cost.
-  **Startup is unaffected** — cold/warm load are catalog-bound and the
-  larger fcache's thumbnail blobs are seeked per-tile, not read at load
-  (only the level table and the ~3× larger v2 offset index are read, which
-  likely accounts for part of the 467 → 511 ms warm-load delta): re-measured
-  100k warm load **511 ms** / cold-walk **2.1 s** (Windows dev box,
-  offscreen), on par with the Linux/v1 reference above. The grid still renders the 256 level, so
-  scroll perf is unchanged until a hi-DPI consumer (`fauxcasa-q7m`) reads
-  the 512 level. RSS at ready for the 100k grid is **~199 MB (329 MB
-  peak)** on the Windows box, via the cross-platform probe added in
-  `fauxcasa-61e`. The **in-app** index rate above is unchanged — adopting
-  a pre-built `--thumbs` cache skips in-app thumbnailing entirely — but the
-  **offline cache build** does ~3× the per-photo work for v2 (decode to
-  512, then JPEG-encode all three levels), so v2 build throughput is lower
-  than v1; that offline rate was not separately benchmarked.
+- **v2 multi-resolution cache format (512/256/128) exists but is not what
+  the shipped app builds today:** the fcache *format* supports multiple
+  levels, and a `--thumbs`-style offline build can be asked for
+  `RECOMMENDED_LEVELS`, but `main.py`'s in-app cold-start path calls
+  `thumbcache.build_cache` with no `levels` override, so the app itself
+  still builds the single 256 px v1-shaped cache described in
+  `docs/research/raw-indexing-throughput.md` — `RECOMMENDED_LEVELS` has no
+  in-app caller yet. The numbers below are from a v2 benchmark of the
+  *format* (via a direct `levels=` override), not a measurement of what a
+  user's own library build produces. Storage is **~4× the v1 256-only
+  cache** (100k benchmark: 377 MB → 1.5 GB) — the 512 hi-DPI level
+  dominates, the 128 level is cheap; this is *not* the "~30 %" a single
+  small added level would cost. **Startup is unaffected** — cold/warm load
+  are catalog-bound and the larger fcache's thumbnail blobs are seeked
+  per-tile, not read at load (only the level table and the ~3× larger v2
+  offset index are read, which likely accounts for part of the 467 → 511 ms
+  warm-load delta): re-measured 100k warm load **511 ms** / cold-walk
+  **2.1 s** (Windows dev box, offscreen), on par with the Linux/v1
+  reference above. The grid still renders the 256 level, so scroll perf is
+  unchanged until both a hi-DPI consumer (`fauxcasa-q7m`) and an in-app
+  caller for `RECOMMENDED_LEVELS` exist. RSS at ready for the 100k grid is
+  **~199 MB (329 MB peak)** on the Windows box, via the cross-platform
+  probe added in `fauxcasa-61e`. The **in-app** index rate above is for the
+  single-level build the app actually runs — adopting a pre-built
+  `--thumbs` cache skips in-app thumbnailing entirely — but a v2-levels
+  **offline cache build** does ~3× the per-photo work (decode to 512, then
+  JPEG-encode all three levels), so v2 build throughput is lower than v1;
+  that offline rate was not separately benchmarked.
 - **Grid hi-DPI consumer (`fauxcasa-q7m`), measured 2026-07-02** (Windows
   dev box, 4K@60 Hz, real display, `QT_SCALE_FACTOR` for exact dpr —
   same-box **relative** signal; the canonical Linux dpr-1 baselines are
