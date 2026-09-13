@@ -22,6 +22,8 @@ Checks (derived from .github/workflows/tests.yml and tracer.yml):
     (skipped with --fast; on Windows this spawns real AppContainer sandbox
     workers -- the i92.3 escape gates; elsewhere only the trusted-side
     protocol fuzz runs)
+  - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodefacade.py -q
+    (skipped with --fast; fauxcasa-ez2.9 Stage 1 facade state machine)
   - git ls-files --error-unmatch -- .beads/issues.jsonl must FAIL            (the one bd preflight
     check that still applies here: no beads-jsonl pollution — the file is
     pollution iff git tracks it, whether staged or committed; a plain
@@ -97,6 +99,12 @@ def checks(root: Path, fast: bool) -> list[dict]:
         result.append({
             "name": "decode-sandbox suite",
             "command": ["uv", "run", "apps/desktop-python/test_decodesvc_win.py", "-q"],
+            "cwd": root,
+            "env": {"QT_QPA_PLATFORM": "offscreen"},
+        })
+        result.append({
+            "name": "decode-facade suite",
+            "command": ["uv", "run", "apps/desktop-python/test_decodefacade.py", "-q"],
             "cwd": root,
             "env": {"QT_QPA_PLATFORM": "offscreen"},
         })
