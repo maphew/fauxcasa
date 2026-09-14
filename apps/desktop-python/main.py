@@ -4049,6 +4049,7 @@ def select_sidebar_view(win: MainWindow, spec: str) -> bool:
     if kind not in ("all", "starred", "recent", "unnamed",
                     "album", "person", "folder"):
         return False
+    matches = []
     it = QTreeWidgetItemIterator(win.tree)
     while it.value():
         item = it.value()
@@ -4064,9 +4065,17 @@ def select_sidebar_view(win: MainWindow, spec: str) -> bool:
                 continue
         elif item_key != key:
             continue
-        win._sidebar_clicked(item, 0)
-        return True
-    return False
+        matches.append(item)
+    if len(matches) != 1:
+        # Picasa permits two albums with one display name, and a name
+        # could equal another album's uid: refuse to guess which the
+        # caller meant rather than screenshot the wrong one.
+        if matches:
+            log.error("--view %r is ambiguous: %d sidebar items match",
+                      spec, len(matches))
+        return False
+    win._sidebar_clicked(matches[0], 0)
+    return True
 
 
 BUNDLE_RUNTIME_MODULES = (
@@ -4223,9 +4232,10 @@ def main() -> int:
                          "slideshow surface instead of the main window "
                          "(screenshot testing)")
     ap.add_argument("--faces", action="store_true",
-                    help="with --open N: show the viewer's face boxes "
-                         "(the F key) before the screenshot; a no-op on a "
-                         "photo without face tags (screenshot testing)")
+                    help="after --open N: show the viewer's face boxes "
+                         "(the F key) before the screenshot; exits 1 if the "
+                         "viewer is not on a face-tagged photo (screenshot "
+                         "testing)")
     ap.add_argument("--window-size", type=_parse_image_size_arg,
                     metavar="WIDTHxHEIGHT",
                     help="resize the window to exactly WIDTHxHEIGHT "
@@ -4770,7 +4780,7 @@ def main() -> int:
             state["probed"] = True
             run_search_probe(win, args.search_probe)
         # Scripted-run screenshot flags: view -> search -> select -> info ->
-        # scroll_to -> open -> play -> (loading waits) -> screenshot. Each
+        # scroll_to -> open -> faces -> play -> (loading waits) -> screenshot. Each
         # step sets its state flag and returns once so the viewport gets a
         # poll cycle to decode (same pattern scroll_to always used).
         if args.view is not None and not state["viewed"]:
@@ -4828,9 +4838,17 @@ def main() -> int:
             # a no-op unless the viewer is current on a face-tagged photo.
             state["faced"] = True
             win.viewer.toggle_faces()
+            if not win.viewer.faces_visible:
+                # Same contract as a --view miss: a screenshot promised to
+                # show face boxes must not quietly come out without them.
+                log.error("--faces: the viewer is not on a face-tagged photo "
+                          "(pair it with --open N on one that is)")
+                print(json.dumps({"event": "view", "ok": False,
+                                  "kind": "faces", "key": ""}), flush=True)
+                app.exit(1)
+                return
             print(json.dumps({"event": "view", "ok": True, "kind": "faces",
-                              "key": "", "shown": int(win.viewer.faces_visible)}),
-                  flush=True)
+                              "key": "", "shown": 1}), flush=True)
             return
         if args.play and not state["played"]:
             state["played"] = True

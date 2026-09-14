@@ -77,7 +77,7 @@ SHOTS: dict[str, tuple[str, list[str]]] = {
         ["--view", "person:Ben Okafor", "--select", "0", "--info"],
     ),
     "search": (
-        "search as you type, matching folder names, keywords and captions",
+        "search as you type, here matching a folder name and keywords",
         ["--search", "lake"],
     ),
     "info": (
@@ -130,8 +130,11 @@ def warm_cache(cache_root: Path) -> None:
 def capture(name: str, extra: list[str], cache_root: Path, out_dir: Path) -> Path:
     with tempfile.TemporaryDirectory() as td:
         png = Path(td) / f"{name}.png"
+        # --finish-build also holds the shot until any background reconcile
+        # has landed, so a drifted warm start cannot reset the view first.
         rc, out = _run(_base_args(cache_root) + [
-            "--window-size", WINDOW, "--screenshot", str(png), *extra])
+            "--finish-build", "--window-size", WINDOW,
+            "--screenshot", str(png), *extra])
         events = [ln for ln in out.splitlines() if '"event": "view"' in ln]
         for ev in events:
             print("  " + ev)
@@ -139,8 +142,14 @@ def capture(name: str, extra: list[str], cache_root: Path, out_dir: Path) -> Pat
             print(out[-4000:])
             raise SystemExit(f"{name}: screenshot run failed (exit {rc})")
         for ev in events:
-            if not json.loads(ev).get("ok", True):
+            parsed = json.loads(ev)
+            if not parsed.get("ok", True):
                 raise SystemExit(f"{name}: a scripted view step failed: {ev}")
+            if parsed.get("shown", 1) < 1:
+                # A step that applied but showed nothing (a search with no
+                # hits, a face toggle on an untagged photo) would otherwise
+                # yield a plausible-looking screenshot of the wrong thing.
+                raise SystemExit(f"{name}: a scripted view step showed nothing: {ev}")
         out_dir.mkdir(parents=True, exist_ok=True)
         jpg = out_dir / f"{name}.jpg"
         img = Image.open(png).convert("RGB")

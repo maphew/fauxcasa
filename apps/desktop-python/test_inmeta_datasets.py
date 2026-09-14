@@ -115,6 +115,19 @@ IPTC_SHA256 = {
 
 
 @needs_dataset("iptc-reference")
+def test_iptc_corpus_complete() -> None:
+    """The skip guard trusts the fetch script's marker; a marker over a
+    half-deleted directory would otherwise collapse every parametrized
+    test below into an empty (green) set. Fail once, loudly, instead."""
+    names = {p.name for p in IPTC_FILES}
+    assert names == set(IPTC_SHA256), (
+        f"iptc-reference corpus incomplete or changed under its marker: "
+        f"missing {sorted(set(IPTC_SHA256) - names)}, unexpected "
+        f"{sorted(names - set(IPTC_SHA256))}; re-fetch with "
+        "'uv run scripts/fetch-test-datasets.py iptc-reference --force'")
+
+
+@needs_dataset("iptc-reference")
 @pytest.mark.parametrize("path", IPTC_FILES, ids=_IPTC_IDS)
 def test_iptc_reference_integrity(path: Path) -> None:
     """Pins the corpus version: a changed upstream file must fail here
@@ -248,6 +261,25 @@ def test_exif_samples_orientation_matches_filename(path: Path) -> None:
 
 INVALID_DIR = EXIF_DIR / "jpg" / "invalid"
 INVALID_FILES = sorted(INVALID_DIR.glob("*.jpg")) if INVALID_DIR.is_dir() else []
+
+
+@needs_dataset("exif-samples")
+def test_exif_samples_corpus_complete() -> None:
+    """Same guard as the IPTC one: the marker alone must not certify a
+    corpus whose files are gone (the parametrized sweeps would silently
+    run over nothing and the named-file tests would raise FileNotFound)."""
+    expected_files = [
+        EXIF_DIR / "jpg" / "corrupted.jpg",
+        EXIF_DIR / "jpg" / "long_description.jpg",
+    ]
+    missing = [str(p.relative_to(EXIF_DIR)) for p in expected_files
+               if not p.exists()]
+    assert not missing and EXIF_ALL_FILES and GPS_FILES \
+        and ORIENTATION_FILES and INVALID_FILES, (
+        f"exif-samples corpus incomplete under its marker (missing "
+        f"{missing}; files={len(EXIF_ALL_FILES)} gps={len(GPS_FILES)} "
+        f"orientation={len(ORIENTATION_FILES)} invalid={len(INVALID_FILES)}); "
+        "re-fetch with 'uv run scripts/fetch-test-datasets.py exif-samples --force'")
 _INVALID_IDS = [p.name for p in INVALID_FILES]
 
 
