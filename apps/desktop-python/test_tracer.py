@@ -4592,6 +4592,52 @@ def test_grid_header_glyph_click_emits_play_group(tmp_path: Path) -> None:
     assert emitted == [g.groups[1].folder]
 
 
+def test_grid_header_glyph_click_pinned_sticky_header(tmp_path: Path) -> None:
+    """The other half of _header_glyph_at's two-path hit-test: when the
+    viewport is scrolled PAST a group's own in-flow header, that header
+    pins to the viewport top (_sticky) and the glyph click must still be
+    recognized via the sticky branch, not the in-flow-headers loop —
+    fauxcasa-q6l.16 / fauxcasa-wqi.4 (the existing
+    test_grid_header_glyph_click_emits_play_group never scrolls, so top
+    stays 0 and _sticky(0) always returns None; the sticky branch of
+    _header_glyph_at was therefore never exercised)."""
+    _offscreen_app()
+    from grid import GridView
+
+    root = tmp_path / "lib"
+    for i in range(12):                     # enough rows to scroll within
+        make_jpeg(root / "folder_a" / f"img{i}.jpg")
+    make_jpeg(root / "folder_b" / "img_b.jpg")
+    cat = scan_library(root)
+
+    g = GridView()
+    g.resize(400, 640)
+    g.show()
+    g.set_data(cat, None)
+    assert len(g.groups) == 2
+    g0, g1 = g.groups
+
+    # Scroll well past group 0's own header, but nowhere near group 1's —
+    # group 0's header must be the pinned/sticky one, fully pushed to the
+    # viewport top (push == 0).
+    top = g0.y + 100
+    assert top < g1.y - 1  # still safely inside group 0's content, not g1's
+    g.verticalScrollBar().setValue(top)
+    st = g._sticky(top)
+    assert st is not None and st[0] is g0 and st[1] == 0, \
+        "test setup must actually produce a pinned header to exercise " \
+        "the sticky branch"
+
+    emitted: list[str] = []
+    g.play_group.connect(emitted.append)
+
+    w = g.viewport().width()
+    glyph = g._header_glyph_rect(st[1], w)   # y_vp = push = 0
+    _header_click(g, glyph.center().x(), glyph.center().y())
+    assert emitted == [g0.folder], \
+        "glyph click on the PINNED header must emit play_group"
+
+
 def test_mainwindow_play_group_starts_slideshow_for_group(
         tmp_path: Path) -> None:
     """_play_group starts the slideshow over THAT group's items from
