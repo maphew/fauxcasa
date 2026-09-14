@@ -1481,7 +1481,7 @@ def _single_root_offline_message(catalog: Catalog) -> str | None:
         keep = (_OFFLINE_DRIVE_NAME_MAX_CHARS - 1) // 2
         name = f"{name[:keep]}…{name[-keep:]}"
     return (f'The drive holding these photos, "{name}", isn\'t '
-            f'connected right now — plug it back in and Fauxcasa will '
+            f'connected right now; plug it back in and Fauxcasa will '
             f'pick up where it left off.')
 
 
