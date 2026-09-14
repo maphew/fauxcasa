@@ -17826,56 +17826,42 @@ def test_scripted_hard_stop_timer_is_owned_and_disarmed(
         "the READY poll outlived the run that armed it (fauxcasa-q6l.15)"
 
 
-def test_abandoned_hard_stop_does_not_kill_the_next_run(
-        monkeypatch, library: Path, tmp_path: Path) -> None:
+def test_abandoned_hard_stop_does_not_fire_after_its_run(
+        monkeypatch, library: Path, tmp_path: Path, caplog) -> None:
     """fauxcasa-9pr, the behaviour the shape above protects: a scripted
     run that finishes BEFORE its own --timeout used to leave the deadline
-    armed in the shared QApplication, so the next in-process run was
-    killed mid-event-loop with exit 1 and a log line quoting the previous
-    run's timeout and state. Seen on main as an ubuntu-only tracer
-    failure (run 34885536050): test_window_size_flag_resizes died on
-    'TIMEOUT after 10.0s ... scan_failure_handled: True' borrowed from a
-    scan-failure test ten seconds earlier."""
-    import time
+    armed in the shared QApplication, so it fired into whatever later run
+    happened to be inside app.exec() and killed it with exit 1 — quoting
+    the dead run's timeout and state dict. Seen on main as an ubuntu-only
+    tracer failure (run 34885536050): test_window_size_flag_resizes died
+    on 'TIMEOUT after 10.0s ... scan_failure_handled: True' borrowed from
+    a scan-failure test ten seconds earlier.
 
+    Spun the same way as test_ready_poll_timer_dies_with_the_run: a rc of
+    0 is itself proof the run beat its own deadline, so anything logging
+    TIMEOUT afterwards is by definition a deadline that outlived it."""
+    import logging
+    import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
     import main
 
     app = QApplication.instance() or QApplication([])
     assert app is not None
-
-    short_timeout = 1.0
-
-    # Run 1: fails its cold scan, so it exits well inside its own
-    # deadline and abandons it.
-    def fake_scan_library_config(cfg_, scan_filter, contacts, pal_dir,
-                                 exts, db3_dir):
-        raise RuntimeError("synthetic scan failure (test)")
-
-    monkeypatch.setattr(main, "_scan_library_config",
-                        fake_scan_library_config)
     monkeypatch.setattr(sys, "argv", [
-        "fauxcasa-tracer", str(library),
-        "--cache-root", str(tmp_path / "cr1"),
-        "--quit-after-ready", "--timeout", str(short_timeout)])
-    t0 = time.monotonic()
-    assert main.main() != 0
-    run1_s = time.monotonic() - t0
-    if run1_s >= short_timeout:
-        pytest.skip(
-            f"run 1 took {run1_s:.2f}s, past its own {short_timeout}s "
-            "deadline — nothing was left armed to detect")
+        "fauxcasa-tracer", str(library), "--cache-root", str(tmp_path / "cr"),
+        "--quit-after-ready", "--finish-build", "--timeout", "2"])
+    assert main.main() == 0  # rc 0 => it finished inside its own 2 s deadline
 
-    # Run 2 must still be inside app.exec() when run 1's abandoned
-    # deadline would fire, which is no later than this.
-    monkeypatch.undo()
-    hold_until = t0 + run1_s + short_timeout + 0.5
-    monkeypatch.setattr(main.MainWindow, "index_busy",
-                        lambda self: time.monotonic() < hold_until)
-    monkeypatch.setattr(sys, "argv", [
-        "fauxcasa-tracer", str(library),
-        "--cache-root", str(tmp_path / "cr2"),
-        "--quit-after-ready", "--finish-build", "--timeout", "30"])
-    assert main.main() == 0, \
-        "the previous run's abandoned --timeout killed this one"
+    # Spin the reused QApplication past that abandoned deadline. A slow
+    # runner cannot make this vacuous: it would fail the rc above, loudly,
+    # rather than quietly skip the race.
+    with caplog.at_level(logging.ERROR, logger="fauxcasa"):
+        for _ in range(45):  # ~2.7 s
+            loop = QEventLoop()
+            QTimer.singleShot(60, loop.quit)
+            loop.exec()
+            QCoreApplication.processEvents()
+    stale = [r for r in caplog.records if "TIMEOUT after" in r.message]
+    assert stale == [], f"the abandoned --timeout fired after its run: {stale}"
