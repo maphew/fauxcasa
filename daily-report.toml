@@ -1,0 +1,19 @@
+# Repo-specific configuration for scripts/daily-report.py (fauxcasa-nn9).
+#
+# Every key here is optional. If this file is absent, or a key/table is
+# missing, scripts/daily-report.py falls back to its built-in default --
+# which is exactly the fauxcasa value shown below. This file simply makes
+# those fauxcasa defaults explicit so the script itself can stay
+# repo-agnostic.
+
+[gates]
+# Command run by the "5. QUALITY GATES" section when --gates is passed.
+command = ["uv", "run", "scripts/preflight.py", "--fast"]
+
+[pollution_gate]
+# Paths that must stay untracked by git, checked in the "3. BEADS HEALTH"
+# section via `git ls-files --error-unmatch -- <path>`. This is a fauxcasa
+# Dolt-sync policy (.beads/issues.jsonl is a passive export, not the sync
+# wire protocol -- see AGENTS.md), not a universal beads rule, hence it is
+# config rather than hardcoded.
+paths = [".beads/issues.jsonl"]

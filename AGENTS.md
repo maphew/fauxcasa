@@ -76,6 +76,7 @@ runs via `uv run`, no separate install step. CI (`.github/workflows/tests.yml`,
 
 ```bash
 uv run scripts/test_delegation_report.py -q
+uv run scripts/test_daily_report.py -q
 uv run scripts/test_picasa_db.py -q
 uv run scripts/test_confirm_archive.py -q
 uv run scripts/check-ingest-parity.py
