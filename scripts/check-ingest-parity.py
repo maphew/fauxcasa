@@ -14,10 +14,14 @@ ingest loss on synthetic corpora." This harness generates (or takes) a
 synthetic picasa-extras corpus (scripts/make-synthetic-library.py
 --picasa-extras), runs BOTH readers over the same tree --
 
-- the survey rollup (scripts/picasa_db.py `_survey_ini_tree`), plus this
-  harness's own filesystem counts for what the ini survey cannot see
-  (photo files, .pal albums, contacts.xml), plus the generator's
-  manifest.json ground truth;
+- the survey rollup (scripts/picasa_db.py `_survey_ini_tree`), which also
+  owns the filesystem counts the ini survey itself cannot see -- photo
+  and video files via its `media` sub-dict, `.pal` albums via
+  `_count_pal_files`, contacts.xml via `_count_contacts_xml` -- plus the
+  generator's manifest.json ground truth. The one walk this harness still
+  does itself is the narrow `.picasaoriginals`/`Originals` scan behind
+  `stashed_fs`, which needs the file LIST for same-name association
+  (fauxcasa-cam.19), not a count;
 - the tracer's `catalog.scan_library` (apps/desktop-python/catalog.py,
   public API only -- this script never modifies the tracer)
 
@@ -51,7 +55,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -198,32 +201,38 @@ def _db3_reference(
 
 def build_reference(corpus: Path) -> Reference:
     library = corpus / "library"
-    survey = picasa_db._survey_ini_tree(library)
-    images = [
+    # Survey-owned media counts (fauxcasa-ed5.11/4lo): photos_fs/videos_fs/
+    # folders_fs/pal_files/contacts_xml all come straight off picasa_db's
+    # helpers instead of this script re-walking the tree.
+    survey = picasa_db._survey_ini_tree(
+        library, image_exts=EXTS, video_exts=VIDEO_EXTS)
+    media = survey["media"]
+    manifest = json.loads((corpus / "manifest.json").read_text("utf-8"))
+    # stashed_fs still needs the file LIST, not just a count, to test each
+    # stash-dir file's same-name sibling (.picasaoriginals association,
+    # cam.19) — a scoped walk of just the stash dirs, not a duplicate of
+    # the survey's full-library walk above.
+    stash_images = [
         p for p in library.rglob("*")
         if p.suffix.lower() in EXTS and p.is_file()
+        and (p.parent.name.lower() == ".picasaoriginals"
+             or p.parent.name == "Originals")
     ]
-    contacts_xml = 0
-    cx = corpus / "contacts" / "contacts.xml"
-    if cx.is_file():
-        contacts_xml = len(re.findall(r"<contact\b", cx.read_text("utf-8")))
-    manifest = json.loads((corpus / "manifest.json").read_text("utf-8"))
     stashed_fs = sum(
-        1 for p in images
-        if (p.parent.name.lower() == ".picasaoriginals"
-            or p.parent.name == "Originals")
-        and (p.parent.parent / p.name).is_file()
+        1 for p in stash_images
+        if (p.parent.parent / p.name).is_file()
     )
     db3_video_dims, db3_video_filetype, db3_caption_precedence = (
         _db3_reference(corpus / "db3", library)
     )
     return Reference(
         survey=survey,
-        photos_fs=len(images),
-        videos_fs=sum(1 for p in images if p.suffix.lower() in VIDEO_EXTS),
-        folders_fs=len({p.parent for p in images}),
-        pal_files=len(list((corpus / "albums").glob("*.pal"))),
-        contacts_xml=contacts_xml,
+        photos_fs=media["files"],
+        videos_fs=media["videos"],
+        folders_fs=media["folders"],
+        pal_files=picasa_db._count_pal_files(corpus / "albums"),
+        contacts_xml=picasa_db._count_contacts_xml(
+            corpus / "contacts" / "contacts.xml"),
         manifest=manifest,
         stashed_fs=stashed_fs,
         db3_video_dims=db3_video_dims,
