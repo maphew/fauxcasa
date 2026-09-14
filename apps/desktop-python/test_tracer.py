@@ -2306,24 +2306,64 @@ def test_eliding_label_paints_like_a_qlabel_when_it_elides() -> None:
     n, _lo, _hi = hits(render(red), QColor("#d0021b"))
     assert n > 0, "elided text was not painted in the style sheet's colour"
 
-    # 3: right-aligned text stays on the right half. Compared against the
-    # SAME label left-aligned so this measures alignment, not glyph luck.
-    left = main.ElidingLabel()
-    left.setText(long_text)
-    left.setAlignment(Qt.AlignmentFlag.AlignLeft
-                      | Qt.AlignmentFlag.AlignVCenter)
-    right = main.ElidingLabel()
-    right.setText(long_text)
-    right.setAlignment(Qt.AlignmentFlag.AlignRight
-                       | Qt.AlignmentFlag.AlignVCenter)
+    # 3: alignment steers the geometry, measured against the ORACLE this
+    # class claims to reproduce -- a real QLabel holding the ALREADY
+    # elided string, same font, same box, same flags. Absolute ink
+    # columns cannot carry this assertion: ElideRight fits the string to
+    # the box, so the leftover gap at the far edge is only whatever the
+    # last glyph's metrics leave behind (~1px on Segoe UI, 14px on DejaVu
+    # Sans), which is exactly why an absolute "right-aligned ink reaches
+    # x >= 85" threshold passed on Windows and failed on Linux.
+    #
+    # An indent is what makes the two alignments differ by a visible
+    # margin on ANY font, because QLabel applies it to the aligned edge
+    # only: with AlignLeft the text box starts `INDENT` px in (ink sits
+    # right), with AlignRight it ends `INDENT` px early (ink sits left).
+    # That also exercises the two pieces of geometry this class
+    # reimplements -- _visual_alignment() and _indent().
+    from PySide6.QtWidgets import QLabel
+
     dark = QColor("#000000")
-    l_n, l_lo, _l_hi = hits(render(left), dark, tol=100)
-    r_n, _r_lo, r_hi = hits(render(right), dark, tol=100)
-    assert l_n > 0 and r_n > 0, "elided text was not painted at all"
-    # Both fill most of the width (that is what eliding means), so the
-    # telling difference is which edge the ink reaches.
-    assert l_lo <= 4, "left-aligned text did not start at the left edge"
-    assert r_hi >= 85, "right-aligned text did not reach the right edge"
+    INDENT = 20
+
+    def ink_pair(align):
+        """Ink extents for `long_text` at `align`, ours and QLabel's."""
+        flags = align | Qt.AlignmentFlag.AlignVCenter
+        ours = main.ElidingLabel()
+        ours.setAlignment(flags)
+        ours.setIndent(INDENT)
+        ours.setText(long_text)
+        oracle = QLabel()
+        oracle.setTextFormat(Qt.TextFormat.PlainText)
+        oracle.setAlignment(flags)
+        oracle.setIndent(INDENT)
+        # What ElidingLabel's paint path will hand to drawItemText: the
+        # box is the 90px widget less the indent it applies to one edge.
+        oracle.setText(ours.fontMetrics().elidedText(
+            long_text, Qt.TextElideMode.ElideRight, 90 - INDENT))
+        return (hits(render(ours), dark, tol=100),
+                hits(render(oracle), dark, tol=100))
+
+    (l_n, l_lo, l_hi), (ql_n, ql_lo, ql_hi) = \
+        ink_pair(Qt.AlignmentFlag.AlignLeft)
+    (r_n, r_lo, r_hi), (qr_n, qr_lo, qr_hi) = \
+        ink_pair(Qt.AlignmentFlag.AlignRight)
+    assert l_n > 0 and r_n > 0 and ql_n > 0 and qr_n > 0, \
+        "elided text was not painted at all"
+    # Non-vacuity guard (the lesson of fauxcasa-9pr/47f): if a real
+    # QLabel puts both alignments in the same place on this font, the
+    # comparisons below would pass for a paint path that ignores
+    # alignment entirely, and the test would prove nothing.
+    assert abs(ql_lo - qr_lo) > 4 and abs(ql_hi - qr_hi) > 4, (
+        "test is vacuous on this font: QLabel itself paints indented "
+        f"left- and right-aligned text alike (left {ql_lo}-{ql_hi}, "
+        f"right {qr_lo}-{qr_hi})")
+    assert abs(l_lo - ql_lo) <= 2 and abs(l_hi - ql_hi) <= 2, (
+        "left-aligned elided text is not where QLabel puts it: "
+        f"ours {l_lo}-{l_hi}, QLabel {ql_lo}-{ql_hi}")
+    assert abs(r_lo - qr_lo) <= 2 and abs(r_hi - qr_hi) <= 2, (
+        "right-aligned elided text is not where QLabel puts it: "
+        f"ours {r_lo}-{r_hi}, QLabel {qr_lo}-{qr_hi}")
 
     # 4: a DISABLED label greys out. (A hand-rolled painter.setPen also
     # passes this one, since QStyleOption.initFrom already hands over the
