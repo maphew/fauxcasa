@@ -266,7 +266,7 @@ docstrings describe a since-superseded stage:
   and viewer; it renders catalog fields only, no file I/O of its own.
 - **Decode seam**: `decodefacade.py` is the dispatch point. Call sites in
   `thumbcache.py` and `viewer.py` ask its `DecodeService` singleton to
-  `decode()`/`index()`, which picks between an in-process transport and
+  `decode()`, which picks between an in-process transport and
   `WinSandboxTransport` (Windows only, backed by `decodesvc_win.py`'s
   worker pool inside a Windows AppContainer, wire-typed by `decodesvc.py`,
   with worker entry point `decodesvc_worker_win.py`). Since fauxcasa-
@@ -277,9 +277,14 @@ docstrings describe a since-superseded stage:
   `pillowload.py`, `videoload.py`), as does the scan-time metadata/header
   read (`metareader.py`, the exiv2 seam for capture date, GPS, XMP
   rating, and EXIF orientation). Linux has no sandbox transport and stays
-  in-process everywhere. Video *playback* (not the poster frame) streams
-  from its own sandboxed worker via `videostream.py`, a separate seam
-  from the still-image one.
+  in-process everywhere. `DecodeService.index()` is not part of this
+  split: it is always in-process and has no production call site yet.
+  Video *playback* (not the poster frame) is a separate seam, in
+  `videostream.py`: a worker process that receives an already-open
+  read-only descriptor and never sees a path, but that is spawned with a
+  plain `subprocess.Popen`. It is **not** sandboxed today; the
+  AppContainer launcher for it is outstanding fauxcasa-i92 work, so do
+  not describe video playback as sandboxed.
 - **`applog.py`** is the diagnostics channel (rotating log file, plus a
   console when one exists) that survives a windowed PyInstaller build
   where `sys.stdout`/`stderr` are `None`.
