@@ -1,126 +1,123 @@
 # Fauxcasa
 
-Fauxcasa is an open source local photo manager in the spirit of Picasa.
-The project exists because useful personal software should survive the
-loss of vendor, maintainer, or business model.
+Fauxcasa shows you your Picasa photo library again: the same folders,
+albums, people, stars and captions, on your own computer. It is a free
+program that reads the photo folders and Picasa files you already have.
+It never changes your photos or Picasa's files.
 
-It is under active development and not ready for regular use.
+![The Fauxcasa window: folders, albums and people down the left, photos grouped by folder on the right](docs/releases/v0.1.0-gallery.png)
 
-## Download
+Fauxcasa is early software. Version 0.1 is for looking, not changing: you
+can browse, search and view your photos, but not edit, tag or export them
+yet. It is not a replacement for Picasa in daily use, but it is safe to
+try on your own photos and easy to remove again.
 
-Fauxcasa is a read-only Picasa-library browser for Windows 10/11 x64 and
-Linux x64.
+## Try it
 
-1. Get the current build from the
-   [latest release](https://github.com/maphew/fauxcasa/releases/latest).
-2. Windows: use **Extract All**. The app is not a one-file executable; keep
-   the extracted folder together, then open the folder and run
-   `fauxcasa.exe`. Linux: extract the `tar.gz` and run the `fauxcasa`
-   binary, or run from source (see Installation/Usage below).
-3. Choose the top-level folder containing the photos you want to browse.
+1. Download the current version from the
+   [releases page](https://github.com/maphew/fauxcasa/releases/latest).
+   Windows 10 or 11: the file ending in `windows-x64.zip`. Linux: the file
+   ending in `linux-x64.tar.gz`. (The "x64" means a 64-bit computer,
+   which is almost every PC made in the last decade.)
+2. **Windows:** right-click the zip, choose **Extract All**, open the new
+   folder, and double-click `fauxcasa.exe`. Keep the folder together; the
+   program needs the other files next to it.
+   **Linux:** extract the archive and run the `fauxcasa` program inside
+   the extracted folder. The folder can live anywhere you like.
+3. Choose the folder that holds your photos. If Picasa is installed on the
+   same Windows PC, Fauxcasa also offers to open the folders Picasa
+   watched.
 
-Fauxcasa scans photos in place but does **not** modify photos, Picasa
-sidecars, or the Picasa database, and normal browsing never writes into your
-library. It writes a rebuildable catalog and thumbnail cache under your user
-cache directory: `%LOCALAPPDATA%\Fauxcasa\cache` on Windows, or
-`$XDG_CACHE_HOME/fauxcasa` (`~/.cache/fauxcasa` if unset) elsewhere. That
-cache directory also holds `config.json` (remembered library, preferences,
-and File Types selections) and `fauxcasa.log` (a rotating diagnostic log —
-include a redacted copy when filing a bug). The optional `--promote`,
-`--add-root`, and `--import-picasa-watched` CLI commands, and the first-run
-"Use Picasa's watched folders" button, do write a `library.json` and/or a
-small `.fauxcasa-root` marker into the library itself — see "Files this app
-writes" in the [release notes](docs/releases/v0.1.0.md) for the full list.
+The window opens right away. Thumbnails fill in while Fauxcasa looks
+through your folders. A big library takes a while the first time and is
+fast after that.
 
-This is an unsigned build, so Windows SmartScreen may show an
-unknown-publisher warning: right-click the zip, open Properties, and click
-Unblock before Extract All, or click "More info" then "Run anyway" at
-launch. Original-media decoding runs in-process and is not sandboxed yet on
-any platform, so use only a library whose files you trust. See the
-[release notes](https://github.com/maphew/fauxcasa/releases/latest) for the
-complete scope and report problems through
-[GitHub Issues](https://github.com/maphew/fauxcasa/issues).
+The [release notes](docs/releases/v0.1.0.md) explain what works, what does
+not work yet, the keyboard shortcuts, and exactly which files Fauxcasa
+keeps on your computer.
 
-## Installation
+### Windows will warn you the first time
 
-Install uv from [https://docs.astral.sh/uv/](https://docs.astral.sh/uv/).
-Install just from [https://just.systems/](https://just.systems/) for the
-root command runners.
+Windows shows a blue "Windows protected your PC" screen for programs that
+are not signed with a paid publisher certificate, which this one is not
+yet. That is normal for a small free program. Click **More info**, then
+**Run anyway**. Do this only for a copy downloaded from the releases page
+above.
 
-## Usage
+If you prefer, right-click the zip before extracting, open
+**Properties**, tick **Unblock**, and Windows will not ask.
+
+## Your photos stay untouched
+
+- Fauxcasa only reads your photos and Picasa's files. Browsing, searching
+  and viewing never change, move or delete anything in your photo
+  folders.
+- Because it only reads, a crash cannot damage your photos. At worst
+  Fauxcasa has to rebuild its own thumbnails.
+- It has no online features. It never connects to the internet: no
+  accounts, no uploads, no update checks, no usage reports. A firewall
+  that asks per program will never ask about it.
+- Everything it makes for itself (a list of your photos and their
+  thumbnails) lives in one folder of its own, away from your photos. On
+  Windows, paste `%LOCALAPPDATA%\Fauxcasa` into the File Explorer address
+  bar to see it; on Linux it is `~/.cache/fauxcasa`. You can delete that
+  folder at any time.
+- One small exception: if you choose **Use Picasa's watched folders** on
+  the first start, Fauxcasa leaves a tiny bookkeeping file called
+  `.fauxcasa-root` in each of those folders so it can recognise them
+  later. It never touches the photos themselves.
+- To remove Fauxcasa completely, delete the extracted program folder and
+  the Fauxcasa folder above.
+
+One caution. Any photo viewer can be crashed or misled by a deliberately
+malformed image file. On Windows, Fauxcasa opens the common photo formats
+in a locked-down helper process to limit what such a file could do. That
+protection does not yet cover camera RAW files, Photoshop files or videos,
+and does not exist on Linux yet. Open your own photo collections, not
+folders of files from people you do not know.
+
+Later versions will let you change things. The plan is to save your
+changes next to your photos, in files Picasa itself understands, never in
+a private database that locks you in. The
+[product spec](docs/product-spec.md) has the details.
+
+## Help and bug reports
+
+Report problems on the project's
+[issue page](https://github.com/maphew/fauxcasa/issues). A free GitHub
+account is needed to post. Please do not attach photos, Picasa files,
+names or real folder paths; the release notes list what a useful report
+contains.
+
+## For developers
+
+Fauxcasa is written in Python with Qt (PySide6). The app lives in
+`apps/desktop-python/`, and its [README](apps/desktop-python/README.md)
+describes the architecture and the measured performance numbers.
+`scripts/` holds tooling and research utilities. `docs/` holds the
+[product spec](docs/product-spec.md), design notes, research and release
+notes.
+
+To run from source, install [uv](https://docs.astral.sh/uv/), then:
 
 ```
-just py ~/Pictures
+uv run apps/desktop-python/main.py ~/Pictures     # run against a folder
+uv run apps/desktop-python/test_tracer.py          # the app's test suite
+uv run scripts/preflight.py                        # every check CI runs
 ```
 
-The current desktop prototype lives under `apps/desktop-python/`. Common
-commands are exposed from the repo root:
+If you have [just](https://just.systems/) installed, `just py ~/Pictures`
+and `just py-test` are shortcuts for the first two; `just --list` shows
+the rest. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull
+request.
 
-```
-just py ~/Pictures
-just py-test
-just py-smoke
-```
+## License
 
-Repository layout:
-
-```
-apps/desktop-python/ = experimental desktop app
-scripts/             = developer/research/build utilities used around the app
-```
-
-## Storage And Picasa Data
-
-The current `tracer` prototype does not write a photo database into your
-library. It scans the library in place, reads compatible metadata, and writes
-only its own rebuildable catalog and thumbnail cache.
-
-By default, that cache is stored outside the photo library:
-
-- Source checkout: `cache/fauxcasa-cache/<library-digest>/`
-- Frozen Windows build: `%LOCALAPPDATA%\\Fauxcasa\\cache/`
-- Frozen other builds: `$XDG_CACHE_HOME/fauxcasa/`, or `~/.cache/fauxcasa/`
-  when `XDG_CACHE_HOME` is not set
-
-Pass `--cache-root <path>` to choose a different cache location. The per-library
-cache currently contains files such as `catalog.json`, `thumbs.fcache`, and
-`thumbs.fcache.json`.
-The old preview cache `~/.cache/fauxcasa-tracer` is no longer read and can be
-deleted.
-
-Existing Picasa sidecar files are read today. The prototype reads
-`.picasa.ini`, `Picasa.ini`, and `picasa.ini` files for stars, captions,
-keywords, rotation, hidden flags, albums, and folder descriptions. It does not
-write those files yet.
-
-The product plan is for durable user state to live in or beside the photo
-library, not in a private database that becomes a lock-in point. Fauxcasa is
-intended to import existing Picasa `.picasa.ini` files, `.pal` album files,
-`contacts.xml`, db3 `.pmp` data, `.picasaoriginals`, and in-file
-XMP/IPTC/EXIF. Version 1 is planned to write durable state as
-Picasa-compatible sidecars where possible, plus standard in-file metadata under
-the metadata write policy; writing Picasa's db3 database is not a v1 goal.
-
-## Licensing
-
-Fauxcasa uses strong copyleft by default so the work and its community remain a
-commons.
-
-- Application code, scripts, tests, and build files are licensed under the GNU
-  Affero General Public License, version 3 or later: `AGPL-3.0-or-later`.
-- Original project documentation written for Fauxcasa is licensed under Creative
-  Commons Attribution-ShareAlike 4.0 International: `CC-BY-SA-4.0`.
-- Archived research material is source-attributed reference material. It is not
-  relicensed by this repository unless a specific file says otherwise.
-- The Fauxcasa name, logos, icons, and other project branding are reserved as
-  trademarks or service marks. The copyright licenses do not grant trademark
-  rights or permission to imply project endorsement.
-
-The AGPL matters for this project because network features such as cross-machine
-sync may become part of the product. Modified versions that users interact with
-over a network must offer the corresponding source code as required by the
-license.
-
-See `LICENSE` for the full AGPL-3.0 text, `docs/LICENSE.md` for documentation
-terms, `docs/research/NOTICE.md` for archived research notes, and
-`CONTRIBUTING.md` for contribution terms.
+Fauxcasa is free software and will stay that way. The code is licensed
+under the [GNU AGPL v3 or later](LICENSE) and the documentation under
+[CC BY-SA 4.0](docs/LICENSE.md). You may use, study, share and improve
+it. If you distribute a changed version, or let others use one over a
+network, you must share your changes under the same terms. The Fauxcasa
+name and logo are reserved as trademarks. Archived research material under
+`docs/research/` keeps its original sources' terms; see
+[docs/research/NOTICE.md](docs/research/NOTICE.md).

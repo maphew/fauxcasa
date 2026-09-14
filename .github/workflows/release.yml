@@ -442,7 +442,7 @@ jobs:
           # dry run reads docs/releases/v0.1.0.md (same rule as the assert).
           NOTES="docs/releases/v${VER%%-*}.md"
           if [ -f "$NOTES" ]; then
-            if uv run --with markdown python -m markdown "$NOTES" > dist/fauxcasa/README.html; then
+            if uv run --with markdown python -m markdown -x tables -x fenced_code "$NOTES" > dist/fauxcasa/README.html; then
               echo "OK: rendered README.html from $NOTES"
             else
               echo "::warning::markdown render failed — falling back to raw copy"
