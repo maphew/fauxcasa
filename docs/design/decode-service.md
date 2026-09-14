@@ -598,15 +598,17 @@ From the threat model's verification section, made concrete:
    same spawn path, same sandbox, hostile payload — attempts, and must
    fail: open a file outside its handed fd (absolute, relative, and
    `..`-traversal; on Windows also `\\?\` and device paths; registry
-   read/write); create/connect a socket (TCP, UDP, DNS lookup);
-   `execve`/`CreateProcess`; write anywhere but its arena (tmp dirs,
-   the library, the cache); exceed its memory limit without being
-   killed; outlive a broker kill (job-object/PDEATHSIG check); on
-   Windows additionally clipboard/SendMessage/desktop handles
-   (UILIMIT_ALL). **Any success fails the build.** Runs on
-   ubuntu-latest + windows-latest; macOS enters the matrix with the
-   hardware (§8 of the spec is explicit that this is blocked on access,
-   not intent).
+   read/write); connect, send, bind, listen, or sendto on a socket, and
+   DNS lookup (TCP, UDP); a bare, unconnected `socket()` call is
+   expected to succeed and is accepted as inert, ratified fauxcasa-i92.6
+   (see the threat model's residual risks); `execve`/`CreateProcess`;
+   write anywhere but its arena (tmp dirs, the library, the cache);
+   exceed its memory limit without being killed; outlive a broker kill
+   (job-object/PDEATHSIG check); on Windows additionally
+   clipboard/SendMessage/desktop handles (UILIMIT_ALL). **Any other
+   success fails the build.** Runs on ubuntu-latest + windows-latest;
+   macOS enters the matrix with the hardware (§8 of the spec is
+   explicit that this is blocked on access, not intent).
 2. **Hostile-file corpus through the real pool.** Truncated, fuzzed, and
    dimension-lying JPEG/PNG/GIF/TIFF/WebP/RAW/MP4 samples (synthetic —
    privacy rule — seeded from the format research; grown by fuzz smoke
