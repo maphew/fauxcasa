@@ -22,3 +22,15 @@ py-bench *args:
 # Run the Python desktop vsync probe.
 py-vsync *args:
     uv run apps/desktop-python/vsync_probe.py "$@"
+
+# Build the demo library of freely licensed photos (cache/demo-library, downloads once).
+demo *args:
+    uv run scripts/make-demo-library.py "$@"
+
+# Open the demo library in the app.
+py-demo *args:
+    uv run apps/desktop-python/main.py cache/demo-library/library --contacts cache/demo-library/contacts/contacts.xml --pal-dir cache/demo-library/albums "$@"
+
+# Capture the documentation screenshot gallery (docs/releases/gallery) from the demo library.
+gallery *args:
+    uv run scripts/make-gallery.py "$@"
