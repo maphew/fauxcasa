@@ -63,6 +63,7 @@ import datetime
 import json
 import struct
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -446,6 +447,37 @@ def _http_get(url: str) -> bytes:
         return resp.read()
 
 
+def _fetch_picsum_photo(url: str, photo_id: int, w: int, h: int) -> bytes:
+    """One picsum photo download, with a single retry on a transient
+    failure (a non-404 HTTPError -- 429/5xx -- or a URLError) and a
+    friendly one-line failure message on the wire -- never a bare
+    traceback. A 404 is not transient (a bad id in PLAN, per the module
+    docstring's picsum-id-picking advice) and keeps its own loud,
+    no-retry message."""
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            return _http_get(url)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise SystemExit(
+                    f"FATAL: picsum id {photo_id} 404s at size {w}x{h} -- "
+                    f"pick a different id in PLAN (scripts/make-demo-library.py)"
+                ) from e
+            last_err = e
+        except urllib.error.URLError as e:
+            last_err = e
+        if attempt == 0:
+            print(f"WARNING: picsum id {photo_id} download failed "
+                  f"({last_err}); retrying once...")
+            time.sleep(2)
+    status = getattr(last_err, "code", None) or getattr(last_err, "reason", last_err)
+    raise SystemExit(
+        f"FATAL: picsum id {photo_id} download failed twice ({status}) -- "
+        "try again later, or pick a different id in PLAN"
+    )
+
+
 def download_picsum(photo_id: int, w: int, h: int, bw: bool) -> tuple[Path, Path]:
     """Return (raw_jpg_path, info_json_path), fetching + caching as needed."""
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
@@ -455,22 +487,21 @@ def download_picsum(photo_id: int, w: int, h: int, bw: bool) -> tuple[Path, Path
         url = f"https://picsum.photos/id/{photo_id}/{w}/{h}"
         if bw:
             url += "?grayscale"
-        try:
-            data = _http_get(url)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                raise SystemExit(
-                    f"FATAL: picsum id {photo_id} 404s at size {w}x{h} -- "
-                    f"pick a different id in PLAN (scripts/make-demo-library.py)"
-                ) from e
-            raise
-        raw_path.write_bytes(data)
+        data = _fetch_picsum_photo(url, photo_id, w, h)
+        # Atomic write (fetch-test-datasets.py's fetch_iptc pattern): a kill
+        # mid-download must never leave a truncated JPEG that the
+        # `raw_path.exists()` short-circuit above then trusts on a later run.
+        tmp = raw_path.with_name(raw_path.name + ".part")
+        tmp.write_bytes(data)
+        tmp.replace(raw_path)
     info_path = DOWNLOADS / f"picsum-{photo_id}-info.json"
     if not info_path.exists():
         try:
             info = _http_get(f"https://picsum.photos/id/{photo_id}/info")
             info_path.write_bytes(info)
-        except urllib.error.HTTPError:
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            print(f"WARNING: picsum id {photo_id} /info fetch failed ({e}); "
+                  "keeping photo without attribution info")
             info_path.write_bytes(b"{}")
     return raw_path, info_path
 
@@ -802,6 +833,66 @@ def write_attribution(records: list[dict]) -> None:
         "\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
+def _expected_ingest(records: list[dict], video: dict | None) -> dict:
+    """The counts the APP SHOULD INDEX, derived from PLAN + `records`
+    (never hardcoded) -- what catalog.scan_library() should produce when
+    it walks the generated library. `records` already carries one row per
+    picsum photo, per Camera-Odds-and-Ends file (build_camera_odds_and_ends),
+    and -- when a video was built -- one row for it (generate_library
+    appends that row before returning), so a plain length/sum over
+    `records` already reflects every on-disk media file. The app's EXTS
+    set (catalog.py) excludes .heic/.heif, so those rows are dropped here;
+    write_manifest's "files_written" block keeps them (it counts what was
+    WRITTEN to disk, not what the app will INGEST). `video` is accepted
+    for symmetry with write_manifest's caller but is not otherwise needed
+    -- its row is already in `records`.
+
+    Shared verbatim by write_manifest's manifest.json "expected_ingest"
+    block and run_verification's sidecar-layer assertions, so the two can
+    never drift apart (fauxcasa demo-library review)."""
+    del video  # unused: video's row is already folded into `records`
+    NOT_INDEXED_SUFFIXES = (".heic", ".heif")
+    indexed = [r for r in records
+              if not r["file"].lower().endswith(NOT_INDEXED_SUFFIXES)]
+    stars = sum(1 for r in indexed if r["star"])
+    captions = sum(1 for r in indexed if r["caption"])
+    faces = sum(r["faces"] for r in indexed)
+    faces_photos = sum(1 for r in indexed if r["faces"])
+    gps = sum(1 for r in indexed if r["gps"])
+    folders = sorted({r["folder"] for r in indexed})
+
+    hidden = sum(1 for folder in PLAN for spec in folder.photos if spec.hidden)
+    rotate = sum(1 for folder in PLAN for spec in folder.photos if spec.rotate)
+    ini_geotag = sum(1 for folder in PLAN for spec in folder.photos
+                     if spec.ini_geotag)
+    album_members = {
+        key: sum(1 for folder in PLAN for spec in folder.photos
+                 if key in spec.albums)
+        for key in ALBUMS
+    }
+    album_members["lake_picks"] = len(LAKE_PAL_MEMBER_IDS)
+    unnamed_face_photos = sum(
+        1 for folder in PLAN for spec in folder.photos
+        if any(cid not in NAMED_CONTACTS for _rect, cid in spec.faces))
+
+    return {
+        "media_total": len(indexed),
+        "folders": len(folders),
+        "stars": stars,
+        "captions": captions,
+        "faces": faces,
+        "faces_photos": faces_photos,
+        "named_people": len(NAMED_CONTACTS),
+        "unnamed_face_photos": unnamed_face_photos,
+        "albums": len(ALBUMS) + 1,  # + the .pal-only "Lake trip picks"
+        "album_members": album_members,
+        "hidden": hidden,
+        "rotate": rotate,
+        "ini_geotag": ini_geotag,
+        "gps": gps,
+    }
+
+
 def write_manifest(records: list[dict], video: dict | None) -> dict:
     photos = [r for r in records if r["kind"] != "video"]
     stars = sum(1 for r in records if r["star"])
@@ -815,18 +906,28 @@ def write_manifest(records: list[dict], video: dict | None) -> dict:
     manifest = {
         "generated_by": "scripts/make-demo-library.py",
         "folders": folders,
-        "expected": {
+        # On-disk counts (every file this script wrote, including the
+        # .heic sample the app does not index -- see "expected_ingest"
+        # below for what the app should actually show). `stars` here is
+        # `records`' own star rows verbatim: the video's row (when built)
+        # already carries star=True, so no separate "+1 for the video" is
+        # added -- that used to double-count it.
+        "files_written": {
             "photos": len(photos),
             "videos": 1 if video else 0,
             "media_total": len(photos) + (1 if video else 0),
             "folders": len(folders),
-            "stars": stars + (1 if video else 0),
+            "stars": stars,
             "captions": captions,
             "faces": faces,
             "named_people": named_people,
             "albums": albums_count,
             "gps": gps,
         },
+        # What the app should INDEX (catalog.scan_library) -- see
+        # _expected_ingest's docstring; run_verification asserts against
+        # this same dict so the two can never drift.
+        "expected_ingest": _expected_ingest(records, video),
         "album_uids": {k: v[0] for k, v in ALBUMS.items()},
         "pal_only_album_uid": ALBUM_LAKE_PICKS,
         "contact_ids": NAMED_CONTACTS,
@@ -877,7 +978,7 @@ def write_contact_sheet(records: list[dict], out_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def run_verification() -> bool:
+def run_verification(records: list[dict], video: dict | None) -> bool:
     sys.path.insert(0, str(APP_DIR))
     import inmeta  # noqa: PLC0415
     import metareader  # noqa: PLC0415
@@ -931,6 +1032,93 @@ def run_verification() -> bool:
                 ok = False
     if ok:
         print(f"VERIFY: {len(checks)}/{len(checks)} sample photos round-tripped OK")
+
+    ok = run_sidecar_verification(records, video) and ok
+    return ok
+
+
+def run_sidecar_verification(records: list[dict], video: dict | None) -> bool:
+    """Verify the PICASA SIDECAR layer (.picasa.ini / contacts.xml / .pal)
+    on top of run_verification()'s in-file (EXIF/XMP/IPTC) round-trip
+    above -- together the two cover both metadata layers catalog.py
+    merges (§4). Builds the app's own catalog over the generated library
+    exactly like main.py's single-root path does (`cfg.is_legacy` in
+    _scan_library_config: scan_library(root, None, contacts, pal_dir)`,
+    with `contacts`/`pal_dir` loaded the same way main.py's --contacts/
+    --pal-dir do), then asserts counts from `_expected_ingest` -- DERIVED
+    FROM PLAN, never hardcoded -- against what that catalog actually
+    contains. Pure-Python: scan_library and its helpers (picasa_db,
+    library, db3rescue) import PySide6 only inside functions this path
+    never calls (rawload/videoload's QImage fallbacks), so this runs
+    without a QApplication."""
+    sys.path.insert(0, str(APP_DIR))
+    import catalog  # noqa: PLC0415
+
+    contacts = catalog.load_contacts_xml(CONTACTS_DIR / "contacts.xml")
+    cat = catalog.scan_library(LIBRARY, None, contacts, ALBUMS_DIR)
+    exp = _expected_ingest(records, video)
+
+    ok = True
+
+    def check(label: str, got, want) -> None:
+        nonlocal ok
+        if got != want:
+            print(f"VERIFY FAIL: sidecar {label} {got!r} != {want!r}")
+            ok = False
+        else:
+            print(f"VERIFY: sidecar {label} OK ({got})")
+
+    check("indexed media", len(cat.photos), exp["media_total"])
+    check("starred", sum(1 for p in cat.photos if p.star), exp["stars"])
+    check("photos with faces", sum(1 for p in cat.photos if p.faces),
+          exp["faces_photos"])
+
+    # named_people: each of the 4 NAMED_CONTACTS names must resolve on
+    # >=1 photo (via contacts.xml or ini [Contacts2] fallback -- see
+    # scan_library's `contacts.get(cid) or local.get(cid)`); an unnamed
+    # face (CONTACT_ORPHAN, named nowhere) resolves to None instead.
+    named_seen: set[str] = set()
+    unnamed_face_photos = 0
+    for p in cat.photos:
+        has_unnamed = False
+        for _rect, _cid, name in p.faces:
+            if name is not None:
+                named_seen.add(name)
+            else:
+                has_unnamed = True
+        if has_unnamed:
+            unnamed_face_photos += 1
+    missing = sorted(set(NAMED_CONTACTS.values()) - named_seen)
+    if missing:
+        print(f"VERIFY FAIL: sidecar named people missing from every photo: "
+              f"{missing}")
+        ok = False
+    else:
+        print(f"VERIFY: sidecar named people OK "
+              f"({len(NAMED_CONTACTS)}/{len(NAMED_CONTACTS)} each on >=1 photo)")
+    check("unnamed-face photos", unnamed_face_photos, exp["unnamed_face_photos"])
+
+    check("albums", len(cat.albums), exp["albums"])
+    album_uids = {"best_of_2014": ALBUM_BEST_OF_2014, "family": ALBUM_FAMILY,
+                 "lake_picks": ALBUM_LAKE_PICKS}
+    albums_ok = True
+    got_members = {}
+    for key, uid in album_uids.items():
+        got_members[key] = len(cat.albums[uid].members) if uid in cat.albums else -1
+        if got_members[key] != exp["album_members"][key]:
+            albums_ok = False
+    if albums_ok:
+        print(f"VERIFY: sidecar album membership OK ({got_members})")
+    else:
+        print(f"VERIFY FAIL: sidecar album membership {got_members} != "
+              f"{exp['album_members']}")
+        ok = False
+
+    check("hidden", sum(1 for p in cat.photos if p.hidden), exp["hidden"])
+    check("rotate", sum(1 for p in cat.photos if p.rotate), exp["rotate"])
+    check("ini geotag", sum(1 for p in cat.photos if p.geotag is not None),
+          exp["ini_geotag"])
+
     return ok
 
 
@@ -1013,14 +1201,15 @@ def main() -> None:
 
     print_summary(records)
     print(f"\n{len(records)} media files "
-          f"({manifest['expected']['photos']} photos"
+          f"({manifest['files_written']['photos']} photos"
           f"{' + 1 video' if video else ''}) at {LIBRARY}")
     print(f"manifest: {DEMO_ROOT / 'manifest.json'}")
-    print(f"expected counts: {json.dumps(manifest['expected'])}")
+    print(f"files written: {json.dumps(manifest['files_written'])}")
+    print(f"expected ingest: {json.dumps(manifest['expected_ingest'])}")
 
     verified = True
     if not args.skip_verify:
-        verified = run_verification()
+        verified = run_verification(records, video)
 
     if args.contact_sheet:
         write_contact_sheet(records, args.contact_sheet)
