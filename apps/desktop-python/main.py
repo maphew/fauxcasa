@@ -1276,49 +1276,77 @@ class ElidingLabel(QLabel):
       stays readable by callers and tests (nothing downstream has to
       know a label elides);
     - sizeHint() is untouched, so the layout still asks for the full
-      width whenever there is room and the text is not elided at all;
+      width whenever there is room and nothing elides at all;
     - minimumSizeHint() collapses to a fixed ellipsis-width stub, so
       the text can never move the window's floor;
     - the full string goes to the tooltip while it is elided, so the
       part that got cut is a hover away rather than lost.
 
+    The custom paint deliberately mirrors QLabel's own geometry and text
+    drawing rather than improvising (QLabelPrivate::layoutRect and
+    QLabel::paintEvent): visual (not logical) alignment so a
+    right-to-left layout is not silently mirrored, QLabel's real
+    default-indent rule, QFrame's frame, and QStyle.drawItemText so the
+    disabled palette and a style sheet's color: are honoured the way
+    they are on every other label. Only the elided case takes this
+    path; text that fits is painted by QLabel itself.
+
     Tooltip text goes through _plain_tooltip for the usual reason
-    (fauxcasa-6vk finding 7): these labels carry catalog text -- paths,
-    captions, keywords, album and people names -- and a caption of
+    (fauxcasa-6vk finding 7): these labels carry catalog text - paths,
+    captions, keywords, album and people names - and a caption of
     "<img src=http://...>" would otherwise be INTERPRETED by the
-    tooltip's AutoText QLabel. Pass auto_tooltip=False where the label
-    already owns its tooltip for something else (decode_sandbox_label
-    shows the degrade reason there).
+    tooltip's AutoText QLabel. A tooltip the OWNER set always wins
+    (decode_sandbox_label shows the degrade reason there); only a
+    tooltip this widget installed itself is ever replaced or cleared.
     """
 
     def __init__(self, parent: QWidget | None = None, *,
-                 mode: Qt.TextElideMode = Qt.TextElideMode.ElideRight,
-                 auto_tooltip: bool = True) -> None:
+                 mode: Qt.TextElideMode = Qt.TextElideMode.ElideRight
+                 ) -> None:
         super().__init__(parent)
         self._elide_mode = mode
-        self._auto_tooltip = auto_tooltip
+        # The tooltip WE last installed, so an owner-set tooltip is
+        # never clobbered and ours is never left behind stale.
+        self._own_tooltip = ""
         # Same PlainText discipline as the QLabels this replaces
-        # (fauxcasa-6vk finding 7) -- set here so no call site can
+        # (fauxcasa-6vk finding 7) - set here so no call site can
         # forget it.
         self.setTextFormat(Qt.TextFormat.PlainText)
 
-    def _text_width(self) -> int:
-        return self.fontMetrics().horizontalAdvance(self.text())
+    # ---------- geometry (QLabelPrivate::layoutRect) ----------
+
+    def _visual_alignment(self) -> int:
+        return int(QStyle.visualAlignment(self.layoutDirection(),
+                                          self.alignment()))
+
+    def _indent(self) -> int:
+        """QLabel's rule: an explicit indent wins; otherwise a FRAMED
+        label gets half an 'x' and an unframed one gets nothing."""
+        if self.indent() >= 0:
+            return self.indent()
+        if self.frameWidth():
+            return (self.fontMetrics().horizontalAdvance("x") // 2
+                    - self.margin())
+        return 0
 
     def _text_rect(self):
-        """The area QLabel would draw text into: contents minus the
-        indent/margin QLabel applies on top of contentsRect()."""
         rect = self.contentsRect()
         m = self.margin()
         rect = rect.adjusted(m, m, -m, -m)
-        indent = self.indent()
-        if indent < 0:                       # QLabel's own default rule
-            indent = 0
-        if self.alignment() & Qt.AlignmentFlag.AlignRight:
-            rect.setRight(rect.right() - indent)
-        else:
-            rect.setLeft(rect.left() + indent)
+        indent = self._indent()
+        if indent > 0:
+            align = self._visual_alignment()
+            if align & Qt.AlignmentFlag.AlignLeft:
+                rect.setLeft(rect.left() + indent)
+            if align & Qt.AlignmentFlag.AlignRight:
+                rect.setRight(rect.right() - indent)
+            if align & Qt.AlignmentFlag.AlignTop:
+                rect.setTop(rect.top() + indent)
+            if align & Qt.AlignmentFlag.AlignBottom:
+                rect.setBottom(rect.bottom() - indent)
         return rect
+
+    # ---------- the fix ----------
 
     def minimumSizeHint(self) -> QSize:
         base = super().minimumSizeHint()
@@ -1327,35 +1355,52 @@ class ElidingLabel(QLabel):
         fm = self.fontMetrics()
         # Room for the ellipsis plus a couple of characters, so a
         # squeezed label still reads as truncated text rather than as a
-        # rendering glitch -- and the chrome QLabel adds around it.
+        # rendering glitch - and the chrome QLabel lays out around it.
         stub = fm.horizontalAdvance("\u2026") + 2 * fm.averageCharWidth()
         margins = self.contentsMargins()
         chrome = (margins.left() + margins.right()
-                  + 2 * self.margin() + max(self.indent(), 0))
+                  + 2 * self.margin() + max(self._indent(), 0))
         return QSize(min(base.width(), stub + chrome), base.height())
+
+    def _set_own_tooltip(self, tip: str) -> None:
+        """Install (or withdraw) OUR tooltip without touching one the
+        owner set. Skipping the no-op keeps this off the hot path: it
+        runs on an elide/un-elide transition, not on every paint."""
+        if self.toolTip() not in ("", self._own_tooltip):
+            return                       # the owner's tooltip wins
+        if self.toolTip() != tip:
+            self.setToolTip(tip)
+        self._own_tooltip = tip
 
     def paintEvent(self, event) -> None:
         rect = self._text_rect()
-        if not self.text() or self._text_width() <= rect.width():
-            if self._auto_tooltip and self.toolTip():
-                self.setToolTip("")
+        text = self.text()
+        if not text or self.fontMetrics().horizontalAdvance(text) \
+                <= rect.width():
+            self._set_own_tooltip("")
             super().paintEvent(event)
             return
-        if self._auto_tooltip:
-            self.setToolTip(_plain_tooltip(self.text()))
+        self._set_own_tooltip(_plain_tooltip(text))
         painter = QPainter(self)
-        # Let the style paint the widget's own background/border first:
-        # a QLabel under a style sheet (activity_label inherits the
+        # The style paints the widget's own background/border first: a
+        # QLabel under a style sheet (activity_label inherits the
         # activity row's) gets nothing otherwise.
         opt = QStyleOption()
         opt.initFrom(self)
         self.style().drawPrimitive(
             QStyle.PrimitiveElement.PE_Widget, opt, painter, self)
-        painter.setPen(opt.palette.color(self.foregroundRole()))
-        painter.drawText(
-            rect, int(self.alignment()),
+        if self.frameWidth():
+            self.drawFrame(painter)
+        # drawItemText, not a raw pen: it is what QLabel uses, so the
+        # disabled palette and a style sheet's color: land the same way
+        # here as on any other label.
+        self.style().drawItemText(
+            painter, rect,
+            self._visual_alignment() | int(Qt.TextFlag.TextSingleLine),
+            self.palette(), self.isEnabled(),
             self.fontMetrics().elidedText(
-                self.text(), self._elide_mode, rect.width()))
+                text, self._elide_mode, rect.width()),
+            self.foregroundRole())
 
 
 def _offline_root_labels(catalog: Catalog) -> list[str]:
@@ -1972,9 +2017,10 @@ class MainWindow(QMainWindow):
         # is the import-report count (_update_import_notes), a different
         # concern with its own show/hide lifecycle; sharing it would let
         # one overwrite the other. Hidden unless state == "degraded".
-        # auto_tooltip=False: this one already owns its tooltip below
-        # (the degrade reason), which an eliding tooltip would clobber.
-        self.decode_sandbox_label = ElidingLabel(auto_tooltip=False)
+        # _sync_decode_sandbox_label sets a tooltip here (the degrade
+        # reason); ElidingLabel never clobbers an owner-set tooltip, so
+        # the reason survives even when the banner text is elided.
+        self.decode_sandbox_label = ElidingLabel()
         self.decode_sandbox_label.setVisible(False)
         self.statusBar().addWidget(self.counts_label)
         self.statusBar().addWidget(self.progress_label)

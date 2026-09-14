@@ -2168,6 +2168,7 @@ def test_status_text_never_raises_the_window_resize_floor(
     appearing) grew the window to the new floor on its own. ElidingLabel
     decouples the two -- the floor is whatever the real chrome needs and
     stays there no matter how long the text gets."""
+    from PySide6.QtWidgets import QApplication
     import main
 
     _offscreen_app()
@@ -2199,8 +2200,17 @@ def test_status_text_never_raises_the_window_resize_floor(
     # ...and the floor is small enough to actually be a floor, not the
     # 2700px trap this test exists to catch.
     assert win.minimumSizeHint().width() < 700
-    # The window must also not have GROWN itself to a new floor.
+    # The window must also not have GROWN itself to a new floor. The
+    # growth was never immediate -- Qt applied the new minimum on the
+    # NEXT layout pass -- so drive one before believing the width.
+    win.layout().activate()
+    QApplication.processEvents()
     assert win.width() == 700
+    # And the floor must not block a deliberate shrink, which is the
+    # user-visible symptom the border handles were reporting.
+    win.resize(640, 480)
+    QApplication.processEvents()
+    assert win.width() == 640
 
     # The text is elided for display only: callers and tests still read
     # the full string back, and the cut part is a hover away.
@@ -2212,11 +2222,13 @@ def test_status_text_never_raises_the_window_resize_floor(
 def test_eliding_label_leaves_short_text_and_owned_tooltips_alone(
         library: Path) -> None:
     """fauxcasa-a3m: ElidingLabel only intervenes when the text does not
-    fit. Text that fits paints through QLabel untouched and gets no
-    tooltip (an ellipsis-free label with a hover repeating itself is
-    noise), and auto_tooltip=False labels keep the tooltip their owner
-    set -- decode_sandbox_label shows the degrade reason there, which an
-    eliding tooltip would otherwise overwrite."""
+    fit, and it only ever owns a tooltip it installed itself.
+
+    Text that fits paints through QLabel untouched and gets no tooltip
+    (an ellipsis-free label with a hover repeating itself is noise). A
+    tooltip the OWNER set always wins: decode_sandbox_label shows the
+    degrade reason there, and an eliding tooltip overwriting it would
+    replace the one piece of diagnosis the banner exists to carry."""
     import main
 
     _offscreen_app()
@@ -2233,10 +2245,15 @@ def test_eliding_label_leaves_short_text_and_owned_tooltips_alone(
     fits.resize(400, 16)
     fits.grab()
     assert fits.toolTip() == ""
-    # ...and once it stops fitting, the tooltip appears.
+    # ...and once it stops fitting, the tooltip appears...
     fits.resize(20, 16)
     fits.grab()
     assert fits.toolTip() == "a.jpg"
+    # ...and is withdrawn again when there is room, so a stale hover
+    # does not outlive the ellipsis that justified it.
+    fits.resize(400, 16)
+    fits.grab()
+    assert fits.toolTip() == ""
 
     win.decode_sandbox_label.setToolTip("worker exited: STATUS_ACCESS_DENIED")
     win.decode_sandbox_label.setText(
@@ -2246,6 +2263,101 @@ def test_eliding_label_leaves_short_text_and_owned_tooltips_alone(
     win.decode_sandbox_label.grab()
     assert win.decode_sandbox_label.toolTip() == \
         "worker exited: STATUS_ACCESS_DENIED"
+
+
+def test_eliding_label_paints_like_a_qlabel_when_it_elides() -> None:
+    """fauxcasa-a3m: the elided branch hand-paints the text, so it has to
+    reproduce what QLabel would have done rather than merely put pixels
+    somewhere.
+
+    Three properties that a raw painter.drawText() gets wrong and
+    QStyle.drawItemText gets right, checked on real rendered pixels
+    because a tooltip assertion cannot see any of them: the text is
+    actually drawn; a style sheet's color: reaches it (status labels
+    inherit one from the activity row); and alignment is honoured, so a
+    right-aligned permanent widget like meta_label does not jump to the
+    left edge the moment it elides."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor
+    import main
+
+    _offscreen_app()
+
+    def render(label, w=90, h=18):
+        label.resize(w, h)
+        return label.grab().toImage()
+
+    def hits(img, want: QColor, tol=60):
+        """Pixels close to `want`, and the leftmost/rightmost columns
+        holding one."""
+        cols = [x for x in range(img.width()) for y in range(img.height())
+                if (abs(img.pixelColor(x, y).red() - want.red()) < tol
+                    and abs(img.pixelColor(x, y).green() - want.green()) < tol
+                    and abs(img.pixelColor(x, y).blue() - want.blue()) < tol)]
+        return len(cols), (min(cols) if cols else -1), \
+            (max(cols) if cols else -1)
+
+    long_text = "a-very-long-status-readout-that-cannot-possibly-fit " * 4
+
+    # 1 + 2: a style sheet colour survives the custom paint.
+    red = main.ElidingLabel()
+    red.setStyleSheet("color: #d0021b;")
+    red.setText(long_text)
+    n, _lo, _hi = hits(render(red), QColor("#d0021b"))
+    assert n > 0, "elided text was not painted in the style sheet's colour"
+
+    # 3: right-aligned text stays on the right half. Compared against the
+    # SAME label left-aligned so this measures alignment, not glyph luck.
+    left = main.ElidingLabel()
+    left.setText(long_text)
+    left.setAlignment(Qt.AlignmentFlag.AlignLeft
+                      | Qt.AlignmentFlag.AlignVCenter)
+    right = main.ElidingLabel()
+    right.setText(long_text)
+    right.setAlignment(Qt.AlignmentFlag.AlignRight
+                       | Qt.AlignmentFlag.AlignVCenter)
+    dark = QColor("#000000")
+    l_n, l_lo, _l_hi = hits(render(left), dark, tol=100)
+    r_n, _r_lo, r_hi = hits(render(right), dark, tol=100)
+    assert l_n > 0 and r_n > 0, "elided text was not painted at all"
+    # Both fill most of the width (that is what eliding means), so the
+    # telling difference is which edge the ink reaches.
+    assert l_lo <= 4, "left-aligned text did not start at the left edge"
+    assert r_hi >= 85, "right-aligned text did not reach the right edge"
+
+    # 4: a DISABLED label greys out. (A hand-rolled painter.setPen also
+    # passes this one, since QStyleOption.initFrom already hands over the
+    # disabled colour group -- it is here as a true property of the
+    # surface, not as the discriminator. Assertion 5 is that.)
+    off = main.ElidingLabel()
+    off.setText(long_text)
+    off.setEnabled(False)
+    on = main.ElidingLabel()
+    on.setText(long_text)
+    off_img, on_img = render(off), render(on)
+
+    def mean_lightness(img):
+        vals = [img.pixelColor(x, y).lightness()
+                for x in range(img.width()) for y in range(img.height())]
+        return sum(vals) / len(vals)
+
+    assert mean_lightness(off_img) > mean_lightness(on_img) + 2, \
+        "disabled elided text was painted as dark as enabled text"
+
+    # 5: RTL uses VISUAL alignment, as QLabel does -- an explicit
+    # AlignLeft renders on the right under a right-to-left layout.
+    # This is what pins the paint path to QStyle.drawItemText +
+    # QStyle.visualAlignment: swapping in a plain painter.drawText with
+    # logical alignment leaves the text on the left and fails here,
+    # which is the whole reason this test is worth its length.
+    rtl = main.ElidingLabel()
+    rtl.setText(long_text)
+    rtl.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+    rtl.setAlignment(Qt.AlignmentFlag.AlignLeft
+                     | Qt.AlignmentFlag.AlignVCenter)
+    _n, _lo, rtl_hi = hits(render(rtl), dark, tol=100)
+    assert rtl_hi >= 85, \
+        "RTL label used logical alignment instead of visual"
 
 
 def test_eliding_label_tooltip_never_renders_catalog_text_as_markup(
