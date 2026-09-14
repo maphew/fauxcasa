@@ -454,8 +454,9 @@ Library & navigation
 - Picasa-native auto-collections: **Starred Photos** and **Recently
   Updated** (plus the Exports collection under In & out, and the
   **Rejected** collection under Organize, below). Scoped star views
-  (footgun 17) — ⚖ argue (proposed 2026-07-03, fauxcasa-07w; §10
-  item 19): scoping reuses the browse dimensions the app already has
+  (footgun 17) — **ratified as proposed** (owner, 2026-09-14,
+  fauxcasa-q6l.20; proposed 2026-07-03, fauxcasa-07w; §10 item 19):
+  scoping reuses the browse dimensions the app already has
   rather than inventing a new one. (a) The star predicate (threshold ≥ N,
   §3) composes with *any* view — folder, album, search, date range — so
   "starred in this folder / this search / this month" needs no dedicated
@@ -765,7 +766,7 @@ to a documented failure:
 | 14 | Frozen RAW table; OS-codec dependency | Updatable decode libraries, bundled codecs |
 | 15 | MakerNote corruption on metadata write | In-file writes round-trip-verified or not made (§5 P1) |
 | 16 | UI floor of year 1903 on dates | Unbounded dates (scanned photos predate 1903) |
-| 17 | Starred Photos accretes forever (the V2 tutorial narrator wades through 84 stale stars), degrading the triage loop | Scoped star views + easy bulk-unstar (semantics proposed in §5 Library & navigation, fauxcasa-07w — ⚖ argue) |
+| 17 | Starred Photos accretes forever (the V2 tutorial narrator wades through 84 stale stars), degrading the triage loop | Scoped star views + easy bulk-unstar (semantics in §5 Library & navigation, fauxcasa-07w; ratified 2026-09-14, fauxcasa-q6l.20) |
 | 18 | Positional row joins across dozens of per-column .pmp files with no cross-file integrity check — documented failures: thumbnails joined to wrong photos after corruption; a hand-edited column file bricking every category | Catalog cache is a single transactional store with explicit keys; durable state is per-file records |
 | 19 | Users hand-edit state files and brick categories | Tier-2 files human-readable and validated on load; unparseable content is quarantined and surfaced, never rewritten (preserves the §4 byte-faithful rule) |
 
@@ -1014,12 +1015,14 @@ items. Argue here, then edit the spec.
     dirs, link original to photo, display it, count it in the ingest
     cross-check); M3 owns the un-bake/restore semantics. §4's "read
     everything" and §9's M1 parenthetical now agree (§9).
-19. **Scoped star views (footgun 17)** — ⚖ argue (proposed 2026-07-03,
-    fauxcasa-07w, awaiting owner ratification): scope = compose the star
+19. ~~Scoped star views (footgun 17)~~ — **ratified as proposed (owner,
+    2026-09-14, fauxcasa-q6l.20):** all three clauses stand as written
+    (proposed 2026-07-03, fauxcasa-07w). Scope = compose the star
     threshold predicate with the existing browse dimensions (folder,
     album, search, date), date-group the Starred collection itself, and
     make bulk-unstar the ordinary select-all-in-scope + one-gesture clear
-    — no new mechanism (§5 Library & navigation).
+    — no new mechanism (§5 Library & navigation). Implementation is
+    fauxcasa-q6l.20, no longer blocked.
 20. ~~Catalog-size budget vs per-row sha256~~ — **re-argued (2026-07-03,
     fauxcasa-1jb):** new number: ≤ 100 B/photo on disk, fully indexed,
     hash included. The identity hash (N6) is irreducible 32 raw bytes;
