@@ -7486,8 +7486,8 @@ def test_ready_poll_timer_dies_with_the_run(
     'uncaught exception' may reach the log.
 
     Asserts on capsys' stderr mirror (applog's _StderrHandler), NOT caplog:
-    the 'fauxcasa' logger sets propagate=False (applog.py:82) so its records
-    never reach the root handler caplog installs, which would make this
+    applog sets `log.propagate = False` on the 'fauxcasa' logger, so its
+    records never reach the root handler caplog installs, which would make this
     guard pass vacuously — the convention note at
     test_cmd_promote_requires_explicit_library says the same.
 
@@ -18149,8 +18149,8 @@ def test_abandoned_hard_stop_does_not_fire_after_its_run(
     A rc of 0 is itself proof the run beat its own deadline, so anything
     logging TIMEOUT after that is by definition a deadline that outlived
     its run. Asserts on capsys' stderr mirror (applog's _StderrHandler),
-    NOT caplog: the 'fauxcasa' logger sets propagate=False (applog.py:83)
-    on purpose, and a caplog form of this assertion was measured passing
+    NOT caplog: applog sets `log.propagate = False` on the 'fauxcasa'
+    logger on purpose, and a caplog form of this assertion was measured passing
     against the UNFIXED main.py when run alone — vacuous. Same convention,
     and the same reason, as the note on
     test_cmd_promote_requires_explicit_library: caplog cannot reliably see
