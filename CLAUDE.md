@@ -223,4 +223,4 @@ layered catalog → thumbcache → grid/viewer/sidebar:
   document must list every file the app writes (cache-root and per-library),
   since "what does this app touch on my machine" is a trust question users
   ask before running an unsigned binary. See `docs/releases/v0.1.0.md`
-  ("Files this app writes") for the pattern (fauxcasa-p93).
+  ("What Fauxcasa writes on your computer") for the pattern (fauxcasa-p93).

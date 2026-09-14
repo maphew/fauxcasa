@@ -42,6 +42,13 @@ this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
 - Minimum-zoom scrolling on high-DPI displays reads a smaller thumbnail
   level (PR 125).
 
+### Changed (0.1 release push, 2026-09-13)
+
+- README and the 0.1 release notes rewritten for readers who are not
+  programmers: plain-language install, safety and removal answers up
+  front, technical material (download verification, command-line options,
+  provenance, gate status) moved to an appendix, and a fresh screenshot.
+
 
 ### Added
 
