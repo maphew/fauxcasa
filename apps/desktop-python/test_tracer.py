@@ -17778,6 +17778,20 @@ def test_scripted_play_starts_slideshow_offscreen(
     assert win._slideshow.isFullScreen()
 
 
+def test_scripted_faces_flag_shows_viewer_face_boxes(
+        monkeypatch, view_spec_library: Path, tmp_path: Path) -> None:
+    """--faces after --open toggles the viewer's face overlay on (the F
+    key) when the opened photo carries face tags, so a documentation
+    screenshot can show Picasa's face boxes without a keypress."""
+    win = _run_main_capturing_window(monkeypatch, [
+        str(view_spec_library), "--cache-root", str(tmp_path / "cr"),
+        "--view", "person:Ada Example", "--open", "0", "--faces",
+        "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    assert win.pages.currentWidget() is win.viewer
+    assert win.catalog.photos[win.viewer.current_index()].faces
+    assert win.viewer.faces_visible
+
+
 def test_window_size_arg_rejects_junk(monkeypatch) -> None:
     """--window-size reuses --min-image-size's WIDTHxHEIGHT parser, so
     junk is rejected at argparse time (SystemExit 2), before any window

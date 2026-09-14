@@ -4222,6 +4222,10 @@ def main() -> int:
                          "current view; --screenshot then captures the "
                          "slideshow surface instead of the main window "
                          "(screenshot testing)")
+    ap.add_argument("--faces", action="store_true",
+                    help="with --open N: show the viewer's face boxes "
+                         "(the F key) before the screenshot; a no-op on a "
+                         "photo without face tags (screenshot testing)")
     ap.add_argument("--window-size", type=_parse_image_size_arg,
                     metavar="WIDTHxHEIGHT",
                     help="resize the window to exactly WIDTHxHEIGHT "
@@ -4630,7 +4634,7 @@ def main() -> int:
     state = {"scrolled": False, "shot": False, "opened": False,
              "probed": False, "scan_failure_handled": False,
              "viewed": False, "searched": False, "selected": False,
-             "info_set": False, "played": False}
+             "info_set": False, "played": False, "faced": False}
     # A scripted probe (any of the three) implies quit — same set the hard
     # timeout below arms on; reused by check_ready's scan-failure gate
     # (fauxcasa-q6l.13, Codex cross-vendor review finding 2).
@@ -4755,7 +4759,8 @@ def main() -> int:
                     and args.scroll_to is None and args.open is None \
                     and args.search_probe is None and args.view is None \
                     and args.search is None and args.select is None \
-                    and not args.info and not args.play and may_quit():
+                    and not args.info and not args.play \
+                    and not args.faces and may_quit():
                 app.quit()
                 return
         if args.search_probe is not None and not state["probed"]:
@@ -4816,6 +4821,16 @@ def main() -> int:
             if display:
                 pos = max(0, min(len(display) - 1, args.open))
                 win._open_viewer(display[pos], display, pos)
+            return
+        if args.faces and not state["faced"]:
+            # Face boxes come from the catalog, not the decoded original,
+            # so this need not wait for the viewer's load; toggle_faces is
+            # a no-op unless the viewer is current on a face-tagged photo.
+            state["faced"] = True
+            win.viewer.toggle_faces()
+            print(json.dumps({"event": "view", "ok": True, "kind": "faces",
+                              "key": "", "shown": int(win.viewer.faces_visible)}),
+                  flush=True)
             return
         if args.play and not state["played"]:
             state["played"] = True
