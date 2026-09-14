@@ -14,10 +14,14 @@ ingest loss on synthetic corpora." This harness generates (or takes) a
 synthetic picasa-extras corpus (scripts/make-synthetic-library.py
 --picasa-extras), runs BOTH readers over the same tree --
 
-- the survey rollup (scripts/picasa_db.py `_survey_ini_tree`), plus this
-  harness's own filesystem counts for what the ini survey cannot see
-  (photo files, .pal albums, contacts.xml), plus the generator's
-  manifest.json ground truth;
+- the survey rollup (scripts/picasa_db.py `_survey_ini_tree`), which also
+  owns the filesystem counts the ini survey itself cannot see -- photo
+  and video files via its `media` sub-dict, `.pal` albums via
+  `_count_pal_files`, contacts.xml via `_count_contacts_xml` -- plus the
+  generator's manifest.json ground truth. The one walk this harness still
+  does itself is the narrow `.picasaoriginals`/`Originals` scan behind
+  `stashed_fs`, which needs the file LIST for same-name association
+  (fauxcasa-cam.19), not a count;
 - the tracer's `catalog.scan_library` (apps/desktop-python/catalog.py,
   public API only -- this script never modifies the tracer)
 
