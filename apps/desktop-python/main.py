@@ -4913,21 +4913,38 @@ def main() -> int:
     # suite) that later deleted the window got a stale fire into a deleted
     # GridView (rediscovered independently three times before the fix).
     poll = QTimer(win)
+    poll.setObjectName("ready-poll")
     poll.setInterval(50)
     poll.timeout.connect(check_ready)
     poll.start()
     # Hard stop for scripted runs: a stuck decode must fail loudly, not
     # hang CI or masquerade as success.
+    #
+    # Parented and stopped below for the same reason as the poll timer
+    # above (fauxcasa-9pr, the case q6l.15 missed): a bare
+    # QTimer.singleShot belongs to no object and nothing cancels it, so a
+    # run that finishes INSIDE its own deadline leaves the deadline armed
+    # in the shared QApplication. Whichever later in-process run happened
+    # to be in app.exec() when it fired was killed with exit 1 and a log
+    # line quoting the dead run's timeout and state — an ubuntu-only
+    # tracer failure on main, and a latent flake everywhere else.
+    hard_stop = None
     if scripted_run:
         def on_timeout() -> None:
             log.error("TIMEOUT after %ss — ready=%s state=%s",
                       args.timeout, win.ready_reported, state)
             app.exit(1)
 
-        QTimer.singleShot(int(args.timeout * 1000), on_timeout)
+        hard_stop = QTimer(win)
+        hard_stop.setObjectName("scripted-hard-stop")
+        hard_stop.setSingleShot(True)
+        hard_stop.timeout.connect(on_timeout)
+        hard_stop.start(int(args.timeout * 1000))
 
     code = app.exec()
     poll.stop()  # belt to the parenting suspenders: never fire post-exec
+    if hard_stop is not None:
+        hard_stop.stop()
     win.shutdown()  # reap any in-flight cache build cleanly
     rss, hwm = read_rss_mb()
     print(json.dumps({"event": "exit", "vm_rss_mb": round(rss, 1),

@@ -17803,3 +17803,74 @@ def test_window_size_arg_rejects_junk(monkeypatch) -> None:
     with pytest.raises(SystemExit) as exc:
         main.main()
     assert exc.value.code == 2
+
+
+def test_scripted_hard_stop_timer_is_owned_and_disarmed(
+        monkeypatch, library: Path, tmp_path: Path) -> None:
+    """fauxcasa-9pr: the scripted-run hard stop must be a QTimer owned by
+    the window and explicitly disarmed once main() returns, exactly like
+    the READY poll timer (fauxcasa-q6l.15). A bare QTimer.singleShot is
+    owned by nobody and survives the run that armed it."""
+    from PySide6.QtCore import QTimer
+
+    win = _run_main_capturing_window(monkeypatch, [
+        str(library), "--cache-root", str(tmp_path / "cr"),
+        "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    hard_stop = win.findChild(QTimer, "scripted-hard-stop")
+    assert hard_stop is not None, \
+        "scripted run armed its hard stop on no owner"
+    assert not hard_stop.isActive(), \
+        "hard stop still armed after main() returned"
+    poll = win.findChild(QTimer, "ready-poll")
+    assert poll is not None and not poll.isActive(), \
+        "the READY poll outlived the run that armed it (fauxcasa-q6l.15)"
+
+
+def test_abandoned_hard_stop_does_not_fire_after_its_run(
+        monkeypatch, library: Path, tmp_path: Path, capsys) -> None:
+    """fauxcasa-9pr, the behaviour the shape above protects: a scripted
+    run that finishes BEFORE its own --timeout used to leave the deadline
+    armed in the shared QApplication, so it fired into whatever later run
+    happened to be inside app.exec() and killed it with exit 1 — quoting
+    the dead run's timeout and state dict. Seen on main as an ubuntu-only
+    tracer failure (run 34885536050): test_window_size_flag_resizes died
+    on 'TIMEOUT after 10.0s ... scan_failure_handled: True' borrowed from
+    a scan-failure test ten seconds earlier.
+
+    A rc of 0 is itself proof the run beat its own deadline, so anything
+    logging TIMEOUT after that is by definition a deadline that outlived
+    its run. Asserts on capsys' stderr mirror (applog's _StderrHandler),
+    NOT caplog: the 'fauxcasa' logger sets propagate=False (applog.py:83)
+    on purpose, and a caplog form of this assertion was measured passing
+    against the UNFIXED main.py when run alone — vacuous. Same convention,
+    and the same reason, as the note on
+    test_cmd_promote_requires_explicit_library: caplog cannot reliably see
+    this logger. (It is not that it never can — a direct probe does capture
+    from it — so the mechanism is narrower than 'never propagates' and
+    looks ordering-dependent. fauxcasa-47f tracks the sibling test that
+    still uses the caplog form.)"""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(library), "--cache-root", str(tmp_path / "cr"),
+        "--quit-after-ready", "--finish-build", "--timeout", "2"])
+    assert main.main() == 0  # rc 0 => it finished inside its own 2 s deadline
+    capsys.readouterr()      # discard the run's own output
+
+    # Spin the reused QApplication past that abandoned deadline. A slow
+    # runner cannot make this vacuous: it would fail the rc above, loudly,
+    # rather than quietly skip the race.
+    for _ in range(45):  # ~2.7 s
+        loop = QEventLoop()
+        QTimer.singleShot(60, loop.quit)
+        loop.exec()
+        QCoreApplication.processEvents()
+    err = capsys.readouterr().err
+    assert "TIMEOUT after" not in err, \
+        f"the abandoned --timeout fired after its run: {err}"
