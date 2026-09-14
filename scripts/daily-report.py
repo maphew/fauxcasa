@@ -74,9 +74,18 @@ def load_config(root: Path) -> Config:
     key within it, falls back to the fauxcasa-shaped defaults above
     unchanged -- so this script's behaviour in this repo is identical
     whether or not daily-report.toml exists. A *present but malformed*
-    file (bad TOML, or a key of the wrong type) is a hard error rather
-    than a silent fallback: someone meant to configure this and the
-    config is broken, and reporting stale defaults would hide that.
+    file (bad TOML, a section that isn't a table, a key of the wrong
+    type, or an empty gates command) is a hard error rather than a
+    silent fallback or a runtime crash: someone meant to configure this
+    and the config is broken, and reporting stale defaults -- or letting
+    an empty command list reach subprocess.run() and blow up with a bare
+    IndexError -- would hide that (review findings on PR 144).
+
+    An empty [pollution_gate].paths is different: it is accepted as a
+    deliberate "disable this gate" (legitimate for a repo that doesn't
+    use fauxcasa's Dolt-sync .beads/issues.jsonl-untracked convention --
+    this script is repo-agnostic now). _pollution_gate() reports that
+    state explicitly rather than printing a vacuous PASS.
     """
     path = root / CONFIG_FILENAME
     if not path.exists():
@@ -87,11 +96,19 @@ def load_config(root: Path) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"{path}: invalid TOML: {exc}") from exc
 
-    gates_command = data.get("gates", {}).get("command", DEFAULT_GATES_COMMAND)
+    gates_section = data.get("gates", {})
+    if not isinstance(gates_section, dict):
+        raise ValueError(f"{path}: [gates] must be a table, got {gates_section!r}")
+    gates_command = gates_section.get("command", DEFAULT_GATES_COMMAND)
     if not (isinstance(gates_command, list) and all(isinstance(c, str) for c in gates_command)):
         raise ValueError(f"{path}: [gates].command must be a list of strings, got {gates_command!r}")
+    if not gates_command:
+        raise ValueError(f"{path}: [gates].command must not be empty")
 
-    pollution_paths = data.get("pollution_gate", {}).get("paths", DEFAULT_POLLUTION_PATHS)
+    pollution_section = data.get("pollution_gate", {})
+    if not isinstance(pollution_section, dict):
+        raise ValueError(f"{path}: [pollution_gate] must be a table, got {pollution_section!r}")
+    pollution_paths = pollution_section.get("paths", DEFAULT_POLLUTION_PATHS)
     if not (isinstance(pollution_paths, list) and all(isinstance(p, str) for p in pollution_paths)):
         raise ValueError(f"{path}: [pollution_gate].paths must be a list of strings, got {pollution_paths!r}")
 
@@ -271,7 +288,16 @@ def _pollution_gate(root: Path, paths: list[str]) -> tuple[list[str], bool]:
     (rc 1) is a PASS: rc 0 means git tracks the path (pollution), and
     anything else (128 corrupt index, timeout, missing git) is an
     operational error that must FAIL rather than silently pass (Codex
-    review finding). The overall gate passes only if every path passes."""
+    review finding). The overall gate passes only if every path passes.
+
+    An empty paths list is a deliberate "no pollution gate configured"
+    for this repo, not a mistake (see load_config()) -- reported as
+    explicitly disabled rather than a PASS with nothing underneath it
+    that would look identical to "checked and clean" (PR 144 review
+    finding)."""
+    if not paths:
+        return ["Pollution gate: disabled ([pollution_gate].paths is empty)"], True
+
     lines = [f"Pollution gate ({', '.join(paths)} must be untracked):"]
     gate_passed = True
     for path in paths:
