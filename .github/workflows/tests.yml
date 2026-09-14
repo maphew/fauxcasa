@@ -27,6 +27,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv run scripts/test_delegation_report.py -q
+      # daily-report.py's daily-report.toml config parsing (fauxcasa-nn9)
+      - run: uv run scripts/test_daily_report.py -q
 
   picasa-db:
     strategy:

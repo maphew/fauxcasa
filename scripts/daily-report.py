@@ -1,24 +1,32 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""One-shot daily status/health report for this repo (fauxcasa).
+"""One-shot daily status/health report for this repo.
 
 Composes a single readable console report from five sections, in order:
 
   1. Git         - fetch, branch/ahead-behind, dirty/clean, worktree list.
   2. CI           - recent gh workflow runs and open PRs (gh CLI).
   3. Beads health - bd stats/ready/in-progress/stale/orphans, plus the
-                    .beads/issues.jsonl pollution gate.
-  4. Delegation   - uv run scripts/delegation-report.py --since <date>.
-  5. Quality      - optional (--gates): uv run scripts/preflight.py --fast.
+                    pollution gate for paths configured in [pollution_gate].
+  4. Delegation   - uv run scripts/delegation-report.py --since <date>
+                    --dir <this repo's Claude Code transcript dir>.
+  5. Quality      - optional (--gates): runs the [gates] command from
+                    config (default: uv run scripts/preflight.py --fast).
 
 Degrades gracefully: a missing `gh` or `bd` binary prints a one-line
 warning for that section and the report continues. The only things that
-can fail the exit code are actual gate failures (the beads-jsonl pollution
-gate, or preflight when --gates is passed) -- unavailable tools are
+can fail the exit code are actual gate failures (the pollution gate, or
+the gates command when --gates is passed) -- unavailable tools are
 warnings, not failures.
+
+Repo-specific behaviour (the gates command and the pollution-gate paths)
+is read from a repo-root `daily-report.toml`, see load_config() below. A
+missing file, or a missing key within it, falls back to this script's
+built-in fauxcasa-shaped defaults -- so this script works unmodified in
+any repo, configured or not.
 
 Usage:
   uv run scripts/daily-report.py
@@ -33,13 +41,77 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
+import tomllib
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
 DEFAULT_TIMEOUT = 120  # seconds
 SECTIONS = ["git", "ci", "beads", "delegation", "gates"]
+
+CONFIG_FILENAME = "daily-report.toml"
+
+# fauxcasa's own values -- also committed explicitly as daily-report.toml
+# (fauxcasa-nn9), so these constants are what any *other* repo gets when it
+# has no config file at all.
+DEFAULT_GATES_COMMAND = ["uv", "run", "scripts/preflight.py", "--fast"]
+DEFAULT_POLLUTION_PATHS = [".beads/issues.jsonl"]
+
+
+@dataclass
+class Config:
+    gates_command: list[str] = field(default_factory=lambda: list(DEFAULT_GATES_COMMAND))
+    pollution_paths: list[str] = field(default_factory=lambda: list(DEFAULT_POLLUTION_PATHS))
+
+
+def load_config(root: Path) -> Config:
+    """Load daily-report.toml from the repo root, if present.
+
+    A missing file, or a missing [gates]/command or [pollution_gate]/paths
+    key within it, falls back to the fauxcasa-shaped defaults above
+    unchanged -- so this script's behaviour in this repo is identical
+    whether or not daily-report.toml exists. A *present but malformed*
+    file (bad TOML, or a key of the wrong type) is a hard error rather
+    than a silent fallback: someone meant to configure this and the
+    config is broken, and reporting stale defaults would hide that.
+    """
+    path = root / CONFIG_FILENAME
+    if not path.exists():
+        return Config()
+
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"{path}: invalid TOML: {exc}") from exc
+
+    gates_command = data.get("gates", {}).get("command", DEFAULT_GATES_COMMAND)
+    if not (isinstance(gates_command, list) and all(isinstance(c, str) for c in gates_command)):
+        raise ValueError(f"{path}: [gates].command must be a list of strings, got {gates_command!r}")
+
+    pollution_paths = data.get("pollution_gate", {}).get("paths", DEFAULT_POLLUTION_PATHS)
+    if not (isinstance(pollution_paths, list) and all(isinstance(p, str) for p in pollution_paths)):
+        raise ValueError(f"{path}: [pollution_gate].paths must be a list of strings, got {pollution_paths!r}")
+
+    return Config(gates_command=list(gates_command), pollution_paths=list(pollution_paths))
+
+
+def claude_transcript_dir(root: Path) -> Path:
+    """This repo's Claude Code transcript directory under ~/.claude/projects.
+
+    Claude Code munges the absolute project path into a directory name by
+    replacing every character that isn't a letter or digit with '-'
+    (verified empirically against ~/.claude/projects/ entries, e.g.
+    "A:\\dev\\fauxcasa" -> "A--dev-fauxcasa", and a worktree path's
+    ".claude\\worktrees\\<name>" suffix mangles the same way). Deriving
+    this from the actual repo root -- rather than delegation-report.py's
+    own hardcoded fauxcasa-shaped default -- makes it correct for
+    worktrees too, not just the primary checkout.
+    """
+    munged = re.sub(r"[^a-zA-Z0-9]", "-", str(root))
+    return Path.home() / ".claude" / "projects" / munged
 
 
 def repo_root() -> Path:
@@ -193,26 +265,29 @@ def section_ci(root: Path) -> str:
 # Section: Beads health
 # ---------------------------------------------------------------------------
 
-def _pollution_gate(root: Path) -> tuple[list[str], bool]:
-    """The .beads/issues.jsonl untracked gate. Only the expected
-    no-match exit (rc 1) is a PASS: rc 0 means git tracks the file
-    (pollution), and anything else (128 corrupt index, timeout, missing
-    git) is an operational error that must FAIL rather than silently
-    pass (Codex review finding)."""
-    gate_rc, gate_out, gate_err = run(
-        ["git", "ls-files", "--error-unmatch", "--", ".beads/issues.jsonl"],
-        cwd=root)
-    gate_passed = gate_rc == 1
-    lines = ["Pollution gate (.beads/issues.jsonl must be untracked):",
-             f"  [{'PASS' if gate_passed else 'FAIL'}] git ls-files --error-unmatch -- .beads/issues.jsonl"]
-    if gate_rc == 0:
-        lines.append("    .beads/issues.jsonl is tracked by git -- this is pollution.")
-    elif gate_rc != 1:
-        lines.append(f"    operational error (rc={gate_rc}): {_text(gate_out, gate_err)}")
+def _pollution_gate(root: Path, paths: list[str]) -> tuple[list[str], bool]:
+    """The untracked-paths gate (config: [pollution_gate].paths, default
+    .beads/issues.jsonl). For each path, only the expected no-match exit
+    (rc 1) is a PASS: rc 0 means git tracks the path (pollution), and
+    anything else (128 corrupt index, timeout, missing git) is an
+    operational error that must FAIL rather than silently pass (Codex
+    review finding). The overall gate passes only if every path passes."""
+    lines = [f"Pollution gate ({', '.join(paths)} must be untracked):"]
+    gate_passed = True
+    for path in paths:
+        gate_rc, gate_out, gate_err = run(
+            ["git", "ls-files", "--error-unmatch", "--", path], cwd=root)
+        path_passed = gate_rc == 1
+        gate_passed = gate_passed and path_passed
+        lines.append(f"  [{'PASS' if path_passed else 'FAIL'}] git ls-files --error-unmatch -- {path}")
+        if gate_rc == 0:
+            lines.append(f"    {path} is tracked by git -- this is pollution.")
+        elif gate_rc != 1:
+            lines.append(f"    operational error (rc={gate_rc}): {_text(gate_out, gate_err)}")
     return lines, gate_passed
 
 
-def section_beads(root: Path) -> tuple[str, bool]:
+def section_beads(root: Path, pollution_paths: list[str]) -> tuple[str, bool]:
     """Return (report_text, pollution_gate_passed)."""
     lines = [_header("3. BEADS HEALTH"), ""]
 
@@ -220,7 +295,7 @@ def section_beads(root: Path) -> tuple[str, bool]:
     if bd_check_rc != 0:
         lines.append("bd unavailable: bd CLI not found on PATH")
         lines.append("")
-        gate_lines, gate_passed = _pollution_gate(root)
+        gate_lines, gate_passed = _pollution_gate(root, pollution_paths)
         lines.extend(gate_lines)
         return "\n".join(lines), gate_passed
 
@@ -240,7 +315,7 @@ def section_beads(root: Path) -> tuple[str, bool]:
             lines.append(f"  [error] rc={rc}: {_trim(_text(out, err))}")
         lines.append("")
 
-    gate_lines, gate_passed = _pollution_gate(root)
+    gate_lines, gate_passed = _pollution_gate(root, pollution_paths)
     lines.extend(gate_lines)
     return "\n".join(lines), gate_passed
 
@@ -249,10 +324,11 @@ def section_beads(root: Path) -> tuple[str, bool]:
 # Section: Delegation report
 # ---------------------------------------------------------------------------
 
-def section_delegation(root: Path, since: str) -> str:
+def section_delegation(root: Path, since: str, transcript_dir: Path) -> str:
     lines = [_header("4. DELEGATION REPORT"), ""]
     rc, out, err = run(
-        ["uv", "run", "scripts/delegation-report.py", "--since", since],
+        ["uv", "run", "scripts/delegation-report.py", "--since", since,
+         "--dir", str(transcript_dir)],
         cwd=root, timeout=180)
     if rc == 0:
         lines.append(out)
@@ -266,17 +342,16 @@ def section_delegation(root: Path, since: str) -> str:
 # Section: Quality gates
 # ---------------------------------------------------------------------------
 
-def section_gates(root: Path, enabled: bool) -> tuple[str, bool]:
+def section_gates(root: Path, enabled: bool, gates_command: list[str]) -> tuple[str, bool]:
     """Return (report_text, gates_passed_or_skipped)."""
     lines = [_header("5. QUALITY GATES"), ""]
+    cmd_str = " ".join(gates_command)
     if not enabled:
-        lines.append("Skipped (pass --gates to run uv run scripts/preflight.py --fast).")
+        lines.append(f"Skipped (pass --gates to run {cmd_str}).")
         return "\n".join(lines), True
 
-    rc, out, err = run(
-        ["uv", "run", "scripts/preflight.py", "--fast"],
-        cwd=root, timeout=10 * 60)
-    lines.append(f"uv run scripts/preflight.py --fast  (rc={rc})")
+    rc, out, err = run(gates_command, cwd=root, timeout=10 * 60)
+    lines.append(f"{cmd_str}  (rc={rc})")
     lines.append(_trim(_text(out, err), max_lines=60))
     return "\n".join(lines), rc == 0
 
@@ -319,7 +394,8 @@ def main() -> int:
     parser.add_argument(
         "--gates",
         action="store_true",
-        help="Also run uv run scripts/preflight.py --fast (off by default)",
+        help=f"Also run the [gates] command from {CONFIG_FILENAME} "
+             f"(default: {' '.join(DEFAULT_GATES_COMMAND)}; off by default)",
     )
     parser.add_argument(
         "--skip",
@@ -335,6 +411,13 @@ def main() -> int:
     since = args.since or (date.today() - timedelta(days=7)).isoformat()
 
     root = repo_root()
+    try:
+        config = load_config(root)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    transcript_dir = claude_transcript_dir(root)
+
     report_sections: list[str] = []
     gates_ok = True
 
@@ -343,13 +426,13 @@ def main() -> int:
     if "ci" not in skip:
         report_sections.append(section_ci(root))
     if "beads" not in skip:
-        text, pollution_ok = section_beads(root)
+        text, pollution_ok = section_beads(root, config.pollution_paths)
         report_sections.append(text)
         gates_ok = gates_ok and pollution_ok
     if "delegation" not in skip:
-        report_sections.append(section_delegation(root, since))
+        report_sections.append(section_delegation(root, since, transcript_dir))
     if "gates" not in skip:
-        text, ok = section_gates(root, args.gates)
+        text, ok = section_gates(root, args.gates, config.gates_command)
         report_sections.append(text)
         gates_ok = gates_ok and ok
 
