@@ -166,3 +166,14 @@ stack choice cannot weaken the isolation requirement.
   image) — accepted: confidentiality/integrity of the *archive* is
   preserved; rendering integrity of a hostile file is not a protected
   asset.
+- **A bare, unconnected `socket()` call inside the AppContainer
+  succeeds, ratified as inert (fauxcasa-i92.6).** WinSock's `socket()`
+  is a local kernel-object allocation with no capability check, so it
+  always succeeds; a zero-capability AppContainer holds no network
+  capabilities and blocks loopback by default (lifting that needs an
+  explicit `CheckNetIsolation LoopbackExempt`), so WFP denies every
+  actual I/O attempt, including `connect`, `send`, `bind`, `listen`,
+  `sendto`, and `getaddrinfo`, as the i92.3 probes confirm. This is
+  invalidated if the worker's AppContainer is ever granted a loopback
+  exemption or any network capability, at which point socket creation
+  itself would need to be blocked.
