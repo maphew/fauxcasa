@@ -2155,6 +2155,120 @@ def test_index_activity_row_is_prominent_and_determinate(
     assert win.activity_row.isHidden()
 
 
+def test_status_text_never_raises_the_window_resize_floor(
+        library: Path) -> None:
+    """fauxcasa-a3m: a long status/activity string must not become the
+    window's minimum width.
+
+    QMainWindow enforces its layout's minimum size as a hard resize
+    floor, and a plain QLabel with word wrap off reports its full
+    sizeHint as its minimumSizeHint. So selecting a photo under a deep
+    path used to push the floor past 2700px: the window could be dragged
+    bigger but never smaller, and the next relayout (the activity row
+    appearing) grew the window to the new floor on its own. ElidingLabel
+    decouples the two -- the floor is whatever the real chrome needs and
+    stays there no matter how long the text gets."""
+    import main
+
+    _offscreen_app()
+    win = main.MainWindow(scan_library(library), None,
+                          cache_dir=None, build_dir=None)
+    win.resize(700, 600)
+    win.show()
+    # Baseline with every text-carrying widget already VISIBLE but empty,
+    # so the comparison below isolates the TEXT. Showing the activity row
+    # does legitimately raise the floor a little (activity_progress has a
+    # real 280px minimum), and that structural cost is not what a3m is
+    # about; only text-driven growth is.
+    win.decode_sandbox_label.setVisible(True)
+    win.activity_row.show()
+    floor = win.minimumSizeHint().width()
+
+    long_text = (r"C:\Users\Someone\Pictures\2019\Summer Vacation Trip"
+                 r"\IMG_20190712_143512_a_very_long_filename.jpg"
+                 "   sunset over the bay   keywords: beach, family, "
+                 "vacation, sunset, ocean, holiday, coastline") * 2
+    win.meta_label.setText(long_text)
+    win.counts_label.setText(long_text)
+    win.progress_label.setText(long_text)
+    win.decode_sandbox_label.setText(long_text)
+    win.activity_label.setText(long_text)
+
+    assert win.minimumSizeHint().width() <= floor, \
+        "status text widened the window's minimum size"
+    # ...and the floor is small enough to actually be a floor, not the
+    # 2700px trap this test exists to catch.
+    assert win.minimumSizeHint().width() < 700
+    # The window must also not have GROWN itself to a new floor.
+    assert win.width() == 700
+
+    # The text is elided for display only: callers and tests still read
+    # the full string back, and the cut part is a hover away.
+    assert win.meta_label.text() == long_text
+    win.meta_label.grab()          # force a paint -> tooltip refresh
+    assert long_text in win.meta_label.toolTip()
+
+
+def test_eliding_label_leaves_short_text_and_owned_tooltips_alone(
+        library: Path) -> None:
+    """fauxcasa-a3m: ElidingLabel only intervenes when the text does not
+    fit. Text that fits paints through QLabel untouched and gets no
+    tooltip (an ellipsis-free label with a hover repeating itself is
+    noise), and auto_tooltip=False labels keep the tooltip their owner
+    set -- decode_sandbox_label shows the degrade reason there, which an
+    eliding tooltip would otherwise overwrite."""
+    import main
+
+    _offscreen_app()
+    win = main.MainWindow(scan_library(library), None,
+                          cache_dir=None, build_dir=None)
+    win.resize(900, 600)
+    win.show()
+
+    # Sized explicitly rather than trusting the status bar's layout: the
+    # contract under test is "the text fits", and a widget's allocated
+    # width inside a just-shown window is not settled enough to assert on.
+    fits = main.ElidingLabel()
+    fits.setText("a.jpg")
+    fits.resize(400, 16)
+    fits.grab()
+    assert fits.toolTip() == ""
+    # ...and once it stops fitting, the tooltip appears.
+    fits.resize(20, 16)
+    fits.grab()
+    assert fits.toolTip() == "a.jpg"
+
+    win.decode_sandbox_label.setToolTip("worker exited: STATUS_ACCESS_DENIED")
+    win.decode_sandbox_label.setText(
+        "Decoding is not sandboxed on this machine: " + "x" * 400)
+    win.decode_sandbox_label.setVisible(True)
+    win.decode_sandbox_label.resize(120, 16)
+    win.decode_sandbox_label.grab()
+    assert win.decode_sandbox_label.toolTip() == \
+        "worker exited: STATUS_ACCESS_DENIED"
+
+
+def test_eliding_label_tooltip_never_renders_catalog_text_as_markup(
+) -> None:
+    """fauxcasa-a3m + fauxcasa-6vk finding 7: the auto tooltip carries
+    catalog text (captions, keywords, paths), and QToolTip has no
+    plain-text mode -- it hands the string to an AutoText QLabel. A
+    caption of '<img src=http://…>' must reach the tooltip as escaped
+    HTML, not as a fetched external image."""
+    from PySide6.QtCore import QSize
+    import main
+
+    _offscreen_app()
+    label = main.ElidingLabel()
+    label.setText('<img src=http://example.invalid/x.png> ' + "y" * 300)
+    label.resize(60, 16)
+    label.grab()
+    tip = label.toolTip()
+    assert "&lt;img" in tip or tip.startswith("<html>")
+    assert "<img src=" not in tip
+    assert isinstance(label.minimumSizeHint(), QSize)
+
+
 def test_index_finished_status_reads_library_ready(
         library: Path, tmp_path: Path) -> None:
     """fauxcasa-ez2.6 §7: the completion status bar message is a plain

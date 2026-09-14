@@ -77,7 +77,13 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QActionGroup, QIcon, QKeySequence, QPalette
+from PySide6.QtGui import (
+    QActionGroup,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPalette,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -94,6 +100,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStatusBar,
+    QStyle,
+    QStyleOption,
     QToolBar,
     QToolButton,
     QTreeWidget,
@@ -1250,6 +1258,106 @@ def _folder_tooltip(path, description: str | None) -> str:
     return _plain_tooltip(tip)
 
 
+class ElidingLabel(QLabel):
+    """A QLabel whose MINIMUM width does not track its text (fauxcasa-a3m).
+
+    QLabel.minimumSizeHint() returns the full sizeHint when word wrap is
+    off, and QMainWindow enforces its layout's minimum as a hard resize
+    floor. So a status-bar label holding one deep path silently became
+    the window's minimum width: selecting a photo under a long folder
+    name pushed the floor past 2700px, and from then on the user could
+    drag the window bigger but never smaller. Worse, the floor is
+    enforced on the NEXT relayout, so the activity row appearing yanked
+    the window wider on its own.
+
+    Eliding at paint time fixes both ends without hiding anything:
+
+    - text() still returns the string the caller set, so status wording
+      stays readable by callers and tests (nothing downstream has to
+      know a label elides);
+    - sizeHint() is untouched, so the layout still asks for the full
+      width whenever there is room and the text is not elided at all;
+    - minimumSizeHint() collapses to a fixed ellipsis-width stub, so
+      the text can never move the window's floor;
+    - the full string goes to the tooltip while it is elided, so the
+      part that got cut is a hover away rather than lost.
+
+    Tooltip text goes through _plain_tooltip for the usual reason
+    (fauxcasa-6vk finding 7): these labels carry catalog text -- paths,
+    captions, keywords, album and people names -- and a caption of
+    "<img src=http://...>" would otherwise be INTERPRETED by the
+    tooltip's AutoText QLabel. Pass auto_tooltip=False where the label
+    already owns its tooltip for something else (decode_sandbox_label
+    shows the degrade reason there).
+    """
+
+    def __init__(self, parent: QWidget | None = None, *,
+                 mode: Qt.TextElideMode = Qt.TextElideMode.ElideRight,
+                 auto_tooltip: bool = True) -> None:
+        super().__init__(parent)
+        self._elide_mode = mode
+        self._auto_tooltip = auto_tooltip
+        # Same PlainText discipline as the QLabels this replaces
+        # (fauxcasa-6vk finding 7) -- set here so no call site can
+        # forget it.
+        self.setTextFormat(Qt.TextFormat.PlainText)
+
+    def _text_width(self) -> int:
+        return self.fontMetrics().horizontalAdvance(self.text())
+
+    def _text_rect(self):
+        """The area QLabel would draw text into: contents minus the
+        indent/margin QLabel applies on top of contentsRect()."""
+        rect = self.contentsRect()
+        m = self.margin()
+        rect = rect.adjusted(m, m, -m, -m)
+        indent = self.indent()
+        if indent < 0:                       # QLabel's own default rule
+            indent = 0
+        if self.alignment() & Qt.AlignmentFlag.AlignRight:
+            rect.setRight(rect.right() - indent)
+        else:
+            rect.setLeft(rect.left() + indent)
+        return rect
+
+    def minimumSizeHint(self) -> QSize:
+        base = super().minimumSizeHint()
+        if not self.text():
+            return base
+        fm = self.fontMetrics()
+        # Room for the ellipsis plus a couple of characters, so a
+        # squeezed label still reads as truncated text rather than as a
+        # rendering glitch -- and the chrome QLabel adds around it.
+        stub = fm.horizontalAdvance("\u2026") + 2 * fm.averageCharWidth()
+        margins = self.contentsMargins()
+        chrome = (margins.left() + margins.right()
+                  + 2 * self.margin() + max(self.indent(), 0))
+        return QSize(min(base.width(), stub + chrome), base.height())
+
+    def paintEvent(self, event) -> None:
+        rect = self._text_rect()
+        if not self.text() or self._text_width() <= rect.width():
+            if self._auto_tooltip and self.toolTip():
+                self.setToolTip("")
+            super().paintEvent(event)
+            return
+        if self._auto_tooltip:
+            self.setToolTip(_plain_tooltip(self.text()))
+        painter = QPainter(self)
+        # Let the style paint the widget's own background/border first:
+        # a QLabel under a style sheet (activity_label inherits the
+        # activity row's) gets nothing otherwise.
+        opt = QStyleOption()
+        opt.initFrom(self)
+        self.style().drawPrimitive(
+            QStyle.PrimitiveElement.PE_Widget, opt, painter, self)
+        painter.setPen(opt.palette.color(self.foregroundRole()))
+        painter.drawText(
+            rect, int(self.alignment()),
+            self.fontMetrics().elidedText(
+                self.text(), self._elide_mode, rect.width()))
+
+
 def _offline_root_labels(catalog: Catalog) -> list[str]:
     """Sidebar/status-bar badge labels for offline roots (design §12, bead
     .e). Only meaningful once a library actually HAS more than one root —
@@ -1791,11 +1899,12 @@ class MainWindow(QMainWindow):
             "#d6bd62;")
         activity_lay = QHBoxLayout(self.activity_row)
         activity_lay.setContentsMargins(12, 6, 12, 6)
-        self.activity_label = QLabel()
         # Carries the library root's folder NAME ("Scanning <root>…"):
         # user-authored text, so never let AutoText read it as markup
-        # (fauxcasa-6vk finding 7).
-        self.activity_label.setTextFormat(Qt.TextFormat.PlainText)
+        # (fauxcasa-6vk finding 7); ElidingLabel sets PlainText itself.
+        # Eliding also keeps a deep root name out of the window's resize
+        # floor (fauxcasa-a3m).
+        self.activity_label = ElidingLabel()
         self.activity_label.setStyleSheet("font-weight: 600; border: none;")
         self.activity_progress = QProgressBar()
         # The count/percent live in activity_label instead (fauxcasa-ez2.6):
@@ -1838,12 +1947,17 @@ class MainWindow(QMainWindow):
         # 7): counts_label carries album and people names, meta_label the
         # caption/keywords/path readout. A QLabel left in the default
         # AutoText format INTERPRETS a caption of "<b>beach</b>".
-        self.counts_label = QLabel()
-        self.counts_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.progress_label = QLabel()
-        self.progress_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.meta_label = QLabel()
-        self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
+        # All three elide (fauxcasa-a3m): a status label's text used to
+        # BE the window's minimum width, so one long caption or path
+        # stopped the window shrinking. ElidingLabel keeps the PlainText
+        # discipline above and puts the full string in the tooltip while
+        # it is cut. meta_label leads with an on-disk path, so it elides
+        # in the middle: the filename at the tail is the half worth
+        # keeping.
+        self.counts_label = ElidingLabel()
+        self.progress_label = ElidingLabel()
+        self.meta_label = ElidingLabel(
+            mode=Qt.TextElideMode.ElideMiddle)
         # Import-report count (fauxcasa-cam.13; button fauxcasa-ez2.13): a
         # flat QToolButton (not a QLabel) reading "N import notes" that
         # opens a read-only dialog listing the report entries — deliberately
@@ -1858,8 +1972,9 @@ class MainWindow(QMainWindow):
         # is the import-report count (_update_import_notes), a different
         # concern with its own show/hide lifecycle; sharing it would let
         # one overwrite the other. Hidden unless state == "degraded".
-        self.decode_sandbox_label = QLabel()
-        self.decode_sandbox_label.setTextFormat(Qt.TextFormat.PlainText)
+        # auto_tooltip=False: this one already owns its tooltip below
+        # (the degrade reason), which an eliding tooltip would clobber.
+        self.decode_sandbox_label = ElidingLabel(auto_tooltip=False)
         self.decode_sandbox_label.setVisible(False)
         self.statusBar().addWidget(self.counts_label)
         self.statusBar().addWidget(self.progress_label)
