@@ -5,7 +5,11 @@ albums, people, stars and captions, on your own computer. It is a free
 program that reads the photo folders and Picasa files you already have.
 It never changes your photos or Picasa's files.
 
-![The Fauxcasa window: folders, albums and people down the left, photos grouped by folder on the right](docs/releases/v0.1.0-gallery.png)
+![The Fauxcasa window: folders, albums and people down the left, photos grouped by folder on the right, with stars and place markers on the thumbnails](docs/releases/gallery/gallery.jpg)
+
+The [release notes](docs/releases/v0.1.0.md#what-it-looks-like) have more
+pictures: the photo viewer, face boxes, an album, a person, search, the
+Info panel and the slideshow.
 
 Fauxcasa is early software. Version 0.1 is for looking, not changing: you
 can browse, search and view your photos, but not edit, tag or export them
