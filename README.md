@@ -3,7 +3,7 @@
 Fauxcasa shows you your Picasa photo library again: the same folders,
 albums, people, stars and captions, on your own computer. It is a free
 program that reads the photo folders and Picasa files you already have.
-It never changes them.
+It never changes your photos or Picasa's files.
 
 ![The Fauxcasa window: folders, albums and people down the left, photos grouped by folder on the right](docs/releases/v0.1.0-gallery.png)
 
@@ -17,12 +17,13 @@ try on your own photos and easy to remove again.
 1. Download the current version from the
    [releases page](https://github.com/maphew/fauxcasa/releases/latest).
    Windows 10 or 11: the file ending in `windows-x64.zip`. Linux: the file
-   ending in `linux-x64.tar.gz`.
+   ending in `linux-x64.tar.gz`. (The "x64" means a 64-bit computer,
+   which is almost every PC made in the last decade.)
 2. **Windows:** right-click the zip, choose **Extract All**, open the new
    folder, and double-click `fauxcasa.exe`. Keep the folder together; the
    program needs the other files next to it.
    **Linux:** extract the archive and run the `fauxcasa` program inside
-   the extracted folder.
+   the extracted folder. The folder can live anywhere you like.
 3. Choose the folder that holds your photos. If Picasa is installed on the
    same Windows PC, Fauxcasa also offers to open the folders Picasa
    watched.
@@ -54,7 +55,8 @@ If you prefer, right-click the zip before extracting, open
 - Because it only reads, a crash cannot damage your photos. At worst
   Fauxcasa has to rebuild its own thumbnails.
 - It has no online features. It never connects to the internet: no
-  accounts, no uploads, no update checks, no usage reports.
+  accounts, no uploads, no update checks, no usage reports. A firewall
+  that asks per program will never ask about it.
 - Everything it makes for itself (a list of your photos and their
   thumbnails) lives in one folder of its own, away from your photos. On
   Windows, paste `%LOCALAPPDATA%\Fauxcasa` into the File Explorer address
