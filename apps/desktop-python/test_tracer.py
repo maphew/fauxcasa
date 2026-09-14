@@ -17840,10 +17840,15 @@ def test_abandoned_hard_stop_does_not_fire_after_its_run(
     A rc of 0 is itself proof the run beat its own deadline, so anything
     logging TIMEOUT after that is by definition a deadline that outlived
     its run. Asserts on capsys' stderr mirror (applog's _StderrHandler),
-    NOT caplog: the 'fauxcasa' logger sets propagate=False (applog.py:82)
-    so its records never reach the root handler caplog installs, which
-    would make this guard pass vacuously — the convention note at
-    test_cmd_promote_requires_explicit_library says the same."""
+    NOT caplog: the 'fauxcasa' logger sets propagate=False (applog.py:83)
+    on purpose, and a caplog form of this assertion was measured passing
+    against the UNFIXED main.py when run alone — vacuous. Same convention,
+    and the same reason, as the note on
+    test_cmd_promote_requires_explicit_library: caplog cannot reliably see
+    this logger. (It is not that it never can — a direct probe does capture
+    from it — so the mechanism is narrower than 'never propagates' and
+    looks ordering-dependent. fauxcasa-47f tracks the sibling test that
+    still uses the caplog form.)"""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
