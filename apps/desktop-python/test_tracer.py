@@ -2390,14 +2390,29 @@ def test_eliding_label_paints_like_a_qlabel_when_it_elides() -> None:
     # QStyle.visualAlignment: swapping in a plain painter.drawText with
     # logical alignment leaves the text on the left and fails here,
     # which is the whole reason this test is worth its length.
+    # Measured the same way as assertion 3, and for the same reason: an
+    # absolute "ink reaches x >= 85" threshold is font-dependent and fails
+    # on DejaVu Sans while passing on Segoe UI. The claim here is a
+    # relation, not a coordinate -- under RTL an explicit AlignLeft must
+    # land exactly where LTR AlignRight lands, and nowhere near where LTR
+    # AlignLeft lands. The indent (applied to the VISUAL aligned edge)
+    # keeps those two places far apart on any font.
     rtl = main.ElidingLabel()
-    rtl.setText(long_text)
     rtl.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
     rtl.setAlignment(Qt.AlignmentFlag.AlignLeft
                      | Qt.AlignmentFlag.AlignVCenter)
-    _n, _lo, rtl_hi = hits(render(rtl), dark, tol=100)
-    assert rtl_hi >= 85, \
-        "RTL label used logical alignment instead of visual"
+    rtl.setIndent(INDENT)
+    rtl.setText(long_text)
+    rtl_n, rtl_lo, rtl_hi = hits(render(rtl), dark, tol=100)
+    assert rtl_n > 0, "RTL elided text was not painted at all"
+    assert abs(rtl_lo - r_lo) <= 2 and abs(rtl_hi - r_hi) <= 2, (
+        "RTL label used logical alignment instead of visual: AlignLeft "
+        f"under RTL painted at {rtl_lo}-{rtl_hi}, but LTR AlignRight "
+        f"paints at {r_lo}-{r_hi}")
+    assert abs(rtl_lo - l_lo) > 4, (
+        "RTL AlignLeft landed on top of LTR AlignLeft, so this assertion "
+        f"cannot tell visual from logical alignment (both {rtl_lo}-"
+        f"{rtl_hi})")
 
 
 def test_eliding_label_tooltip_never_renders_catalog_text_as_markup(
