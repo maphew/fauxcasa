@@ -37,28 +37,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from catalog import Photo, format_date_taken, format_geotag
+from catalog import Photo, format_date_taken, format_file_size, format_geotag
 
 PANEL_WIDTH = 280  # sizeHint only — the owning splitter owns actual size.
 
 _NAME_STYLE = "color: #888;"
 _STATE_STYLE = "color: #888; padding: 12px;"
-
-
-def _human_size(n: int) -> str:
-    """KB/MB/GB with one decimal (spec); plain bytes below 1 KB. Videos
-    are in scope (Photo.media), so the GB tier is real, not theoretical.
-    Caller guarantees n >= 0 (negative = unindexed, filtered out before
-    here)."""
-    if n < 1024:
-        return f"{n} B"
-    kb = n / 1024
-    if kb < 1024:
-        return f"{kb:.1f} KB"
-    mb = kb / 1024
-    if mb < 1024:
-        return f"{mb:.1f} MB"
-    return f"{mb / 1024:.1f} GB"
 
 
 def _rows_for(photo: Photo, album_names: list[str]) -> list[tuple[str, str]]:
@@ -86,7 +70,7 @@ def _rows_for(photo: Photo, album_names: list[str]) -> list[tuple[str, str]]:
         rows.append(("Dimensions", f"{w} × {h}"))
 
     if photo.size >= 0:  # -1 = unindexed (spec)
-        rows.append(("Size", _human_size(photo.size)))
+        rows.append(("Size", format_file_size(photo.size)))
 
     if photo.mtime >= 0:  # -1 = unindexed (spec)
         stamp = datetime.fromtimestamp(photo.mtime)

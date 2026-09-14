@@ -6735,7 +6735,7 @@ def test_status_readout_dims_and_size(library: Path) -> None:
     # present: dims and size both populated
     win._photo_selected(idx)
     text = win.meta_label.text()
-    assert "3648x2736" in text
+    assert "3648 × 2736" in text
     assert "2.1 MB" in text
 
     # absent: dims=None, size=-1 — omit cleanly
@@ -6743,7 +6743,7 @@ def test_status_readout_dims_and_size(library: Path) -> None:
     a.size = -1
     win._photo_selected(idx)
     text2 = win.meta_label.text()
-    assert "3648x2736" not in text2
+    assert "3648 × 2736" not in text2
     assert " MB" not in text2
     assert " KB" not in text2
 
