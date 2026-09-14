@@ -17600,3 +17600,192 @@ def test_sidebar_menu_ignores_folders_root_click_for_view_selection(
         if h.data(0, Qt.ItemDataRole.UserRole) == ("folders_root", ""))
     win._sidebar_clicked(folders_header, 0)
     assert win.grid.display == before
+
+
+# ---------------------------------------------------------------------------
+# Scripted-run screenshot flags (--view/--search/--select/--info/--play/
+# --window-size): main.py CLI additions that let a headless --screenshot
+# run capture every major surface (albums, people, search, the inspector,
+# the slideshow) for documentation screenshots.
+# ---------------------------------------------------------------------------
+
+VIEW_SPEC_ALBUM_UID = "deadbeefdeadbeefdeadbeefdeadbeef"
+
+
+@pytest.fixture()
+def view_spec_library(tmp_path: Path) -> Path:
+    """Covers every --view SPEC kind with a DISTINCT result set each, so a
+    test can tell "matched the right kind" from "matched by accident":
+    a.jpg is the lone album member AND the lone named-person photo; b.jpg
+    carries only an unnamed (UNKNOWN_CONTACT) face; d.jpg is the lone
+    starred photo; Control/c.jpg has none of the above (a plain control).
+    Synthetic .picasa.ini only — no real Picasa data."""
+    root = tmp_path / "lib"
+    make_jpeg(root / "Trip" / "a.jpg")
+    make_jpeg(root / "Trip" / "b.jpg")
+    make_jpeg(root / "Trip" / "d.jpg")
+    make_jpeg(root / "Control" / "c.jpg")
+    (root / "Trip" / ".picasa.ini").write_text(
+        "[Contacts2]\r\naaaaaaaaaaaaaaa1=Ada Example;;\r\n"
+        f"[.album:{VIEW_SPEC_ALBUM_UID}]\r\n"
+        f"name=Best Of\r\ntoken={VIEW_SPEC_ALBUM_UID}\r\n"
+        "[a.jpg]\r\n"
+        f"albums={VIEW_SPEC_ALBUM_UID}\r\n"
+        "faces=rect64(4a8e8e6b),aaaaaaaaaaaaaaa1\r\n"
+        "[b.jpg]\r\nfaces=rect64(ff),ffffffffffffffff\r\n"
+        "[d.jpg]\r\nstar=yes\r\n"
+    )
+    return root
+
+
+def test_select_sidebar_view_matches_each_kind(
+        view_spec_library: Path) -> None:
+    """select_sidebar_view walks the sidebar tree and applies a view
+    exactly like a real click, for every SPEC kind --view can name
+    (album accepts either its uid or its display name); an unknown kind
+    or a spec with no matching item returns False and leaves the grid
+    untouched."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from main import MainWindow, select_sidebar_view
+
+    cat = scan_library(view_spec_library)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+
+    def rels() -> list[str]:
+        return [cat.photos[i].rel for i in win.grid.display]
+
+    assert select_sidebar_view(win, "all")
+    assert len(win.grid.display) == 4
+
+    assert select_sidebar_view(win, "starred")
+    assert rels() == ["Trip/d.jpg"]
+
+    assert select_sidebar_view(win, f"album:{VIEW_SPEC_ALBUM_UID}")
+    assert rels() == ["Trip/a.jpg"]
+
+    assert select_sidebar_view(win, "album:Best Of")  # by display name too
+    assert rels() == ["Trip/a.jpg"]
+
+    assert select_sidebar_view(win, "person:Ada Example")
+    assert rels() == ["Trip/a.jpg"]
+
+    assert select_sidebar_view(win, "unnamed")
+    assert rels() == ["Trip/b.jpg"]
+
+    assert select_sidebar_view(win, "folder:Trip")
+    assert win.tree.currentItem().data(0, Qt.ItemDataRole.UserRole) \
+        == ("folder", "Trip")
+
+    before = list(win.grid.display)
+    assert not select_sidebar_view(win, "album:no-such-album")
+    assert not select_sidebar_view(win, "person:Nobody Here")
+    assert not select_sidebar_view(win, "bogus:xyz")
+    assert win.grid.display == before  # no match -> no state change
+
+
+def _run_main_capturing_window(monkeypatch, argv_tail: list[str]):
+    """In-process, offscreen main() run that captures the constructed
+    MainWindow via a constructor spy — main() itself returns only an exit
+    code. Asserts a clean exit and exactly one window built."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    captured: list = []
+    real_init = main.MainWindow.__init__
+
+    def spy_init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        captured.append(self)
+
+    monkeypatch.setattr(main.MainWindow, "__init__", spy_init)
+    monkeypatch.setattr(sys, "argv", ["fauxcasa-tracer", *argv_tail])
+    rc = main.main()
+    assert rc == 0, rc
+    assert len(captured) == 1
+    return captured[0]
+
+
+def test_window_size_flag_resizes(
+        monkeypatch, library: Path, tmp_path: Path) -> None:
+    """--window-size WxH resizes the window to exactly that size before
+    show() — a stable screenshot size regardless of the machine's screen.
+    Asserted on a WARM run: a COLD run's window briefly grows past the
+    requested size while the deferred first-scan build lands (a
+    pre-existing Qt/offscreen relayout quirk unrelated to this flag — the
+    exact same drift happens with no --window-size at all), but a warm
+    run — the realistic case for a documentation --screenshot pass
+    against an already-built library — holds the requested size exactly."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    cache_root = tmp_path / "cr"
+
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(library), "--cache-root", str(cache_root),
+        "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    assert main.main() == 0  # cold: build the cache once
+
+    captured: list = []
+    real_init = main.MainWindow.__init__
+
+    def spy_init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        captured.append(self)
+
+    monkeypatch.setattr(main.MainWindow, "__init__", spy_init)
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(library), "--cache-root", str(cache_root),
+        "--window-size", "900x600", "--quit-after-ready",
+        "--finish-build", "--timeout", "30"])
+    assert main.main() == 0  # warm: the actual assertion run
+    assert len(captured) == 1
+    assert (captured[0].width(), captured[0].height()) == (900, 600)
+
+
+def test_scripted_select_and_info_populate_inspector(
+        monkeypatch, library: Path, tmp_path: Path) -> None:
+    """--select 1 --info leaves the inspector panel visible and populated
+    for the 2nd displayed photo, end to end through main()'s scripted-run
+    state machine."""
+    win = _run_main_capturing_window(monkeypatch, [
+        str(library), "--cache-root", str(tmp_path / "cr"),
+        "--select", "1", "--info", "--quit-after-ready",
+        "--finish-build", "--timeout", "30"])
+    assert win.info_action.isChecked()
+    assert not win.inspector.isHidden()
+    assert win.grid.current == win.grid.display[1]
+    assert win.inspector._form.rowCount() > 0
+    assert _inspector_text(win.inspector) \
+        .find(win.catalog.photos[win.grid.display[1]].name) >= 0
+
+
+def test_scripted_play_starts_slideshow_offscreen(
+        monkeypatch, library: Path, tmp_path: Path) -> None:
+    """--play (screenshot testing) starts the slideshow over the current
+    view, offscreen-safe — no real display needed to prove the state
+    machine kicked it off."""
+    win = _run_main_capturing_window(monkeypatch, [
+        str(library), "--cache-root", str(tmp_path / "cr"),
+        "--play", "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    assert win._slideshow is not None
+    assert win._slideshow.isFullScreen()
+
+
+def test_window_size_arg_rejects_junk(monkeypatch) -> None:
+    """--window-size reuses --min-image-size's WIDTHxHEIGHT parser, so
+    junk is rejected at argparse time (SystemExit 2), before any window
+    is ever constructed."""
+    import main
+
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", "--window-size", "junk"])
+    with pytest.raises(SystemExit) as exc:
+        main.main()
+    assert exc.value.code == 2
