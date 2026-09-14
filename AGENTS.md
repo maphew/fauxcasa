@@ -77,9 +77,12 @@ runs via `uv run`, no separate install step. CI (`.github/workflows/tests.yml`,
 ```bash
 uv run scripts/test_delegation_report.py -q
 uv run scripts/test_picasa_db.py -q
+uv run scripts/test_confirm_archive.py -q
 uv run scripts/check-ingest-parity.py
-QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q
+uv run scripts/perf-canary.py
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_inmeta_datasets.py -q   # self-skips without cache/test-datasets (uv run scripts/fetch-test-datasets.py)
+QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py              # tracer.yml runs it without -q
+QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_sandbox_e2e.py -q       # tracer.yml, Windows leg only
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q
 
 # local-only gate (not a CI job): no beads-jsonl pollution —
