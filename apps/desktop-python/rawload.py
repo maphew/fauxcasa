@@ -128,10 +128,11 @@ def _jpeg_has_exif_orientation(jpeg: bytes) -> bool:
 
 def _inject_exif_orientation(jpeg: bytes, orientation: int) -> bytes:
     """Return `jpeg` with a minimal EXIF APP1 carrying only the Orientation
-    tag (274) spliced in right after the SOI marker. Call only when the JPEG
-    has no existing EXIF Orientation (_jpeg_has_exif_orientation is False):
-    two EXIF APP1 segments are technically legal but some readers honour only
-    the first, so the injected tag must be the sole Orientation source."""
+    tag (274) spliced in right after the SOI marker (and after a JFIF APP0,
+    when present — see below). Call only when the JPEG has no existing EXIF
+    Orientation (_jpeg_has_exif_orientation is False): two EXIF APP1
+    segments are technically legal but some readers honour only the first,
+    so the injected tag must be the sole Orientation source."""
     # Minimal TIFF-in-EXIF: LE marker, magic 42, IFD0 at offset 8,
     # 1 entry (tag 274, SHORT, count 1, value=orientation), next-IFD=0.
     tiff = b"II" + struct.pack("<H", 42) + struct.pack("<I", 8)
@@ -141,7 +142,19 @@ def _inject_exif_orientation(jpeg: bytes, orientation: int) -> bytes:
            + struct.pack("<I", 0))               # next-IFD offset
     payload = b"Exif\x00\x00" + tiff + ifd
     seg = b"\xFF\xE1" + struct.pack(">H", len(payload) + 2) + payload
-    return jpeg[:2] + seg + jpeg[2:]             # splice after SOI
+    # A JFIF APP0, when present, must stay the FIRST segment after SOI
+    # (strictly required; Qt's own JPEG encoder always writes one). Qt,
+    # libjpeg and exiv2 all tolerate APP1-before-APP0, but splice after
+    # APP0 instead of blindly right after SOI so the output is strictly
+    # conformant too. Falls back to right-after-SOI (old behavior) when
+    # there is no APP0 or its declared length runs past the buffer.
+    insert_at = 2
+    if jpeg[2:4] == b"\xFF\xE0" and len(jpeg) >= 6:
+        seg_len = struct.unpack_from(">H", jpeg, 4)[0]
+        candidate = 4 + seg_len
+        if candidate <= len(jpeg):
+            insert_at = candidate
+    return jpeg[:insert_at] + seg + jpeg[insert_at:]
 
 
 # Picasa 3's documented RAW support: 18 extensions across 16 vendors

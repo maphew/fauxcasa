@@ -7150,6 +7150,44 @@ def test_flip_helpers_inject_and_detect() -> None:
     assert rawload._jpeg_has_exif_orientation(already)
 
 
+def test_inject_exif_orientation_app0_ordering() -> None:
+    """_inject_exif_orientation must keep a JFIF APP0 first when the source
+    JPEG has one (fauxcasa-wqi.5): strictly, APP0 must precede any other
+    application segment, and Qt's own JPEG encoder (_jpeg_bytes) always
+    writes one right after SOI. Splicing the EXIF APP1 before it (the old
+    behavior) is tolerated by Qt/libjpeg/exiv2 but non-conformant. The
+    no-APP0 shape must keep working too (splice right after SOI, as before).
+    """
+    import rawload
+
+    # Shape 1: Qt's encoder output — SOI, APP0(JFIF), ... . Confirmed by
+    # construction: Qt always emits FFD8 FFE0 for its own JPEG output.
+    with_app0 = _jpeg_bytes(16, 16)
+    assert with_app0[2:4] == b"\xff\xe0", \
+        "test assumption: Qt's JPEG encoder writes a JFIF APP0"
+    app0_len = struct.unpack_from(">H", with_app0, 4)[0]
+    app0_end = 4 + app0_len
+
+    injected = rawload._inject_exif_orientation(with_app0, 6)
+    assert injected[:2] == b"\xff\xd8"
+    assert injected[2:4] == b"\xff\xe0", "APP0 must stay the first segment"
+    # The injected APP1 (EXIF) must sit immediately after APP0, not before.
+    assert injected[app0_end:app0_end + 2] == b"\xff\xe1"
+    assert rawload._jpeg_has_exif_orientation(injected)
+
+    # Shape 2: no APP0 at all — strip Qt's APP0 out of the same source so
+    # the rest of the stream (any trailing segments + scan data) still
+    # decodes, then confirm the no-APP0 path is unchanged: splice right
+    # after SOI.
+    no_app0 = with_app0[:2] + with_app0[app0_end:]
+    assert no_app0[2:4] != b"\xff\xe0"
+    injected_no_app0 = rawload._inject_exif_orientation(no_app0, 6)
+    assert injected_no_app0[:2] == b"\xff\xd8"
+    assert injected_no_app0[2:4] == b"\xff\xe1", \
+        "no JFIF APP0 present: EXIF APP1 splices right after SOI"
+    assert rawload._jpeg_has_exif_orientation(injected_no_app0)
+
+
 def test_flip_helpers_garbage_input() -> None:
     """_jpeg_has_exif_orientation and _inject_exif_orientation are fail-soft:
     garbage bytes don't raise."""
