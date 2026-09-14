@@ -10,12 +10,14 @@ on:
       - "apps/desktop-python/**"
       - "scripts/make-thumbcache.py"
       - "scripts/picasa_db.py"
+      - "scripts/fetch-test-datasets.py"
       - ".github/workflows/tracer.yml"
   pull_request:
     paths:
       - "apps/desktop-python/**"
       - "scripts/make-thumbcache.py"
       - "scripts/picasa_db.py"
+      - "scripts/fetch-test-datasets.py"
       - ".github/workflows/tracer.yml"
   workflow_dispatch:
 
@@ -39,6 +41,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+      - name: Fetch the IPTC reference set (tiny)
+        # Third-party host: an iptc.org outage must not redden every PR.
+        # Without the .fetch-complete marker the dataset tests self-skip.
+        continue-on-error: true
+        run: uv run scripts/fetch-test-datasets.py iptc-reference
+      - name: Dataset-gated metadata tests
+        run: uv run apps/desktop-python/test_inmeta_datasets.py -q
       - name: Unit tests
         run: uv run apps/desktop-python/test_tracer.py
       - name: Generate a smoke library

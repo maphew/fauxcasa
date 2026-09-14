@@ -16,5 +16,14 @@ screenshots, videos, extracted stills, transcripts, and other third-party
 material are not relicensed by this repository unless a specific file says
 otherwise. See `docs/research/NOTICE.md` for the research archive policy.
 
+The screenshots under `docs/releases/gallery/` show a demo library built by
+`scripts/make-demo-library.py`: photographs from picsum.photos (Unsplash
+licence, attribution not required; the generated `ATTRIBUTION.md` in the
+local cache names each photographer) and, in the "Camera Odds and Ends"
+folder, test files from ianare/exif-samples
+(<https://github.com/ianare/exif-samples>, CC BY-SA 4.0). Those files keep
+their own licences; the screenshots as a whole are CC-BY-SA-4.0 like the
+rest of the documentation.
+
 The Fauxcasa name, logos, icons, and other project branding are not licensed
 under CC-BY-SA-4.0. Trademark rights are reserved.

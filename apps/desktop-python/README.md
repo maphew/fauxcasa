@@ -198,6 +198,19 @@ QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/main.py --finish-build --sc
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/main.py cache/benchmark-library \
     --thumbs cache/benchmark-thumbs.fcache --screenshot /tmp/t100k.png --scroll-to 0.5
 
+# scripted views for documentation screenshots: --view picks a sidebar item
+# (all | starred | recent | unnamed | album:<name-or-uid> | person:<name> |
+# folder:<rel>), --search types a query, --select N makes the Nth shown
+# photo current, --info opens the inspector, --open N opens the viewer,
+# --faces shows its face boxes, --play starts the slideshow (the shot then
+# captures the slideshow surface), --window-size pins the window. Each step
+# prints a {"event":"view",...} line. Run natively (no offscreen) for real
+# fonts; scripts/make-gallery.py drives the whole docs gallery this way
+# over the demo library from scripts/make-demo-library.py.
+uv run apps/desktop-python/main.py cache/demo-library/library \
+    --contacts cache/demo-library/contacts/contacts.xml --pal-dir cache/demo-library/albums \
+    --window-size 1600x1000 --view "person:Alice Hartley" --open 0 --faces --screenshot faces.png
+
 # cold-start probe
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/main.py --quit-after-ready
 

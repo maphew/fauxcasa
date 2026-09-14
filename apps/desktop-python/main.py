@@ -4030,6 +4030,54 @@ def run_search_probe(win: MainWindow, spec: str) -> list[dict]:
     return events
 
 
+def select_sidebar_view(win: MainWindow, spec: str) -> bool:
+    """Select a sidebar view exactly as a click on its tree item would
+    (scripted-run screenshot flag --view). SPEC is 'all', 'starred',
+    'recent', 'unnamed', 'album:<name-or-uid>', 'person:<name>', or
+    'folder:<rel-path>' — the part before ':' (or the whole string, for
+    the colon-less kinds) is matched against a tree item's (kind, key)
+    UserRole payload set up in _rebuild_sidebar/_build_sidebar. An album
+    matches by UID OR by its resolved display name (win.catalog.albums
+    [uid].name), since a human would rather type "Best Of" than a hex
+    token; person/folder match the key exactly (case-sensitive). Drives
+    win._sidebar_clicked(item, 0) so the tree highlights too, exactly
+    like a real click — not just win._apply_view, which leaves the tree
+    selection stale. Returns False for an unknown kind or a spec with no
+    matching item; the caller (check_ready) decides how to fail a
+    scripted run on that."""
+    kind, _, key = spec.partition(":")
+    if kind not in ("all", "starred", "recent", "unnamed",
+                    "album", "person", "folder"):
+        return False
+    matches = []
+    it = QTreeWidgetItemIterator(win.tree)
+    while it.value():
+        item = it.value()
+        it += 1
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if data is None or data[0] != kind:
+            continue
+        item_key = data[1]
+        if kind == "album":
+            album = win.catalog.albums.get(item_key)
+            if item_key != key and not (album is not None
+                                        and album.name == key):
+                continue
+        elif item_key != key:
+            continue
+        matches.append(item)
+    if len(matches) != 1:
+        # Picasa permits two albums with one display name, and a name
+        # could equal another album's uid: refuse to guess which the
+        # caller meant rather than screenshot the wrong one.
+        if matches:
+            log.error("--view %r is ambiguous: %d sidebar items match",
+                      spec, len(matches))
+        return False
+    win._sidebar_clicked(matches[0], 0)
+    return True
+
+
 BUNDLE_RUNTIME_MODULES = (
     "PySide6.QtWidgets",
     # QtMultimedia ships from PySide6-Addons for QAudioSink ONLY (video
@@ -4160,6 +4208,39 @@ def main() -> int:
     ap.add_argument("--open", type=int, default=None, metavar="N",
                     help="after ready, open the viewer on the Nth photo "
                          "of the current view (screenshot testing)")
+    ap.add_argument("--view", type=str, default=None, metavar="SPEC",
+                    help="after ready, select a sidebar view exactly as a "
+                         "click would: 'all', 'starred', 'recent', "
+                         "'unnamed', 'album:<name-or-uid>', "
+                         "'person:<name>', or 'folder:<rel-path>' "
+                         "(screenshot testing)")
+    ap.add_argument("--search", type=str, default=None, metavar="QUERY",
+                    help="after ready (and --view, if given), type QUERY "
+                         "into the search box (screenshot testing; "
+                         "distinct from --search-probe, which is a "
+                         "latency probe that quits)")
+    ap.add_argument("--select", type=int, default=None, metavar="N",
+                    help="after ready/--view/--search, make the Nth photo "
+                         "of the current view the grid's current/selected "
+                         "item (clamped like --open; screenshot testing)")
+    ap.add_argument("--info", action="store_true",
+                    help="after ready, open the metadata inspector panel "
+                         "(screenshot testing)")
+    ap.add_argument("--play", action="store_true",
+                    help="after ready, start the slideshow over the "
+                         "current view; --screenshot then captures the "
+                         "slideshow surface instead of the main window "
+                         "(screenshot testing)")
+    ap.add_argument("--faces", action="store_true",
+                    help="after --open N: show the viewer's face boxes "
+                         "(the F key) before the screenshot; exits 1 if the "
+                         "viewer is not on a face-tagged photo (screenshot "
+                         "testing)")
+    ap.add_argument("--window-size", type=_parse_image_size_arg,
+                    metavar="WIDTHxHEIGHT",
+                    help="resize the window to exactly WIDTHxHEIGHT "
+                         "before showing it, for a screenshot size that "
+                         "doesn't depend on the machine's screen")
     ap.add_argument("--quit-after-ready", action="store_true",
                     help="exit right after the READY line (perf probe)")
     ap.add_argument("--search-probe", type=str, default=None, metavar="TERMS",
@@ -4522,6 +4603,10 @@ def main() -> int:
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
+    if args.window_size is not None:
+        # Before show(), not after: a stable screenshot size regardless of
+        # the machine's screen (screenshot testing).
+        win.resize(*args.window_size)
     win.show()
     win.grid.setFocus()  # only really lands once the window is mapped
 
@@ -4557,7 +4642,9 @@ def main() -> int:
     # READY instrumentation (§7 cold start): poll until every visible
     # tile is decoded, then report cold start + RSS on stdout.
     state = {"scrolled": False, "shot": False, "opened": False,
-             "probed": False, "scan_failure_handled": False}
+             "probed": False, "scan_failure_handled": False,
+             "viewed": False, "searched": False, "selected": False,
+             "info_set": False, "played": False, "faced": False}
     # A scripted probe (any of the three) implies quit — same set the hard
     # timeout below arms on; reused by check_ready's scan-failure gate
     # (fauxcasa-q6l.13, Codex cross-vendor review finding 2).
@@ -4680,7 +4767,10 @@ def main() -> int:
             }), flush=True)
             if args.quit_after_ready and args.screenshot is None \
                     and args.scroll_to is None and args.open is None \
-                    and args.search_probe is None and may_quit():
+                    and args.search_probe is None and args.view is None \
+                    and args.search is None and args.select is None \
+                    and not args.info and not args.play \
+                    and not args.faces and may_quit():
                 app.quit()
                 return
         if args.search_probe is not None and not state["probed"]:
@@ -4689,6 +4779,48 @@ def main() -> int:
             # --search-probe implies quit (see the bottom of check_ready).
             state["probed"] = True
             run_search_probe(win, args.search_probe)
+        # Scripted-run screenshot flags: view -> search -> select -> info ->
+        # scroll_to -> open -> faces -> play -> (loading waits) -> screenshot. Each
+        # step sets its state flag and returns once so the viewport gets a
+        # poll cycle to decode (same pattern scroll_to always used).
+        if args.view is not None and not state["viewed"]:
+            state["viewed"] = True
+            if not select_sidebar_view(win, args.view):
+                log.error("--view: no sidebar item matches %r", args.view)
+                print(json.dumps({"event": "view", "ok": False,
+                                  "spec": args.view}), flush=True)
+                app.exit(1)
+                return
+            kind, _, key = args.view.partition(":")
+            print(json.dumps({
+                "event": "view", "ok": True, "kind": kind, "key": key,
+                "shown": len(win.grid.display),
+            }), flush=True)
+            return  # let the new view's viewport decode
+        if args.search is not None and not state["searched"]:
+            state["searched"] = True
+            win.search.setText(args.search)
+            print(json.dumps({
+                "event": "view", "ok": True, "kind": "search",
+                "key": args.search, "shown": len(win.grid.display),
+            }), flush=True)
+            return
+        if args.select is not None and not state["selected"]:
+            state["selected"] = True
+            display = win.grid.display
+            if display:
+                pos = max(0, min(len(display) - 1, args.select))
+                win.grid._select(display[pos])
+                win.grid._ensure_visible(display[pos])
+            print(json.dumps({
+                "event": "view", "ok": True, "kind": "select",
+                "key": str(args.select), "shown": len(display),
+            }), flush=True)
+            return
+        if args.info and not state["info_set"]:
+            state["info_set"] = True
+            win.info_action.setChecked(True)  # opens the inspector
+            return
         if args.scroll_to is not None and not state["scrolled"]:
             state["scrolled"] = True
             win.grid.scroll_to_fraction(args.scroll_to)
@@ -4699,6 +4831,28 @@ def main() -> int:
             if display:
                 pos = max(0, min(len(display) - 1, args.open))
                 win._open_viewer(display[pos], display, pos)
+            return
+        if args.faces and not state["faced"]:
+            # Face boxes come from the catalog, not the decoded original,
+            # so this need not wait for the viewer's load; toggle_faces is
+            # a no-op unless the viewer is current on a face-tagged photo.
+            state["faced"] = True
+            win.viewer.toggle_faces()
+            if not win.viewer.faces_visible:
+                # Same contract as a --view miss: a screenshot promised to
+                # show face boxes must not quietly come out without them.
+                log.error("--faces: the viewer is not on a face-tagged photo "
+                          "(pair it with --open N on one that is)")
+                print(json.dumps({"event": "view", "ok": False,
+                                  "kind": "faces", "key": ""}), flush=True)
+                app.exit(1)
+                return
+            print(json.dumps({"event": "view", "ok": True, "kind": "faces",
+                              "key": "", "shown": 1}), flush=True)
+            return
+        if args.play and not state["played"]:
+            state["played"] = True
+            win._start_slideshow()  # no-op (no _slideshow surface) if empty
             return
         if state["opened"] and win.viewer.loading:
             # Let the original finish loading before the shot — but never
@@ -4715,11 +4869,32 @@ def main() -> int:
                 OPEN_WAIT_MS, bool(dec is not None and dec.is_alive()),
                 win.viewer._jobs.qsize())
             win.viewer.loading = False
+        if state["played"] and win._slideshow is not None \
+                and win._slideshow.loading:
+            # Same bounded-wait pattern as the viewer original above, for
+            # the slideshow's own first-slide decode.
+            state["play_wait"] = state.get("play_wait", 0) + 1
+            if state["play_wait"] * poll.interval() < OPEN_WAIT_MS:
+                return
+            dec = getattr(win._slideshow, "_decoder", None)
+            log.error(
+                "slideshow original still loading after %d ms (decoder "
+                "alive=%s, queued jobs=%d) — taking the screenshot anyway",
+                OPEN_WAIT_MS, bool(dec is not None and dec.is_alive()),
+                win._slideshow._jobs.qsize())
+            win._slideshow.loading = False
         if not may_quit():
             return  # --finish-build: hold the quit for the cache build
         if args.screenshot is not None and not state["shot"]:
             state["shot"] = True
-            if win.grab().save(str(args.screenshot)):
+            # --play's surface is its own top-level window (slideshow.py
+            # module docstring) — grab THAT, not the main window it sits
+            # on top of, once it is actually up.
+            shot_target = win
+            if state["played"] and win._slideshow is not None \
+                    and win._slideshow.isVisible():
+                shot_target = win._slideshow
+            if shot_target.grab().save(str(args.screenshot)):
                 log.info("screenshot: %s", args.screenshot)
             else:
                 log.error("FAILED to save screenshot to %s", args.screenshot)

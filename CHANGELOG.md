@@ -12,6 +12,18 @@ Changes since the `tracer-test-v1` preview (2026-08-10, commit `553d31a`).
 The `v0.1.0-rc2` release candidate (2026-09-13) contains everything in
 this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
 
+### Added (2026-09-14)
+
+- Screenshot gallery in the README and release notes, made from a demo
+  library of freely licensed photos with realistic dates, places,
+  captions, keywords, faces and albums (`scripts/make-demo-library.py`,
+  `scripts/make-gallery.py`).
+- Scripted-run options for screenshots and testing: `--view`, `--search`,
+  `--select`, `--info`, `--faces`, `--play`, `--window-size`.
+- The public metadata test corpora adopted in June (IPTC reference images,
+  exif-samples) are now exercised by a dataset-gated test suite, with the
+  small IPTC set fetched in CI.
+
 ### Added (0.1 release push, 2026-09-13)
 
 - Still images decode inside a Windows AppContainer sandbox for thumbnails
