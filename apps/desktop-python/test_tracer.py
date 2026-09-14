@@ -6794,125 +6794,57 @@ def test_viewer_info_line_stashed_original(library: Path) -> None:
 # QImageReader/PIL), embedded-JPEG-preview-first with demosaic fallback,
 # orientation applied exactly once per path, and corrupt-RAW fail-soft.
 #
-# Fixture provenance (privacy rule: NEVER real family data): _make_dng below
-# hand-rolls a minimal-but-valid little-endian DNG 1.4 from scratch — a TIFF
-# container holding a deterministic synthetic 16-bit RGGB CFA mosaic
-# (struct-packed gradient, no camera involved), optionally an embedded JPEG
-# preview built by the suite's own Qt encoder (_jpeg_bytes), plus the tags
-# LibRaw's identify() requires (DNGVersion, CFA geometry, ColorMatrix1,
-# UniqueCameraModel; note LibRaw rejects raws under 22 px per side). Verified
-# against rawpy/LibRaw: imread + postprocess succeed, extract_thumb returns
-# the preview when present and LibRawNoThumbnailError when absent.
+# Fixture provenance (privacy rule: NEVER real family data): the DNG bytes
+# below come from scripts/make-synthetic-dng.py's `_make_dng_bytes` (loaded
+# once via the module-loader below, same pattern as the make-thumbcache.py
+# imports elsewhere in this file) — a hand-rolled minimal-but-valid little-
+# endian DNG 1.4, a TIFF container holding a deterministic synthetic 16-bit
+# RGGB CFA mosaic (struct-packed gradient, no camera involved), optionally an
+# embedded JPEG preview built by the suite's own Qt encoder (_jpeg_bytes),
+# plus the tags LibRaw's identify() requires (DNGVersion, CFA geometry,
+# ColorMatrix1, UniqueCameraModel; note LibRaw rejects raws under 22 px per
+# side). Verified against rawpy/LibRaw: imread + postprocess succeed,
+# extract_thumb returns the preview when present and LibRawNoThumbnailError
+# when absent. The two builders used to be independently hand-rolled and
+# drifted apart (fauxcasa-wqi.3); this test now imports the single source of
+# truth instead of re-duplicating ~150 lines of TIFF-packing logic.
 # ---------------------------------------------------------------------------
 
 
-def _dng_ifd(entries: list, ifd_off: int) -> bytes:
-    """Serialize one TIFF IFD at ifd_off: sorted 12-byte entries, values
-    <= 4 bytes inline, larger payloads appended after the table (word-
-    aligned). entries: (tag, type, count, payload_bytes)."""
-    entries = sorted(entries, key=lambda e: e[0])
-    data_off = ifd_off + 2 + 12 * len(entries) + 4
-    table = struct.pack("<H", len(entries))
-    data = b""
-    for tag, typ, count, payload in entries:
-        if len(payload) <= 4:
-            table += struct.pack("<HHI", tag, typ, count) \
-                + payload.ljust(4, b"\0")
-        else:
-            if (data_off + len(data)) % 2:
-                data += b"\0"
-            table += struct.pack("<HHII", tag, typ, count,
-                                 data_off + len(data))
-            data += payload
-    return table + struct.pack("<I", 0) + data
+def _synth_dng_module():
+    """Load scripts/make-synthetic-dng.py once and cache it on this
+    function (mirrors the make-thumbcache.py loader pattern used
+    elsewhere in this file, e.g. test_raw_extensions_in_both_walkers)."""
+    mod = getattr(_synth_dng_module, "_cached", None)
+    if mod is None:
+        import importlib.util
 
-
-def _dng_ifd_size(entries: list) -> int:
-    return 2 + 12 * len(entries) + 4 + sum(
-        len(p) + (len(p) % 2) for _t, _y, _c, p in entries if len(p) > 4)
+        spec = importlib.util.spec_from_file_location(
+            "synth_dng", REPO / "scripts" / "make-synthetic-dng.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _synth_dng_module._cached = mod
+    return mod
 
 
 def _make_dng(path: Path, w: int = 32, h: int = 24, orientation: int = 1,
               preview_jpeg: bytes | None = None,
               preview_size: tuple[int, int] = (0, 0),
               truncate: bool = False) -> Path:
-    """A tiny synthetic DNG (see the section comment for provenance). With
-    `preview_jpeg`, IFD0 is a JPEG-compressed preview (the layout real
-    cameras use) and the CFA raw lives in a SubIFD; without, the raw IS
-    IFD0 and the file carries no thumbnail at all (forces the demosaic
-    fallback). `orientation` writes TIFF tag 274 so LibRaw bakes the flip
-    during postprocess. `truncate` chops half the CFA strip off the end —
-    a structurally-valid header whose pixel read fails (fail-soft test)."""
-    _SHORT, _LONG, _BYTE, _ASCII, _SRAT = 3, 4, 1, 2, 10
-    strip = struct.pack(f"<{w * h}H", *(((x * 89 + y * 71) % 4096)
-                                        for y in range(h) for x in range(w)))
-    cam = b"Fauxcasa Synthetic\0"
-    cm = b"".join(struct.pack("<ii", v, 10000) for v in
-                  (10000, 0, 0, 0, 10000, 0, 0, 0, 10000))  # identity XYZ
-
-    def E(tag, typ, fmt, *vals):
-        return (tag, typ, len(vals) if len(vals) > 1 else 1,
-                struct.pack(fmt, *vals))
-
-    raw_entries = [
-        E(254, _LONG, "<I", 0),            # NewSubfileType: the raw image
-        E(256, _LONG, "<I", w), E(257, _LONG, "<I", h),
-        E(258, _SHORT, "<H", 16),          # 16-bit samples
-        E(259, _SHORT, "<H", 1),           # uncompressed
-        E(262, _SHORT, "<H", 32803),       # PhotometricInterpretation: CFA
-        E(277, _SHORT, "<H", 1),           # 1 sample/px
-        E(278, _LONG, "<I", h),            # RowsPerStrip
-        E(279, _LONG, "<I", len(strip)),   # StripByteCounts
-        E(284, _SHORT, "<H", 1),
-        E(33421, _SHORT, "<HH", 2, 2),     # CFARepeatPatternDim
-        (33422, _BYTE, 4, bytes([0, 1, 1, 2])),  # CFAPattern: RGGB
-        E(50714, _SHORT, "<H", 0),         # BlackLevel
-        E(50717, _LONG, "<I", 4095),       # WhiteLevel
-    ]
-    shared = [
-        (50706, _BYTE, 4, bytes([1, 4, 0, 0])),      # DNGVersion 1.4
-        (50708, _ASCII, len(cam), cam),              # UniqueCameraModel
-        (50721, _SRAT, 9, cm),                       # ColorMatrix1
-        E(50778, _SHORT, "<H", 21),                  # CalibrationIlluminant1
-        E(274, _SHORT, "<H", orientation),           # Orientation
-    ]
-
-    if preview_jpeg is None:
-        ifd0 = raw_entries + shared + [E(273, _LONG, "<I", 0)]
-        strip_off = 8 + _dng_ifd_size(ifd0)
-        ifd0[-1] = E(273, _LONG, "<I", strip_off)    # StripOffsets -> raw
-        out = struct.pack("<2sHI", b"II", 42, 8) + _dng_ifd(ifd0, 8)
-        assert len(out) == strip_off
-        out += strip
-    else:
-        pw, ph = preview_size
-        ifd0 = [
-            E(254, _LONG, "<I", 1),        # reduced-resolution preview
-            E(256, _LONG, "<I", pw), E(257, _LONG, "<I", ph),
-            (258, _SHORT, 3, struct.pack("<HHH", 8, 8, 8)),
-            E(259, _SHORT, "<H", 7),       # JPEG-compressed strip
-            E(262, _SHORT, "<H", 6),       # YCbCr
-            E(277, _SHORT, "<H", 3),
-            E(278, _LONG, "<I", ph),
-            E(279, _LONG, "<I", len(preview_jpeg)),
-            E(273, _LONG, "<I", 0),        # -> preview jpeg (patched below)
-            E(330, _LONG, "<I", 0),        # SubIFDs -> raw (patched below)
-        ] + shared
-        raw_ifd = raw_entries + [E(273, _LONG, "<I", 0)]
-        sub_off = 8 + _dng_ifd_size(ifd0)
-        jpeg_off = sub_off + _dng_ifd_size(raw_ifd)
-        strip_off = jpeg_off + len(preview_jpeg)
-        ifd0 = [E(273, _LONG, "<I", jpeg_off) if e[0] == 273
-                else E(330, _LONG, "<I", sub_off) if e[0] == 330
-                else e for e in ifd0]
-        raw_ifd[-1] = E(273, _LONG, "<I", strip_off)
-        out = struct.pack("<2sHI", b"II", 42, 8) + _dng_ifd(ifd0, 8)
-        assert len(out) == sub_off
-        out += _dng_ifd(raw_ifd, sub_off)
-        assert len(out) == jpeg_off
-        out += preview_jpeg + strip
+    """A tiny synthetic DNG (see the section comment for provenance), built
+    by scripts/make-synthetic-dng.py:_make_dng_bytes. With `preview_jpeg`,
+    IFD0 is a JPEG-compressed preview (the layout real cameras use) and the
+    CFA raw lives in a SubIFD; without, the raw IS IFD0 and the file
+    carries no thumbnail at all (forces the demosaic fallback).
+    `orientation` writes TIFF tag 274 so LibRaw bakes the flip during
+    postprocess. `truncate` chops half the CFA strip off the end — a
+    structurally-valid header whose pixel read fails (fail-soft test)."""
+    out = _synth_dng_module()._make_dng_bytes(
+        w=w, h=h, orientation=orientation,
+        preview_jpeg=preview_jpeg, preview_size=preview_size)
     if truncate:
-        out = out[:len(out) - len(strip) // 2]
+        strip_len = struct.calcsize(f"<{w * h}H")
+        out = out[:len(out) - strip_len // 2]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(out)
     return path
