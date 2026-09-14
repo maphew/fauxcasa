@@ -17803,3 +17803,79 @@ def test_window_size_arg_rejects_junk(monkeypatch) -> None:
     with pytest.raises(SystemExit) as exc:
         main.main()
     assert exc.value.code == 2
+
+
+def test_scripted_hard_stop_timer_is_owned_and_disarmed(
+        monkeypatch, library: Path, tmp_path: Path) -> None:
+    """fauxcasa-9pr: the scripted-run hard stop must be a QTimer owned by
+    the window and explicitly disarmed once main() returns, exactly like
+    the READY poll timer (fauxcasa-q6l.15). A bare QTimer.singleShot is
+    owned by nobody and survives the run that armed it."""
+    from PySide6.QtCore import QTimer
+
+    win = _run_main_capturing_window(monkeypatch, [
+        str(library), "--cache-root", str(tmp_path / "cr"),
+        "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    hard_stop = win.findChild(QTimer, "scripted-hard-stop")
+    assert hard_stop is not None, \
+        "scripted run armed its hard stop on no owner"
+    assert not hard_stop.isActive(), \
+        "hard stop still armed after main() returned"
+    poll = win.findChild(QTimer, "ready-poll")
+    assert poll is not None and not poll.isActive(), \
+        "the READY poll outlived the run that armed it (fauxcasa-q6l.15)"
+
+
+def test_abandoned_hard_stop_does_not_kill_the_next_run(
+        monkeypatch, library: Path, tmp_path: Path) -> None:
+    """fauxcasa-9pr, the behaviour the shape above protects: a scripted
+    run that finishes BEFORE its own --timeout used to leave the deadline
+    armed in the shared QApplication, so the next in-process run was
+    killed mid-event-loop with exit 1 and a log line quoting the previous
+    run's timeout and state. Seen on main as an ubuntu-only tracer
+    failure (run 34885536050): test_window_size_flag_resizes died on
+    'TIMEOUT after 10.0s ... scan_failure_handled: True' borrowed from a
+    scan-failure test ten seconds earlier."""
+    import time
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    import main
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    short_timeout = 1.0
+
+    # Run 1: fails its cold scan, so it exits well inside its own
+    # deadline and abandons it.
+    def fake_scan_library_config(cfg_, scan_filter, contacts, pal_dir,
+                                 exts, db3_dir):
+        raise RuntimeError("synthetic scan failure (test)")
+
+    monkeypatch.setattr(main, "_scan_library_config",
+                        fake_scan_library_config)
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(library),
+        "--cache-root", str(tmp_path / "cr1"),
+        "--quit-after-ready", "--timeout", str(short_timeout)])
+    t0 = time.monotonic()
+    assert main.main() != 0
+    run1_s = time.monotonic() - t0
+    if run1_s >= short_timeout:
+        pytest.skip(
+            f"run 1 took {run1_s:.2f}s, past its own {short_timeout}s "
+            "deadline — nothing was left armed to detect")
+
+    # Run 2 must still be inside app.exec() when run 1's abandoned
+    # deadline would fire, which is no later than this.
+    monkeypatch.undo()
+    hold_until = t0 + run1_s + short_timeout + 0.5
+    monkeypatch.setattr(main.MainWindow, "index_busy",
+                        lambda self: time.monotonic() < hold_until)
+    monkeypatch.setattr(sys, "argv", [
+        "fauxcasa-tracer", str(library),
+        "--cache-root", str(tmp_path / "cr2"),
+        "--quit-after-ready", "--finish-build", "--timeout", "30"])
+    assert main.main() == 0, \
+        "the previous run's abandoned --timeout killed this one"
