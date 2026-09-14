@@ -66,6 +66,17 @@ FACE) until a face-matching algorithm is chosen.
 Fetch the core set with `uv run scripts/fetch-test-datasets.py`; see
 `--list` / `--all` for the rest.
 
+`apps/desktop-python/test_inmeta_datasets.py` (fauxcasa-co7) is what
+actually consumes the IPTC reference, exif-samples, and metadata-extractor
+corpora above, running inmeta.py's and metareader.py's readers over them.
+Every test in that file is gated on the fetch script's `.fetch-complete`
+marker, so the suite self-skips cleanly for any corpus that hasn't been
+fetched on the machine running it. Tracer CI
+(`.github/workflows/tracer.yml`) fetches only the tiny IPTC reference set
+before running the suite; the larger exif-samples corpus and the opt-in
+metadata-extractor corpus are left to self-skip there and are exercised
+locally instead, by a developer who has fetched them.
+
 ## 1. Metadata & interoperability test sets (most relevant)
 
 - **IPTC Photo Metadata Reference Images** — closest thing to an industry

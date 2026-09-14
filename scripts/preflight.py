@@ -17,6 +17,9 @@ Checks (derived from .github/workflows/tests.yml and tracer.yml):
   - uv run scripts/test_picasa_db.py -q
   - uv run scripts/test_confirm_archive.py -q
   - uv run scripts/check-ingest-parity.py
+  - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_inmeta_datasets.py -q
+    (dataset-gated: self-skips cleanly when cache/test-datasets/ isn't
+    fetched, so always safe here)
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q   (skipped with --fast)
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q
     (skipped with --fast; on Windows this spawns real AppContainer sandbox
@@ -91,6 +94,15 @@ def checks(root: Path, fast: bool) -> list[dict]:
             "command": ["uv", "run", "scripts/check-ingest-parity.py"],
             "cwd": root,
             "env": None,
+        },
+        {
+            "name": "dataset-gated metadata tests",
+            "command": ["uv", "run", "apps/desktop-python/test_inmeta_datasets.py", "-q"],
+            "cwd": root,
+            "env": {"QT_QPA_PLATFORM": "offscreen"},
+            # Self-skips cleanly (exit 0) when cache/test-datasets/ isn't
+            # fetched, so this is safe to run unconditionally, unlike the
+            # slow --fast-gated suites below.
         },
     ]
     if not fast:
