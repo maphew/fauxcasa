@@ -15266,6 +15266,129 @@ def test_offline_root_labels_empty_for_single_root_library(
     assert main._offline_root_labels(cat) == ["b"]     # falls back to path.name
 
 
+def test_single_root_offline_message_explains_and_suppresses_badge(
+        tmp_path: Path) -> None:
+    """fauxcasa-hi2 items 4/5: the owner's 2026-09-14 decision. A
+    single-root library whose one root is offline has no badge target
+    (item 4 stays suppressed — asserted again here via
+    _offline_root_labels), but it must NOT leave the user looking at an
+    empty grid with no explanation (item 5) — _single_root_offline_message
+    is that explanation, and _reconcile_online_roots must emit the SAME
+    empty (no-badge) label list _offline_root_labels does, since bead .e
+    item 4 was filed on the two disagreeing."""
+    import main
+    from catalog import Catalog, Photo
+
+    root = tmp_path / "solo"
+    root.mkdir()
+    single = Catalog(
+        root=root, photos=[Photo(rel="1.jpg", folder="", name="1.jpg")],
+        folders={}, albums={},
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=root,
+                                  label="Vacation Drive")])
+    single.offline_ids = {"aaaaaaaa"}      # contrived — still len(roots) == 1
+
+    # No badge (item 4, unchanged) ...
+    assert main._offline_root_labels(single) == []
+    # ... but a real, non-technical explanation (item 5).
+    msg = main._single_root_offline_message(single)
+    assert msg is not None
+    assert "Vacation Drive" in msg
+    for banned in ("root", "catalog", "reconcile", "offline_ids"):
+        assert banned not in msg.lower()
+    assert "isn't connected" in msg
+    assert "pick up where it left off" in msg
+    # One sentence: exactly one terminal period, at the end.
+    assert msg.count(".") == 1 and msg.endswith(".")
+
+    # A library with no offline root at all has nothing to explain.
+    online = Catalog(
+        root=root, photos=[], folders={}, albums={},
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=root)])
+    online.refresh_offline_ids()
+    assert main._single_root_offline_message(online) is None
+
+    # A genuine multi-root library keeps using the badge surface instead
+    # — _single_root_offline_message declines so callers fall back to
+    # _offline_root_labels.
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    root_a.mkdir()
+    multi = Catalog(
+        root=root_a, photos=[], folders={}, albums={},
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=root_a),
+               libmod.LibraryRoot(id="bbbbbbbb", path=root_b)])
+    multi.refresh_offline_ids()   # root_b was never created -> offline
+    assert main._single_root_offline_message(multi) is None
+    assert main._offline_root_labels(multi) == ["b"]   # badge still works
+
+
+def test_single_root_offline_message_elides_long_drive_name() -> None:
+    """The drive name is elided in the middle (like ElidingLabel's own
+    choice for path-shaped text) rather than left to make the status-bar
+    sentence unreasonably long."""
+    import main
+    from catalog import Catalog, Photo
+    from pathlib import Path as _P
+
+    long_label = "This Is A Very Long External Hard Drive Volume Label"
+    assert len(long_label) > main._OFFLINE_DRIVE_NAME_MAX_CHARS
+    root = _P("solo")
+    single = Catalog(
+        root=root, photos=[Photo(rel="1.jpg", folder="", name="1.jpg")],
+        folders={}, albums={},
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=root,
+                                  label=long_label)])
+    single.offline_ids = {"aaaaaaaa"}
+
+    msg = main._single_root_offline_message(single)
+    assert msg is not None
+    assert long_label not in msg          # too long — must be shortened
+    assert "…" in msg                # middle-ellipsis marker present
+    assert long_label[:5] in msg          # start survives
+    assert long_label[-5:] in msg         # end survives
+
+
+def test_reconcile_online_roots_suppresses_single_root_offline_label(
+        tmp_path: Path) -> None:
+    """_reconcile_online_roots (fauxcasa-hi2 item 4) must agree with
+    _offline_root_labels: a single-root library's offline root produces NO
+    label from either — the inconsistency the bead was filed about. A
+    genuine multi-root library still gets its offline labels from the
+    reconcile path, unchanged."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import main
+    from catalog import Catalog, Photo
+
+    root = tmp_path / "solo"
+    make_jpeg(root / "1.jpg")
+    id_only = "aaaaaaaa"
+    photo = Photo(rel="1.jpg", folder="", name="1.jpg", root_id=id_only)
+    single = Catalog(
+        root=root, photos=[photo], folders={}, albums={},
+        roots=[libmod.LibraryRoot(id=id_only, path=root)])
+
+    # Simulate an unplugged single root: delete the directory outright so
+    # refresh_offline_ids() (called inside _reconcile_online_roots) marks
+    # it offline for real, not by contrived offline_ids construction.
+    import shutil
+    shutil.rmtree(root)
+
+    drift, labels = main._reconcile_online_roots(single, None, None, None)
+    assert drift is not None
+    assert labels == []   # single-root: no badge label, matching item 4
+
+    # Multi-root control: the offline root DOES still get a label here.
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    make_jpeg(root_a / "1.jpg")
+    cat = Catalog(
+        root=root_a, photos=[], folders={}, albums={},
+        roots=[libmod.LibraryRoot(id="aaaaaaaa", path=root_a),
+               libmod.LibraryRoot(id="bbbbbbbb", path=root_b, label="B")])
+    drift2, labels2 = main._reconcile_online_roots(cat, None, None, None)
+    assert drift2 is not None
+    assert labels2 == ["B"]
+
+
 def test_sidebar_shows_offline_root_badge(tmp_path: Path) -> None:
     """_build_sidebar (design §12, bead .e): a >1-root library with an
     offline root gets a greyed 'B (offline)' root node under Folders. Bead

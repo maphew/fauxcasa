@@ -1185,19 +1185,22 @@ def _reconcile_online_roots(
     result. None (the default) skips the check entirely, matching every
     existing call site that never threaded a contacts path through."""
     catalog.refresh_offline_ids()
-    # NOTE (hi2 item 6): this stays inline rather than calling
-    # catalog.online_roots()/offline_roots() directly. Those helpers filter
+    # NOTE (hi2 item 6): the WALK loop's online set stays inline rather
+    # than calling catalog.online_roots() directly. That helper filters
     # `self.roots` as-is, so on a hand-built Catalog fixture that never set
-    # `roots` (empty list, per the docstring above) they'd both return []
+    # `roots` (empty list, per the docstring above) it would return []
     # and this loop would silently reconcile NOTHING instead of falling
     # back to the one implicit legacy root — a real behavior change, not
     # just a refactor. The `roots` local below applies that fallback
-    # FIRST, then filters it the same way online_roots()/offline_roots()
-    # do, so the two stay in lockstep whenever `catalog.roots` is actually
-    # populated (the normal case).
+    # FIRST, then filters it the same way online_roots() does, so the two
+    # stay in lockstep whenever `catalog.roots` is actually populated (the
+    # normal case). The returned LABELS, below, are a separate concern —
+    # they go through `_offline_root_labels(catalog)` instead, which reads
+    # `catalog.roots`/`offline_roots()` directly; see that call for why
+    # that is fine even for the bare-fixture case this loop's fallback
+    # exists for.
     roots = catalog.roots or [LibraryRoot(id=LEGACY_ROOT_ID, path=catalog.root)]
     online = [r for r in roots if r.id not in catalog.offline_ids]
-    offline = [r for r in roots if r.id in catalog.offline_ids]
 
     total = Drift()
     for r in online:
@@ -1219,8 +1222,18 @@ def _reconcile_online_roots(
     if stat_sig(contacts_path) != catalog.contacts_sig:
         total.ini_changed = True
 
-    labels = [r.label or r.path.name or str(r.path) for r in offline]
-    return total, labels
+    # fauxcasa-hi2 item 4/6: reuse _offline_root_labels rather than
+    # building a second label list from the `offline` local above, so the
+    # single-root suppression it applies (a single-root library has no
+    # badge to show — see its docstring) can only ever live in ONE place.
+    # `offline` above stays the walk-loop's own online/offline split (its
+    # own docstring explains why: the `roots` fallback for a bare-fixture
+    # Catalog that never set `roots`) — it is not reused here because a
+    # bare-fixture catalog leaves `catalog.roots` empty, which
+    # `_offline_root_labels` reads directly, and `refresh_offline_ids()`
+    # above only ever populates `offline_ids` from `catalog.roots` too —
+    # so the fixture case naturally yields [] from both, in lockstep.
+    return total, _offline_root_labels(catalog)
 
 
 def _plain_tooltip(text: str) -> str:
@@ -1416,11 +1429,60 @@ def _offline_root_labels(catalog: Catalog) -> list[str]:
     pixels." Does NOT call refresh_offline_ids() itself: callers
     (load_catalog on open, _reconcile_online_roots on reconcile) already
     keep `offline_ids` current, and re-stat-ing on every sidebar rebuild
-    would be surprising I/O in a UI-paint path."""
+    would be surprising I/O in a UI-paint path.
+
+    fauxcasa-hi2 item 4: the owner explicitly RATIFIED this single-root
+    suppression on 2026-09-14 rather than lifting it — it is deliberate,
+    not an oversight a future reviewer should "fix" by deleting the
+    `len(catalog.roots) <= 1` guard. `_reconcile_online_roots` below
+    reuses this same function (instead of building its own label list) so
+    the two callers can never drift back out of sync. The real gap that
+    prompted the review finding — a single-root offline library leaving
+    an unexplained empty grid — is closed separately, by
+    `_single_root_offline_message`'s status-bar text (hi2 item 5)."""
     if len(catalog.roots) <= 1:
         return []
     return [r.label or r.path.name or str(r.path)
             for r in catalog.offline_roots()]
+
+
+# One sentence needs to stay readable in a status bar at ordinary window
+# widths even when a drive's label/folder name is a long real-world path;
+# see _single_root_offline_message's elision below (same middle-ellipsis
+# choice ElidingLabel makes for path-shaped text — fauxcasa-a3m).
+_OFFLINE_DRIVE_NAME_MAX_CHARS = 40
+
+
+def _single_root_offline_message(catalog: Catalog) -> str | None:
+    """The status-bar sentence for the gap `_offline_root_labels`
+    deliberately leaves open (fauxcasa-hi2 item 5): a single-root library
+    whose one root is offline shows an empty grid with no badge to
+    explain it (item 4 keeps that badge suppressed on purpose — there is
+    nothing in the grid to badge). This is the only in-app explanation
+    such a user gets, so callers should prefer it over the raw
+    `_offline_root_labels` badge text whenever it returns non-None.
+
+    Returns None whenever there is nothing to explain this way: a
+    multi-root library (badges are the right surface there — this
+    function only ever covers the single-root case) or a single root
+    that is not offline.
+
+    Deliberately non-technical wording (matches docs/releases/v0.1.0.md's
+    register, not developer phrasing) — never says "root", "catalog",
+    "reconcile", or "offline_ids"."""
+    if len(catalog.roots) > 1:
+        return None
+    offline = catalog.offline_roots()
+    if not offline:
+        return None
+    r = offline[0]
+    name = r.label or r.path.name or str(r.path)
+    if len(name) > _OFFLINE_DRIVE_NAME_MAX_CHARS:
+        keep = (_OFFLINE_DRIVE_NAME_MAX_CHARS - 1) // 2
+        name = f"{name[:keep]}…{name[-keep:]}"
+    return (f'The drive holding these photos, "{name}", isn\'t '
+            f'connected right now — plug it back in and Fauxcasa will '
+            f'pick up where it left off.')
 
 
 def _scan_library_config(
@@ -2033,11 +2095,18 @@ class MainWindow(QMainWindow):
         # design §12): a fresh open surfaces any already-offline root here
         # too, not just the sidebar badge (_build_sidebar/
         # _offline_root_labels) — a transient notice like the backfill
-        # banner, not a permanent widget.
-        offline_at_open = _offline_root_labels(self.catalog)
-        if offline_at_open:
-            self.statusBar().showMessage(
-                f"offline: {', '.join(offline_at_open)}", 8000)
+        # banner, not a permanent widget. A single-root library (today's
+        # real case — bead .d/.g) has no badge to show at all (fauxcasa-hi2
+        # items 4/5), so it gets the friendlier explanatory sentence
+        # instead of the terse multi-root badge-style text below.
+        single_root_message = _single_root_offline_message(self.catalog)
+        if single_root_message:
+            self.statusBar().showMessage(single_root_message, 8000)
+        else:
+            offline_at_open = _offline_root_labels(self.catalog)
+            if offline_at_open:
+                self.statusBar().showMessage(
+                    f"offline: {', '.join(offline_at_open)}", 8000)
 
         # --- wiring ---
         # The grid's set-valued signal drives the status label (single
