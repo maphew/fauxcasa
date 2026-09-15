@@ -3006,6 +3006,15 @@ class MainWindow(QMainWindow):
             # build_cache merged in-file captions/keywords into these SAME
             # Photo objects in place — the prebuilt haystacks are stale.
             self._rebuild_search_index()
+            # ...and so are the People/Starred sidebar counts (fauxcasa-
+            # cam.5: XMP-only faces and XMP Rating stars land on these
+            # SAME Photo objects too, only now, at cold-build completion —
+            # same rebuild-then-reselect shape as _on_backfill_done, so a
+            # cold index's People section reflects XMP faces immediately,
+            # with no reveal toggle or relaunch needed to see them).
+            kind, key = self._selected_view()
+            self._rebuild_sidebar()
+            self._reselect_view(kind, key)
             self._update_import_notes()  # the cold build collected a fresh report
             if self.info_action.isChecked():
                 # The build merged in-file metadata into these SAME Photo

@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import struct
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -39,6 +40,13 @@ from catalog import (
     save_catalog_retrying,
     save_report,
 )
+
+# picasa_db.UNKNOWN_CONTACT (fauxcasa-cam.5's XMP-face merge needs the same
+# "unnamed/suggested" sentinel the ini faces= ingest uses) — same
+# scripts/-on-sys.path pattern catalog.py and db3rescue.py already use to
+# reach the project's researched Picasa-format reader from apps/desktop-python.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+import picasa_db  # noqa: E402
 from cropmap import crop_pixel_box, crop_qimage_upright
 from inmeta import read_jpeg_metadata
 from library import LEGACY_ROOT_ID
@@ -398,8 +406,14 @@ def read_photo_meta(src: Path | None, photo):
     sha256 is the N6 identity, size/mtime the cheap staleness signals, and
     the two metadata reads come from the bytes already in hand —
     caption/keywords (inmeta, XMP/IPTC, JPEG only) plus capture date / GPS /
-    XMP Rating (metareader, the exiv2 seam, all carriers). An unreadable
-    file fails soft: empty bytes, -1 signals, empty metadata.
+    XMP Rating / faces-in-XMP / its OWN caption+keywords read (metareader,
+    the exiv2 seam, all carriers — fauxcasa-cam.5 added faces/caption/
+    keywords there so non-JPEG containers get tier-1 ingest too; see
+    apply_photo_meta for how the two readers' caption/keywords are
+    reconciled and metareader.read_file_meta's `extended_xmp` param, fed
+    from inmeta.extended_xmp(data) below, for how an overflowing JPEG XMP
+    packet still gets read). An unreadable file fails soft: empty bytes,
+    -1 signals, empty metadata.
 
     `src` is the photo's already-resolved absolute path (multiroot .b,
     design §6) — callers compute it via Catalog.abs(photo), the single
@@ -441,8 +455,85 @@ def read_photo_meta(src: Path | None, photo):
         data, size, mtime = b"", -1, -1
     sha = hashlib.sha256(data).hexdigest()
     meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG)
-    fmeta = read_file_meta(data)     # in-file date/GPS/Rating
+    # ExtendedXMP (fauxcasa-cam.5): a >64 KB XMP packet (a long caption, a
+    # big keyword set, or many face regions) splits across extra APP1
+    # segments; reassemble once here and hand it to both readers so a
+    # field living only in the extension (inmeta.read_jpeg_metadata calls
+    # this again internally, cheaply — extended_xmp() bails fast when
+    # there's nothing to reassemble) still gets read.
+    fmeta = read_file_meta(data, extended_xmp=inmeta.extended_xmp(data))
     return data, size, mtime, sha, meta, fmeta
+
+
+def _face_iou(a: tuple[float, float, float, float],
+             b: tuple[float, float, float, float]) -> float:
+    """Intersection-over-union of two (left, top, right, bottom) rects in
+    the same fraction frame (STORED pixels — both ini faces= and
+    metareader's XMP faces already share it). 0.0 for non-overlapping or
+    degenerate rects, never a division error."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    iw = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    ih = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = iw * ih
+    area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+_FACE_IOU_MATCH = 0.5
+
+
+def _merge_xmp_faces(photo, xmp_faces, report: ImportReport | None) -> None:
+    """Merge metareader's XMP faces (rect, name-or-None) into photo.faces
+    (the ini-derived FaceTag list) by rect geometry — see apply_photo_meta's
+    docstring for the precedence. Mutates photo.faces in place (a new
+    tuple); a no-op when nothing actually changed (no XMP face matched or
+    was added), so a photo whose XMP faces exactly restate its ini faces
+    doesn't spuriously mark the catalog dirty.
+
+    Reporting (fauxcasa-cam.17 no-flood rule): an ADDED face (no ini
+    match — the common case once a library has "write faces to XMP"
+    turned on, since Picasa then strips faces= from the ini entirely) is
+    a gap-fill and is NEVER reported, exactly like every other §4 field's
+    gap-fill. A MATCHED face that fills a previously unnamed ini region is
+    also a gap-fill — not reported. Only a matched face whose ini/contacts
+    display name gets REPLACED by a different, non-empty XMP name is a
+    genuine conflict; every such replacement on this photo is collected
+    into ONE infile_override entry (matching the caption/keywords/geotag
+    fields' one-entry-per-field shape)."""
+    merged = list(photo.faces)
+    claimed: set[int] = set()  # ini indices already matched to an XMP face
+    replaced: list[str] = []  # 'ini "X" -> in-file "Y"' fragments to report
+    changed = False
+    for rect_x, name_x in xmp_faces:
+        best_idx, best_iou = -1, 0.0
+        for i, (rect_ini, _cid, _name) in enumerate(photo.faces):
+            if i in claimed:
+                continue
+            score = _face_iou(rect_x, rect_ini)
+            if score > best_iou:
+                best_idx, best_iou = i, score
+        if best_idx >= 0 and best_iou >= _FACE_IOU_MATCH:
+            claimed.add(best_idx)  # same face either way: never double-add
+            rect_ini, cid_ini, name_ini = merged[best_idx]
+            new_name = name_x or name_ini
+            if new_name != name_ini:
+                merged[best_idx] = (rect_ini, cid_ini, new_name)
+                changed = True
+                if name_ini:  # a REAL replacement, not a gap-fill: report it
+                    replaced.append(f'ini "{name_ini}" -> in-file "{new_name}"')
+        else:
+            cid = f"xmp:{name_x}" if name_x else picasa_db.UNKNOWN_CONTACT
+            merged.append((rect_x, cid, name_x))  # ADDED: always a gap-fill
+            changed = True
+    if not changed:
+        return
+    photo.faces = tuple(merged)
+    if report is not None and replaced:
+        report.add("file", "infile_override", photo.rel,
+                   "faces: " + "; ".join(replaced))
 
 
 def apply_photo_meta(photo, size: int, mtime: int, sha: str,
@@ -473,13 +564,40 @@ def apply_photo_meta(photo, size: int, mtime: int, sha: str,
     an in-file value REPLACES a DIFFERENT non-empty ini value (fauxcasa-cam.17).
     A gap-fill — ini had nothing, in-file supplies a value — is NOT reported.
     star is excluded even though it can be overridden: see the inline
-    comment at the star assignment below."""
+    comment at the star assignment below.
+
+    Faces-in-XMP (fauxcasa-cam.5): fmeta.faces (metareader's library-
+    neutral mwg-rs read) is merged into the ini-derived photo.faces by
+    RECT GEOMETRY, not by any id — the two stores have no shared key. An
+    XMP face whose rect overlaps an ini face (IoU >= 0.5) is the SAME
+    face: the ini rect + contact id are kept (the ini is the geometry/id
+    of record for a face Picasa already resolved to a contact), but the
+    XMP name wins for display when it's non-empty (§4 in-file wins tier-1
+    — a name in the file is fresher than whatever the ini/contacts.xml
+    had, or fills a suggested/unnamed ini face). An XMP face with no ini
+    match is a face the ini simply doesn't have (e.g. never opened in
+    Picasa, or added by a non-Picasa XMP writer): it's ADDED, with contact
+    id "xmp:<name>" (stable across re-scans, so the People sidebar/person
+    search — which key purely on Photo.faces' display name, not the id —
+    group repeats of the same named XMP-only face together) or
+    picasa_db.UNKNOWN_CONTACT when unnamed (matching the ini's own
+    suggested-face sentinel, so it surfaces as an unnamed/suggested face
+    the same way). caption/keywords: non-JPEG containers get nothing from
+    inmeta (JPEG-only), so metareader's own dc:description/dc:subject read
+    (fmeta.caption/keywords) is the fallback source for those — same
+    truthy-wins-over-ini rule, one field-level tier below inmeta's JPEG
+    read (a JPEG's inmeta value, when present, already won above)."""
     photo.size, photo.mtime, photo.sha256 = size, mtime, sha
     if meta.caption:
         if report is not None and photo.caption and photo.caption != meta.caption:
             report.add("file", "infile_override", photo.rel,
                        f'caption: ini "{photo.caption}" -> in-file "{meta.caption}"')
         photo.caption = meta.caption
+    elif fmeta.caption:  # non-JPEG containers: metareader is the only reader
+        if report is not None and photo.caption and photo.caption != fmeta.caption:
+            report.add("file", "infile_override", photo.rel,
+                       f'caption: ini "{photo.caption}" -> in-file "{fmeta.caption}"')
+        photo.caption = fmeta.caption
     if meta.keywords:
         if report is not None and photo.keywords and photo.keywords != meta.keywords:
             ini_kw = ", ".join(photo.keywords)
@@ -487,6 +605,15 @@ def apply_photo_meta(photo, size: int, mtime: int, sha: str,
             report.add("file", "infile_override", photo.rel,
                        f'keywords: ini "{ini_kw}" -> in-file "{new_kw}"')
         photo.keywords = meta.keywords
+    elif fmeta.keywords:
+        if report is not None and photo.keywords and photo.keywords != fmeta.keywords:
+            ini_kw = ", ".join(photo.keywords)
+            new_kw = ", ".join(fmeta.keywords)
+            report.add("file", "infile_override", photo.rel,
+                       f'keywords: ini "{ini_kw}" -> in-file "{new_kw}"')
+        photo.keywords = fmeta.keywords
+    if fmeta.faces:
+        _merge_xmp_faces(photo, fmeta.faces, report)
     if fmeta.date_taken and not photo.date_taken:
         # ini has no per-photo date key; probe_creation_time also fills only
         # when absent — §4: any existing value (ini-seeded or prior index)
