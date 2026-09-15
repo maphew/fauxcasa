@@ -39,16 +39,16 @@ shipping inside an AGPLv3 application (Fauxcasa's own license,
 the reason the owner deferred this work in the first place
 (fauxcasa-ilu, 2026-09-14).
 
-Verified on this development machine (`uv run --no-project --with pi-heif
-python -c "import pi_heif; print(pi_heif.libheif_version())"`):
-pi-heif 1.4.0 bundles **libheif 1.23.0** and, per the wheel's own
-(slightly stale-looking) `LICENSES_bundled.txt` template, **libde265**
-— the actual libde265 version bundled is reported by the orchestrator's
-own recon as **1.1.1**, newer than the `LICENSES_bundled.txt` template's
-cited v1.0.15. Both native components are treated as `LGPL-3.0-only`
-per the wheel's declared binary-distribution license; see
-`THIRD-PARTY-NOTICES.md`'s pi-heif entry for the "verify upstream" caveat
-on the exact point-release license text.
+Verified on the dev box with `pi_heif.libheif_info()` (`uv run
+--no-project --with pi-heif python -c "import pi_heif; print(pi_heif.
+libheif_info())"` → `{'libheif': '1.23.0', ..., 'decoders': {'libde265':
+'libde265 HEVC decoder, version 1.1.1'}}`): pi-heif 1.4.0 bundles
+**libheif 1.23.0** and **libde265 1.1.1** — both newer than the
+versions the wheel's own (slightly stale-looking) `LICENSES_bundled.txt`
+template cites (v1.18.1 / v1.0.15). Both native components are treated
+as `LGPL-3.0-only` per the wheel's declared binary-distribution license;
+see `THIRD-PARTY-NOTICES.md`'s pi-heif entry for the "verify upstream"
+caveat on the exact point-release license text.
 
 **What this memo does NOT decide — owner call before v0.1.0 ships with
 HEIC on:** HEIC/HEIF's video-derived codec, HEVC/H.265, is

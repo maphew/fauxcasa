@@ -12934,12 +12934,68 @@ def test_heic_extensions_in_both_walkers(tmp_path: Path) -> None:
     assert [p.name for p in script_walk] == walked
 
 
-def test_heic_decodes_through_real_indexer(tmp_path: Path) -> None:
+class _StubSandboxedService:
+    """A minimal decodefacade.get_service() stand-in that CLAIMS to be
+    sandboxed and answers UNSUPPORTED (a null QImage) for .heic/.heif
+    paths specifically, deciding purely from the extension — never a
+    real sandbox spawn. Non-HEIC paths decode via plain QImage(path) so
+    an unrelated neighbor file in the same test still gets a real tile
+    (the generic top-level scaled/quality resize in _index_one/viewer
+    still applies afterward regardless of edge).
+
+    The point: thumbcache._index_one and viewer.load_original_oriented
+    only ever reach decodefacade.get_service().decode() when a still
+    ISN'T pre-routed by extension first (psd/16-bit-tiff/heic all skip
+    it via elif branches evaluated in order). Patching get_service() to
+    return this stub, then asserting a HEIC file still decodes, proves
+    the .heic/.heif elif intercepted BEFORE this stub's decode() could
+    ever run — delete that elif and the dispatch falls through to this
+    stub instead, which answers null, exactly like a real sandboxed
+    worker's UNSUPPORTED for a format its canRead() doesn't recognize
+    (fauxcasa-ez2.9 Stage 2 review P1-1, the same risk documented for
+    the PSD pre-route)."""
+
+    state = None  # set to decodefacade.STATE_SANDBOXED by the fixture below
+    reason = "test stub -- never a real sandbox"
+
+    def decode(self, path: str, route: str = "still", edge: int = 0):
+        from PySide6.QtGui import QImage
+
+        if path.lower().endswith((".heic", ".heif")):
+            return QImage()  # UNSUPPORTED, as a real sandboxed worker
+                              # would answer for a format its canRead()
+                              # rejects -- this must never be reached.
+        return QImage(path)
+
+
+def _patch_sandboxed_service(monkeypatch) -> None:
+    """Make decodefacade.get_service() (as thumbcache.py/viewer.py call
+    it, `import decodefacade` + `decodefacade.get_service()`) return
+    _StubSandboxedService -- see its docstring for why this is the
+    tightest way to prove a HEIC pre-route branch, not the generic
+    post-Qt-null Pillow fallback, is what decoded the fixture (a plain
+    green run without this patch can't tell the two apart: the generic
+    fallback rescues HEIC too when the service is merely in-process/
+    degraded, the default in this test process)."""
+    import decodefacade
+
+    stub = _StubSandboxedService()
+    stub.state = decodefacade.STATE_SANDBOXED
+    monkeypatch.setattr(decodefacade, "get_service", lambda: stub)
+
+
+def test_heic_decodes_through_real_indexer(
+        tmp_path: Path, monkeypatch) -> None:
     """HEIC through the REAL _index_one path: Qt has no HEIF plugin, so
     the Pillow fallback (pillowload, via pi-heif's opener) must decode
     all four quadrants color-correct at native size — while a truncated,
     undecodable HEIC yields the standard zero-length error tile and never
-    sinks the batch."""
+    sinks the batch. decodefacade.get_service() is patched to a stub
+    that CLAIMS sandboxed and answers null for .heic paths specifically
+    (_patch_sandboxed_service), so this only stays green because the
+    .heic/.heif elif in _index_one intercepts before that stub's
+    decode() ever runs — delete the elif and "good.heic" error-tiles."""
+    _patch_sandboxed_service(monkeypatch)
     root = tmp_path / "lib"
     root.mkdir()
     (root / "good.heic").write_bytes(_heic_bytes())
@@ -12958,13 +13014,17 @@ def test_heic_decodes_through_real_indexer(tmp_path: Path) -> None:
     assert ent["ok.jpg"][1] > 0                    # neighbors unharmed
 
 
-def test_viewer_load_original_heic(tmp_path: Path) -> None:
+def test_viewer_load_original_heic(tmp_path: Path, monkeypatch) -> None:
     """The viewer's full-decode path (shared by the slideshow prefetch):
     the fixture renders via the Pillow/pi-heif fallback, the Picasa
     rotate= turns compose on top exactly like any format, and a
     truncated HEIC returns a null QImage (fail-soft contract, mirrors
-    test_viewer_load_original_psd)."""
+    test_viewer_load_original_psd). Same decodefacade stub as the
+    indexer test above, for the same reason: proves the viewer's
+    .heic/.heif elif intercepts before load_original_oriented would
+    ever consult the (stubbed, HEIC-answers-null) sandboxed branch."""
     _offscreen_app()
+    _patch_sandboxed_service(monkeypatch)
     from viewer import load_original
 
     good = tmp_path / "g.heic"
@@ -12978,6 +13038,46 @@ def test_viewer_load_original_heic(tmp_path: Path) -> None:
     broken = tmp_path / "b.heic"
     broken.write_bytes(_heic_bytes(broken=True))
     assert load_original(str(broken), 0).isNull()
+
+
+def test_heic_container_rotation_decodes_upright_exif_reports_raw_tag(
+        tmp_path: Path) -> None:
+    """The "Apple shape" (fixtures/heic-smoke/synthetic-rot6.heic.txt):
+    a REAL `irot` container transform (angle=3, 270 deg anticlockwise =
+    90 deg clockwise) AND a real EXIF Orientation=6 tag, together, on
+    the same file -- exactly what an iPhone HEIC carries. This is the
+    load-bearing proof for pillowload.py's orientation docstring: HEIC
+    uprightness comes from libheif applying the container's irot/imir
+    transform DURING DECODE, never from pillow_qimage's exif_transpose
+    call (pi-heif's opener resets EXIF Orientation to 1 before
+    exif_transpose ever runs, so exif_transpose is always a no-op for
+    HEIC) -- yet metareader.read_orientation (exiv2, reading the file's
+    raw bytes directly, never through pi-heif) still reports the RAW
+    tag, 6, unaffected by pi-heif's in-process neutering. The stored
+    (coded-plane) frame is the same 96x64 quadrant layout as
+    synthetic.heic; the irot swaps it to a displayed 64x96 with the
+    quadrants rotated 270 deg anticlockwise from the stored layout:
+    displayed TL = stored BL (blue), TR = stored TL (red), BL = stored
+    BR (yellow), BR = stored TR (green)."""
+    _offscreen_app()
+    from metareader import read_orientation
+    from viewer import load_original_oriented
+
+    fixture = REPO / "fixtures" / "heic-smoke" / "synthetic-rot6.heic"
+    data = fixture.read_bytes()
+    assert read_orientation(data) == 6           # exiv2 reads the raw tag
+
+    path = tmp_path / "rot6.heic"
+    path.write_bytes(data)
+    img, orientation = load_original_oriented(str(path), rotate=0)
+    assert orientation == 6                      # reported, not neutralised
+    assert (img.width(), img.height()) == (64, 96)  # the irot ran
+    tl, tr = img.pixelColor(5, 5), img.pixelColor(59, 5)
+    bl, br = img.pixelColor(5, 91), img.pixelColor(59, 91)
+    assert abs(tl.red() - 40) < 30 and abs(tl.blue() - 220) < 30   # blue
+    assert abs(tr.red() - 220) < 30 and abs(tr.green() - 40) < 30  # red
+    assert abs(bl.red() - 230) < 30 and abs(bl.green() - 210) < 30  # yellow
+    assert abs(br.red() - 40) < 30 and abs(br.green() - 200) < 30  # green
 
 
 def test_file_types_cache_key_and_walk_seam(tmp_path: Path) -> None:
@@ -13147,6 +13247,33 @@ def test_make_thumbcache_exclude_exts(tmp_path: Path) -> None:
                      "--sidecar-only"]) == 2
     assert mtc.main(["--library", str(lib), "--out", str(out),
                      "--exclude-exts", ".bogus"]) == 2
+
+
+def test_pillowload_import_registers_heif_opener() -> None:
+    """Importing pillowload registers pi-heif's opener at IMPORT time,
+    not lazily from pillow_qimage() (fauxcasa-y5b review): a decode
+    worker thread calling register_heif_opener() for the first time
+    while ANOTHER worker thread is mid-Image.open() on an unrelated
+    photo can KeyError on Pillow's own OPEN dict (populated a moment
+    AFTER the format id is appended to the probe order) -- registering
+    once, at import, before any worker thread exists, closes that
+    window. Skips if pi_heif truly is not installed in this environment
+    (mirrors pillowload's own fail-soft contract; this test asserts the
+    registration SIDE EFFECT, not that pi-heif is always present)."""
+    import importlib
+
+    import pillowload
+
+    importlib.reload(pillowload)  # re-run the module-level call fresh
+    try:
+        import pi_heif  # noqa: F401
+    except ImportError:
+        pytest.skip("pi_heif not installed in this environment")
+    from PIL import Image
+
+    assert "HEIF" in Image.OPEN
+    assert pillowload._heif_registered is True
+    assert pillowload._heif_import_failed is False
 
 
 def test_tiff_is_16bit_header_sniff(tmp_path: Path) -> None:

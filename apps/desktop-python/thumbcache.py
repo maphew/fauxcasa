@@ -751,8 +751,13 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
             # canRead() would always be false (same UNSUPPORTED -> stuck
             # zero-byte tile risk fauxcasa-ez2.9 Stage 2 review P1-1
             # documented for PSD). pillow_qimage registers pi-heif's
-            # opener lazily and applies exif_transpose itself, same as
-            # every other Pillow-fallback format (fauxcasa-y5b).
+            # opener at import time (pillowload module doc), not here.
+            # Uprightness for HEIC does NOT come from pillow_qimage's
+            # exif_transpose call the way it does for every other format
+            # this fallback serves: pi-heif's opener resets EXIF
+            # Orientation to 1 at open time, so exif_transpose always
+            # no-ops for HEIC; libheif applies the container's own irot/
+            # imir transform while decoding instead (fauxcasa-y5b).
             img = pillow_qimage(data, top)
         elif (not from_preview and src is not None
               and decodefacade.get_service().state

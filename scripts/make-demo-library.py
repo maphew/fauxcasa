@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "pillow",
+#   "pi-heif",
 #   "piexif",
 #   "av",
 #   "exiv2",
@@ -71,6 +72,20 @@ from pathlib import Path
 
 import piexif
 from PIL import Image, ImageDraw
+
+try:
+    # Register pi-heif's opener (fauxcasa-y5b review) so build_camera_
+    # odds_and_ends's Image.open(dst) below can read the real dimensions
+    # of the corpus's IMG_5195.HEIC sample -- without this, HEIC opens
+    # raise, dims falls back to None, and manifest.json's per-file dims
+    # column silently reads "null" for a file the app has indexed since
+    # this bead, even though its actual pixel size is knowable.
+    from pi_heif import register_heif_opener
+
+    register_heif_opener()
+except Exception as _e:  # noqa: BLE001 -- fail-soft: dims stays None
+    print(f"pi-heif unavailable ({_e}) -- HEIC dims will read null",
+          file=sys.stderr)
 
 REPO = Path(__file__).resolve().parent.parent
 DEMO_ROOT = REPO / "cache" / "demo-library"

@@ -10,7 +10,9 @@ GitHub release tags, not a semantic-versioning contract.
 
 Changes since the `tracer-test-v1` preview (2026-08-10, commit `553d31a`).
 The `v0.1.0-rc2` release candidate (2026-09-13) contains everything in
-this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
+this section dated 2026-09-13 or earlier; see `docs/releases/v0.1.0.md`
+for the full user-facing notes. Entries dated after 2026-09-13 (below)
+landed since rc2 and are not yet in any tagged release.
 
 ### Added (2026-09-15)
 

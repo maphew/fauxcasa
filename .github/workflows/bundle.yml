@@ -16,6 +16,7 @@ on:
       - "scripts/picasa_db.py"
       - "scripts/make-synthetic-dng.py"
       - "fixtures/raw-smoke/**"
+      - "fixtures/heic-smoke/**"
       - ".github/workflows/bundle.yml"
   pull_request:
     paths:
@@ -23,6 +24,7 @@ on:
       - "scripts/picasa_db.py"
       - "scripts/make-synthetic-dng.py"
       - "fixtures/raw-smoke/**"
+      - "fixtures/heic-smoke/**"
       - ".github/workflows/bundle.yml"
 
 jobs:
@@ -54,14 +56,23 @@ jobs:
       # runtime.
       EXIV2: "exiv2==0.18.1"
       PILLOW: "pillow==12.3.0"
-      # HEIC/HEIF opener for the pillowload fallback (fauxcasa-y5b): a
-      # delvewheel-repaired wheel whose native libheif/libde265 + the
-      # `_pi_heif` extension module install as TOP-LEVEL files in
-      # site-packages, not inside pi_heif/'s own folder, and it ships no
-      # PyInstaller hook of its own — verified with a local frozen build
-      # that PyInstaller's own binary-dependency walker still finds and
-      # bundles them once "pi_heif" is a spec hiddenimport (fauxcasa-
-      # tracer.spec _hidden), same as the PIL entries above.
+      # HEIC/HEIF opener for the pillowload fallback (fauxcasa-y5b):
+      # ships no PyInstaller hook of its own, so PyInstaller must
+      # discover its native bits via "pi_heif" being a spec hiddenimport
+      # (fauxcasa-tracer.spec _hidden), same as the PIL entries above.
+      # On WINDOWS this is verified with a real local frozen build: the
+      # wheel is delvewheel-repaired, its `_pi_heif` extension + native
+      # libheif/libde265 DLLs land as TOP-LEVEL files in site-packages
+      # (not inside pi_heif/'s own folder), and PyInstaller's own
+      # binary-dependency walker found and bundled all of it with no
+      # extra flag (spec comment has the full writeup). The Linux leg
+      # below (ubuntu-22.04) uses a DIFFERENT wheel layout (manylinux/
+      # auditwheel: the .so files live in a sibling `pi_heif.libs/`
+      # directory instead of flat at site-packages root) that was NOT
+      # locally verified (no Linux box available for review) — this
+      # workflow run is the actual gate for that platform, not this
+      # comment; if it goes red, see fauxcasa-tracer.spec's header for
+      # what to check first (an ELF RPATH the walker didn't resolve).
       PIHEIF: "pi-heif==1.4.0"
       # LibRaw as a wheel (fauxcasa-v46.1): the artifact must bundle RAW
       # decode — rawpy is imported lazily (rawload.py), so a build without

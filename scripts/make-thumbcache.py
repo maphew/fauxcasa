@@ -119,21 +119,28 @@ EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
 # apps/desktop-python/pillowload.py._ensure_heif_opener): pi-heif's
 # native lib load is not free, and a build without the wheel should fail
 # soft to the same zero-length-blob error tile any unreadable source
-# gets in _make_thumb's broad except, not crash the whole run.
+# gets in _make_thumb's broad except, not crash the whole run -- but
+# still warn ONCE (this script's print-to-stderr idiom, not pillowload's
+# logging.warning) so a missing wheel isn't silently invisible, and
+# never claim "registered" on a failed attempt (so a transient import
+# error can't permanently mask a real HEIC/HEIF source as fine).
 _heif_registered = False
+_heif_import_failed = False
 
 
 def _ensure_heif_opener() -> None:
-    global _heif_registered
-    if _heif_registered:
+    global _heif_registered, _heif_import_failed
+    if _heif_registered or _heif_import_failed:
         return
     try:
         from pi_heif import register_heif_opener
 
         register_heif_opener()
-    except Exception:
-        pass  # fail-soft: HEIC/HEIF sources fall through to the error tile
-    _heif_registered = True
+        _heif_registered = True
+    except Exception as e:  # noqa: BLE001 -- ImportError or native-lib faults
+        _heif_import_failed = True
+        print(f"pi-heif unavailable ({e}) -- HEIC/HEIF sources will "
+              "error-tile this run", file=sys.stderr)
 
 
 # Mirror of apps/desktop-python/library.py LIBRARY_DIR / ROOT_MARKER — the

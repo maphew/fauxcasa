@@ -19,18 +19,33 @@ never fall through here, so a TIFF-based RAW container can't be
 HEIC/HEIF (fauxcasa-y5b) rides the SAME fallback: Qt ships no HEIF
 plugin either, so callers route .heic/.heif by extension straight here,
 exactly like .psd. Pillow itself cannot decode HEIC without a plugin —
-this module registers one lazily via **pi-heif** (PyPI `pi-heif`), not
+this module registers one via **pi-heif** (PyPI `pi-heif`), not
 pillow-heif: pi-heif wheels bundle only the libheif/libde265 decoder
 (LGPLv3), while pillow-heif's wheels also bundle the x265 ENCODER and
 are GPLv2 as a result (docs/research/heic-decode-decision.md). The
-opener is registered once per process, fail-soft: a build without the
-wheel logs one warning and HEIC/HEIF then error-tile exactly like any
-other still Pillow cannot open.
+opener is registered ONCE per process, at IMPORT time (module scope,
+below) rather than lazily from pillow_qimage() — see
+_ensure_heif_opener's docstring for the worker-thread race that
+motivates this — fail-soft: a build without the wheel logs one warning
+and HEIC/HEIF then error-tile exactly like any other still Pillow
+cannot open.
 
 Orientation is applied exactly once per path, like rawload: Qt's path
 uses setAutoTransform; this path bakes the tag via PIL's exif_transpose
-(a no-op for untagged formats — PSD carries no EXIF Orientation). The
-two paths are alternatives, never composed.
+for every format EXCEPT HEIC/HEIF (a no-op for untagged formats — PSD
+carries no EXIF Orientation). pi-heif's opener resets EXIF Orientation
+to 1 at open time (pi_heif/as_plugin.py's set_orientation(), called
+automatically in Pillow-plugin mode), so exif_transpose is always a
+no-op for HEIC specifically; libheif applies the container's own irot/
+imir transform boxes while decoding instead, before pixels ever reach
+PIL. KNOWN LIMITATION (not fixed here, tracked as fauxcasa-zq9, P4): an
+HEIC whose rotation lives ONLY in an EXIF Orientation tag, with no
+irot/imir in the container (not the common case — most encoders write
+both, and Apple's HEIC shape uses irot/imir) decodes SIDEWAYS: pi-heif
+neutralises the tag by design, and libheif has no container transform
+to apply, so no orientation signal survives either path. The two paths
+(Qt's autoTransform vs. this module's exif_transpose/libheif-native
+handling) are alternatives, never composed.
 
 Threat-model note (docs/decode-threat-model.md): in-process like all
 tracer decode, but a single bytes-in/pixels-out function so the future
@@ -127,10 +142,25 @@ def tiff_is_16bit(data: bytes) -> bool:
 
 
 def _ensure_heif_opener() -> None:
-    """Register pi-heif's Pillow opener lazily, once per process; on
-    failure (missing wheel, native-lib load fault) warn ONCE and leave
-    HEIC/HEIF to fail-soft to the error tile like any other format
-    Pillow cannot open (N7 pattern, mirrors metareader._module)."""
+    """Register pi-heif's Pillow opener, once per process (no-op on every
+    call after the first, any outcome); on failure (missing wheel,
+    native-lib load fault) warn ONCE and leave HEIC/HEIF to fail-soft to
+    the error tile like any other format Pillow cannot open (N7 pattern,
+    mirrors metareader._module).
+
+    Called once at IMPORT time below, deliberately NOT from
+    pillow_qimage() per call: Pillow's Image.register_open(id, ...)
+    appends `id` to the format-probe order (Image._plugins/ID) BEFORE
+    Image.OPEN[id] is populated, a window that is empty when this runs
+    once at import (before the indexer's thread pool exists) but is a
+    real race if the first call instead happens lazily from a decode
+    worker thread while ANOTHER worker thread is mid-Image.open() on an
+    unrelated photo -- that thread can observe `id` in the probe order
+    and KeyError on the not-yet-populated OPEN entry, producing a
+    permanent null tile for a file that has nothing to do with HEIC
+    (fauxcasa-y5b review). Kept as a callable (not inlined at module
+    scope) so an explicit caller can still assert it ran (e.g. a test
+    importing this module fresh)."""
     global _heif_registered, _heif_import_failed
     if _heif_registered or _heif_import_failed:
         return
@@ -145,6 +175,9 @@ def _ensure_heif_opener() -> None:
                     "error-tile this run", e)
 
 
+_ensure_heif_opener()  # at import time, single-threaded -- see docstring above
+
+
 def pillow_qimage(data: bytes, max_edge: int | None = None):
     """Decode `data` with Pillow to a QImage (null on ANY failure —
     including Pillow itself being unavailable; the import is lazy so a
@@ -157,10 +190,23 @@ def pillow_qimage(data: bytes, max_edge: int | None = None):
     try:
         from PIL import Image, ImageOps
 
-        _ensure_heif_opener()  # no-op after the first call, any outcome
-
         with Image.open(io.BytesIO(data)) as im:
-            im = ImageOps.exif_transpose(im)  # the ONE orientation apply
+            # exif_transpose is the ONE orientation apply for every
+            # OTHER format this fallback serves (PSD carries no EXIF
+            # Orientation; 16-bit TIFF's tag, if any, is untouched here)
+            # -- but NOT for HEIC/HEIF: pi-heif's opener calls its own
+            # set_orientation() at open time (pi_heif/as_plugin.py),
+            # which RESETS the EXIF Orientation tag to 1 unconditionally
+            # whenever one is present, so this exif_transpose is always
+            # a no-op for HEIC. Uprightness instead comes from libheif
+            # itself applying the HEIF container's own irot/imir
+            # transform boxes while DECODING, before pixels ever reach
+            # PIL. Known gap (not fixed here, tracked as fauxcasa-zq9, P4):
+            # an HEIC whose rotation lives ONLY in EXIF, with no irot/
+            # imir in the container, decodes SIDEWAYS -- pi-heif
+            # neutralises the tag by design and libheif has nothing to
+            # rotate, so no orientation signal survives to correct it.
+            im = ImageOps.exif_transpose(im)
             # Normalise high-bit-depth integer modes before any conversion:
             # convert('RGB') clips values > 255 for 'I' and 'I;*' modes
             # rather than scaling them, so a 16-bit grayscale sample of

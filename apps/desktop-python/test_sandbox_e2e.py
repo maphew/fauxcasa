@@ -43,6 +43,8 @@ from pathlib import Path
 
 import pytest
 
+REPO = Path(__file__).resolve().parents[2]
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import decodefacade as df  # noqa: E402
@@ -357,6 +359,44 @@ def test_psd_indexes_and_views_with_sandbox_on(tmp_path, monkeypatch):
     assert not img.isNull(), (
         "the viewer's PSD pre-route must also bypass the sandbox branch")
     assert (img.width(), img.height()) == (64, 48)
+
+
+@_WINDOWS_ONLY
+def test_heic_indexes_and_views_with_sandbox_on(tmp_path, monkeypatch):
+    """HEIC twin of test_psd_indexes_and_views_with_sandbox_on
+    (fauxcasa-y5b): with a REAL sandboxed worker running, Qt ships no
+    HEIF plugin either, so the worker's canRead() would always be false
+    and the sandbox route would return UNSUPPORTED -> a permanent
+    zero-byte tile (the same fauxcasa-ez2.9 Stage 2 review P1-1 risk
+    documented for PSD) unless .heic/.heif pre-routes to pillow_qimage
+    ahead of the sandboxed branch in both thumbcache._index_one and
+    viewer.load_original_oriented. Uses the committed synthetic fixture
+    (fixtures/heic-smoke/synthetic.heic) since this file stays a self-
+    contained script (no PIL-write HEIC encoder to hand-build one)."""
+    root = tmp_path / "lib"
+    dst = root / "f" / "photo.heic"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes((REPO / "fixtures" / "heic-smoke" / "synthetic.heic")
+                     .read_bytes())
+
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+    df.reset_service()
+    svc = df.get_service()
+    svc.ensure_started()
+    assert svc.state == df.STATE_SANDBOXED, f"sandbox failed: {svc.reason}"
+
+    cat = scan_library(root)
+    result = thumbcache.build_cache(cat, tmp_path / "c")
+    cache = thumbcache.load_cache(result.path)
+    by_rel = dict(zip(cache.files, cache.entries))
+    assert by_rel["f/photo.heic"][1] > 0, (
+        "HEIC must pre-route to pillow_qimage, not the sandbox, and "
+        "produce a non-empty tile")
+
+    img, _ = load_original_oriented(str(dst), rotate=0)
+    assert not img.isNull(), (
+        "the viewer's HEIC pre-route must also bypass the sandbox branch")
+    assert (img.width(), img.height()) == (96, 64)
 
 
 # ---------------------------------------------------------------------------

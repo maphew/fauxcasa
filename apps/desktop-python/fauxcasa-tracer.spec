@@ -14,14 +14,26 @@
 # classes Multimedia as an add-on, so Essentials alone would silently
 # ship a build whose video playback has no sound; the excludes + the
 # binary filter below keep every OTHER Addons module out). pi-heif ships
-# its native libheif/libde265 + the `_pi_heif` extension module as
-# TOP-LEVEL files in site-packages (a delvewheel-repaired wheel — see
-# docs/research/heic-decode-decision.md), not inside pi_heif/'s own
-# folder; PyInstaller's own binary-dependency walker picks up `_pi_heif`
-# and its DLLs once "pi_heif" is a hiddenimport (verified with a local
-# frozen build, fauxcasa-y5b) — provides no PyInstaller hook of its own,
-# so this spec names it explicitly like PIL below rather than relying on
-# transitive discovery through pillowload.py's lazy import:
+# no PyInstaller hook of its own, so this spec names it explicitly like
+# PIL below rather than relying on transitive discovery through
+# pillowload.py's lazy import. Its native-library layout differs by
+# platform (both put the compiled `_pi_heif` extension at the TOP LEVEL
+# of site-packages, not inside pi_heif/'s own folder):
+#   - Windows (delvewheel-repaired wheel): libheif/libde265 DLLs sit
+#     FLAT beside `_pi_heif*.pyd` at site-packages root; PyInstaller's
+#     own binary-dependency walker picks up the extension and its DLLs
+#     automatically once "pi_heif" is a hiddenimport -- VERIFIED with a
+#     real local frozen Windows build (fauxcasa-y5b review, Python 3.12
+#     matching bundle.yml): both landed under dist/*/_internal/ and the
+#     frozen exe decoded the committed HEIC fixture end to end.
+#   - manylinux (auditwheel-repaired wheel): libheif/libde265 .so files
+#     instead live in a sibling `pi_heif.libs/` directory (auditwheel's
+#     convention, not delvewheel's flat layout), found via the
+#     extension's RPATH -- UNVERIFIED on this box (no Linux available
+#     here); PyInstaller's ELF dependency walker is expected to resolve
+#     an RPATH-relative shared object the same way it resolves any other
+#     native dependency, but bundle.yml's ubuntu-22.04 leg (fauxcasa-y5b)
+#     is the actual gate for this claim, not this comment.
 #   uv run --with "PySide6-Essentials==6.11.1" \
 #       --with "PySide6-Addons==6.11.1" --with "pyinstaller==6.20.0" \
 #       --with "rawpy==0.27.0" --with "av==18.0.0" --with "pillow==12.3.0" \

@@ -533,7 +533,12 @@ def _image_size(path: Path) -> tuple[int, int] | None:
     wrong answer), so the size filter must never judge a RAW by it — the
     file is kept and the rawpy path decodes it (rawload module doc).
     Video files likewise report None: QImageReader must never sniff video
-    bytes (videoload module doc), so the size filter always keeps them."""
+    bytes (videoload module doc), so the size filter always keeps them.
+    HEIC/HEIF falls through to the QImageReader probe below like any
+    ordinary still, but since the pinned PySide6 build ships no HEIF
+    plugin (pillowload module doc, fauxcasa-y5b) that probe's size() is
+    never valid, so it ALSO reports None and the filter keeps it,
+    matching RAW/video's outcome without a dedicated branch."""
     if is_raw_suffix(path.name) or is_video_suffix(path.name):
         return None
     try:
