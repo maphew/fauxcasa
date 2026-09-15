@@ -58,36 +58,29 @@ def _pin_decode_sandbox_off():
         os.environ["FAUXCASA_DECODE_SANDBOX"] = prev
 
 
-@pytest.fixture(autouse=True)
-def _isolate_qt_per_test():
-    """Per-test Qt isolation. Two things otherwise accumulate across the whole
-    session and, on Windows offscreen, surface as a flaky native access
-    violation in a later paint-heavy test (test_reveal_*'s _toggle_reveal),
-    with this test's own decode workers merely parked at jobs.get() in the
-    dump — i.e. the crash is cumulative state, not an active worker race
-    (fauxcasa-gfz):
+def _sweep_qt_widgets(app) -> None:
+    """Retire GridView/ViewerPage workers, then delete every top-level Qt
+    widget and flush the deferred deletion. Factored out of
+    ``_isolate_qt_per_test`` (fauxcasa-xf2) so that fixture teardown and
+    ``test_ready_poll_timer_dies_with_the_window`` — which needs this SAME
+    sweep to run mid-test, not just at fixture teardown — share one
+    implementation and cannot drift apart.
 
     1. Each GridView starts 4 daemon decode threads that block forever on
        jobs.get(). stop() retires them — and must run BEFORE widget deletion,
        so a worker can never emit tile_ready into a half-deleted notifier.
     2. QWidgets created in a test are never destroyed; they pile up as live
        Qt objects. Delete every top-level widget and flush the deferred
-       deletions so each test starts from a clean widget tree — the way the
-       suite behaved before the loupe tests added this much widget churn.
-
+       deletions so the widget tree is actually clean afterward — the way
+       the suite behaved before the loupe tests added this much widget
+       churn.
     3. Same discipline for ViewerPage (and its SlideshowPage subclass):
        quiesce() ages out and joins any in-flight original-decode /
        prefetch thread. The LAST navigation's loader still holds a VALID
-       serial when the test ends, so without this it can emit into the
+       serial when the sweep runs, so without this it can emit into the
        widget deletion below — the same gfz access-violation family, seen
        on Windows once the slideshow tests added rapid-navigation churn."""
-    yield
     from PySide6.QtCore import QEvent
-    from PySide6.QtWidgets import QApplication
-
-    app = QApplication.instance()
-    if app is None:
-        return
     from grid import GridView
     from viewer import ViewerPage
 
@@ -101,6 +94,22 @@ def _isolate_qt_per_test():
         w.deleteLater()
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # actually free them
     app.processEvents()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_qt_per_test():
+    """Per-test Qt isolation: run ``_sweep_qt_widgets`` (see its docstring
+    for why) after every test so accumulated decode threads and undeleted
+    widgets from the whole session don't surface as a flaky native access
+    violation in a later paint-heavy test (test_reveal_*'s _toggle_reveal) —
+    the crash is cumulative state, not an active worker race (fauxcasa-gfz)."""
+    yield
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        return
+    _sweep_qt_widgets(app)
 
 
 def _raw_catalog(path: Path) -> dict:
@@ -7505,43 +7514,57 @@ def test_search_haystack_visible_subset_and_reveal(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_ready_poll_timer_dies_with_the_run(
+def test_ready_poll_timer_dies_with_the_window(
         monkeypatch, library: Path, tmp_path: Path, capsys) -> None:
-    """After a self-quitting in-process main() run, spinning the (reused)
-    QApplication's event loop must fire no stale check_ready — no CRITICAL
-    'uncaught exception' may reach the log.
+    """After a self-quitting in-process main() run, the window is torn down
+    and the (reused) QApplication's event loop is spun several times; no
+    stale check_ready may reach the excepthook.
+
+    The original (caplog-based, `_run`-named) version of this test could
+    never go red against the bug it documents: inside the test body `win`
+    was still referenced by check_ready's own closure (a live Python object
+    whose C++ side was never deleted), and the per-test widget sweep that
+    actually deletes the window (`_sweep_qt_widgets`, called from
+    `_isolate_qt_per_test`) runs only at FIXTURE teardown — after this
+    test's assertions had already passed either way. A stale check_ready
+    firing into a still-alive window just re-runs harmlessly; it needs an
+    already-deleted GridView to raise. So this version calls
+    `_sweep_qt_widgets` itself, INSIDE the test body, before spinning the
+    loop, forcing the same teardown the fixture performs but early enough
+    to matter (fauxcasa-xf2).
 
     Asserts on capsys' stderr mirror (applog's _StderrHandler), NOT caplog:
-    applog sets `log.propagate = False` on the 'fauxcasa' logger, so its
-    records never reach the root handler caplog installs, which would make this
-    guard pass vacuously — the convention note at
-    test_cmd_promote_requires_explicit_library says the same.
+    the 'fauxcasa' logger sets propagate=False (applog.py:83), matching the
+    convention on test_cmd_promote_requires_explicit_library.
 
-    fauxcasa-47f investigated whether this guard was vacuous the same way
-    fauxcasa-9pr's first attempt was. Run ALONE (-k ready_poll_timer_dies)
-    against a main.py with the fauxcasa-q6l.15 parenting reverted (poll =
-    QTimer() instead of QTimer(win)), the caplog form passed 1/1 — vacuous
-    by the same symptom as 9pr. But switching to capsys here (this edit)
-    did NOT flip it red the way it did in 85ee302: it still passes 1/1
-    against the reverted main.py, even with main()'s poll.stop() also
-    removed as a second probe. Root cause is structural, not a
-    caplog-visibility gap: `win` stays alive in Python for the whole test
-    (captured by check_ready's own closure, referenced again inside
-    check_ready via `poll.stop()`), and the widget sweep that actually
-    destroys the C++ GridView the original bug fired into
-    (_isolate_qt_per_test, test_tracer.py) only runs at THIS test's own
-    fixture teardown — after the test body and its assertions have already
-    finished. So nothing this test's body can observe ever gets a deleted
-    GridView to fire into; the caplog->capsys swap is kept anyway as the
-    file's documented convention (and is a strict improvement, since
-    caplog cannot reliably see this logger), but it cannot make this
-    particular guard a real regression test for the cross-test leak by
-    itself. See fauxcasa-xf2 for a possible follow-up that would need to
-    force the same teardown inside the test body to actually exercise the
-    C++-deletion race."""
+    Confirmed red only when BOTH parts of the fix are reverted together —
+    `poll = QTimer()` (unparented) AND dropping the `poll.stop()` after
+    `app.exec()` in main.py: the stale poll then fires check_ready into the
+    deleted window's `win.pages` and the RuntimeError ("Internal C++ object
+    already deleted") reaches the excepthook as "uncaught exception".
+    Reverting ONLY the parenting while keeping `poll.stop()` stays GREEN:
+    `poll.stop()` alone disarms the timer before this test (or anything
+    else) ever gets a chance to spin the loop, so that half of the bug
+    can't be observed this way — this is expected, not a hole in the test;
+    do not re-investigate it as a gap.
+
+    The spin below drives `app.exec()`, NOT a bare `QEventLoop()` (unlike
+    the sibling `test_abandoned_hard_stop_does_not_fire_after_its_run`,
+    whose own spin loop this was originally copied from). Measured directly
+    while building this test: after `main.main()` has called
+    `QCoreApplication.quit()` once (the --quit-after-ready path), Qt leaves
+    `QThreadData::quitNow` set, and every later bare `QEventLoop().exec()`
+    on this thread returns in well under a millisecond WITHOUT servicing
+    any pending timer, forever — only `QCoreApplication::exec()` resets that
+    flag on entry. A bare-`QEventLoop()` version of this spin is silently a
+    no-op no matter how many rounds or how long each `singleShot` is, so it
+    stays green against BOTH the fixed and the fully-reverted main.py — an
+    even more vacuous failure mode than the one this test was written to
+    fix. `app.exec()` + `app.quit()` is the only form of this spin that
+    actually lets a leaked timer fire."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
+    from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
     import main
 
@@ -7551,16 +7574,20 @@ def test_ready_poll_timer_dies_with_the_run(
         "fauxcasa-tracer", str(library), "--cache-root", str(cache_root),
         "--quit-after-ready", "--finish-build", "--timeout", "30"])
     assert main.main() == 0
-    capsys.readouterr()      # discard the run's own output
+    capsys.readouterr()          # discard the run's own stdout/stderr
 
-    # The window is gone; give any leaked 50 ms poll several chances to fire.
+    # Force the window's real teardown NOW, inside the test, instead of
+    # waiting for the fixture to do it after these assertions run.
+    _sweep_qt_widgets(app)
+
+    # The window is gone; give any leaked 50 ms poll several chances to
+    # fire into it.
     for _ in range(6):
-        loop = QEventLoop()
-        QTimer.singleShot(60, loop.quit)
-        loop.exec()
-        QCoreApplication.processEvents()
+        QTimer.singleShot(60, app.quit)
+        app.exec()
     err = capsys.readouterr().err
-    assert "uncaught exception" not in err, f"stale check_ready fired: {err}"
+    assert "uncaught exception" not in err, \
+        f"stale check_ready fired into the deleted window: {err}"
 
 
 # ---------------------------------------------------------------------------
@@ -10601,7 +10628,7 @@ def test_cold_scan_orphan_ignored_after_shutdown(
     outlives both a scripted --timeout and shutdown()'s own 5 s join
     leaves _scan_thread alive after main() has already returned this
     window. main() supports reusing the same QApplication across an
-    in-process run (test_ready_poll_timer_dies_with_the_run) — if a later
+    in-process run (test_ready_poll_timer_dies_with_the_window) — if a later
     run restarts the event loop, the orphaned worker's queued scan_done
     can fire into this now-stale window and reload/rebuild against
     deleted Qt objects. shutdown() must set _shut_down (whether its join
