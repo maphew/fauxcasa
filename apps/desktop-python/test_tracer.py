@@ -19051,3 +19051,60 @@ def test_starred_grouper_never_raises_on_unbounded_date_taken_year(
     assert groups["0000-05"].items == [by_name["zero_year.jpg"]]
     assert groups["undated"].items == [by_name["huge_year.jpg"]]
     assert groups["2026-01"].items == [by_name["normal.jpg"]]
+
+
+def test_resync_widens_to_thresholded_folder_view_not_just_starred(
+        tmp_path: Path) -> None:
+    """fauxcasa-q6l.20 review finding 4: a >=3-star FOLDER view (not the
+    Starred collection) must also resync after a bulk clear-stars from
+    inside it — the display empties and the status label's count drops
+    to 0, instead of leaving cleared tiles on screen with a stale
+    '>=3★: 2 photos' readout."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["a.jpg"]].star = 3
+    cat.photos[by_name["b.jpg"]].star = 4
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._set_star_min(3)
+    assert sorted(win.grid.display) == sorted([
+        by_name["a.jpg"], by_name["b.jpg"]])
+
+    _key(win.grid, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    _key(win.grid, Qt.Key.Key_Space, Qt.KeyboardModifier.ShiftModifier)
+
+    assert win.grid.display == []
+    assert "0 photos" in win.counts_label.text()
+    assert "≥3★" in win.counts_label.text()
+
+
+def test_recently_updated_empty_message_blames_threshold_not_backfill(
+        tmp_path: Path) -> None:
+    """fauxcasa-q6l.20 review finding 7: an empty Recently Updated under
+    an active star threshold must not claim the backfill is still
+    running when that isn't why it's empty."""
+    _offscreen_app()
+    from catalog import BACKFILL_NOT_STARTED
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    cat = scan_library(root)
+    cat.photos[0].star = 1
+    cat.backfill_state = BACKFILL_NOT_STARTED   # would normally explain 0
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._set_star_min(3)   # nothing qualifies -> Recently Updated is empty
+    _sidebar_click(win, "recent", "")
+
+    assert win.grid.display == []
+    msg = win.statusBar().currentMessage()
+    assert "star threshold" in msg
+    assert "backfill" not in msg

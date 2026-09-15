@@ -3701,7 +3701,14 @@ class MainWindow(QMainWindow):
             label = self._label_with_stars("Recently Updated")
             self.grid.set_filter(idxs, label)
             self._show_counts(label, len(idxs))
-            if not idxs and self.catalog.backfill_state != BACKFILL_COMPLETE:
+            if not idxs and self._star_min > 0:
+                # fauxcasa-q6l.20 review finding 7: don't misattribute an
+                # empty view to the backfill when the star threshold is
+                # what's actually filtering everything out.
+                self.statusBar().showMessage(
+                    "No recently updated photos at this star threshold — "
+                    "try View > Stars > Any", 8000)
+            elif not idxs and self.catalog.backfill_state != BACKFILL_COMPLETE:
                 # empty-state honesty (cam.12): mtimes are still being
                 # backfilled, so an empty view is pending, not final
                 self.statusBar().showMessage(
@@ -3980,13 +3987,20 @@ class MainWindow(QMainWindow):
                 revealed = True
             if idx not in self.grid.display_pos:
                 # Still absent (filter reason or reveal didn't surface it):
-                # clear to All photos as the last resort.
+                # clear to All photos as the last resort. Threshold-aware
+                # (fauxcasa-q6l.20 review finding 5) via _apply_all_photos
+                # — deliberately does NOT clear an active star threshold
+                # as a side effect of a tray click; a below-threshold held
+                # photo stays absent and falls to the existing "Photo not
+                # visible in any view" message below, which already says
+                # so honestly (N7) without silently discarding the user's
+                # filter choice.
                 self.search.blockSignals(True)
                 self.search.clear()
                 self.search.blockSignals(False)
-                self.grid.set_filter(None, "")
+                n = self._apply_all_photos()
                 self._reselect_view("all", "")
-                self._show_counts("All photos", self._shown_count())
+                self._show_counts(self._label_with_stars("All photos"), n)
         if idx in self.grid.display_pos:
             self.grid._select(idx)
             self.grid._ensure_visible(idx)
@@ -4306,36 +4320,11 @@ class MainWindow(QMainWindow):
 
     def _clear_stars(self, indices: list[int]) -> None:
         """Bulk-unstar (fauxcasa-q6l.20 clause c, spec §3): set star=0 on
-        every given photo in ONE starstore save — unconditionally (unlike
-        _toggle_stars' mixed-selection normalization, "clear" has only one
-        outcome), so a selection scoped to a folder/search/Starred view
-        only ever clears what's actually in that scope."""
-        indices = sorted({
-            i for i in indices if 0 <= i < len(self.catalog.photos)
-        })
-        if not indices:
-            return
-        for i in indices:
-            photo = self.catalog.photos[i]
-            photo.star = 0
-            self.star_overrides[photo_key(photo)] = 0
-        try:
-            save_star_overrides(self.state_dir, self.star_overrides)
-        except OSError as e:
-            log.error("could not save star choices: %s", e)
-            self.statusBar().showMessage(
-                "star changed for this session; could not save it", 8000)
-        self.grid.viewport().update()
-        self.viewer.update()
-        self.tray.update()
-        self._refresh_star_count()
-        self._resync_starred_view()
-        if self.pages.currentWidget() is self.viewer:
-            self._photo_selected(self.viewer.current_index())
-        elif len(self.grid.selection) > 1:
-            self._selection_changed(self.grid.selection)
-        else:
-            self._photo_selected(self.grid.current)
+        every given photo — unconditionally (unlike _toggle_stars' mixed-
+        selection normalization, "clear" has only one outcome), so a
+        selection scoped to a folder/search/Starred view only ever clears
+        what's actually in that scope."""
+        self._set_stars(indices, 0)
 
     def _menu_clear_stars(self) -> None:
         """View > Clear Star(s): the same bulk-unstar as Shift+Space,
@@ -4357,12 +4346,24 @@ class MainWindow(QMainWindow):
         A mixed selection is normalized to starred; an all-starred selection
         is cleared. This makes one press deterministic for bulk selection.
         """
+        valid = sorted({
+            i for i in indices if 0 <= i < len(self.catalog.photos)
+        })
+        if not valid:
+            return
+        target = 0 if all(self.catalog.photos[i].star for i in valid) else 1
+        self._set_stars(valid, target)
+
+    def _set_stars(self, indices: list[int], target: int) -> None:
+        """The shared tail of _toggle_stars/_clear_stars (fauxcasa-q6l.20
+        review finding 6 — this used to be duplicated near-verbatim in
+        both): set `target` on every valid index in ONE starstore save,
+        then refresh every surface that reads star state."""
         indices = sorted({
             i for i in indices if 0 <= i < len(self.catalog.photos)
         })
         if not indices:
             return
-        target = 0 if all(self.catalog.photos[i].star for i in indices) else 1
         for i in indices:
             photo = self.catalog.photos[i]
             photo.star = target
@@ -4390,27 +4391,37 @@ class MainWindow(QMainWindow):
             self._photo_selected(self.grid.current)
 
     def _resync_starred_view(self) -> None:
-        """Re-materialize the Starred view after a star change made from
+        """Re-materialize the active view after a star change made from
         INSIDE it (fauxcasa-6vk finding 1). `set_filter` snapshots the
-        matching catalog indices, so an unstarred photo otherwise keeps
-        its tile — and its slot in `display` — until the next view switch,
-        contradicting the sidebar count `_refresh_star_count` just updated.
+        matching catalog indices, so a star change that drops a photo out
+        of the CURRENTLY DISPLAYED scope otherwise leaves a stale tile —
+        and a stale status-line count — until the next view switch.
+
+        Runs when the Starred collection is the active sidebar selection
+        OR a star threshold is active (fauxcasa-q6l.20 review finding 4):
+        either can drop a photo out of scope, whether that scope is the
+        sidebar's Starred view, a plain folder/album view narrowed by
+        threshold, or a search scoped by both — so the search-vs-view
+        dispatch below mirrors _apply_star_min's.
 
         Grid page only. The VIEWER's display list is deliberately frozen
         for the duration of a navigation session (a photo unstarred while
-        viewing must stay reachable with Left/Right), and an active search
-        owns the display set, so neither is re-derived here."""
+        viewing must stay reachable with Left/Right), so it is never
+        re-derived here."""
         if self.pages.currentWidget() is self.viewer:
             return
-        if self._selected_view()[0] != "starred":
-            return
-        if self.search.text().strip():
+        kind, key = self._selected_view()
+        if kind != "starred" and self._star_min <= 0:
             return
         keep = self.grid.current
         pos = self.grid.display_pos.get(keep, 0)
         sb = self.grid.verticalScrollBar()
         frac = sb.value() / sb.maximum() if sb.maximum() > 0 else 0.0
-        self._apply_view("starred", "")
+        search_text = self.search.text()
+        if search_text.strip():
+            self._search_changed(search_text)
+        else:
+            self._apply_view(kind, key)
         if keep not in self.grid.display_pos and self.grid.display:
             # The current photo just left the view: land on the nearest
             # surviving display position rather than on nothing at all
