@@ -126,12 +126,12 @@ class Transport:
 
 
 class InProcessTransport(Transport):
-    """Today's decode code paths, duplicated (fauxcasa-ez2.9 Stage 1 scope
-    note: NOT moved -- thumbcache.py/viewer.py keep their own copies until
-    Stage 2). Mirrors viewer.load_original_oriented's still/raw/tiff16/
-    video routing and thumbcache._index_one's scaled-decode call, minus
-    the crop/orientation/downscale/JPEG-encode steps that stay in the
-    (not-yet-migrated) call sites themselves."""
+    """Today's decode code paths, duplicated on purpose (fauxcasa-ez2.9):
+    thumbcache.py and viewer.py keep their own copies rather than calling
+    this class directly. Mirrors viewer.load_original_oriented's
+    still/raw/tiff16/video routing and thumbcache._index_one's
+    scaled-decode call, minus the crop/orientation/downscale/JPEG-encode
+    steps that stay in those call sites themselves."""
 
     def decode(self, path: str, route: str = "still", edge: int = 0):
         from PySide6.QtCore import Qt
@@ -183,17 +183,18 @@ class InProcessTransport(Transport):
 
 
 class NotSandboxed(Exception):
-    """Raised by a sandbox transport's decode() for a route it does not
-    implement yet (Stage 1: only route="still"); a MODULE-level exception
+    """Raised by a sandbox transport's decode() for a route it has no
+    sandboxed op for (only route="still" does); a MODULE-level exception
     (not nested in WinSandboxTransport) so DecodeService.decode()'s except
     clause still works when a test monkeypatches df.WinSandboxTransport to
     a stub class -- the stub raises decodefacade.NotSandboxed directly."""
 
 
 class WinSandboxTransport(Transport):
-    """decode() for route="still" only (Stage 1 scope), backed by a
-    decodesvc_win.DecodePoolSet. Any other route raises NotSandboxed so
-    the caller (DecodeService) falls back to InProcessTransport."""
+    """decode() for route="still" only -- the only sandboxed op that
+    exists -- backed by a decodesvc_win.DecodePoolSet. Any other route
+    raises NotSandboxed so the caller (DecodeService) falls back to
+    InProcessTransport."""
 
     def __init__(self, n_batch: int) -> None:
         import decodesvc_win as dw
@@ -415,8 +416,9 @@ class DecodeService:
 
     def index(self, path: str, top: int, crop=None, orientation: int = 1,
               route: str = "still"):
-        """Stage 1: always InProcess (no sandboxed "index" op yet, design
-        doc migration plan item 1 -- lands with call-site migration)."""
+        """Always InProcess: no sandboxed "index" op exists (design doc
+        migration plan item 1). No real call site uses this today --
+        thumbcache._index_one calls decode() directly instead."""
         img = self._in_process.decode(path, route=route, edge=top)
         if crop is not None and not img.isNull():
             try:
@@ -427,7 +429,7 @@ class DecodeService:
         return img
 
     def poster(self, path: str, edge: int = 512):
-        """Stage 1: always InProcess (no sandboxed "poster" op yet)."""
+        """Always InProcess: no sandboxed "poster" op exists."""
         return self._in_process.decode(path, route="video", edge=edge)
 
     def close(self) -> None:
