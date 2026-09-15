@@ -1396,16 +1396,26 @@ def _survey_ini_tree(root: Path, *,
         if p.is_dir():
             n_dirs += 1
             continue
+        # Cheap name/extension test FIRST (pure string ops, no syscall) so
+        # a stat (is_file()) only happens for entries that could possibly
+        # matter — an ini file or a media extension — not every walked
+        # entry. On a 100k-file library the vast majority of names match
+        # neither and are skipped without ever touching the filesystem
+        # again (fauxcasa-wqi.6: this order had inverted, so every entry
+        # was stat'd regardless of name).
+        ext = p.suffix.lower() if image_exts is not None else None
+        is_media_ext = image_exts is not None and ext in image_exts
+        is_ini = p.name.lower() in (".picasa.ini", "picasa.ini")
+        if not (is_media_ext or is_ini):
+            continue
         if not p.is_file():
             continue
-        if image_exts is not None:
-            ext = p.suffix.lower()
-            if ext in image_exts:
-                n_media += 1
-                media_folders.add(p.parent)
-                if video_exts is not None and ext in video_exts:
-                    n_video += 1
-        if p.name.lower() not in (".picasa.ini", "picasa.ini"):
+        if is_media_ext:
+            n_media += 1
+            media_folders.add(p.parent)
+            if video_exts is not None and ext in video_exts:
+                n_video += 1
+        if not is_ini:
             continue
         n_files += 1
         try:

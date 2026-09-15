@@ -4018,7 +4018,7 @@ class MainWindow(QMainWindow):
             # (fauxcasa-cam.19); restore machinery is M3.
             parts.append("Picasa-saved original kept")
         if p.dims is not None:
-            parts.append(f"{p.dims[0]}x{p.dims[1]}")
+            parts.append(f"{p.dims[0]} × {p.dims[1]}")
         if p.size >= 0:
             parts.append(format_file_size(p.size))
         self.meta_label.setText("   ".join(parts) + "  ")
