@@ -18660,13 +18660,20 @@ def test_star_min_persistence_roundtrip(tmp_path: Path) -> None:
 
 def test_star_min_persists_across_mainwindow_instances(tmp_path: Path) -> None:
     """Setting the threshold via the View > Stars menu persists it, and a
-    fresh MainWindow over the same state dir starts with it applied."""
+    fresh MainWindow over the same state dir starts with it ALREADY
+    APPLIED to the very first paint (fauxcasa-q6l.20 review finding 1) —
+    not just remembered as a number the menu agrees with while the grid
+    still shows everything."""
     _offscreen_app()
     from main import MainWindow
 
     root = tmp_path / "lib"
-    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "low.jpg")
+    make_jpeg(root / "f" / "high.jpg")
     cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["low.jpg"]].star = 1
+    cat.photos[by_name["high.jpg"]].star = 3
     state_dir = tmp_path / "state"
     win = MainWindow(cat, None, cache_dir=None, build_dir=None,
                      state_dir=state_dir)
@@ -18674,11 +18681,16 @@ def test_star_min_persists_across_mainwindow_instances(tmp_path: Path) -> None:
     assert win._star_min == 3
 
     cat2 = scan_library(root)
+    by_name2 = {p.name: i for i, p in enumerate(cat2.photos)}
+    cat2.photos[by_name2["low.jpg"]].star = 1
+    cat2.photos[by_name2["high.jpg"]].star = 3
     win2 = MainWindow(cat2, None, cache_dir=None, build_dir=None,
                       state_dir=state_dir)
     assert win2._star_min == 3
     assert win2.star_actions[3].isChecked()
     assert not win2.star_actions[0].isChecked()
+    assert win2.grid.display == [by_name2["high.jpg"]]   # already filtered
+    assert "≥3★" in win2.counts_label.text()
 
 
 def test_star_min_filters_folder_view_keeps_grouping_and_sort(
@@ -18970,3 +18982,72 @@ def test_menu_clear_stars_dispatches_grid_or_viewer_by_current_page(
     win.star_clear_action.trigger()
     assert cat.photos[by_name["b.jpg"]].star == 0
     win.viewer.quiesce()
+
+
+# ---------------------------------------------------------------------------
+# Scoped star views (fauxcasa-q6l.20), post-review fixes: the persisted
+# threshold must apply at startup and survive a reconcile swap, and the
+# month grouper must never raise on an unbounded date_taken year.
+# ---------------------------------------------------------------------------
+
+def test_reload_data_keeps_star_threshold_applied(tmp_path: Path) -> None:
+    """A reconcile-swap reload (fauxcasa-q6l.20 review finding 3) must not
+    silently drop an active star threshold back to the unfiltered default
+    — reload_data's own set_data call re-applies the plain default view,
+    so the fix must redo the threshold pass afterward."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "low.jpg")
+    make_jpeg(root / "f" / "high.jpg")
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["low.jpg"]].star = 1
+    cat.photos[by_name["high.jpg"]].star = 3
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._set_star_min(3)
+    assert win.grid.display == [by_name["high.jpg"]]
+
+    cat2 = scan_library(root)
+    by_name2 = {p.name: i for i, p in enumerate(cat2.photos)}
+    cat2.photos[by_name2["low.jpg"]].star = 1
+    cat2.photos[by_name2["high.jpg"]].star = 3
+    win.reload_data(cat2, None)
+
+    assert win._star_min == 3
+    assert win.grid.display == [by_name2["high.jpg"]]
+    assert "≥3★" in win.counts_label.text()
+
+
+def test_starred_grouper_never_raises_on_unbounded_date_taken_year(
+        tmp_path: Path) -> None:
+    """date_taken's year is UNBOUNDED (§6 footgun 16) — an all-zero EXIF
+    placeholder ("0000-05-01T...") groups sensibly by month, and a
+    malformed/non-4-digit year ("12345-06-07T...") sinks to Undated —
+    neither ever raises out of set_filter's grouper (fauxcasa-q6l.20
+    review finding 2, was a bare datetime.strptime)."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "zero_year.jpg")
+    make_jpeg(root / "f" / "huge_year.jpg")
+    make_jpeg(root / "f" / "normal.jpg")
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["zero_year.jpg"]].date_taken = "0000-05-01T10:00:00"
+    cat.photos[by_name["huge_year.jpg"]].date_taken = "12345-06-07T00:00:00"
+    cat.photos[by_name["normal.jpg"]].date_taken = "2026-01-01T00:00:00"
+    for i in by_name.values():
+        cat.photos[i].star = 1
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    _sidebar_click(win, "starred", "")   # must not raise
+
+    groups = {g.folder: g for g in win.grid.groups}
+    assert groups["0000-05"].title == "May 0000"
+    assert groups["0000-05"].items == [by_name["zero_year.jpg"]]
+    assert groups["undated"].items == [by_name["huge_year.jpg"]]
+    assert groups["2026-01"].items == [by_name["normal.jpg"]]

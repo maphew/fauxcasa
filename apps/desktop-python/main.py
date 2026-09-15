@@ -35,6 +35,7 @@ scripts/make-thumbcache.py and adopt via --thumbs.
 from __future__ import annotations
 
 import argparse
+import calendar
 import html
 import importlib
 import json
@@ -44,7 +45,6 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 T0 = time.perf_counter()
@@ -273,12 +273,24 @@ def _starred_grouper(cat: Catalog, i: int) -> tuple[str, str, str | None]:
     same date substrate _order_starred_newest_first sorts by, so grouping
     and ordering agree; genuinely dateless photos share one trailing
     'undated' bucket titled "Undated". No description (the header already
-    paints the per-group count; repeating it there would be redundant)."""
+    paints the per-group count; repeating it there would be redundant).
+
+    Deliberately never round-trips through datetime.strptime: date_taken's
+    year is UNBOUNDED (§6 footgun 16 — metareader applies no year floor),
+    so a 5+-digit year or an all-zero EXIF placeholder like
+    "0000-05-01T..." both occur in real libraries and the LATTER must
+    group cleanly (May of year zero is still a real month bucket) while
+    strptime raises on it depending on platform libc. A plain slice +
+    guard handles both: a well-formed 4-digit year groups by month, and
+    anything that doesn't fit that shape (a 5-digit year included) sinks
+    to Undated rather than raising."""
     sort_key = _date_sort_key(cat.photos[i])
-    if sort_key[0] != 0:
-        return "undated", "Undated", None
-    stamp = datetime.strptime(sort_key[1][:7], "%Y-%m")
-    return stamp.strftime("%Y-%m"), stamp.strftime("%B %Y"), None
+    if sort_key[0] == 0:
+        s = sort_key[1]
+        y, m = s[:4], s[5:7]
+        if s[4:5] == "-" and m.isdigit() and 1 <= int(m) <= 12:
+            return f"{y}-{m}", f"{calendar.month_name[int(m)]} {y}", None
+    return "undated", "Undated", None
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -2220,6 +2232,13 @@ class MainWindow(QMainWindow):
         self.grid.play_group.connect(self._play_group)
 
         self.grid.set_data(catalog, thumbs)
+        if self._star_min:
+            # set_data's own set_filter(None, "") call is threshold-blind
+            # (fauxcasa-q6l.20 review finding 1): a persisted threshold
+            # must already be applied to the very first paint, not wait
+            # for the first _apply_view/_apply_star_min call.
+            n = self._apply_all_photos()
+            self._show_counts(self._label_with_stars("All photos"), n)
         self._refresh_tray_readout()
 
         # --- background index plumbing (modes, not modals) ---
@@ -3026,7 +3045,12 @@ class MainWindow(QMainWindow):
         # re-resolves them against the new catalog's indices and counts
         # any that vanished for the readout's note (fauxcasa-q6l.2).
         self.tray.rebind(catalog, thumbs)
-        self._show_counts("All photos", self._shown_count())
+        # Threshold-aware (fauxcasa-q6l.20 review finding 3): set_data just
+        # above already re-applied the UNFILTERED default view, so redo it
+        # through _apply_all_photos or an active star filter silently drops
+        # mid-session on the next reconcile swap.
+        n = self._apply_all_photos()
+        self._show_counts(self._label_with_stars("All photos"), n)
         self._update_import_notes()   # the rescan collected a fresh report
         self.meta_label.setText("")
         if self.info_action.isChecked():
