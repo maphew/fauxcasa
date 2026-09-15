@@ -10,7 +10,9 @@ GitHub release tags, not a semantic-versioning contract.
 
 Changes since the `tracer-test-v1` preview (2026-08-10, commit `553d31a`).
 The `v0.1.0-rc2` release candidate (2026-09-13) contains everything in
-this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
+this section dated 2026-09-13 or earlier; see `docs/releases/v0.1.0.md`
+for the full user-facing notes. Entries dated after 2026-09-13 (below)
+landed since rc2 and are not yet in any tagged release.
 
 ### Added (2026-09-15)
 
@@ -35,6 +37,10 @@ this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
   keywords stored inside RAW and TIFF files (not just JPEG) are read too.
   A caption or keyword set too long for a single JPEG XMP block
   (ExtendedXMP) is reassembled and read as well (fauxcasa-cam.5).
+- HEIC/HEIF photos (what recent iPhones save by default) now decode for
+  thumbnails and the viewer, via the same Pillow fallback path already
+  used for Photoshop PSD and 16-bit TIFF files (fauxcasa-y5b). Licensing
+  and sandbox-posture notes: `docs/research/heic-decode-decision.md`.
 
 ### Added (2026-09-14)
 

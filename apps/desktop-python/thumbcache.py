@@ -744,6 +744,21 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
             # check, not a pixel decode -- exactly like the 16-bit TIFF
             # pre-route above.
             img = pillow_qimage(data, top)
+        elif data and photo.rel.lower().endswith((".heic", ".heif")):
+            # Pre-route HEIC/HEIF to Pillow on ALL platforms, sandboxed or
+            # not, exactly like the PSD branch above: the pinned PySide6
+            # build ships no HEIF plugin, so the sandbox worker's
+            # canRead() would always be false (same UNSUPPORTED -> stuck
+            # zero-byte tile risk fauxcasa-ez2.9 Stage 2 review P1-1
+            # documented for PSD). pillow_qimage registers pi-heif's
+            # opener at import time (pillowload module doc), not here.
+            # Uprightness for HEIC does NOT come from pillow_qimage's
+            # exif_transpose call the way it does for every other format
+            # this fallback serves: pi-heif's opener resets EXIF
+            # Orientation to 1 at open time, so exif_transpose always
+            # no-ops for HEIC; libheif applies the container's own irot/
+            # imir transform while decoding instead (fauxcasa-y5b).
+            img = pillow_qimage(data, top)
         elif (not from_preview and src is not None
               and decodefacade.get_service().state
               == decodefacade.STATE_SANDBOXED):

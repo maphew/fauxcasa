@@ -1,0 +1,78 @@
+synthetic-rot6.heic — provenance
+=================================
+
+Generated once, by hand, for fauxcasa-y5b (HEIC/HEIF decode support),
+review round 2 (orientation coverage).
+
+This is a SYNTHETIC file — no real camera, no personal data.
+
+The "Apple shape": a REAL container-level rotation (an `irot` item
+property box, angle=3, i.e. 270 degrees anticlockwise = 90 degrees
+clockwise) AND a real EXIF Orientation=6 tag, together, on the same
+file — exactly what an iPhone HEIC typically carries (the sensor-native
+plane stored as captured, corrected for display two different ways:
+once via the mandatory-to-apply HEIF container transform, once via the
+EXIF hint for readers that only understand EXIF).
+
+Structure:
+  - Same 96x64 four-quadrant source image as synthetic.heic (top-left
+    red (220,40,40), top-right green (40,200,60), bottom-left blue
+    (40,80,220), bottom-right yellow (230,210,30)), stored UNROTATED at
+    the coded-plane level (96x64).
+  - `irot` box (angle=3) in the HEIF item properties (`iprp`/`ipco`),
+    associated with the primary item via `ipma` — libheif applies this
+    automatically while DECODING, so a correct reader's pixel output is
+    64x96 with quadrants rotated 270 degrees anticlockwise from the
+    stored plane: displayed top-left is the STORED bottom-left (blue),
+    top-right is stored top-left (red), bottom-left is stored
+    bottom-right (yellow), bottom-right is stored top-right (green).
+  - A real Exif item (EXIF Orientation = 6), wired into `iinf`/`iloc`/
+    `iref` by the encoder — read directly off the file's bytes by
+    exiv2 (metareader.read_orientation), independent of pi-heif's own
+    in-process handling.
+
+Generation note (NOT a repo dependency, same as synthetic.heic): made
+with pillow-heif (the encode-capable sibling of the app's own pi-heif,
+never a repo dependency) as a throwaway, dev-time-only tool. The `irot`
+box was NOT hand-constructed — pillow-heif's encoder writes it
+automatically when the source PIL.Image.Exif carries an Orientation tag
+at save time; no lower-level API call was needed:
+
+    uv run --no-project --with pillow-heif --with pillow python - <<'EOF'
+    from pathlib import Path
+    from PIL import Image
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    W, H = 96, 64
+    img = Image.new("RGB", (W, H))
+    colors = {(0, 0): (220, 40, 40), (1, 0): (40, 200, 60),
+              (0, 1): (40, 80, 220), (1, 1): (230, 210, 30)}
+    px = img.load()
+    for y in range(H):
+        for x in range(W):
+            px[x, y] = colors[(1 if x >= W // 2 else 0, 1 if y >= H // 2 else 0)]
+    exif = Image.Exif()
+    exif[0x0112] = 6  # Orientation = 6
+    img.save(Path("synthetic-rot6.heic"), format="HEIF",
+              exif=exif.tobytes(), quality=90)
+    EOF
+
+Verified before committing, both against pi-heif directly and through
+the app's own apps/desktop-python/viewer.load_original_oriented and
+apps/desktop-python/metareader.read_orientation:
+  - decoded size: 64x96 (swapped from the stored 96x64 -- the irot
+    ran)
+  - decoded quadrants upright as described above (+/-1 lossy-HEVC
+    tolerance)
+  - load_original_oriented's reported `orientation` is 6 (exiv2 reads
+    the raw tag; pi-heif's own in-process neutering to 1, documented in
+    pillowload.py, never reaches metareader -- exiv2 parses the file's
+    bytes independently)
+
+Purpose: proves pillowload.pillow_qimage's HEIC path is upright by way
+of libheif's native container-transform handling, NOT PIL's
+exif_transpose (which is always a no-op for HEIC -- pi-heif resets the
+EXIF tag to 1 before exif_transpose ever runs). See pillowload.py's
+module docstring for the known limitation this does NOT cover: an HEIC
+whose rotation lives ONLY in EXIF, with no irot/imir in the container,
+still decodes sideways.

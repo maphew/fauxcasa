@@ -7,16 +7,37 @@
 # austerity on resident memory + cold start, not installer megabytes.
 #
 # Build from the repo root (ONE invocation produces BOTH variants below;
-# rawpy, av AND pillow MUST be in the build env or the artifact silently
-# ships without RAW/video/PSD decode — rawload.py, videoload.py and
-# pillowload.py import them lazily, so nothing fails at build. PySide6-
-# Addons is needed ONLY for QtMultimedia's QAudioSink — Qt classes
-# Multimedia as an add-on, so Essentials alone would silently ship a
-# build whose video playback has no sound; the excludes + the binary
-# filter below keep every OTHER Addons module out):
+# rawpy, av, pillow AND pi-heif MUST be in the build env or the artifact
+# silently ships without RAW/video/PSD/HEIC decode — rawload.py,
+# videoload.py and pillowload.py import them lazily, so nothing fails at
+# build. PySide6-Addons is needed ONLY for QtMultimedia's QAudioSink — Qt
+# classes Multimedia as an add-on, so Essentials alone would silently
+# ship a build whose video playback has no sound; the excludes + the
+# binary filter below keep every OTHER Addons module out). pi-heif ships
+# no PyInstaller hook of its own, so this spec names it explicitly like
+# PIL below rather than relying on transitive discovery through
+# pillowload.py's lazy import. Its native-library layout differs by
+# platform (both put the compiled `_pi_heif` extension at the TOP LEVEL
+# of site-packages, not inside pi_heif/'s own folder):
+#   - Windows (delvewheel-repaired wheel): libheif/libde265 DLLs sit
+#     FLAT beside `_pi_heif*.pyd` at site-packages root; PyInstaller's
+#     own binary-dependency walker picks up the extension and its DLLs
+#     automatically once "pi_heif" is a hiddenimport -- VERIFIED with a
+#     real local frozen Windows build (fauxcasa-y5b review, Python 3.12
+#     matching bundle.yml): both landed under dist/*/_internal/ and the
+#     frozen exe decoded the committed HEIC fixture end to end.
+#   - manylinux (auditwheel-repaired wheel): libheif/libde265 .so files
+#     instead live in a sibling `pi_heif.libs/` directory (auditwheel's
+#     convention, not delvewheel's flat layout), found via the
+#     extension's RPATH -- UNVERIFIED on this box (no Linux available
+#     here); PyInstaller's ELF dependency walker is expected to resolve
+#     an RPATH-relative shared object the same way it resolves any other
+#     native dependency, but bundle.yml's ubuntu-22.04 leg (fauxcasa-y5b)
+#     is the actual gate for this claim, not this comment.
 #   uv run --with "PySide6-Essentials==6.11.1" \
 #       --with "PySide6-Addons==6.11.1" --with "pyinstaller==6.20.0" \
 #       --with "rawpy==0.27.0" --with "av==18.0.0" --with "pillow==12.3.0" \
+#       --with "pi-heif==1.4.0" \
 #       pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 #
 # Decisions (see the synthesis in the §7-validation report):
@@ -76,6 +97,11 @@ _hidden = ["catalog", "grid", "thumbcache", "viewer", "slideshow", "peek",
            "inspector",
            "picasa_db", "applog", "metareader", "exiv2", "rawload", "rawpy",
            "videoload", "av", "pillowload", "PIL", "PIL.Image", "PIL.ImageOps",
+           # pi-heif (fauxcasa-y5b): pillowload.pillow_qimage's HEIC/HEIF
+           # opener, imported lazily inside _ensure_heif_opener() -- named
+           # here like PIL above so a missed collection can't silently
+           # ship a build that error-tiles every HEIC/HEIF file.
+           "pi_heif",
            # Video playback (fauxcasa-v46.3): videostream is BOTH the broker
            # class viewer.py imports lazily AND the sandboxed worker
            # entrypoint; decodesvc carries its typed errors/StreamInfo. "av"

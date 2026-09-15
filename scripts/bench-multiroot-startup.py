@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["PySide6", "rawpy", "exiv2", "pillow", "av", "zstandard"]
+# dependencies = ["PySide6", "rawpy", "exiv2", "pillow", "pi-heif", "av", "zstandard"]
 # ///
 """Reproducible §7 two-root / 100k warm-catalog process-start benchmark.
 

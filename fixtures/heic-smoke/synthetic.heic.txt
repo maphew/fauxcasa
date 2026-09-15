@@ -1,0 +1,51 @@
+synthetic.heic — provenance
+===========================
+
+Generated once, by hand, for fauxcasa-y5b (HEIC/HEIF decode support).
+
+This is a SYNTHETIC file — no real camera, no personal data.
+
+Structure:
+  - 96x64 RGB HEIC (HEVC still, libx265 encode)
+  - Four solid-color quadrants, deterministic:
+      top-left     (220, 40, 40)   red
+      top-right    (40, 200, 60)   green
+      bottom-left  (40, 80, 220)   blue
+      bottom-right (230, 210, 30)  yellow
+  - EXIF Orientation = 1 (no rotation)
+
+Purpose: exercises the app's pi-heif decode path (pillowload.
+pillow_qimage, thumbcache._index_one, viewer.load_original_oriented)
+in apps/desktop-python/test_tracer.py, and gates the frozen PyInstaller
+artifact's HEIC decode in .github/workflows/bundle.yml / release.yml
+(mirrors the existing fixtures/raw-smoke/synthetic.dng gate for rawpy).
+
+Generation note (NOT a repo dependency): the app ships pi-heif
+(decode-only, LGPLv3 wheel — see docs/research/heic-decode-decision.md).
+pi-heif cannot ENCODE, so this one fixture was produced with the sibling
+package pillow-heif (which bundles the x265 ENCODER and is GPLv2 as a
+result) as a throwaway, dev-time-only tool, never added to any
+dependencies list in this repo:
+
+    uv run --no-project --with pillow-heif --with pillow python - <<'EOF'
+    from pathlib import Path
+    import pillow_heif
+    from PIL import Image
+    pillow_heif.register_heif_opener()
+    W, H = 96, 64
+    img = Image.new("RGB", (W, H))
+    colors = {(0, 0): (220, 40, 40), (1, 0): (40, 200, 60),
+              (0, 1): (40, 80, 220), (1, 1): (230, 210, 30)}
+    px = img.load()
+    for y in range(H):
+        for x in range(W):
+            px[x, y] = colors[(1 if x >= W // 2 else 0, 1 if y >= H // 2 else 0)]
+    exif = Image.Exif()
+    exif[0x0112] = 1  # Orientation = 1
+    img.save(Path("synthetic.heic"), format="HEIF", exif=exif.tobytes(),
+              quality=90)
+    EOF
+
+Verified round-trip through pi-heif (the app's actual runtime decoder,
+not just the pillow-heif encoder) before committing: quadrant colors
+decode within lossy-HEVC tolerance (+/-1 on the sample above).

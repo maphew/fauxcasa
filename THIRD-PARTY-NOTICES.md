@@ -97,6 +97,33 @@ explicitly as "verify upstream" rather than guessed.
 - License text in wheel: `pillow-12.3.0.dist-info/licenses/LICENSE`
 - Why bundled: general image loading, resizing, and thumbnail generation.
 
+### pi-heif 1.4.0
+
+- Upstream: <https://github.com/bigcat88/pillow_heif> (pi-heif is the
+  decode-only build of the same project, published separately)
+- License (as declared in wheel metadata `License` field): `BSD-3-Clause`
+- License text in wheel: `pi_heif-1.4.0.dist-info/licenses/LICENSE.txt`
+- Why bundled: HEIC/HEIF decoding (registers a Pillow opener consumed by
+  `apps/desktop-python/pillowload.py`'s decode fallback).
+- **Bundled native libraries**: this wheel vendors compiled `libheif` and
+  `libde265` (the HEVC decoder libheif uses) as native DLLs/shared
+  objects loaded by its `_pi_heif` extension module. The wheel's own
+  `pi_heif-1.4.0.dist-info/licenses/LICENSES_bundled.txt` declares both
+  `LGPLv3`, citing libheif v1.18.1 and libde265 v1.0.15 as a generic
+  template; the ACTUAL versions bundled in this 1.4.0 wheel, per the
+  library's own runtime version report, are **libheif 1.23.0** and
+  **libde265 1.1.1** — newer than the template cites. Treat both native
+  components as `LGPL-3.0-only` per the wheel's own declared license for
+  its binary distribution; **verify upstream**
+  (<https://github.com/strukturag/libheif>,
+  <https://github.com/strukturag/libde265>) if the exact license of the
+  specific 1.23.0/1.1.1 releases matters for compliance purposes.
+- **Patent note (not a licensing determination)**: libde265 decodes
+  HEVC/H.265, a patent-encumbered codec family; patent licensing is
+  independent of the copyright licenses above and is not addressed by
+  this notice. See `docs/research/heic-decode-decision.md` for the
+  owner-facing summary of this gap.
+
 ### PyAV (av) 18.0.0
 
 - Upstream: <https://github.com/PyAV-Org/PyAV>

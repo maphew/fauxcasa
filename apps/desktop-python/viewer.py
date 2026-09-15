@@ -277,6 +277,22 @@ def load_original_oriented(path: str, rotate: int,
                 # extension check, exactly like the 16-bit TIFF pre-route
                 # above.
                 img = pillow_qimage(data)
+            elif path.lower().endswith((".heic", ".heif")):
+                # Pre-route HEIC/HEIF to Pillow, sandboxed or not, exactly
+                # like the PSD pre-route above: the pinned PySide6 build
+                # ships no HEIF plugin, so the sandbox worker's canRead()
+                # would always be false (same UNSUPPORTED -> null-image
+                # risk fauxcasa-ez2.9 Stage 2 review P1-1 documented for
+                # PSD). pillow_qimage registers pi-heif's opener at
+                # import time (pillowload module doc), not here.
+                # Uprightness does NOT come from pillow_qimage's
+                # exif_transpose call the way it does for every other
+                # format this fallback serves: pi-heif's opener resets
+                # EXIF Orientation to 1 at open time, so exif_transpose
+                # always no-ops for HEIC; libheif applies the container's
+                # own irot/imir transform while decoding instead
+                # (fauxcasa-y5b).
+                img = pillow_qimage(data)
             elif decodefacade.get_service().state == decodefacade.STATE_SANDBOXED:
                 # STILL route through the decode sandbox (fauxcasa-ez2.9
                 # Stage 2), full resolution (edge=0 -> the reserved
