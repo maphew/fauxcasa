@@ -555,6 +555,10 @@ class GridView(QAbstractScrollArea):
     # reaches here — Qt routes the key event to the focused widget, and
     # a literal '/' in a search query keeps inserting normally.
     search_requested = Signal()
+    # A Picasa chord from keymap.PLANNED_KEYS was pressed (fauxcasa-s6i):
+    # the feature is not built yet, and the user must hear that rather
+    # than nothing. Payload: the status-bar wording. MainWindow shows it.
+    notice = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1660,6 +1664,18 @@ class GridView(QAbstractScrollArea):
             self._select(idx)
             self._activate(idx)
 
+    def _fall_through(self, event) -> None:
+        """No live binding matched. A known-but-unbuilt Picasa chord
+        (keymap.PLANNED_KEYS["grid"]) becomes a status-bar notice
+        (fauxcasa-s6i); anything else goes to Qt's default handler as
+        before — including PgUp/PgDown, which QAbstractScrollArea pages
+        with, so those are NOT in the grid's planned set."""
+        msg = keymap.planned(event, "grid")
+        if msg is not None:
+            self.notice.emit(msg)
+        else:
+            super().keyPressEvent(event)
+
     def keyPressEvent(self, event) -> None:
         # Every binding is a keymap lookup (fauxcasa-q6l.8): the default-
         # scheme table is the single source of truth; this handler only
@@ -1740,7 +1756,7 @@ class GridView(QAbstractScrollArea):
             self._activate(self.current)
             return
         if not self.display:
-            super().keyPressEvent(event)
+            self._fall_through(event)
             return
         fwd = keymap.matches(event, "grid.next")   # Right / J (q6l.8)
         if fwd or keymap.matches(event, "grid.prev"):
@@ -1761,7 +1777,7 @@ class GridView(QAbstractScrollArea):
             # End: jump to the last photo in the current view (ed5.12).
             target = self.display[-1]
         else:
-            super().keyPressEvent(event)
+            self._fall_through(event)
             return
         if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier
                 and self.anchor in self.display_pos):

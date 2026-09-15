@@ -257,6 +257,11 @@ FROZEN = getattr(sys, "frozen", False)
 # wedged decode is reported, not silently timed out.
 OPEN_WAIT_MS = 10_000
 
+# Status-bar dwell for a "not implemented yet" notice (fauxcasa-s6i): long
+# enough to read the milestone it names, short enough to clear before the
+# next counts readout matters.
+NOTICE_MS = 8_000
+
 # Application icon (rel-0.1). Wordless on purpose: APP_NAME is provisional,
 # so the mark must never bake the name into pixels. Source of truth is
 # assets/icon.svg; assets/make-icons.py rasterizes the PNG set + .ico that
@@ -2124,6 +2129,10 @@ class MainWindow(QMainWindow):
         self.grid.info_toggle_requested.connect(self.info_action.toggle)
         self.viewer.info_toggle_requested.connect(self.info_action.toggle)
         self.grid.search_requested.connect(self._focus_search)
+        # Not-yet-implemented features never fail silently (fauxcasa-s6i):
+        # both surfaces route their notice through one status-bar slot.
+        self.grid.notice.connect(self._show_notice)
+        self.viewer.notice.connect(self._show_notice)
         # Selection-tray wiring (fauxcasa-q6l.2). The readout also listens
         # to selection_changed and the search box directly — SEPARATE
         # connections, so the status-bar dual mode (_selection_changed)
@@ -2300,6 +2309,13 @@ class MainWindow(QMainWindow):
             max(self.zoom.minimum(),
                 min(self.zoom.maximum(), self.zoom.value() + delta)))
 
+    def _show_notice(self, text: str) -> None:
+        """Status-bar notice for a feature the user reached for that is
+        not built yet (keymap.PLANNED_KEYS / PLANNED_FEATURES). Transient
+        (NOTICE_MS) so it never sticks over the counts readout, and long
+        enough to read the milestone it names."""
+        self.statusBar().showMessage(text, NOTICE_MS)
+
     def _show_shortcuts_dialog(self) -> None:
         """Help > Keyboard shortcuts…: a read-only table built at runtime
         from keymap.DEFAULT_SCHEME + keymap.ACTION_LABELS — one source
@@ -2324,14 +2340,28 @@ class MainWindow(QMainWindow):
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        for action in sorted(keymap.DEFAULT_SCHEME):
-            label = keymap.ACTION_LABELS.get(action, action)
-            chords = " / ".join(
-                s.toString() for s in keymap.shortcuts(action))
+        def add_row(label: str, chords: str) -> None:
             row = table.rowCount()
             table.insertRow(row)
             table.setItem(row, 0, QTableWidgetItem(label))
             table.setItem(row, 1, QTableWidgetItem(chords))
+
+        for action in sorted(keymap.DEFAULT_SCHEME):
+            add_row(keymap.ACTION_LABELS.get(action, action),
+                    " / ".join(s.toString() for s in keymap.shortcuts(action)))
+        # Not yet available (fauxcasa-s6i): the Picasa chords the app
+        # recognises but has not built, and the keyless features a shipped
+        # key stands in for — same source the status-bar notices read.
+        add_row("— Not yet available —", "")
+        seen: set[tuple[str, str]] = set()
+        for planned in keymap.PLANNED_KEYS.values():
+            for chords, (label, note) in planned.items():
+                if (label, chords[0]) in seen:   # shared across surfaces
+                    continue
+                seen.add((label, chords[0]))
+                add_row(f"{label} ({note})", " / ".join(chords))
+        for label, note in keymap.PLANNED_FEATURES.items():
+            add_row(f"{label} ({note})", "")
         lay.addWidget(table)
         dlg.exec()
 

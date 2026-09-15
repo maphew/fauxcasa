@@ -11014,8 +11014,126 @@ def test_viewer_face_toggle_only_with_faces(tmp_path: Path) -> None:
     v._on_loaded(v._serial, orig, 1)
     assert v.faces_visible               # sticky across navigation...
     assert v._face_rects() == []         # ...but nothing to draw here
+    got: list[str] = []
+    v.notice.connect(got.append)
     _press(v, Qt.Key.Key_F)
-    assert v.faces_visible               # F on a faceless photo: no-op
+    assert v.faces_visible               # F on a faceless photo: state kept
+    # ...but never silent (fauxcasa-s6i): the user hears there are no
+    # Picasa tags here and that naming faces is still to come.
+    assert len(got) == 1
+    assert "no picasa face tags" in got[0].lower()
+    assert "not implemented yet" in got[0].lower()
+    assert "M4" in got[0]
+
+
+def test_planned_keys_notice_instead_of_silence(tmp_path: Path) -> None:
+    """A Picasa chord Fauxcasa knows but has not built (keymap.PLANNED_KEYS)
+    raises a notice from BOTH surfaces, and the window shows it in the
+    status bar (fauxcasa-s6i) — never a silent nothing. Live bindings are
+    untouched: the same press path still runs them first."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+
+    import keymap
+
+    def chord(widget, key, mods=Qt.KeyboardModifier.NoModifier):
+        widget.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, mods))
+
+    _offscreen_app()
+    import main
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    win = main.MainWindow(scan_library(root), None,
+                          cache_dir=None, build_dir=None)
+    ctrl = Qt.KeyboardModifier.ControlModifier
+    # grid: Ctrl+3 (Picasa edit mode) -> notice names the feature + M3
+    win.grid.setFocus()
+    chord(win.grid, Qt.Key.Key_3, ctrl)
+    msg = win.statusBar().currentMessage()
+    assert "edit mode" in msg.lower() and "M3" in msg, msg
+    # grid: bare digit (M2 star-set) — the grid has no '1' binding, so
+    # the notice fires there; X (reject) likewise
+    chord(win.grid, Qt.Key.Key_1)
+    assert "1 star" in win.statusBar().currentMessage()
+    chord(win.grid, Qt.Key.Key_X)
+    assert "reject" in win.statusBar().currentMessage().lower()
+    # viewer: Ctrl+R (rotate) -> notice; '1' is the live zoom toggle
+    # there and must keep winning over the planned star-set entry
+    win.viewer.show_photo([0, 1], 0)
+    got: list[str] = []
+    win.viewer.notice.connect(got.append)
+    chord(win.viewer, Qt.Key.Key_R, ctrl)
+    assert got and "rotate" in got[-1].lower() and "M3" in got[-1]
+    assert "rotate" in win.statusBar().currentMessage().lower()
+    before = len(got)
+    chord(win.viewer, Qt.Key.Key_1)
+    assert len(got) == before            # live binding, no notice
+    # an unknown key still falls through quietly (no notice spam)
+    chord(win.viewer, Qt.Key.Key_Q)
+    assert len(got) == before
+    # main-row '+' keeps its Shift (exact matching) and the platform
+    # picks the key: Key_Equal on Windows/macOS ("Shift+="), Key_Plus on
+    # X11 ("Shift++"). Both spellings must reach the viewer's zoom-step
+    # notice — Picasa's "+/- (not the numeric keypad)"; the grid says
+    # nothing about video keys
+    shift = Qt.KeyboardModifier.ShiftModifier
+    chord(win.viewer, Qt.Key.Key_Plus, shift)
+    assert "zoom in" in got[-1].lower()
+    before = len(got)
+    chord(win.viewer, Qt.Key.Key_Equal, shift)
+    assert len(got) == before + 1 and "zoom in" in got[-1].lower(), got[-1:]
+    gg: list[str] = []
+    win.grid.notice.connect(gg.append)
+    chord(win.grid, Qt.Key.Key_Comma)
+    assert gg == []
+    # PgDown in the grid still reaches QAbstractScrollArea's paging (a
+    # notice there would eat a working key): no notice
+    chord(win.grid, Qt.Key.Key_PageDown)
+    assert gg == []
+    # the one status-bar wording
+    assert keymap.notice("Edit mode", "planned for M3 (edit room)") == \
+        "Edit mode is not implemented yet — planned for M3 (edit room)."
+
+
+def test_keymap_planned_keys_never_shadow_live_bindings(tmp_path: Path) -> None:
+    """PLANNED_KEYS[scope] is consulted only after every live binding on
+    that surface, so a chord the surface ALSO binds would be dead text.
+    Live means: DEFAULT_SCHEME exact chords (StandardKey ones compiled
+    through Qt, e.g. Ctrl+A), key_only bare keys under ANY modifier, and
+    every window-level QAction shortcut (those intercept BEFORE the
+    widget's keyPressEvent). Any overlap means a notice that can never
+    show — fail here, not in the field."""
+    from PySide6.QtGui import QAction, QKeySequence
+
+    import keymap
+    import main
+
+    _offscreen_app()
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    win = main.MainWindow(scan_library(root), None,
+                          cache_dir=None, build_dir=None)
+    window_chords = {sc.toString() for a in win.findChildren(QAction)
+                     for sc in a.shortcuts() if not sc.isEmpty()}
+    for scope, table in keymap.PLANNED_KEYS.items():
+        exact: set[str] = set()
+        bare: set[int] = set()
+        for action, b in keymap.DEFAULT_SCHEME.items():
+            if action.split(".", 1)[0] not in (scope, "app"):
+                continue
+            if b.key_only:
+                bare |= {int(k) for k in keymap._bare_keys(b)}
+            else:
+                exact |= {c.toString() for c in keymap._compiled(b)}
+        for chords in table:
+            assert len(chords) >= 1
+            for c in chords:
+                seq = QKeySequence(c)
+                assert seq.count() == 1, (scope, c)   # a typo never matches
+                assert seq.toString() not in exact, (scope, c)
+                assert seq.toString() not in window_chords, (scope, c)
+                assert int(seq[0].key()) not in bare, (scope, c)
 
 
 def test_viewer_face_rects_wait_for_original(tmp_path: Path) -> None:
@@ -12454,9 +12572,19 @@ def test_help_keyboard_shortcuts_dialog_lists_every_action(
         qtw.QDialog.exec = orig
 
     labels = captured["labels"]
-    assert len(labels) == len(keymap.DEFAULT_SCHEME)
+    # live actions, then a heading, then every planned key and keyless
+    # planned feature (fauxcasa-s6i) — one table, one source
+    distinct = {(label, chords[0])
+                for table in keymap.PLANNED_KEYS.values()
+                for chords, (label, _n) in table.items()}
+    assert len(labels) == (len(keymap.DEFAULT_SCHEME) + 1 + len(distinct)
+                           + len(keymap.PLANNED_FEATURES))
     for action in keymap.DEFAULT_SCHEME:
         assert keymap.ACTION_LABELS[action] in labels
+    heading = labels.index("— Not yet available —")
+    assert heading == len(keymap.DEFAULT_SCHEME)
+    assert any("Edit mode" in lbl for lbl in labels[heading:])
+    assert any("face tagging" in lbl for lbl in labels[heading:])
 
 
 def test_help_about_shows_icon_version_and_license(library: Path) -> None:

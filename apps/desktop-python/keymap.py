@@ -73,6 +73,11 @@ Fauxcasa-only bindings (no Picasa equivalent):
     I                     app.info — metadata inspector toggle (q6l.25;
                                      Lightroom-style, no Picasa equivalent)
 
+Every "M2"/"M3"/"later" row above is ALSO a PLANNED_KEYS entry: pressing
+one shows a status-bar notice naming the feature and its milestone
+(fauxcasa-s6i) rather than doing nothing, and Help > Keyboard Shortcuts
+lists them under "Not yet available".
+
 ARBITRATIONS (encoded in the table below):
 
 * '1' = 1:1 zoom TODAY, but the digit row 0–5 is RESERVED for the M2
@@ -357,6 +362,93 @@ _CONTEXT_LAYERED: frozenset[frozenset[str]] = frozenset({
     frozenset({"viewer.pan_right", "viewer.seek_fwd"}),
 })
 
+# Picasa chords Fauxcasa KNOWS but has not implemented (fauxcasa-s6i).
+# Pressing one must never be a silent nothing: the owning surface's
+# keyPressEvent falls through to planned(event, scope) and the window
+# shows the notice in the status bar, so the user learns the feature is
+# missing (and roughly when it is due) instead of wondering whether the
+# key worked. Keyed by SCOPE (the surface, as in DEFAULT_SCHEME's
+# "<scope>.<action>"), because the honest wording differs per surface:
+# ",": "rewind video" is true in the viewer and nonsense in the grid, and
+# PgUp/PgDown page-scroll the grid through Qt's base handler (a notice
+# there would EAT a working key — reviewer finding, PR for s6i). Each
+# entry: (chord aliases, (feature label, availability note)); aliases are
+# QKeySequence portable strings, listed because exact matching keeps
+# Shift and the platform decides the key: main-row '+' arrives as
+# "Shift+=" on Windows/macOS (the '=/+' key is Key_Equal there) but as
+# "Shift++" on X11 (shifted XK_plus), while keypad '+' (keypad modifier
+# stripped) arrives as "+".
+#
+# Not a scheme: a live binding always wins (planned() runs after every
+# matches() call), so a chord here that the same scope also binds — via
+# DEFAULT_SCHEME, a StandardKey, a key_only bare key under ANY modifier,
+# or a window-level QAction — would be dead text.
+# test_keymap_planned_keys_never_shadow_live_bindings fails on any such
+# overlap; that is why bare '1' is grid-only (viewer.zoom_toggle owns it
+# there), '/' is absent (app.search) and Ctrl+D is absent (grid.deselect).
+_M2_STARS = "planned for M2 (star-set keys 0-5)"
+_M3 = "planned for M3 (edit room)"
+_WRITES = "planned for M2 (library writes)"
+_EVERYWHERE: dict[tuple[str, ...], tuple[str, str]] = {
+    ("Ctrl+3",): ("Edit mode", _M3),
+    ("Ctrl+R",): ("Rotate clockwise", _M3),
+    ("Ctrl+Shift+R",): ("Rotate counter-clockwise", _M3),
+    ("Ctrl+8",): ("Add / remove star (Picasa's Ctrl+8)",
+                  "use Space for now; Ctrl+8 lands with M2 star machinery"),
+    ("0",): ("Clear stars", _M2_STARS),
+    ("2",): ("Set 2 stars", _M2_STARS),
+    ("3",): ("Set 3 stars", _M2_STARS),
+    ("4",): ("Set 4 stars", _M2_STARS),
+    ("5",): ("Set 5 stars", _M2_STARS),
+    ("X",): ("Reject / reverse star", "planned for M2"),
+    ("Ctrl+O",): ("Add folder to library", "planned for a later milestone"),
+    ("Ctrl+M",): ("Move to new folder", _WRITES),
+    ("Ctrl+N",): ("New album", _WRITES),
+    ("Ctrl+T",): ("Add tag", _WRITES),
+    ("Ctrl+E",): ("Export", "planned for a later milestone"),
+    ("Ctrl+P",): ("Print", "planned for a later milestone"),
+}
+PLANNED_KEYS: dict[str, dict[tuple[str, ...], tuple[str, str]]] = {
+    "grid": {
+        **_EVERYWHERE,
+        ("1",): ("Set 1 star", _M2_STARS),
+        ("Ctrl+1",): ("Small thumbnails",
+                      "use the thumbnail zoom slider instead"),
+        ("Ctrl+2",): ("Large thumbnails",
+                      "use the thumbnail zoom slider instead"),
+    },
+    "viewer": {
+        **_EVERYWHERE,
+        ("8",): ("Toggle star (Picasa viewer's 8)",
+                 "use Space for now; 8 lands with M2 star machinery"),
+        ("PgUp", "+", "Shift++", "Shift+="): ("Zoom in one step",
+                                              "not yet available; 1 toggles 100%"),
+        ("PgDown", "-"): ("Zoom out one step",
+                          "not yet available; 1 toggles 100%"),
+        (",",): ("Rewind video", "not yet available; Ctrl+Left skips back 5 s"),
+        (".",): ("Fast-forward video",
+                 "not yet available; Ctrl+Right skips forward 5 s"),
+    },
+}
+
+# Features with no key at all yet, surfaced by the shipped action whose
+# no-op path the user would otherwise hit: label -> availability note.
+# Kept beside PLANNED_KEYS so Help > Keyboard Shortcuts lists both under
+# one "Not yet available" heading. Callers index by the named constant,
+# never by position.
+FACE_TAGGING = "Name a face / manual face tagging"
+PLANNED_FEATURES: dict[str, str] = {
+    FACE_TAGGING:
+        "planned for M4 (people registry); today F only shows the boxes "
+        "Picasa already drew",
+}
+
+
+def notice(label: str, note: str) -> str:
+    """The one status-bar wording for a not-yet-implemented feature."""
+    return f"{label} is not implemented yet — {note}."
+
+
 # Modifiers stripped before exact matching: keypad Enter/digits count as
 # their main-row keys (the pre-keymap handlers accepted KeypadModifier).
 _IGNORED_MODS = Qt.KeyboardModifier.KeypadModifier
@@ -400,6 +492,29 @@ def matches(event, action: str, scheme: dict[str, Binding] | None = None,
         return event.key() in {int(k) for k in _bare_keys(b)}
     seq = _event_sequence(event)
     return any(seq == c for c in _compiled(b))
+
+
+# scope -> [(compiled chord, notice text)], built once (mirrors the
+# _compiled() caching style; a keypress must not re-parse the table).
+_PLANNED_COMPILED: dict[str, list[tuple[QKeySequence, str]]] = {
+    scope: [(QKeySequence(chord), notice(label, note))
+            for chords, (label, note) in table.items()
+            for chord in chords]
+    for scope, table in PLANNED_KEYS.items()
+}
+
+
+def planned(event, scope: str) -> str | None:
+    """The status-bar notice for a PLANNED_KEYS[scope] chord, or None
+    when the event is not one. Exact chord equality, keypad stripped,
+    same as matches() — callers put this LAST in keyPressEvent, after
+    every live binding, so a shipped action on the same key can never be
+    shadowed."""
+    seq = _event_sequence(event)
+    for compiled, text in _PLANNED_COMPILED[scope]:
+        if seq == compiled:
+            return text
+    return None
 
 
 def shortcuts(action: str) -> list[QKeySequence]:
