@@ -1606,6 +1606,137 @@ def test_infile_override_no_flood(tmp_path: Path) -> None:
     assert not overrides, f"unexpected override entries: {overrides}"
 
 
+# ---- fauxcasa-cam.5: XMP faces + non-JPEG caption/keywords merge into the
+# catalog at index time (thumbcache.apply_photo_meta) -----------------------
+
+def _rect64(left: float, top: float, right: float, bottom: float) -> str:
+    return "".join(format(round(v * 65536) & 0xFFFF, "04x")
+                  for v in (left, top, right, bottom))
+
+
+def test_apply_photo_meta_merges_xmp_faces_by_geometry(tmp_path: Path) -> None:
+    """One photo: an ini faces= region overlapping a NAMED XMP region (IoU
+    >= 0.5) keeps the ini rect + contact id but takes the XMP display name
+    (in-file wins tier-1); a second ini region with nothing overlapping it
+    stays untouched; a THIRD, non-overlapping XMP region is ADDED with an
+    'xmp:<name>' contact id. The report records the resolution."""
+    import metareader
+    import picasa_db
+
+    root = tmp_path / "lib"
+    matched_rect = (0.40, 0.40, 0.60, 0.60)
+    untouched_rect = (0.80, 0.80, 0.90, 0.90)
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(),
+        faces=[("Xmp Match", 0.50, 0.50, 0.20, 0.20),   # center of matched_rect
+               ("Xmp New", 0.10, 0.10, 0.05, 0.05)])     # nowhere near either
+    (root / "p.jpg").parent.mkdir(parents=True, exist_ok=True)
+    (root / "p.jpg").write_bytes(data)
+    (root / ".picasa.ini").write_text(
+        "[p.jpg]\r\n"
+        f"faces=rect64({_rect64(*matched_rect)}),cccccccccccccccc;"
+        f"rect64({_rect64(*untouched_rect)}),{picasa_db.UNKNOWN_CONTACT}\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    p = next(ph for ph in cat.photos if ph.rel == "p.jpg")
+    assert len(p.faces) == 3
+    rect0, cid0, name0 = p.faces[0]
+    assert rect0 == pytest.approx(matched_rect, abs=1e-4)  # rect64 quantization
+    assert (cid0, name0) == ("cccccccccccccccc", "Xmp Match")
+    rect1, cid1, name1 = p.faces[1]
+    assert rect1 == pytest.approx(untouched_rect, abs=1e-4)
+    assert (cid1, name1) == (picasa_db.UNKNOWN_CONTACT, None)
+    rect2, cid2, name2 = p.faces[2]
+    assert rect2 == pytest.approx((0.075, 0.075, 0.125, 0.125))
+    assert (cid2, name2) == ("xmp:Xmp New", "Xmp New")
+    entries = [e for e in cat.report.entries
+              if e.kind == "infile_override" and e.detail.startswith("faces:")]
+    assert len(entries) == 1
+    assert "merged 1" in entries[0].detail and "added 1" in entries[0].detail
+
+
+def test_apply_photo_meta_xmp_face_noop_when_name_unchanged(
+        tmp_path: Path) -> None:
+    """A geometric match that changes nothing (XMP face is unnamed, or its
+    name already matches the ini's) does not rewrite photo.faces or add a
+    report entry — matching apply_photo_meta's other §4 fields, which only
+    report a REPLACEMENT, never a same-value touch."""
+    import metareader
+
+    root = tmp_path / "lib"
+    rect = (0.40, 0.40, 0.60, 0.60)
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(), faces=[(None, 0.50, 0.50, 0.20, 0.20)])
+    (root / "p.jpg").parent.mkdir(parents=True, exist_ok=True)
+    (root / "p.jpg").write_bytes(data)
+    (root / ".picasa.ini").write_text(
+        f"[p.jpg]\r\nfaces=rect64({_rect64(*rect)}),cccccccccccccccc\r\n")
+    cat = scan_library(root)
+    original_faces = cat.photos[0].faces
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    p = next(ph for ph in cat.photos if ph.rel == "p.jpg")
+    assert p.faces == original_faces  # unchanged: (rect, cid, None) already
+    assert not [e for e in cat.report.entries
+               if e.kind == "infile_override" and e.detail.startswith("faces:")]
+
+
+def test_xmp_added_face_visible_in_people_sidebar(tmp_path: Path) -> None:
+    """A non-overlapping XMP-only face (no ini match) is ADDED with an
+    'xmp:<name>' id and shows up in the People sidebar under that name —
+    the sidebar groups purely by Photo.faces' display name, not by id
+    shape, so no people-registry change was needed for this to work."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    import metareader
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    root = tmp_path / "lib"
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(), faces=[("Xmp Person", 0.5, 0.5, 0.2, 0.2)])
+    (root / "p.jpg").parent.mkdir(parents=True, exist_ok=True)
+    (root / "p.jpg").write_bytes(data)
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    p = next(ph for ph in cat.photos if ph.rel == "p.jpg")
+    assert p.faces == (((0.4, 0.4, 0.6, 0.6), "xmp:Xmp Person", "Xmp Person"),)
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    people, _unnamed, _name_cids = win._people_counts()
+    assert people.get("Xmp Person") == 1
+
+
+def test_metareader_caption_keywords_fallback_for_tiff(tmp_path: Path) -> None:
+    """inmeta is JPEG-only, so a TIFF's caption/keywords come from
+    metareader's own dc:description/dc:subject read (fmeta) — same §4
+    truthy-wins-over-ini rule, reported the same way as the JPEG path."""
+    import metareader
+
+    root = tmp_path / "lib"
+    data = metareader.embed_test_metadata(
+        _tiff_bytes(), caption="file tiff cap", keywords=["filekw"])
+    (root / "p.tif").parent.mkdir(parents=True, exist_ok=True)
+    (root / "p.tif").write_bytes(data)
+    (root / ".picasa.ini").write_text(
+        "[p.tif]\r\ncaption=ini tiff cap\r\nkeywords=inikw\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    p = next(ph for ph in cat.photos if ph.rel == "p.tif")
+    assert p.caption == "file tiff cap"
+    assert p.keywords == ("filekw",)
+    entries = {e.detail.split(":")[0]: e for e in cat.report.entries
+              if e.kind == "infile_override"}
+    assert "caption" in entries and "keywords" in entries
+
+
 # ---- EXIF orientation baked consistently into the thumbnail cache --------
 
 def test_index_bakes_exif_orientation(tmp_path: Path) -> None:
