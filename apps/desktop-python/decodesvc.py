@@ -1,13 +1,24 @@
-"""Typed interface skeleton for the sandboxed decode service (fauxcasa-i92.2).
+"""Shared wire-protocol types for the sandboxed decode boundary
+(fauxcasa-i92.2).
 
-This module is the *shape* of the boundary designed in
-docs/design/decode-service.md — the request/response dataclasses, the
-closed enums, the response-validation invariant, and the abstract
-transport — with no transport implementation (that is fauxcasa-i92.3).
-Nothing in the app imports it yet; it exists so the design is expressed
-in the one language a review can't argue with.
+This module holds the *shape* of the boundary designed in
+docs/design/decode-service.md: the request/response dataclasses, the
+closed enums, the exception taxonomy (DecodeServiceError,
+ProtocolViolation), and the wire-protocol constants (PROTO, MAX_EDGE,
+MAX_PIXELS, ARENA_BYTES, ...). Real code imports these directly:
+decodesvc_win.py (the Windows sandbox transport), decodefacade.py (its
+error mapping), thumbcache.py (MAX_EDGE), and videostream.py (StreamInfo
+plus the exception types) all build on the types defined here.
 
-Boundary rules it encodes (see the design doc, sections 2-3):
+The abstract `Transport`, `StreamHandle`, and `DecodeService` classes
+below are the ORIGINAL design sketch and are not subclassed by any real
+code today -- decodefacade.py and videostream.py each grew their own
+simpler, concrete shape instead (decodefacade.DecodeService/Transport,
+videostream.VideoStream). Read those three classes as design-doc
+context, not as an interface anything implements.
+
+Boundary rules this module's types encode (see the design doc, sections
+2-3):
 
 - Workers receive an OPEN FILE (fd on POSIX via SCM_RIGHTS, duplicated
   handle on Windows) and return ONLY raw pixel buffers + plain fields.
