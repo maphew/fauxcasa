@@ -20,13 +20,28 @@ unsupported container, an unparseable field, or even a missing exiv2 wheel
 yield ``FileMeta()`` (all None) — ``read_file_meta`` never raises, because
 one corrupt photo must not abort an index over the whole library.
 
-Scope: exactly the fields inmeta.py does NOT read — capture date
-(fauxcasa-cam.9), GPS (fauxcasa-cam.10), XMP Rating (fauxcasa-cam.11),
-plus the raw EXIF Orientation value (read_orientation, fauxcasa-cam.4 —
-a VIEW-time read for the face overlay, not an index-time field).
-inmeta.py remains the caption/keywords reader; the two run side by side on
-the same bytes at index time. Containers: whatever exiv2 sniffs from the
-bytes (JPEG/TIFF/PNG/WebP for the tracer's walk set; GIF/BMP fail soft).
+Scope: capture date (fauxcasa-cam.9), GPS (fauxcasa-cam.10), XMP Rating
+(fauxcasa-cam.11), the raw EXIF Orientation value (read_orientation,
+fauxcasa-cam.4 — a VIEW-time read for the face overlay, not an index-time
+field), plus, since fauxcasa-cam.5, faces-in-XMP (mwg-rs RegionInfo) and a
+library-neutral caption/keywords pair read from XMP dc:description/
+dc:subject. The caption/keywords fields here exist so non-JPEG containers
+(TIFF/RAW, PNG, WebP) get tier-1 ingest too — inmeta.py remains the
+JPEG-specific reader (XMP + its IPTC mirror) and stays authoritative for
+JPEG at the merge site (thumbcache.apply_photo_meta): these fields are the
+fallback for the containers inmeta.py cannot parse. Containers: whatever
+exiv2 sniffs from the bytes (JPEG/TIFF/PNG/WebP for the tracer's walk set;
+GIF/BMP fail soft).
+
+Faces-in-XMP (mwg-rs RegionInfo, per the MWG Metadata Guidelines): each
+region is a normalized (0..1) center x/y + width/height rect inside
+``Xmp.mwg-rs.Regions/mwg-rs:RegionList[N]/...``; this module converts to
+the same (left, top, right, bottom) STORED-pixel-fraction rect the ini
+``faces=`` grammar uses (picasa-ini-format.md), clamped to [0, 1], so a
+downstream merge (catalog/thumbcache) can compare XMP faces and ini faces
+by rect geometry without knowing which store a photo came from. No
+contact ids here — those are a Picasa-catalog concept; a bare (rect,
+name-or-None) pair is the library-neutral shape.
 """
 
 from __future__ import annotations
@@ -60,6 +75,21 @@ class FileMeta:
     # explicit 0. A negative Rating (XMP -1 = rejected) clamps to 0 for now;
     # the M2 reverse-star work owns the -1 mapping.
     rating: int | None = None
+    # dc:description (LangAlt: x-default, else the first alternative).
+    # None when absent or blank — same "truthy wins" contract inmeta.py
+    # uses, so a merge site can treat "" and None identically.
+    caption: str | None = None
+    # dc:subject (Bag), in packet order. Empty tuple when absent.
+    keywords: tuple[str, ...] = ()
+    # mwg-rs Face regions (fauxcasa-cam.5): ((left, top, right, bottom),
+    # name-or-None) pairs, rect fractions of the STORED pixels (same frame
+    # as ini faces=, clamped to [0, 1]). Only mwg-rs:Type == "Face" (or a
+    # region with no Type at all — MWG's documented default) and
+    # stArea:unit == "normalized" (or absent) regions are included; other
+    # types (Pet, BarCode, ...) and pixel-unit regions are skipped. Capped
+    # at _FACE_CAP entries so a hostile packet cannot balloon the catalog.
+    faces: tuple[tuple[tuple[float, float, float, float], str | None], ...] \
+        = ()
 
 
 EMPTY = FileMeta()
@@ -164,6 +194,71 @@ def _parse_rating(value: str | None) -> int | None:
     return max(0, min(5, r))
 
 
+def _parse_caption(value: str | None) -> str | None:
+    """dc:description toString() -> the x-default (or only) alternative's
+    text. python-exiv2 renders a LangAlt as ``lang="<code>" <text>``
+    (confirmed against jpeg_full's XMP: docs/research/spikes/
+    metadata-lib-spike.py read_exiv2); a plain (non-LangAlt) value passes
+    through unchanged. Blank -> None."""
+    if not value:
+        return None
+    if value.startswith("lang="):
+        value = value.split(" ", 1)[-1] if " " in value else ""
+    value = value.strip()
+    return value or None
+
+
+def _parse_subject(value: str | None) -> tuple[str, ...]:
+    """dc:subject toString() -> its comma-joined Bag items, split back out
+    (same rendering as _parse_caption's LangAlt: exiv2's Value::toString()
+    joins XMP arrays with ", "). A keyword containing a literal comma is
+    not distinguishable from two keywords — the same limitation the ini
+    keywords= reader (catalog.py) already has."""
+    if not value:
+        return ()
+    return tuple(k.strip() for k in value.split(",") if k.strip())
+
+
+def _parse_mwg_faces(xmp: dict[str, str]
+                     ) -> tuple[tuple[tuple[float, float, float, float],
+                                      str | None], ...]:
+    """mwg-rs RegionList (already filtered into `xmp` by read_file_meta) ->
+    (rect, name-or-None) pairs. See FileMeta.faces for the field contract."""
+    faces: list[tuple[tuple[float, float, float, float], str | None]] = []
+    for i in range(1, _REGION_INDEX_CAP + 1):
+        if len(faces) >= _FACE_CAP:
+            break
+        prefix = f"{_MWG_REGIONLIST}[{i}]/mwg-rs:Area/stArea:"
+        if prefix + "x" not in xmp:
+            break  # RegionList is a contiguous Bag: no gaps, so this ends it
+        region_type = xmp.get(f"{_MWG_REGIONLIST}[{i}]/mwg-rs:Type")
+        if region_type is not None and region_type.strip().lower() not in \
+                ("", "face"):
+            continue
+        unit = xmp.get(prefix + "unit")
+        if unit is not None and unit.strip().lower() not in \
+                ("", "normalized"):
+            continue
+        try:
+            x = float(xmp[prefix + "x"])
+            y = float(xmp[prefix + "y"])
+            w = float(xmp[prefix + "w"])
+            h = float(xmp[prefix + "h"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if not all(math.isfinite(v) for v in (x, y, w, h)) or w <= 0 or h <= 0:
+            continue
+        left = max(0.0, min(1.0, x - w / 2.0))
+        top = max(0.0, min(1.0, y - h / 2.0))
+        right = max(0.0, min(1.0, x + w / 2.0))
+        bottom = max(0.0, min(1.0, y + h / 2.0))
+        if right <= left or bottom <= top:
+            continue  # degenerate after clamping (e.g. entirely off-frame)
+        name = (xmp.get(f"{_MWG_REGIONLIST}[{i}]/mwg-rs:Name") or "").strip()
+        faces.append(((left, top, right, bottom), name or None))
+    return tuple(faces)
+
+
 # ---- the reader ------------------------------------------------------------
 
 _EXIF_KEYS = frozenset((
@@ -174,6 +269,17 @@ _EXIF_KEYS = frozenset((
 ))
 _XMP_RATING_KEY = "Xmp.xmp.Rating"
 _ORIENTATION_KEY = "Exif.Image.Orientation"
+_CAPTION_KEY = "Xmp.dc.description"
+_SUBJECT_KEY = "Xmp.dc.subject"
+_MWG_REGIONLIST = "Xmp.mwg-rs.Regions/mwg-rs:RegionList"
+
+# Faces-in-XMP caps (fauxcasa-cam.5): _FACE_CAP bounds the OUTPUT (a
+# hostile packet cannot balloon the catalog); _REGION_INDEX_CAP bounds how
+# far the 1-based mwg-rs:RegionList[N] scan looks before giving up, even
+# when every region is skipped as non-Face/non-normalized (so a packet
+# full of *rejected* regions cannot spin the loop unboundedly either).
+_FACE_CAP = 64
+_REGION_INDEX_CAP = 4096
 
 
 def read_orientation(data: bytes) -> int:
@@ -206,12 +312,13 @@ def read_orientation(data: bytes) -> int:
 
 
 def read_file_meta(data: bytes) -> FileMeta:
-    """date_taken / gps / rating from one file's bytes. Never raises."""
+    """date_taken / gps / rating / caption / keywords / faces from one
+    file's bytes. Never raises."""
     exiv2 = _module()
     if exiv2 is None or not data:
         return EMPTY
     exif: dict[str, str] = {}
-    rating_raw: str | None = None
+    xmp: dict[str, str] = {}
     try:
         with _LOCK:
             img = exiv2.ImageFactory.open(data)  # bytes-mode: sniffs the type
@@ -221,9 +328,14 @@ def read_file_meta(data: bytes) -> FileMeta:
                 if k in _EXIF_KEYS:
                     exif[k] = d.toString()
             for d in img.xmpData():
-                if d.key() == _XMP_RATING_KEY:
-                    rating_raw = d.toString()
-                    break
+                k = d.key()
+                # Filtered, not a full dump: an XMP graph can carry
+                # arbitrary unrelated data (thumbnails, editor history)
+                # that this module has no business holding in memory.
+                if k == _XMP_RATING_KEY or k == _CAPTION_KEY \
+                        or k == _SUBJECT_KEY \
+                        or k.startswith(_MWG_REGIONLIST):
+                    xmp[k] = d.toString()
     except Exception:  # noqa: BLE001 — hostile bytes: exiv2 raises, we shrug
         return EMPTY
 
@@ -241,7 +353,10 @@ def read_file_meta(data: bytes) -> FileMeta:
         gps = (lat, lon)
 
     return FileMeta(date_taken=date_taken, gps=gps,
-                    rating=_parse_rating(rating_raw))
+                    rating=_parse_rating(xmp.get(_XMP_RATING_KEY)),
+                    caption=_parse_caption(xmp.get(_CAPTION_KEY)),
+                    keywords=_parse_subject(xmp.get(_SUBJECT_KEY)),
+                    faces=_parse_mwg_faces(xmp))
 
 
 # ---- test-fixture support ---------------------------------------------------
@@ -260,8 +375,14 @@ def embed_test_metadata(data: bytes, *,
                         date_time: str | None = None,
                         gps: tuple[float, float] | None = None,
                         rating: object | None = None,
-                        orientation: int | None = None) -> bytes:
-    """Write date/GPS/Rating INTO image bytes — TEST-FIXTURE SUPPORT ONLY.
+                        orientation: int | None = None,
+                        caption: str | None = None,
+                        keywords: list[str] | None = None,
+                        faces: list[tuple[str | None, float, float,
+                                          float, float]] | None = None,
+                        ) -> bytes:
+    """Write date/GPS/Rating/caption/keywords/faces INTO image bytes —
+    TEST-FIXTURE SUPPORT ONLY.
 
     This is NOT the §5 P1 product writer (no round-trip verification, no
     MakerNote care, no sidecar staging): it exists so test_tracer.py can
@@ -275,6 +396,18 @@ def embed_test_metadata(data: bytes, *,
     rating is written as str(rating) so tests can plant out-of-range values;
     orientation writes EXIF tag 274 verbatim (tests plant all 8 cases —
     and out-of-range values to prove read_orientation's fail-soft).
+
+    caption -> dc:description (exiv2 renders it as a LangAlt automatically,
+    per its built-in XMP property schema); keywords -> dc:subject, one
+    bracket-assignment per item (confirmed to APPEND to the existing Bag
+    rather than overwrite — exiv2's XmpData::operator[] semantics).
+
+    faces -> mwg-rs:RegionList, one Bag entry per (name, x, y, w, h) tuple
+    (x/y/w/h already normalized center+dims, the MWG/XMP wire shape;
+    name=None omits mwg-rs:Name entirely, matching a real unnamed/
+    suggested region). The Bag container itself must exist before any
+    indexed sub-key can be assigned (XMP Toolkit error 102 "Indexing
+    applied to non-array" otherwise) — built once, on first use.
     """
     exiv2 = _module()
     if exiv2 is None:
@@ -283,6 +416,7 @@ def embed_test_metadata(data: bytes, *,
         img = exiv2.ImageFactory.open(data)
         img.readMetadata()
         exif = img.exifData()
+        xmp = img.xmpData()
         if date_time_original is not None:
             exif["Exif.Photo.DateTimeOriginal"] = date_time_original
         if date_time is not None:
@@ -294,9 +428,28 @@ def embed_test_metadata(data: bytes, *,
             exif["Exif.GPSInfo.GPSLongitude"] = _degrees_to_rational(lon)
             exif["Exif.GPSInfo.GPSLongitudeRef"] = "E" if lon >= 0 else "W"
         if rating is not None:
-            img.xmpData()[_XMP_RATING_KEY] = str(rating)
+            xmp[_XMP_RATING_KEY] = str(rating)
         if orientation is not None:
             exif[_ORIENTATION_KEY] = str(orientation)
+        if caption is not None:
+            xmp[_CAPTION_KEY] = caption
+        if keywords:
+            for kw in keywords:
+                xmp[_SUBJECT_KEY] = kw
+        if faces:
+            base = exiv2.XmpTextValue()
+            base.setXmpArrayType(exiv2.XmpValue.XmpArrayType.xaBag)
+            xmp.add(exiv2.XmpKey(_MWG_REGIONLIST), base)
+            for i, (name, x, y, w, h) in enumerate(faces, start=1):
+                prefix = f"{_MWG_REGIONLIST}[{i}]/mwg-rs:"
+                if name is not None:
+                    xmp[prefix + "Name"] = name
+                xmp[prefix + "Type"] = "Face"
+                xmp[prefix + "Area/stArea:x"] = str(x)
+                xmp[prefix + "Area/stArea:y"] = str(y)
+                xmp[prefix + "Area/stArea:w"] = str(w)
+                xmp[prefix + "Area/stArea:h"] = str(h)
+                xmp[prefix + "Area/stArea:unit"] = "normalized"
         img.writeMetadata()
         bio = img.io()
         view = bio.mmap()

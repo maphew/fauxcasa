@@ -6563,6 +6563,92 @@ def test_metareader_non_jpeg_carriers() -> None:
         fm = metareader.read_file_meta(data)
         assert fm.date_taken == "2015-03-15T09:30:00", fmt
         assert fm.rating == 2, fmt
+# ---------------------------------------------------------------------------
+# faces-in-XMP + caption/keywords via metareader (fauxcasa-cam.5): mwg-rs
+# RegionInfo and dc:description/dc:subject, the library-neutral fields that
+# feed non-JPEG containers and the ini-face geometry merge (thumbcache).
+# ---------------------------------------------------------------------------
+
+
+def _tiff_bytes(w: int = 40, h: int = 30) -> bytes:
+    """A minimal TIFF via Qt's own encoder — no exiv2 involved yet, so the
+    fixture stays privacy-safe synthetic pixels like _jpeg_bytes."""
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QColor, QImage
+
+    img = QImage(w, h, QImage.Format.Format_RGB32)
+    img.fill(QColor(20, 40, 60))
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert img.save(buf, "TIFF")
+    return bytes(buf.data())
+
+
+def test_metareader_reads_faces_xmp() -> None:
+    """mwg-rs RegionList: one named face, one unnamed (suggested) face —
+    center+dims normalized XMP -> (left, top, right, bottom) STORED-pixel
+    fractions, the same rect frame as ini faces= (picasa-ini-format.md)."""
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(),
+        faces=[("Ada Test", 0.40, 0.35, 0.20, 0.30),
+               (None, 0.70, 0.60, 0.15, 0.25)])
+    fm = metareader.read_file_meta(data)
+    assert len(fm.faces) == 2
+    rect1, name1 = fm.faces[0]
+    assert name1 == "Ada Test"
+    assert rect1 == pytest.approx((0.30, 0.20, 0.50, 0.50))
+    rect2, name2 = fm.faces[1]
+    assert name2 is None
+    assert rect2 == pytest.approx((0.625, 0.475, 0.775, 0.725))
+
+
+def test_metareader_reads_caption_keywords_faces_tiff() -> None:
+    """A TIFF carrier (fauxcasa-cam.5: RAW/TIFF containers) round-trips
+    caption, keywords, and a face region through the same exiv2 seam."""
+    data = metareader.embed_test_metadata(
+        _tiff_bytes(), caption="Family at the beach",
+        keywords=["beach", "family"],
+        faces=[("Bob Example", 0.5, 0.5, 0.2, 0.2)])
+    fm = metareader.read_file_meta(data)
+    assert fm.caption == "Family at the beach"
+    assert fm.keywords == ("beach", "family")
+    assert len(fm.faces) == 1
+    assert fm.faces[0][1] == "Bob Example"
+
+
+def test_metareader_faces_garbage_packet_is_empty() -> None:
+    """Hostile/non-image bytes: faces (and caption/keywords) fail soft to
+    the all-empty FileMeta, same contract as date/gps/rating."""
+    assert metareader.read_file_meta(b"garbage" * 1000) == metareader.EMPTY
+    assert metareader.read_file_meta(b"") == metareader.EMPTY
+
+
+def test_metareader_faces_capped_at_64() -> None:
+    """A packet carrying 100 valid Face regions yields only 64 — the DoS
+    guard (_FACE_CAP) so a hostile packet cannot balloon the catalog."""
+    faces = [(f"Person {i}", 0.1, 0.1, 0.02, 0.02) for i in range(100)]
+    data = metareader.embed_test_metadata(_jpeg_bytes(), faces=faces)
+    fm = metareader.read_file_meta(data)
+    assert len(fm.faces) == 64
+
+
+def test_metareader_faces_pixel_unit_skipped() -> None:
+    """stArea:unit != 'normalized' (e.g. legacy pixel-unit regions) is
+    skipped outright rather than misread as a 0..1 fraction."""
+    import exiv2  # noqa: PLC0415 (test-only direct use, to plant a unit
+    # this module's own writer never emits — embed_test_metadata always
+    # writes normalized, so proving the reader's unit filter needs a
+    # hand-planted non-normalized value)
+
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(), faces=[("Px Person", 100, 100, 50, 50)])
+    img = exiv2.ImageFactory.open(data)
+    img.readMetadata()
+    img.xmpData()["Xmp.mwg-rs.Regions/mwg-rs:RegionList[1]/mwg-rs:Area/"
+                   "stArea:unit"] = "pixel"
+    img.writeMetadata()
+    out = bytes(img.io().mmap())
+    assert metareader.read_file_meta(out).faces == ()
 
 
 def test_scan_ini_geotag_and_star_count(tmp_path: Path) -> None:
