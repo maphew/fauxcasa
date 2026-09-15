@@ -2188,7 +2188,7 @@ class MainWindow(QMainWindow):
         # 5 s join leaves _scan_thread alive after main() has already
         # returned. If a later in-process run reuses the same
         # QApplication (main() supports this — see
-        # test_ready_poll_timer_dies_with_the_run) and restarts the event
+        # test_ready_poll_timer_dies_with_the_window) and restarts the event
         # loop, the orphaned worker's queued scan_done can fire into this
         # now-stale window and reload/rebuild against deleted Qt objects.
         # _on_scan_done checks this FIRST and returns immediately once set;
@@ -2444,7 +2444,7 @@ class MainWindow(QMainWindow):
         round 3): a scan that outlives shutdown()'s join leaves the worker
         thread alive after main() has already returned this window to the
         caller. main() supports reusing the same QApplication across an
-        in-process run (test_ready_poll_timer_dies_with_the_run) — if a
+        in-process run (test_ready_poll_timer_dies_with_the_window) — if a
         later run restarts the event loop, the orphaned worker's queued
         scan_done can fire into this now-stale window. shutdown() sets
         _shut_down and disconnects this slot, but an emit already queued

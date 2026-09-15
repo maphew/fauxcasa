@@ -7534,7 +7534,7 @@ def test_ready_poll_timer_dies_with_the_window(
     to matter (fauxcasa-xf2).
 
     Asserts on capsys' stderr mirror (applog's _StderrHandler), NOT caplog:
-    the 'fauxcasa' logger sets propagate=False (applog.py:83), matching the
+    applog sets `log.propagate = False` on the 'fauxcasa' logger, matching the
     convention on test_cmd_promote_requires_explicit_library.
 
     Confirmed red only when BOTH parts of the fix are reverted together —
