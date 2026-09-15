@@ -10986,8 +10986,88 @@ def test_viewer_face_toggle_only_with_faces(tmp_path: Path) -> None:
     v._on_loaded(v._serial, orig, 1)
     assert v.faces_visible               # sticky across navigation...
     assert v._face_rects() == []         # ...but nothing to draw here
+    got: list[str] = []
+    v.notice.connect(got.append)
     _press(v, Qt.Key.Key_F)
-    assert v.faces_visible               # F on a faceless photo: no-op
+    assert v.faces_visible               # F on a faceless photo: state kept
+    # ...but never silent (fauxcasa-s6i): the user hears there are no
+    # Picasa tags here and that naming faces is still to come.
+    assert len(got) == 1
+    assert "no picasa face tags" in got[0].lower()
+    assert "not implemented yet" in got[0].lower()
+    assert "M4" in got[0]
+
+
+def test_planned_keys_notice_instead_of_silence(tmp_path: Path) -> None:
+    """A Picasa chord Fauxcasa knows but has not built (keymap.PLANNED_KEYS)
+    raises a notice from BOTH surfaces, and the window shows it in the
+    status bar (fauxcasa-s6i) — never a silent nothing. Live bindings are
+    untouched: the same press path still runs them first."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+
+    import keymap
+
+    def chord(widget, key, mods=Qt.KeyboardModifier.NoModifier):
+        widget.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, mods))
+
+    _offscreen_app()
+    import main
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    win = main.MainWindow(scan_library(root), None,
+                          cache_dir=None, build_dir=None)
+    ctrl = Qt.KeyboardModifier.ControlModifier
+    # grid: Ctrl+3 (Picasa edit mode) -> notice names the feature + M3
+    win.grid.setFocus()
+    chord(win.grid, Qt.Key.Key_3, ctrl)
+    msg = win.statusBar().currentMessage()
+    assert "edit mode" in msg.lower() and "M3" in msg, msg
+    # grid: bare digit (M2 star-set) — the grid has no '1' binding, so
+    # the notice fires there; X (reject) likewise
+    chord(win.grid, Qt.Key.Key_1)
+    assert "1 star" in win.statusBar().currentMessage()
+    chord(win.grid, Qt.Key.Key_X)
+    assert "reject" in win.statusBar().currentMessage().lower()
+    # viewer: Ctrl+R (rotate) -> notice; '1' is the live zoom toggle
+    # there and must keep winning over the planned star-set entry
+    win.viewer.show_photo([0, 1], 0)
+    got: list[str] = []
+    win.viewer.notice.connect(got.append)
+    chord(win.viewer, Qt.Key.Key_R, ctrl)
+    assert got and "rotate" in got[-1].lower() and "M3" in got[-1]
+    assert "rotate" in win.statusBar().currentMessage().lower()
+    before = len(got)
+    chord(win.viewer, Qt.Key.Key_1)
+    assert len(got) == before            # live binding, no notice
+    # an unknown key still falls through quietly (no notice spam)
+    chord(win.viewer, Qt.Key.Key_Q)
+    assert len(got) == before
+    # Help > Keyboard Shortcuts lists the same table under one heading
+    assert keymap.notice("Edit mode", "planned for M3 (edit room)") == \
+        "Edit mode is not implemented yet — planned for M3 (edit room)."
+
+
+def test_keymap_planned_keys_never_shadow_live_bindings() -> None:
+    """PLANNED_KEYS is consulted only after every live binding, so a chord
+    that a surface ALSO binds would be dead text there. The one tolerated
+    overlap is bare '1' (viewer.zoom_toggle's grandfathered tenant; the
+    planned star-set entry still fires from the grid). Any other overlap
+    means a notice that can never show — fail here, not in the field."""
+    from PySide6.QtGui import QKeySequence
+
+    import keymap
+
+    live: set[str] = set()
+    for b in keymap.DEFAULT_SCHEME.values():
+        for c in b.chords:
+            live.add(QKeySequence(c).toString())
+    planned = {QKeySequence(c).toString() for c in keymap.PLANNED_KEYS}
+    assert planned & live == {"1"}
+    # every entry parses to exactly one chord (a typo would never match)
+    for c in keymap.PLANNED_KEYS:
+        assert QKeySequence(c).count() == 1, c
 
 
 def test_viewer_face_rects_wait_for_original(tmp_path: Path) -> None:
@@ -12426,9 +12506,17 @@ def test_help_keyboard_shortcuts_dialog_lists_every_action(
         qtw.QDialog.exec = orig
 
     labels = captured["labels"]
-    assert len(labels) == len(keymap.DEFAULT_SCHEME)
+    # live actions, then a heading, then every planned key and keyless
+    # planned feature (fauxcasa-s6i) — one table, one source
+    assert len(labels) == (len(keymap.DEFAULT_SCHEME) + 1
+                           + len(keymap.PLANNED_KEYS)
+                           + len(keymap.PLANNED_FEATURES))
     for action in keymap.DEFAULT_SCHEME:
         assert keymap.ACTION_LABELS[action] in labels
+    heading = labels.index("— Not yet available —")
+    assert heading == len(keymap.DEFAULT_SCHEME)
+    assert any("Edit mode" in lbl for lbl in labels[heading:])
+    assert any("face tagging" in lbl for lbl in labels[heading:])
 
 
 def test_help_about_shows_icon_version_and_license(library: Path) -> None:

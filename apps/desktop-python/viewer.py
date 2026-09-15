@@ -727,6 +727,11 @@ class ViewerPage(QWidget):
     # keyPressEvent entirely (its own scheme, slideshow.*), so this never
     # reaches playback.
     info_toggle_requested = Signal()
+    # A not-yet-implemented feature was asked for (fauxcasa-s6i): a Picasa
+    # chord from keymap.PLANNED_KEYS, or F on a photo carrying no face
+    # tags. Payload: the status-bar wording. MainWindow shows it; the
+    # viewer never blocks on a dialog for a key that did nothing.
+    notice = Signal(str)
 
     def __init__(self, catalog: Catalog, thumbs: ThumbCache | None = None,
                  parent=None):
@@ -1371,7 +1376,16 @@ class ViewerPage(QWidget):
         if not self.face_overlay_allowed:
             return
         idx = self.current_index()
-        if idx < 0 or not self.catalog.photos[idx].faces:
+        if idx < 0:
+            return
+        if not self.catalog.photos[idx].faces:
+            # Not silent (fauxcasa-s6i): the user pressed F expecting to
+            # see or name people. Say what the key does today and that
+            # tagging is still to come, instead of leaving them to wonder
+            # whether the key registered.
+            label, note = next(iter(keymap.PLANNED_FEATURES.items()))
+            self.notice.emit("No Picasa face tags on this photo. "
+                             + keymap.notice(label, note))
             return
         self.faces_visible = not self.faces_visible
         self.update()
@@ -1517,6 +1531,11 @@ class ViewerPage(QWidget):
             # Ctrl-chord check above (pan/hold/locate), per the keymap
             # dispatch-order contract.
             self.info_toggle_requested.emit()
+        elif (msg := keymap.planned(event)) is not None:
+            # LAST, after every live binding: a Picasa chord Fauxcasa knows
+            # but has not built yet gets a status-bar notice instead of
+            # silence (fauxcasa-s6i).
+            self.notice.emit(msg)
         else:
             super().keyPressEvent(event)
 

@@ -73,6 +73,11 @@ Fauxcasa-only bindings (no Picasa equivalent):
     I                     app.info — metadata inspector toggle (q6l.25;
                                      Lightroom-style, no Picasa equivalent)
 
+Every "M2"/"M3"/"later" row above is ALSO a PLANNED_KEYS entry: pressing
+one shows a status-bar notice naming the feature and its milestone
+(fauxcasa-s6i) rather than doing nothing, and Help > Keyboard Shortcuts
+lists them under "Not yet available".
+
 ARBITRATIONS (encoded in the table below):
 
 * '1' = 1:1 zoom TODAY, but the digit row 0–5 is RESERVED for the M2
@@ -357,6 +362,70 @@ _CONTEXT_LAYERED: frozenset[frozenset[str]] = frozenset({
     frozenset({"viewer.pan_right", "viewer.seek_fwd"}),
 })
 
+# Picasa chords Fauxcasa KNOWS but has not implemented (fauxcasa-s6i).
+# Pressing one must never be a silent nothing: the owning surface's
+# keyPressEvent falls through to planned() and the window shows the
+# notice in the status bar, so the user learns the feature is missing
+# (and roughly when it is due) instead of wondering whether the key
+# worked. Chords are QKeySequence portable strings; every entry maps to
+# (feature label, availability note). Bare digits/X here echo
+# RESERVED_KEYS — the '1' zoom_toggle tenant is matched FIRST by the
+# viewer, so its entry only fires from the grid. Not a scheme: a live
+# binding always wins (planned() runs after every matches() call), so a
+# chord here that a surface also binds would be dead text on that surface
+# — test_keymap_planned_keys_never_shadow_live_bindings pins the ONE
+# tolerated overlap ('1', grid-only) and fails on any other. Picasa's '/'
+# (pause video) and Ctrl+D (set as desktop) are absent on purpose: they
+# are app.search and grid.deselect here.
+PLANNED_KEYS: dict[str, tuple[str, str]] = {
+    "Ctrl+3": ("Edit mode", "planned for M3 (edit room)"),
+    "Ctrl+R": ("Rotate clockwise", "planned for M3 (edit room)"),
+    "Ctrl+Shift+R": ("Rotate counter-clockwise", "planned for M3 (edit room)"),
+    "Ctrl+8": ("Add / remove star (Picasa's Ctrl+8)",
+               "use Space for now; Ctrl+8 lands with M2 star machinery"),
+    "8": ("Toggle star (Picasa viewer's 8)",
+          "use Space for now; 8 lands with M2 star machinery"),
+    "0": ("Clear stars", "planned for M2 (star-set keys 0-5)"),
+    "1": ("Set 1 star", "planned for M2 (star-set keys 0-5)"),
+    "2": ("Set 2 stars", "planned for M2 (star-set keys 0-5)"),
+    "3": ("Set 3 stars", "planned for M2 (star-set keys 0-5)"),
+    "4": ("Set 4 stars", "planned for M2 (star-set keys 0-5)"),
+    "5": ("Set 5 stars", "planned for M2 (star-set keys 0-5)"),
+    "X": ("Reject / reverse star", "planned for M2"),
+    "Ctrl+1": ("Small thumbnails", "use the thumbnail zoom slider instead"),
+    "Ctrl+2": ("Large thumbnails", "use the thumbnail zoom slider instead"),
+    "Ctrl+O": ("Add folder to library", "not yet available"),
+    "Ctrl+M": ("Move to new folder", "not yet available (writes land in M2)"),
+    "Ctrl+N": ("New album", "not yet available (writes land in M2)"),
+    "Ctrl+T": ("Add tag", "not yet available (writes land in M2)"),
+    "Ctrl+E": ("Export", "not yet available"),
+    "Ctrl+P": ("Print", "not yet available"),
+    "PgUp": ("Zoom in one step", "not yet available; 1 toggles 100%"),
+    "PgDown": ("Zoom out one step", "not yet available; 1 toggles 100%"),
+    "+": ("Zoom in one step", "not yet available; 1 toggles 100%"),
+    "-": ("Zoom out one step", "not yet available; 1 toggles 100%"),
+    ",": ("Rewind video", "not yet available; Ctrl+Left skips back 5 s"),
+    ".": ("Fast-forward video",
+          "not yet available; Ctrl+Right skips forward 5 s"),
+}
+
+# Features with no key at all yet, surfaced by the shipped action whose
+# no-op path the user would otherwise hit (viewer.toggle_faces on a photo
+# without Picasa face tags): label -> availability note. Kept beside
+# PLANNED_KEYS so Help > Keyboard Shortcuts lists both under one
+# "Not yet available" heading.
+PLANNED_FEATURES: dict[str, str] = {
+    "Name a face / manual face tagging":
+        "planned for M4 (people registry); today F only shows the boxes "
+        "Picasa already drew",
+}
+
+
+def notice(label: str, note: str) -> str:
+    """The one status-bar wording for a not-yet-implemented feature."""
+    return f"{label} is not implemented yet — {note}."
+
+
 # Modifiers stripped before exact matching: keypad Enter/digits count as
 # their main-row keys (the pre-keymap handlers accepted KeypadModifier).
 _IGNORED_MODS = Qt.KeyboardModifier.KeypadModifier
@@ -400,6 +469,18 @@ def matches(event, action: str, scheme: dict[str, Binding] | None = None,
         return event.key() in {int(k) for k in _bare_keys(b)}
     seq = _event_sequence(event)
     return any(seq == c for c in _compiled(b))
+
+
+def planned(event) -> str | None:
+    """The status-bar notice for a PLANNED_KEYS chord, or None when the
+    event is not one. Exact chord equality, keypad stripped, same as
+    matches() — callers put this LAST in keyPressEvent, after every live
+    binding, so a shipped action on the same key can never be shadowed."""
+    seq = _event_sequence(event)
+    for chord, (label, note) in PLANNED_KEYS.items():
+        if seq == QKeySequence(chord):
+            return notice(label, note)
+    return None
 
 
 def shortcuts(action: str) -> list[QKeySequence]:
