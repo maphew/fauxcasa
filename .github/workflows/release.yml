@@ -62,6 +62,7 @@ jobs:
       PYINSTALLER: "pyinstaller==6.20.0"
       EXIV2: "exiv2==0.18.1"
       PILLOW: "pillow==12.3.0"
+      PIHEIF: "pi-heif==1.4.0"
       RAWPY: "rawpy==0.27.0"
       AV: "av==18.0.0"
       ZSTD: "zstandard==0.23.0"
@@ -131,7 +132,8 @@ jobs:
           uv run --with "${{ env.PYSIDE6 }}" --with "${{ env.PYSIDE6_ADDONS }}"
           --with "${{ env.PYINSTALLER }}"
           --with "${{ env.RAWPY }}" --with "${{ env.EXIV2 }}"
-          --with "${{ env.PILLOW }}" --with "${{ env.AV }}" --with "${{ env.ZSTD }}"
+          --with "${{ env.PILLOW }}" --with "${{ env.PIHEIF }}"
+          --with "${{ env.AV }}" --with "${{ env.ZSTD }}"
           pyinstaller --noconfirm --clean apps/desktop-python/fauxcasa-tracer.spec
 
       - name: Frozen lazy-dependency self-check
@@ -167,6 +169,11 @@ jobs:
           # Pre-committed synthetic DNG (fauxcasa-v46.5): gates the RAW
           # decode path (rawpy hidden-import) in the frozen artifact.
           cp fixtures/raw-smoke/synthetic.dng "ci-library/2019-03-02 Hike/"
+          # Pre-committed synthetic HEIC (fauxcasa-y5b): gates the HEIC/
+          # HEIF decode path (pi-heif hidden-import + native DLLs) in the
+          # frozen artifact. Dropped in the OTHER folder so it never
+          # shifts the synthetic.dng walk-order index below.
+          cp fixtures/heic-smoke/synthetic.heic "ci-library/2022-11-20 Birthday/"
 
       - name: Smoke-run the FROZEN artifact headless (the whole point)
         shell: bash
@@ -282,6 +289,58 @@ jobs:
 
           if not dng_found:
               sys.exit("DNG not found in ci-cache — was it indexed?")
+          EOF
+
+      - name: Assert HEIC thumbnail decoded in frozen artifact (pi-heif gated)
+        # Mirrors bundle.yml's HEIC assertion step exactly (fauxcasa-y5b).
+        shell: bash
+        run: |
+          uv run --with "${{ env.PYSIDE6 }}" python - <<'EOF'
+          import json, struct, sys
+          from pathlib import Path
+
+          cache_root = Path("ci-cache")
+          if not cache_root.exists():
+              sys.exit("ci-cache not found — smoke run may have failed")
+
+          heic_found = False
+          for d in sorted(cache_root.iterdir()):
+              if not d.is_dir():
+                  continue
+              fc = d / "thumbs.fcache"
+              fj = d / "thumbs.fcache.json"
+              if not fc.exists() or not fj.exists():
+                  continue
+              meta = json.loads(fj.read_text())
+              files = meta.get("files", [])
+              heic_files = [f for f in files if f.lower().endswith(".heic")]
+              if not heic_files:
+                  continue
+              idx = files.index(heic_files[0])
+              raw_data = fc.read_bytes()
+              if raw_data[:4] != b"FCTC":
+                  sys.exit(f"Bad fcache magic: {raw_data[:4]!r}")
+              version = struct.unpack_from("<I", raw_data, 4)[0]
+              if version != 1:
+                  sys.exit(f"Unexpected fcache version {version}")
+              entry_off = 16 + idx * 16
+              offset, length, w, h = struct.unpack_from("<QIHH", raw_data,
+                                                        entry_off)
+              if length == 0:
+                  sys.exit(
+                      "HEIC decoded to error tile (pi-heif/hiddenimport "
+                      f"missing?) — {heic_files[0]}"
+                  )
+              if (w, h) != (96, 64):
+                  sys.exit(f"unexpected HEIC thumb size {w}x{h} (fixture is "
+                           "96x64, never upscaled)")
+              print(f"OK: HEIC thumb decoded ({w}x{h}, {length} bytes) "
+                    "— pi-heif bundled correctly")
+              heic_found = True
+              break
+
+          if not heic_found:
+              sys.exit("HEIC not found in ci-cache — was it indexed?")
           EOF
 
       # --- Decode-sandbox go/no-go (fauxcasa-ez2.9 Stage 2) -----------------

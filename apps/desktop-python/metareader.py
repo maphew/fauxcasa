@@ -31,7 +31,10 @@ JPEG-specific reader (XMP + its IPTC mirror) and stays authoritative for
 JPEG at the merge site (thumbcache.apply_photo_meta): these fields are the
 fallback for the containers inmeta.py cannot parse. Containers: whatever
 exiv2 sniffs from the bytes (JPEG/TIFF/PNG/WebP for the tracer's walk set;
-GIF/BMP fail soft).
+GIF/BMP fail soft), plus HEIC/HEIF since fauxcasa-y5b — exiv2 reads its
+own BMFF/ISOBMFF support for these, independent of pillowload's pi-heif
+decode path (verified: mimeType() reports "image/heic" on the committed
+fixture, fixtures/heic-smoke/synthetic.heic).
 
 Faces-in-XMP (mwg-rs RegionInfo, per the MWG Metadata Guidelines): each
 region is a normalized (0..1) center x/y + width/height rect inside

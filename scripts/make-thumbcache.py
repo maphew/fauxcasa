@@ -3,6 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "pillow",
+#   "pi-heif",
 #   "rawpy",
 #   "av",
 # ]
@@ -110,8 +111,38 @@ POSTER_SEEK_S = 1.0
 # Must match apps/desktop-python/catalog.py EXTS exactly (cache-order parity).
 # TGA/PSD joined the stills set with fauxcasa-v46.4; PIL reads both natively
 # (PSD = the flattened composite, matching the app's Pillow fallback).
+# HEIC/HEIF joined with fauxcasa-y5b; PIL reads them via the pi-heif opener
+# _open_source registers below, matching apps/desktop-python/pillowload.py.
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
-        ".webp", ".tga", ".psd"} | RAW_EXTS | VIDEO_EXTS
+        ".webp", ".tga", ".psd", ".heic", ".heif"} | RAW_EXTS | VIDEO_EXTS
+# Lazy, once-per-process HEIF opener registration (mirrors
+# apps/desktop-python/pillowload.py._ensure_heif_opener): pi-heif's
+# native lib load is not free, and a build without the wheel should fail
+# soft to the same zero-length-blob error tile any unreadable source
+# gets in _make_thumb's broad except, not crash the whole run -- but
+# still warn ONCE (this script's print-to-stderr idiom, not pillowload's
+# logging.warning) so a missing wheel isn't silently invisible, and
+# never claim "registered" on a failed attempt (so a transient import
+# error can't permanently mask a real HEIC/HEIF source as fine).
+_heif_registered = False
+_heif_import_failed = False
+
+
+def _ensure_heif_opener() -> None:
+    global _heif_registered, _heif_import_failed
+    if _heif_registered or _heif_import_failed:
+        return
+    try:
+        from pi_heif import register_heif_opener
+
+        register_heif_opener()
+        _heif_registered = True
+    except Exception as e:  # noqa: BLE001 -- ImportError or native-lib faults
+        _heif_import_failed = True
+        print(f"pi-heif unavailable ({e}) -- HEIC/HEIF sources will "
+              "error-tile this run", file=sys.stderr)
+
+
 # Mirror of apps/desktop-python/library.py LIBRARY_DIR / ROOT_MARKER — the
 # library-state dir and per-root id marker are excluded from the walk in
 # BOTH twins (multiroot .a, fauxcasa-ed5.7.1) or caches stop binding.
@@ -267,6 +298,7 @@ def _open_source(path: Path):
             if op is not None:
                 img = img.transpose(op)
             return img.convert("RGB")
+    _ensure_heif_opener()  # no-op after the first call, any outcome
     with Image.open(path) as img:
         # Bake EXIF orientation (all 8 cases, mirrors too) so this builder
         # agrees with the in-app one (apps/desktop-python/thumbcache.py) and
