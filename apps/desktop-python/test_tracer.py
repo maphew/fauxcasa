@@ -18819,3 +18819,154 @@ def test_star_menu_actions_reflect_current_threshold(tmp_path: Path) -> None:
     win._set_star_min(2)
     assert win.star_actions[2].isChecked()
     assert [a.isChecked() for a in win.star_actions].count(True) == 1
+
+
+# ---------------------------------------------------------------------------
+# Scoped star views (fauxcasa-q6l.20), clause (c): bulk-unstar is Ctrl+A
+# (select-all-in-scope, shipped) plus one gesture — Shift+Space, or the
+# View > Clear Star(s) menu item — that zeroes stars on the whole selection
+# in one starstore save.
+# ---------------------------------------------------------------------------
+
+def test_shift_space_clears_stars_on_whole_selection_in_starred_view(
+        tmp_path: Path) -> None:
+    """Ctrl+A then Shift+Space over a MIXED-star selection in the default
+    view: unconditional zero on every selected photo, never Space's
+    toggle semantics (which would normalize a mixed selection to ALL-
+    starred instead) — every cleared photo's zero lands in stars.json,
+    and the Starred sidebar count drops to 0."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    import starstore
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    make_jpeg(root / "f" / "c.jpg")   # unstarred: makes the selection MIXED
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["a.jpg"]].star = 3
+    cat.photos[by_name["b.jpg"]].star = 5
+    # c.jpg stays star=0
+
+    state_dir = tmp_path / "state"
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None,
+                     state_dir=state_dir)
+    _key(win.grid, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    assert win.grid.selection == {
+        by_name["a.jpg"], by_name["b.jpg"], by_name["c.jpg"]}
+    _key(win.grid, Qt.Key.Key_Space, Qt.KeyboardModifier.ShiftModifier)
+
+    # Star_toggle's mixed-selection rule would have set target=1 (normalize
+    # to starred) here; clear must zero all three regardless.
+    assert cat.photos[by_name["a.jpg"]].star == 0
+    assert cat.photos[by_name["b.jpg"]].star == 0
+    assert cat.photos[by_name["c.jpg"]].star == 0
+    assert _sidebar_text(win, "starred", "") == "Starred  (0)"
+    overrides = starstore.load_star_overrides(state_dir)
+    assert overrides[("", "f/a.jpg")] == 0
+    assert overrides[("", "f/b.jpg")] == 0
+    assert overrides[("", "f/c.jpg")] == 0
+
+    _sidebar_click(win, "starred", "")
+    assert win.grid.display == []
+
+
+def test_shift_space_in_search_scope_clears_only_the_searched_photos(
+        tmp_path: Path) -> None:
+    """The same gesture in a search scope only clears what Ctrl+A actually
+    selected there — the search results, a MIXED-star pair so toggle's
+    normalize-to-starred behavior would visibly diverge from clear —
+    leaving an equally-starred photo outside the search term untouched."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "beach_sun.jpg")
+    make_jpeg(root / "f" / "beach_shade.jpg")
+    make_jpeg(root / "f" / "hill.jpg")
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["beach_sun.jpg"]].star = 4
+    # beach_shade.jpg stays star=0: mixed search-result selection
+    cat.photos[by_name["hill.jpg"]].star = 4
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.search.setText("beach")
+    assert sorted(win.grid.display) == sorted([
+        by_name["beach_sun.jpg"], by_name["beach_shade.jpg"]])
+
+    _key(win.grid, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    _key(win.grid, Qt.Key.Key_Space, Qt.KeyboardModifier.ShiftModifier)
+
+    # Toggle's mixed-selection rule would have STARRED beach_shade.jpg
+    # (target=1); clear must zero the whole mixed pair instead.
+    assert cat.photos[by_name["beach_sun.jpg"]].star == 0
+    assert cat.photos[by_name["beach_shade.jpg"]].star == 0
+    assert cat.photos[by_name["hill.jpg"]].star == 4   # outside the search
+
+
+def test_shift_space_in_viewer_clears_only_the_current_photo(
+        tmp_path: Path) -> None:
+    """The viewer half of the gesture (fauxcasa-q6l.20 clause c): Shift+
+    Space is unconditional CLEAR, not star_toggle's add/remove — on an
+    unstarred current photo, toggle would STAR it (target=1) but clear
+    must leave it at 0 — and the rest of the (frozen) display list is
+    untouched either way."""
+    _offscreen_app()
+    from PySide6.QtCore import Qt
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    # a.jpg stays star=0 — the discriminating case: star_toggle would SET
+    # it to 1 (nothing selected is "already starred"), clear must not.
+    cat.photos[by_name["b.jpg"]].star = 3
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    display = [by_name["a.jpg"], by_name["b.jpg"]]
+    win._open_viewer(by_name["a.jpg"], display, 0)
+
+    _key(win.viewer, Qt.Key.Key_Space, Qt.KeyboardModifier.ShiftModifier)
+
+    assert cat.photos[by_name["a.jpg"]].star == 0   # stayed cleared
+    assert cat.photos[by_name["b.jpg"]].star == 3   # untouched
+
+    win._open_viewer(by_name["b.jpg"], display, 1)
+    _key(win.viewer, Qt.Key.Key_Space, Qt.KeyboardModifier.ShiftModifier)
+    assert cat.photos[by_name["b.jpg"]].star == 0   # the ordinary case too
+    win.viewer.quiesce()
+
+
+def test_menu_clear_stars_dispatches_grid_or_viewer_by_current_page(
+        tmp_path: Path) -> None:
+    """View > Clear Star(s) is the mouse-only equivalent of Shift+Space:
+    it clears the grid selection when the grid is showing, and just the
+    current photo when the viewer is showing."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["a.jpg"]].star = 1
+    cat.photos[by_name["b.jpg"]].star = 1
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.grid._select(by_name["a.jpg"])
+    win.star_clear_action.trigger()
+    assert cat.photos[by_name["a.jpg"]].star == 0
+    assert cat.photos[by_name["b.jpg"]].star == 1
+
+    display = [by_name["a.jpg"], by_name["b.jpg"]]
+    win._open_viewer(by_name["b.jpg"], display, 1)
+    win.star_clear_action.trigger()
+    assert cat.photos[by_name["b.jpg"]].star == 0
+    win.viewer.quiesce()

@@ -172,6 +172,14 @@ DEFAULT_SCHEME: dict[str, Binding] = {
     "grid.star_toggle": Binding(
         ("Space",), key_only=True,
         note="Picasa: add/remove star on the selected/current photo(s)."),
+    "grid.star_clear": Binding(
+        ("Shift+Space",),
+        note="Bulk-unstar (fauxcasa-q6l.20 clause c, spec §3): clears "
+             "stars on the WHOLE current selection (or the current photo "
+             "alone) in one gesture — Space's natural sibling, no Picasa "
+             "equivalent documented. An EXACT chord checked BEFORE "
+             "grid.star_toggle's key_only Space (conflicts() allows this "
+             "layering — same convention as app.info vs Ctrl-chords)."),
     "grid.deselect": Binding(
         ("Ctrl+D",),
         note="Picasa: Deselect photos (ed5.12). Clears the selection set; "
@@ -250,6 +258,11 @@ DEFAULT_SCHEME: dict[str, Binding] = {
         ("Space",), key_only=True,
         note="Picasa library shortcut: add/remove star. Fauxcasa stores "
              "the override in its own cache; originals remain read-only."),
+    "viewer.star_clear": Binding(
+        ("Shift+Space",),
+        note="Clear the star on the shown photo (fauxcasa-q6l.20 clause "
+             "c) — same chord as grid.star_clear; checked before "
+             "viewer.star_toggle's key_only Space."),
     "viewer.next": Binding(
         ("Right", "J"), key_only=True,
         note="Picasa: Right/J = next. Checked AFTER pan, so Ctrl+Right "
@@ -300,6 +313,7 @@ ACTION_LABELS: dict[str, str] = {
     "grid.select_all": "Select all",
     "grid.hold": "Hold selection in tray",
     "grid.star_toggle": "Add / remove star",
+    "grid.star_clear": "Clear star(s) on selection",
     "grid.deselect": "Deselect",
     "grid.invert": "Invert selection",
     "grid.locate": "Locate on disk",
@@ -322,6 +336,7 @@ ACTION_LABELS: dict[str, str] = {
     "viewer.pan_up": "Pan up (while zoomed)",
     "viewer.pan_down": "Pan down (while zoomed)",
     "viewer.star_toggle": "Add / remove star",
+    "viewer.star_clear": "Clear star on this photo",
     "viewer.next": "Next photo",
     "viewer.prev": "Previous photo",
     "viewer.play_pause": "Play / pause video",

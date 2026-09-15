@@ -23,6 +23,10 @@ this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
   needing a dedicated surface for "starred in this folder/search". The
   status line shows the active threshold (e.g. "Starred ≥3★") so a
   filtered-empty grid is never a silent no-op (fauxcasa-q6l.20).
+- Bulk-unstar: Shift+Space (or **View > Clear Star(s)**) clears stars on
+  the whole current selection in one gesture — pair it with Ctrl+A to
+  clear an entire folder, search or Starred scope at once; in the viewer
+  it clears just the shown photo (fauxcasa-q6l.20).
 
 ### Added (2026-09-14)
 

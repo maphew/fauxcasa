@@ -2203,9 +2203,12 @@ class MainWindow(QMainWindow):
         # and _search_changed stay untouched.
         self.grid.hold_requested.connect(self._hold_selection)
         self.grid.star_toggle_requested.connect(self._toggle_grid_stars)
+        self.grid.star_clear_requested.connect(self._clear_grid_stars)
         self.viewer.hold_requested.connect(self._hold_from_viewer)
         self.viewer.star_toggle_requested.connect(
             lambda idx: self._toggle_stars([idx]))
+        self.viewer.star_clear_requested.connect(
+            lambda idx: self._clear_stars([idx]))
         self.tray.hold_clicked.connect(self._hold_selection)
         self.tray.navigate.connect(self._tray_navigate)
         self.tray.changed.connect(self._refresh_tray_readout)
@@ -2352,6 +2355,18 @@ class MainWindow(QMainWindow):
 
         view_menu.addSeparator()
         self.star_menu = self._build_star_menu(view_menu)
+        # Bulk-unstar (fauxcasa-q6l.20 clause c): no pre-existing "toggle
+        # star" menu action to sit next to (star toggle is Space-only,
+        # dispatched from grid/viewer keyPressEvent) — deliberately NO
+        # QAction shortcut here, same reasoning as info_action's Space/I:
+        # a window-level Shift+Space shortcut would fire while typing in
+        # the search box. Shift+Space still works per-surface.
+        self.star_clear_action = view_menu.addAction("Clear Star(s)")
+        _clear_chords = " / ".join(
+            s.toString() for s in keymap.shortcuts("grid.star_clear"))
+        self.star_clear_action.setToolTip(
+            f"Clear stars on the current selection ({_clear_chords})")
+        self.star_clear_action.triggered.connect(self._menu_clear_stars)
 
         view_menu.addSeparator()
         view_menu.addAction(self.play_action)   # toolbar's "Play" action
@@ -4254,6 +4269,63 @@ class MainWindow(QMainWindow):
         if not indices and self.grid.current >= 0:
             indices = [self.grid.current]
         self._toggle_stars(indices)
+
+    def _clear_grid_stars(self) -> None:
+        """Shift+Space in the grid (fauxcasa-q6l.20 clause c): clear stars
+        on the WHOLE current selection, same scope Ctrl+A just selected —
+        or the current photo alone with no multi-selection, matching
+        _toggle_grid_stars' fallback."""
+        indices = list(self.grid.selection)
+        if not indices and self.grid.current >= 0:
+            indices = [self.grid.current]
+        self._clear_stars(indices)
+
+    def _clear_stars(self, indices: list[int]) -> None:
+        """Bulk-unstar (fauxcasa-q6l.20 clause c, spec §3): set star=0 on
+        every given photo in ONE starstore save — unconditionally (unlike
+        _toggle_stars' mixed-selection normalization, "clear" has only one
+        outcome), so a selection scoped to a folder/search/Starred view
+        only ever clears what's actually in that scope."""
+        indices = sorted({
+            i for i in indices if 0 <= i < len(self.catalog.photos)
+        })
+        if not indices:
+            return
+        for i in indices:
+            photo = self.catalog.photos[i]
+            photo.star = 0
+            self.star_overrides[photo_key(photo)] = 0
+        try:
+            save_star_overrides(self.state_dir, self.star_overrides)
+        except OSError as e:
+            log.error("could not save star choices: %s", e)
+            self.statusBar().showMessage(
+                "star changed for this session; could not save it", 8000)
+        self.grid.viewport().update()
+        self.viewer.update()
+        self.tray.update()
+        self._refresh_star_count()
+        self._resync_starred_view()
+        if self.pages.currentWidget() is self.viewer:
+            self._photo_selected(self.viewer.current_index())
+        elif len(self.grid.selection) > 1:
+            self._selection_changed(self.grid.selection)
+        else:
+            self._photo_selected(self.grid.current)
+
+    def _menu_clear_stars(self) -> None:
+        """View > Clear Star(s): the same bulk-unstar as Shift+Space,
+        dispatched to whichever surface is showing (fauxcasa-q6l.20 clause
+        c). There is no pre-existing "toggle star" menu action to sit next
+        to — star toggle has always been Space-only, dispatched from grid/
+        viewer keyPressEvent — so this is the feature's one menu entry
+        point."""
+        if self.pages.currentWidget() is self.viewer:
+            idx = self.viewer.current_index()
+            if idx >= 0:
+                self._clear_stars([idx])
+        else:
+            self._clear_grid_stars()
 
     def _toggle_stars(self, indices: list[int]) -> None:
         """Picasa Space semantics, persisted only in Fauxcasa's cache.

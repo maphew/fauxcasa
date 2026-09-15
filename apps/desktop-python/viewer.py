@@ -722,6 +722,11 @@ class ViewerPage(QWidget):
     # Space — Picasa's library shortcut. MainWindow owns persistence and
     # refreshes every surface after changing this catalog photo.
     star_toggle_requested = Signal(int)
+    # Shift+Space — bulk-unstar's viewer half (fauxcasa-q6l.20 clause c):
+    # clears the star on just the CURRENT photo (the viewer shows one at a
+    # time, so "bulk" collapses to "this one"). Same MainWindow ownership
+    # as star_toggle_requested.
+    star_clear_requested = Signal(int)
     # Bare I — metadata inspector toggle (fauxcasa-q6l.25), same contract
     # as the grid's info_toggle_requested. SlideshowPage overrides
     # keyPressEvent entirely (its own scheme, slideshow.*), so this never
@@ -1499,6 +1504,12 @@ class ViewerPage(QWidget):
             # F = face overlay (toggle_faces docstring: our own binding —
             # Picasa documents no view-mode key for face boxes).
             self.toggle_faces()
+        elif keymap.matches(event, "viewer.star_clear"):
+            # Checked BEFORE the key_only star_toggle below (Shift+Space
+            # shares the Space key — fauxcasa-q6l.20 clause c).
+            idx = self.current_index()
+            if idx >= 0:
+                self.star_clear_requested.emit(idx)
         elif keymap.matches(event, "viewer.star_toggle"):
             idx = self.current_index()
             if idx >= 0:

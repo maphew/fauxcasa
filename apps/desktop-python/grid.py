@@ -566,6 +566,11 @@ class GridView(QAbstractScrollArea):
     # Space — MainWindow applies Picasa's add/remove-star semantics and owns
     # the machine-local persistence.
     star_toggle_requested = Signal()
+    # Shift+Space — bulk-unstar (fauxcasa-q6l.20 clause c): clear stars on
+    # the whole current selection (or the current photo alone) in one
+    # gesture. MainWindow owns the one starstore save + sidebar/Starred
+    # resync, same as star_toggle_requested.
+    star_clear_requested = Signal()
     # Bare I — metadata inspector toggle (fauxcasa-q6l.25). The grid only
     # asks; MainWindow owns the toolbar action's checked state and the
     # splitter panel's visibility (both views share one InspectorPanel).
@@ -1732,6 +1737,12 @@ class GridView(QAbstractScrollArea):
         if keymap.matches(event, "grid.hold"):
             # Ctrl+H: hold the current selection in the tray (q6l.2).
             self.hold_requested.emit()
+            return
+        if keymap.matches(event, "grid.star_clear"):
+            # Checked BEFORE the key_only star_toggle below (Shift+Space
+            # shares the Space key; conflicts() allows the layering, same
+            # convention as app.info vs Ctrl-chords — fauxcasa-q6l.20 c).
+            self.star_clear_requested.emit()
             return
         if keymap.matches(event, "grid.star_toggle"):
             self.star_toggle_requested.emit()
