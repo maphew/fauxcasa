@@ -12,6 +12,22 @@ Changes since the `tracer-test-v1` preview (2026-08-10, commit `553d31a`).
 The `v0.1.0-rc2` release candidate (2026-09-13) contains everything in
 this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
 
+### Added (2026-09-15)
+
+- Starred Photos is now date-grouped (month buckets, newest first, with
+  the same pinned headers, jump buttons and per-group play as the main
+  grid); undated photos land in a trailing "Undated" group
+  (fauxcasa-q6l.20).
+- A star-threshold filter (**View > Stars**: Any / 1-5 stars or more)
+  composes with any view — folder, album, search, Starred — instead of
+  needing a dedicated surface for "starred in this folder/search". The
+  status line shows the active threshold (e.g. "Starred ≥3★") so a
+  filtered-empty grid is never a silent no-op (fauxcasa-q6l.20).
+- Bulk-unstar: Shift+Space (or **View > Clear Star(s)**) clears stars on
+  the whole current selection in one gesture — pair it with Ctrl+A to
+  clear an entire folder, search or Starred scope at once; in the viewer
+  it clears just the shown photo (fauxcasa-q6l.20).
+
 ### Added (2026-09-14)
 
 - Screenshot gallery in the README and release notes, made from a demo

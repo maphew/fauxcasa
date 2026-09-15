@@ -35,6 +35,7 @@ scripts/make-thumbcache.py and adopt via --thumbs.
 from __future__ import annotations
 
 import argparse
+import calendar
 import html
 import importlib
 import json
@@ -78,6 +79,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QAction,
     QActionGroup,
     QIcon,
     QKeySequence,
@@ -150,6 +152,7 @@ from grid import (  # noqa: E402
     SORT_MODES,
     CompositeThumbCache,
     GridView,
+    _date_sort_key,
     folder_key,
 )
 import icons  # noqa: E402
@@ -247,6 +250,50 @@ def recent_indices(catalog: Catalog, reveal: bool,
         return idxs
     known.sort(key=lambda im: im[1], reverse=True)
     return sorted(i for i, _m in known[:RECENT_FALLBACK_K])
+
+
+def _order_starred_newest_first(cat: Catalog, idxs: list[int]) -> list[int]:
+    """Newest-first ordering for the date-grouped Starred collection
+    (fauxcasa-q6l.20 clause b, spec §5): reuses cam.9's date_taken/mtime
+    fallback substrate (grid._date_sort_key, the same one per-folder date
+    sort uses) so ordering and grouping agree. Dated photos (date_taken,
+    or mtime when date_taken is absent) sort descending by that key;
+    genuinely dateless photos (no date_taken, no usable mtime) keep their
+    incoming catalog order and sink after every dated photo, landing in
+    the trailing Undated group (see _starred_grouper). One _date_sort_key
+    call per index (fauxcasa-q6l.20 review nit 11), not three."""
+    keyed = [(i, _date_sort_key(cat.photos[i])) for i in idxs]
+    dated = sorted((ik for ik in keyed if ik[1][0] == 0),
+                   key=lambda ik: ik[1], reverse=True)
+    undated = [ik for ik in keyed if ik[1][0] != 0]
+    return [i for i, _k in dated] + [i for i, _k in undated]
+
+
+def _starred_grouper(cat: Catalog, i: int) -> tuple[str, str, str | None]:
+    """set_filter `grouper` for the Starred collection (fauxcasa-q6l.20
+    clause b): month buckets ('YYYY-MM', title "September 2026") from the
+    same date substrate _order_starred_newest_first sorts by, so grouping
+    and ordering agree; genuinely dateless photos share one trailing
+    'undated' bucket titled "Undated". No description (the header already
+    paints the per-group count; repeating it there would be redundant).
+
+    Deliberately never round-trips through datetime.strptime: date_taken's
+    year is UNBOUNDED (§6 footgun 16 — metareader applies no year floor),
+    so a 5+-digit year or an all-zero EXIF placeholder like
+    "0000-05-01T..." both occur in real libraries and the LATTER must
+    group cleanly (May of year zero is still a real month bucket) while
+    strptime raises on it depending on platform libc. A plain slice +
+    guard handles both: a well-formed 4-digit year groups by month, and
+    anything that doesn't fit that shape (a 5-digit year included) sinks
+    to Undated rather than raising."""
+    sort_key = _date_sort_key(cat.photos[i])
+    if sort_key[0] == 0:
+        s = sort_key[1]
+        y, m = s[:4], s[5:7]
+        if s[4:5] == "-" and m.isdigit() and 1 <= int(m) <= 12:
+            return f"{y}-{m}", f"{calendar.month_name[int(m)]} {y}", None
+    return "undated", "Undated", None
+
 
 APP_DIR = Path(__file__).resolve().parent
 REPO = APP_DIR.parents[1]
@@ -497,6 +544,32 @@ def save_sort_modes(state_dir: Path | None, modes: dict[str, str]) -> None:
             if mode in SORT_MODES and mode != DEFAULT_SORT_MODE}
     doc = _read_library_config(state_dir)
     doc["sort_modes"] = keep
+    _write_library_config(state_dir, doc)
+
+
+def load_star_min(state_dir: Path | None) -> int:
+    """The persisted star-threshold predicate (fauxcasa-q6l.20 clause a):
+    0 ("Any", off) through 5. Tolerates missing/garbage config and an
+    out-of-range value — view prefs are a convenience, never a gate.
+    Absent/invalid == 0."""
+    if state_dir is None:
+        return 0
+    v = _read_library_config(state_dir).get("star_min")
+    return v if isinstance(v, int) and not isinstance(v, bool) \
+        and 0 <= v <= 5 else 0
+
+
+def save_star_min(state_dir: Path | None, star_min: int) -> None:
+    """Persist the star-threshold predicate. Best-effort and torn-proof.
+    Merges into the existing config so sort_modes/folder_view_flat
+    survive the write. The default (0/Any) is stored as absent, not 0."""
+    if state_dir is None:
+        return
+    doc = _read_library_config(state_dir)
+    if 0 < star_min <= 5:
+        doc["star_min"] = star_min
+    else:
+        doc.pop("star_min", None)
     _write_library_config(state_dir, doc)
 
 
@@ -1797,6 +1870,11 @@ class MainWindow(QMainWindow):
         self._search_pairs: list[tuple[int, str]] = []
         self._search_pairs_vis: list[tuple[int, str]] = []
         self._rebuild_search_index()
+        # Star-threshold predicate composing with any view (fauxcasa-q6l.20
+        # clause a, spec §3/§5): 0 = "Any" (off), 1-5 = "N stars or more".
+        # Loaded before the first _apply_view/_search_changed call so a
+        # remembered threshold shapes the very first paint.
+        self._star_min: int = load_star_min(self.state_dir)
         # Library first, product second (rel-0.1 identity): the title bar /
         # taskbar tooltip answers "which library am I in?" before it repeats
         # the app name, and carries no internal codename.
@@ -2139,9 +2217,12 @@ class MainWindow(QMainWindow):
         # and _search_changed stay untouched.
         self.grid.hold_requested.connect(self._hold_selection)
         self.grid.star_toggle_requested.connect(self._toggle_grid_stars)
+        self.grid.star_clear_requested.connect(self._clear_grid_stars)
         self.viewer.hold_requested.connect(self._hold_from_viewer)
         self.viewer.star_toggle_requested.connect(
             lambda idx: self._toggle_stars([idx]))
+        self.viewer.star_clear_requested.connect(
+            lambda idx: self._clear_stars([idx]))
         self.tray.hold_clicked.connect(self._hold_selection)
         self.tray.navigate.connect(self._tray_navigate)
         self.tray.changed.connect(self._refresh_tray_readout)
@@ -2153,6 +2234,13 @@ class MainWindow(QMainWindow):
         self.grid.play_group.connect(self._play_group)
 
         self.grid.set_data(catalog, thumbs)
+        if self._star_min:
+            # set_data's own set_filter(None, "") call is threshold-blind
+            # (fauxcasa-q6l.20 review finding 1): a persisted threshold
+            # must already be applied to the very first paint, not wait
+            # for the first _apply_view/_apply_star_min call.
+            n = self._apply_all_photos()
+            self._show_counts(self._label_with_stars("All photos"), n)
         self._refresh_tray_readout()
 
         # --- background index plumbing (modes, not modals) ---
@@ -2287,6 +2375,26 @@ class MainWindow(QMainWindow):
         self._flat_check.toggled.connect(flat_folders_action.setChecked)
 
         view_menu.addSeparator()
+        self.star_menu = self._build_star_menu(view_menu)
+        # Bulk-unstar (fauxcasa-q6l.20 clause c): no pre-existing "toggle
+        # star" menu action to sit next to (star toggle is Space-only,
+        # dispatched from grid/viewer keyPressEvent) — deliberately NO
+        # QAction shortcut here, same reasoning as info_action's Space/I:
+        # a window-level Shift+Space shortcut would fire while typing in
+        # the search box. Shift+Space still works per-surface.
+        _clear_chords = " / ".join(
+            s.toString() for s in keymap.shortcuts("grid.star_clear"))
+        # A QMenu hides QAction tooltips (fauxcasa-q6l.20 review nit 9), so
+        # the tab-separated shortcut-column convention is what actually
+        # makes Shift+Space visible here — no QAction shortcut is bound
+        # (see the note above), this is text only.
+        self.star_clear_action = view_menu.addAction(
+            f"Clear Star(s)\t{_clear_chords}")
+        self.star_clear_action.setToolTip(
+            f"Clear stars on the current selection ({_clear_chords})")
+        self.star_clear_action.triggered.connect(self._menu_clear_stars)
+
+        view_menu.addSeparator()
         view_menu.addAction(self.play_action)   # toolbar's "Play" action
 
         help_menu = self.help_menu = menubar.addMenu("&Help")
@@ -2300,6 +2408,64 @@ class MainWindow(QMainWindow):
         help_menu.addSeparator()
         about_action = help_menu.addAction(f"&About {APP_NAME}")
         about_action.triggered.connect(self._show_about)
+
+    # Menu text for each star-threshold radio action, index == threshold
+    # (0 = Any/off). fauxcasa-q6l.20 clause a.
+    STAR_MENU_LABELS = ("&Any", "&1 star or more", "&2 stars or more",
+                       "&3 stars or more", "&4 stars or more", "&5 stars")
+
+    def _build_star_menu(self, view_menu: QMenu) -> QMenu:
+        """The View > Stars submenu (fauxcasa-q6l.20 clause a): an
+        exclusive radio group, "Any" (off) through "5 stars", the current
+        threshold checked. Durable references (self.star_menu,
+        self.star_actions) let tests read/drive it without findChildren
+        (see the pyside-findchildren-wrapper-heisenbug memory)."""
+        menu = view_menu.addMenu("&Stars")
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self.star_actions: list[QAction] = []
+        for n, text in enumerate(self.STAR_MENU_LABELS):
+            act = menu.addAction(text)
+            act.setCheckable(True)
+            act.setChecked(n == self._star_min)
+            act.setData(n)
+            group.addAction(act)
+            act.triggered.connect(
+                lambda _checked=False, n=n: self._set_star_min(n))
+            self.star_actions.append(act)
+        return menu
+
+    def _set_star_min(self, n: int) -> None:
+        """Apply + persist the star-threshold predicate, then re-apply the
+        current view/search in place (fauxcasa-q6l.20 clause a). Syncs the
+        View > Stars radio group's checked state itself rather than
+        relying on the caller having been a menu click — a direct/
+        programmatic call (tests, a future keyboard chord) must leave the
+        menu agreeing with reality too."""
+        n = max(0, min(5, n))
+        for act in self.star_actions:
+            act.setChecked(act.data() == n)
+        if n == self._star_min:
+            return
+        self._star_min = n
+        save_star_min(self.state_dir, n)
+        self._apply_star_min()
+
+    def _apply_star_min(self) -> None:
+        """Re-apply the current view or search in place after the star
+        threshold changes — the same reapply-in-place shape _toggle_reveal
+        uses for a reveal change, minus the sidebar rebuild (the threshold
+        changes only what's SHOWN, not which folders/albums/people exist)."""
+        kind, key = self._selected_view()
+        search_text = self.search.text()
+        sb = self.grid.verticalScrollBar()
+        frac = sb.value() / sb.maximum() if sb.maximum() > 0 else 0.0
+        if search_text.strip():
+            self._search_changed(search_text)
+        else:
+            self._apply_view(kind, key)
+        self.grid.scroll_to_fraction(frac)   # best-effort scroll restore
+        self.grid.setFocus()
 
     def _step_zoom(self, delta: int) -> None:
         """Zoom In/Out menu actions step the SAME slider the toolbar
@@ -2886,7 +3052,12 @@ class MainWindow(QMainWindow):
         # re-resolves them against the new catalog's indices and counts
         # any that vanished for the readout's note (fauxcasa-q6l.2).
         self.tray.rebind(catalog, thumbs)
-        self._show_counts("All photos", self._shown_count())
+        # Threshold-aware (fauxcasa-q6l.20 review finding 3): set_data just
+        # above already re-applied the UNFILTERED default view, so redo it
+        # through _apply_all_photos or an active star filter silently drops
+        # mid-session on the next reconcile swap.
+        n = self._apply_all_photos()
+        self._show_counts(self._label_with_stars("All photos"), n)
         self._update_import_notes()   # the rescan collected a fresh report
         self.meta_label.setText("")
         if self.info_action.isChecked():
@@ -3477,6 +3648,44 @@ class MainWindow(QMainWindow):
         self._apply_view(*data)
         self.grid.setFocus()
 
+    def _scope_indices(self, idxs: list[int]) -> list[int]:
+        """The single star-threshold choke point (fauxcasa-q6l.20 clause a,
+        spec §3/§5): every view (folder, album, search, starred, recent,
+        person, unnamed) passes its candidate indices through here so "N
+        stars or more" composes with any of them. A no-op at the default
+        threshold (0 = Any)."""
+        if self._star_min <= 0:
+            return idxs
+        cat = self.catalog
+        return [i for i in idxs if cat.photos[i].star >= self._star_min]
+
+    def _label_with_stars(self, label: str) -> str:
+        """Append the active star-threshold suffix to a view/search label
+        (fauxcasa-q6l.20 clause a, spec N7): a filtered-empty grid must
+        never read as a silent no-op. No-op at the default threshold
+        (0 = Any)."""
+        if self._star_min <= 0:
+            return label
+        return f"{label}  ≥{self._star_min}★"
+
+    def _apply_all_photos(self) -> int:
+        """The default folder-grouped view, star-threshold aware. Plain
+        set_filter(None) is what triggers BOTH the default folder grouping
+        AND the per-folder sort_modes lookup (set_filter's `default_view`),
+        so a threshold — which must filter that same set while keeping
+        both — computes the indices itself and opts back into the sort
+        pass via `default_sort=True` instead. Returns the shown count."""
+        cat = self.catalog
+        if self._star_min > 0:
+            idxs = self._scope_indices(
+                [i for i, p in enumerate(cat.photos)
+                 if p.visible or self.grid.reveal])
+            self.grid.set_filter(idxs, self._label_with_stars("All photos"),
+                                 default_sort=True)
+            return len(idxs)
+        self.grid.set_filter(None, "")
+        return self._shown_count()
+
     def _apply_view(self, kind: str, key: str) -> None:
         """Apply a sidebar view's grid filter + status counts WITHOUT touching
         the search box. Shared by _sidebar_clicked and the Show-hidden toggle,
@@ -3486,13 +3695,27 @@ class MainWindow(QMainWindow):
         if kind == "starred":
             idxs = [i for i, p in enumerate(cat.photos)
                     if (p.visible or self.grid.reveal) and p.star]
-            self.grid.set_filter(idxs, "Starred")
-            self._show_counts("Starred", len(idxs))
+            # "Starred under threshold N" is star >= max(1, N): the base
+            # filter above already guarantees >=1, so _scope_indices (a
+            # no-op at N<=0) only ever tightens it further.
+            idxs = self._scope_indices(idxs)
+            idxs = _order_starred_newest_first(cat, idxs)
+            label = self._label_with_stars("Starred")
+            self.grid.set_filter(idxs, label, grouper=_starred_grouper)
+            self._show_counts(label, len(idxs))
         elif kind == "recent":
-            idxs = self._recent_indices()
-            self.grid.set_filter(idxs, "Recently Updated")
-            self._show_counts("Recently Updated", len(idxs))
-            if not idxs and self.catalog.backfill_state != BACKFILL_COMPLETE:
+            idxs = self._scope_indices(self._recent_indices())
+            label = self._label_with_stars("Recently Updated")
+            self.grid.set_filter(idxs, label)
+            self._show_counts(label, len(idxs))
+            if not idxs and self._star_min > 0:
+                # fauxcasa-q6l.20 review finding 7: don't misattribute an
+                # empty view to the backfill when the star threshold is
+                # what's actually filtering everything out.
+                self.statusBar().showMessage(
+                    "No recently updated photos at this star threshold — "
+                    "try View > Stars > Any", 8000)
+            elif not idxs and self.catalog.backfill_state != BACKFILL_COMPLETE:
                 # empty-state honesty (cam.12): mtimes are still being
                 # backfilled, so an empty view is pending, not final
                 self.statusBar().showMessage(
@@ -3500,25 +3723,31 @@ class MainWindow(QMainWindow):
                     "indexes file dates…", 8000)
         elif kind == "album" and key in cat.albums:
             album = cat.albums[key]
-            self.grid.set_filter(list(album.members), album.name)
-            self._show_counts(f"Album “{album.name}”", len(album.members))
+            idxs = self._scope_indices(list(album.members))
+            self.grid.set_filter(idxs, self._label_with_stars(album.name))
+            self._show_counts(
+                self._label_with_stars(f"Album “{album.name}”"), len(idxs))
         elif kind == "person":
-            idxs = [i for i, p in enumerate(cat.photos)
-                    if (p.visible or self.grid.reveal)
-                    and any(n == key for _rect, _cid, n in p.faces)]
-            self.grid.set_filter(idxs, key)
-            self._show_counts(f"Person “{key}”", len(idxs))
+            idxs = self._scope_indices([
+                i for i, p in enumerate(cat.photos)
+                if (p.visible or self.grid.reveal)
+                and any(n == key for _rect, _cid, n in p.faces)])
+            self.grid.set_filter(idxs, self._label_with_stars(key))
+            self._show_counts(
+                self._label_with_stars(f"Person “{key}”"), len(idxs))
         elif kind == "unnamed":
-            idxs = [i for i, p in enumerate(cat.photos)
-                    if (p.visible or self.grid.reveal)
-                    and any(n is None for _rect, _cid, n in p.faces)]
-            self.grid.set_filter(idxs, "Unnamed faces")
-            self._show_counts("Unnamed faces", len(idxs))
+            idxs = self._scope_indices([
+                i for i, p in enumerate(cat.photos)
+                if (p.visible or self.grid.reveal)
+                and any(n is None for _rect, _cid, n in p.faces)])
+            label = self._label_with_stars("Unnamed faces")
+            self.grid.set_filter(idxs, label)
+            self._show_counts(label, len(idxs))
         else:  # "all", "folder", or an album that no longer exists
-            self.grid.set_filter(None, "")
+            n = self._apply_all_photos()
             if kind == "folder":
                 self.grid.scroll_to_folder(key)
-            self._show_counts("All photos", self._shown_count())
+            self._show_counts(self._label_with_stars("All photos"), n)
 
     # ---------- per-folder sort modes (fauxcasa-q6l.11) ----------
 
@@ -3677,9 +3906,9 @@ class MainWindow(QMainWindow):
         t0 = time.perf_counter()
         pos, neg = self._parse_query(text)
         if not pos and not neg:
-            self.grid.set_filter(None, "")
-            self._show_counts("All photos", self._shown_count())
-            self.last_search_hits = self._shown_count()
+            n = self._apply_all_photos()
+            self._show_counts(self._label_with_stars("All photos"), n)
+            self.last_search_hits = n
             self.last_search_ms = (time.perf_counter() - t0) * 1000.0
             return
         # Scan the PREBUILT haystack pairs (_rebuild_search_index) as a term
@@ -3696,10 +3925,11 @@ class MainWindow(QMainWindow):
             cur = [ih for ih in cur if term in ih[1]]
         for term in neg:
             cur = [ih for ih in cur if term not in ih[1]]
-        idxs = [ih[0] for ih in cur]
+        idxs = self._scope_indices([ih[0] for ih in cur])
         q = text.strip().lower()
-        self.grid.set_filter(idxs, f"search: {q}")
-        self._show_counts(f"Search “{q}”", len(idxs))
+        self.grid.set_filter(idxs, self._label_with_stars(f"search: {q}"))
+        self._show_counts(
+            self._label_with_stars(f"Search “{q}”"), len(idxs))
         self.last_search_hits = len(idxs)
         self.last_search_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -3764,13 +3994,20 @@ class MainWindow(QMainWindow):
                 revealed = True
             if idx not in self.grid.display_pos:
                 # Still absent (filter reason or reveal didn't surface it):
-                # clear to All photos as the last resort.
+                # clear to All photos as the last resort. Threshold-aware
+                # (fauxcasa-q6l.20 review finding 5) via _apply_all_photos
+                # — deliberately does NOT clear an active star threshold
+                # as a side effect of a tray click; a below-threshold held
+                # photo stays absent and falls to the existing "Photo not
+                # visible in any view" message below, which already says
+                # so honestly (N7) without silently discarding the user's
+                # filter choice.
                 self.search.blockSignals(True)
                 self.search.clear()
                 self.search.blockSignals(False)
-                self.grid.set_filter(None, "")
+                n = self._apply_all_photos()
                 self._reselect_view("all", "")
-                self._show_counts("All photos", self._shown_count())
+                self._show_counts(self._label_with_stars("All photos"), n)
         if idx in self.grid.display_pos:
             self.grid._select(idx)
             self.grid._ensure_visible(idx)
@@ -4062,6 +4299,10 @@ class MainWindow(QMainWindow):
             self.inspector.set_none()
 
     def _refresh_star_count(self) -> None:
+        # Deliberately ignores _star_min (fauxcasa-q6l.20 review nit 8):
+        # this is the sidebar's total-starred FACT (>=1), matching what a
+        # threshold of Any would show; the active view's own >=N★ label
+        # suffix (_label_with_stars) is what discloses the narrower count.
         reveal = self.grid.reveal
         n = sum(1 for p in self.catalog.photos
                 if (p.visible or reveal) and p.star)
@@ -4078,18 +4319,62 @@ class MainWindow(QMainWindow):
             indices = [self.grid.current]
         self._toggle_stars(indices)
 
+    def _clear_grid_stars(self) -> None:
+        """Shift+Space in the grid (fauxcasa-q6l.20 clause c): clear stars
+        on the WHOLE current selection, same scope Ctrl+A just selected —
+        or the current photo alone with no multi-selection, matching
+        _toggle_grid_stars' fallback."""
+        indices = list(self.grid.selection)
+        if not indices and self.grid.current >= 0:
+            indices = [self.grid.current]
+        self._clear_stars(indices)
+
+    def _clear_stars(self, indices: list[int]) -> None:
+        """Bulk-unstar (fauxcasa-q6l.20 clause c, spec §3): set star=0 on
+        every given photo — unconditionally (unlike _toggle_stars' mixed-
+        selection normalization, "clear" has only one outcome), so a
+        selection scoped to a folder/search/Starred view only ever clears
+        what's actually in that scope."""
+        self._set_stars(indices, 0)
+
+    def _menu_clear_stars(self) -> None:
+        """View > Clear Star(s): the same bulk-unstar as Shift+Space,
+        dispatched to whichever surface is showing (fauxcasa-q6l.20 clause
+        c). There is no pre-existing "toggle star" menu action to sit next
+        to — star toggle has always been Space-only, dispatched from grid/
+        viewer keyPressEvent — so this is the feature's one menu entry
+        point."""
+        if self.pages.currentWidget() is self.viewer:
+            idx = self.viewer.current_index()
+            if idx >= 0:
+                self._clear_stars([idx])
+        else:
+            self._clear_grid_stars()
+
     def _toggle_stars(self, indices: list[int]) -> None:
         """Picasa Space semantics, persisted only in Fauxcasa's cache.
 
         A mixed selection is normalized to starred; an all-starred selection
         is cleared. This makes one press deterministic for bulk selection.
         """
+        valid = sorted({
+            i for i in indices if 0 <= i < len(self.catalog.photos)
+        })
+        if not valid:
+            return
+        target = 0 if all(self.catalog.photos[i].star for i in valid) else 1
+        self._set_stars(valid, target)
+
+    def _set_stars(self, indices: list[int], target: int) -> None:
+        """The shared tail of _toggle_stars/_clear_stars (fauxcasa-q6l.20
+        review finding 6 — this used to be duplicated near-verbatim in
+        both): set `target` on every valid index in ONE starstore save,
+        then refresh every surface that reads star state."""
         indices = sorted({
             i for i in indices if 0 <= i < len(self.catalog.photos)
         })
         if not indices:
             return
-        target = 0 if all(self.catalog.photos[i].star for i in indices) else 1
         for i in indices:
             photo = self.catalog.photos[i]
             photo.star = target
@@ -4117,27 +4402,37 @@ class MainWindow(QMainWindow):
             self._photo_selected(self.grid.current)
 
     def _resync_starred_view(self) -> None:
-        """Re-materialize the Starred view after a star change made from
+        """Re-materialize the active view after a star change made from
         INSIDE it (fauxcasa-6vk finding 1). `set_filter` snapshots the
-        matching catalog indices, so an unstarred photo otherwise keeps
-        its tile — and its slot in `display` — until the next view switch,
-        contradicting the sidebar count `_refresh_star_count` just updated.
+        matching catalog indices, so a star change that drops a photo out
+        of the CURRENTLY DISPLAYED scope otherwise leaves a stale tile —
+        and a stale status-line count — until the next view switch.
+
+        Runs when the Starred collection is the active sidebar selection
+        OR a star threshold is active (fauxcasa-q6l.20 review finding 4):
+        either can drop a photo out of scope, whether that scope is the
+        sidebar's Starred view, a plain folder/album view narrowed by
+        threshold, or a search scoped by both — so the search-vs-view
+        dispatch below mirrors _apply_star_min's.
 
         Grid page only. The VIEWER's display list is deliberately frozen
         for the duration of a navigation session (a photo unstarred while
-        viewing must stay reachable with Left/Right), and an active search
-        owns the display set, so neither is re-derived here."""
+        viewing must stay reachable with Left/Right), so it is never
+        re-derived here."""
         if self.pages.currentWidget() is self.viewer:
             return
-        if self._selected_view()[0] != "starred":
-            return
-        if self.search.text().strip():
+        kind, key = self._selected_view()
+        if kind != "starred" and self._star_min <= 0:
             return
         keep = self.grid.current
         pos = self.grid.display_pos.get(keep, 0)
         sb = self.grid.verticalScrollBar()
         frac = sb.value() / sb.maximum() if sb.maximum() > 0 else 0.0
-        self._apply_view("starred", "")
+        search_text = self.search.text()
+        if search_text.strip():
+            self._search_changed(search_text)
+        else:
+            self._apply_view(kind, key)
         if keep not in self.grid.display_pos and self.grid.display:
             # The current photo just left the view: land on the nearest
             # surviving display position rather than on nothing at all

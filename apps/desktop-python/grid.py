@@ -81,6 +81,7 @@ def folder_key(catalog: Catalog, root_id: str, rel: str) -> str:
     return f"{root_id}/{rel}" if rel else root_id
 
 
+
 class CompositeThumbCache:
     """Catalog-index facade over N independent per-root fcaches.
 
@@ -499,6 +500,13 @@ class _HeaderRule(QWidget):
 
 @dataclass
 class _Group:
+    # Group identity key: a folder key by default, but any set_filter
+    # `grouper` may substitute a different key (e.g. "YYYY-MM"/"undated"
+    # for the date-grouped Starred collection, fauxcasa-q6l.20 clause b).
+    # Every consumer of this field (play_group, scroll_to_folder, the
+    # per-folder sort_modes lookup, jump_prev/next_folder via group INDEX
+    # only) treats it as an opaque group key, not necessarily a real
+    # folder path.
     folder: str
     title: str
     items: list[int]  # catalog/cache indices
@@ -545,6 +553,11 @@ class GridView(QAbstractScrollArea):
     # Space — MainWindow applies Picasa's add/remove-star semantics and owns
     # the machine-local persistence.
     star_toggle_requested = Signal()
+    # Shift+Space — bulk-unstar (fauxcasa-q6l.20 clause c): clear stars on
+    # the whole current selection (or the current photo alone) in one
+    # gesture. MainWindow owns the one starstore save + sidebar/Starred
+    # resync, same as star_toggle_requested.
+    star_clear_requested = Signal()
     # Bare I — metadata inspector toggle (fauxcasa-q6l.25). The grid only
     # asks; MainWindow owns the toolbar action's checked state and the
     # splitter panel's visibility (both views share one InspectorPanel).
@@ -735,7 +748,8 @@ class GridView(QAbstractScrollArea):
         self.done.put((self.generation, idx, None))
         self._notifier.tile_ready.emit()
 
-    def set_filter(self, indices: list[int] | None, label: str) -> None:
+    def set_filter(self, indices: list[int] | None, label: str,
+                   grouper=None, default_sort: bool = False) -> None:
         """indices=None -> all visible photos grouped by folder; otherwise
         an explicit display set (album members, stars, search hits).
         Grouping is by folder key (not consecutive runs): with nested
@@ -743,7 +757,22 @@ class GridView(QAbstractScrollArea):
         around its subfolders' blocks, which would split the parent into
         several same-title groups. Display order is therefore a
         display-level regrouping of cache order; items carry their
-        catalog indices so decode mapping is unaffected."""
+        catalog indices so decode mapping is unaffected.
+
+        `grouper(cat, catalog_index) -> (group_key, title, description)`
+        overrides the default per-folder grouping (fauxcasa-q6l.20 clause
+        b: the date-grouped Starred collection passes one). Groups appear
+        in insertion order of their first-seen item, so the CALLER controls
+        group order by ordering `indices`; every layout/paint/jump/play
+        consumer keys off `_Group.folder` generically, so a non-folder key
+        works with no further change (see the field's docstring).
+
+        `default_sort` opts an EXPLICIT indices list into the per-folder
+        sort_modes pass below that indices=None always gets (fauxcasa-
+        q6l.20 clause a: a star-threshold view over the default folder
+        grouping needs both the threshold-filtered index list AND the
+        remembered per-folder sort mode, and indices=None can no longer
+        do both at once). Ignored when indices is None (already implied)."""
         if self.catalog is None:
             return
         self._hover_idx = -1  # stale index into the OLD self.loc/groups
@@ -752,26 +781,43 @@ class GridView(QAbstractScrollArea):
         if default_view:
             indices = [i for i, p in enumerate(cat.photos)
                        if p.visible or self.reveal]
+            default_sort = True
         self.filter_label = label
-        by_folder: dict[str, _Group] = {}
-        for i in indices:
-            photo = cat.photos[i]
-            f = folder_key(cat, photo.root_id, photo.folder)
-            g = by_folder.get(f)
-            if g is None:
-                folder = cat.folders.get(f)
-                title = folder.title if folder is not None else f
-                desc = folder.description if folder is not None else None
-                g = by_folder[f] = _Group(folder=f, title=title, items=[],
-                                          description=desc)
-            g.items.append(i)
-        self.groups = list(by_folder.values())
+        by_key: dict[str, _Group] = {}
+        if grouper is None:
+            # Inline fast path (fauxcasa-q6l.20 review nit 12): the
+            # generic `grouper(cat, i)` indirection below measured ~50%
+            # slower here at 100k photos (10 -> 15 ms) on EVERY
+            # set_filter(None) — i.e. every default-view rebuild — purely
+            # from the extra call + tuple-unpack per item, so the common
+            # case keeps the old direct lookup and only a custom grouper
+            # (date-grouped Starred, clause b) pays the indirection.
+            for i in indices:
+                photo = cat.photos[i]
+                f = folder_key(cat, photo.root_id, photo.folder)
+                g = by_key.get(f)
+                if g is None:
+                    folder = cat.folders.get(f)
+                    title = folder.title if folder is not None else f
+                    desc = folder.description if folder is not None else None
+                    g = by_key[f] = _Group(folder=f, title=title, items=[],
+                                           description=desc)
+                g.items.append(i)
+        else:
+            for i in indices:
+                key, title, desc = grouper(cat, i)
+                g = by_key.get(key)
+                if g is None:
+                    g = by_key[key] = _Group(folder=key, title=title,
+                                             items=[], description=desc)
+                g.items.append(i)
+        self.groups = list(by_key.values())
         # Per-folder sort modes (fauxcasa-q6l.11): reorder each group's
         # DISPLAY slice — never the catalog — on the folder-grouped default
         # view only. Explicit display sets keep their given order (albums =
         # membership order, search/starred/recent = catalog order); the
         # module constants block up top records the scoping rationale.
-        if default_view and self.sort_modes:
+        if default_sort and self.sort_modes:
             for g in self.groups:
                 mode = self.sort_modes.get(g.folder, DEFAULT_SORT_MODE)
                 if mode != DEFAULT_SORT_MODE:
@@ -1696,6 +1742,12 @@ class GridView(QAbstractScrollArea):
         if keymap.matches(event, "grid.hold"):
             # Ctrl+H: hold the current selection in the tray (q6l.2).
             self.hold_requested.emit()
+            return
+        if keymap.matches(event, "grid.star_clear"):
+            # Checked BEFORE the key_only star_toggle below (Shift+Space
+            # shares the Space key; conflicts() allows the layering, same
+            # convention as app.info vs Ctrl-chords — fauxcasa-q6l.20 c).
+            self.star_clear_requested.emit()
             return
         if keymap.matches(event, "grid.star_toggle"):
             self.star_toggle_requested.emit()
