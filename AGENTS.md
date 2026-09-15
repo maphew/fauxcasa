@@ -238,6 +238,57 @@ a prompt.
 - A *current* prompt saying "no workflow" / "keep it cheap" wins for that
   turn, same as the commit-policy override rule.
 
+## Architecture Overview
+
+The shipping app lives under `apps/desktop-python/` (Python + PySide6/Qt),
+layered catalog -> thumbcache -> grid/viewer/sidebar. Verified by reading
+each module's own docstring and by grepping actual call sites, since a few
+docstrings describe a since-superseded stage:
+
+- **`catalog.py`** walks a library root in place, merges Picasa metadata
+  from `.picasa.ini`/db3 sidecars (via `scripts/picasa_db.py`, shared with
+  the standalone build/research scripts) with in-file metadata
+  (`inmeta.py`, `metareader.py`), and persists the result as
+  `catalog.json`; a warm start loads it and a background reconcile
+  rebuilds on drift. `library.py` sits above it, modeling a library as one
+  home directory plus N watched roots (multi-root support); `filetypes.py`
+  holds the per-extension include/exclude set the walk honors.
+- **`thumbcache.py`** reads and builds the packed `fcache` thumbnail cache
+  (v1 single-resolution, v2 multi-resolution) that catalog photos bind to
+  by content hash plus library-relative path; it is the layer that decodes
+  originals during indexing.
+- **`grid.py`**, **`viewer.py`**, and the folder-tree/albums sidebar (built
+  directly in `main.py`, there is no separate sidebar module) render the
+  catalog plus thumbcache: the grid reads only the cache pair, never
+  originals, while the viewer decodes originals on demand through the
+  decode seam below. `inspector.py`'s `InspectorPanel` is the read-only
+  metadata panel shown for the selected/current photo alongside the grid
+  and viewer; it renders catalog fields only, no file I/O of its own.
+- **Decode seam**: `decodefacade.py` is the dispatch point. Call sites in
+  `thumbcache.py` and `viewer.py` ask its `DecodeService` singleton to
+  `decode()`, which picks between an in-process transport and
+  `WinSandboxTransport` (Windows only, backed by `decodesvc_win.py`'s
+  worker pool inside a Windows AppContainer, wire-typed by `decodesvc.py`,
+  with worker entry point `decodesvc_worker_win.py`). Since fauxcasa-
+  ez2.9, plain still-image decoding for thumbnails and the viewer routes
+  through the sandbox **by default on Windows**
+  (`FAUXCASA_DECODE_SANDBOX=1` by default outside tests). RAW, PSD,
+  16-bit TIFF, and video always decode in-process (`rawload.py`,
+  `pillowload.py`, `videoload.py`), as does the scan-time metadata/header
+  read (`metareader.py`, the exiv2 seam for capture date, GPS, XMP
+  rating, and EXIF orientation). Linux has no sandbox transport and stays
+  in-process everywhere. `DecodeService.index()` is not part of this
+  split: it is always in-process and has no production call site yet.
+  Video *playback* (not the poster frame) is a separate seam, in
+  `videostream.py`: a worker process that receives an already-open
+  read-only descriptor and never sees a path, but that is spawned with a
+  plain `subprocess.Popen`. It is **not** sandboxed today; the
+  AppContainer launcher for it is outstanding fauxcasa-i92 work, so do
+  not describe video playback as sandboxed.
+- **`applog.py`** is the diagnostics channel (rotating log file, plus a
+  console when one exists) that survives a windowed PyInstaller build
+  where `sys.stdout`/`stderr` are `None`.
+
 ## Conventions & Patterns
 
 - **Repo tooling/scripts are self-contained Python** with PEP 723 inline
