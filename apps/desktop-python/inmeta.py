@@ -11,12 +11,17 @@ used *only* for formats with no IPTC/XMP home (non-JPEG). See
 JPEG caption — the gap this module closes for the §4 tier-1 ingest contract.
 
 Scope and stance (a tracer, not the product writer):
-- READ ONLY. Two fields only — caption and keywords — the tier-1 data the
-  grid/search/viewer surface. Faces-in-XMP, geotags, dates, and the full
-  XMP graph are out of tracer scope (the product wraps a mature metadata
-  library, spec §5 P1 — "wrap, don't reimplement"). This is a small, self-
-  contained pure-Python segment walker: no new dependencies, matching the
-  tracer's minimalism, and privacy-safe to test with synthetic fixtures.
+- READ ONLY. Two fields — caption and keywords — plus, since fauxcasa-
+  cam.5, ExtendedXMP reassembly (extended_xmp()): a >64 KB XMP packet
+  spills across extra APP1 segments, and this module's own reassembled
+  packet also feeds metareader.py's faces-in-XMP read (thumbcache wires
+  the two together — see apps/desktop-python/README.md or
+  thumbcache.read_photo_meta). Geotags, dates, and the rest of the XMP
+  graph stay out of tracer scope (the product wraps a mature metadata
+  library, spec §5 P1 — "wrap, don't reimplement"; metareader.py is that
+  seam). This is a small, self-contained pure-Python segment walker: no
+  new dependencies, matching the tracer's minimalism, and privacy-safe to
+  test with synthetic fixtures.
 - FAIL SOFT. Any malformed segment, truncation, or undecodable text yields
   no metadata for that field, never an exception — a corrupt APP block in
   one photo must not abort an index over the whole library.
@@ -33,6 +38,8 @@ IPTC 8BIM block is the legacy mirror), so XMP is authoritative here.
 
 from __future__ import annotations
 
+import re
+import struct
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
@@ -46,6 +53,24 @@ _APP13 = 0xED  # Photoshop Image Resource Block (carries IPTC-NAA)
 _XMP_PREFIX = b"http://ns.adobe.com/xap/1.0/\x00"
 _PHOTOSHOP_PREFIX = b"Photoshop 3.0\x00"
 _IPTC_NAA_ID = 0x0404  # 8BIM resource type holding the IPTC IIM stream
+
+# ExtendedXMP (Adobe/Google convention, fauxcasa-cam.5): a main XMP packet
+# over ~64 KB (the single-APP1-segment ceiling: 0xFFFF minus the segment
+# and identifier-string overhead) is split. The main packet gets a
+# xmpNote:HasExtendedXMP="<32-hex-char GUID>" attribute in place of the
+# overflowing property; the overflow itself lives in one or more separate
+# APP1 segments, each: this prefix + the 32-byte ASCII GUID (repeated per
+# chunk so a reader can ignore any chunk from a DIFFERENT packet sharing
+# the same file) + a 4-byte BE total length + a 4-byte BE chunk offset +
+# the chunk bytes.
+_EXT_XMP_PREFIX = b"http://ns.adobe.com/xmp/extension/\x00"
+_EXT_GUID_LEN = 32
+_HAS_EXTENDED_XMP_RE = re.compile(
+    rb'HasExtendedXMP=["\']([0-9A-Fa-f]{32})["\']')
+# Bounds the "total length" a chunk header can claim: real packets are KB
+# to low-MB even with a face-heavy region list; a hostile length field
+# must not drive an allocation anywhere near that number.
+_MAX_EXTENDED_XMP_BYTES = 8 * 1024 * 1024
 
 # IPTC IIM datasets (record 2, the "application" record).
 _IIM_CAPTION = 120  # 2:120 Caption/Abstract
@@ -156,6 +181,63 @@ def _iter_segments(data: bytes):
             return  # truncated segment
         yield marker, data[start:end]
         pos = end
+
+
+def extended_xmp(data: bytes) -> bytes | None:
+    """Reassemble a split ExtendedXMP packet (see the module-level comment)
+    back into one XMP byte string — the raw packet content, WITHOUT the
+    ``http://ns.adobe.com/xap/1.0/\\x00`` identifier prefix the main APP1
+    packet carries (callers that feed this into an XMP parser add that
+    prefix themselves, same as the main-packet payload).
+
+    None when: there is no HasExtendedXMP note in the main packet, no
+    extension segments match its GUID, the declared total length exceeds
+    _MAX_EXTENDED_XMP_BYTES, or the chunks (sorted by their declared
+    offset) don't tile the declared length exactly — a gap, an overlap, or
+    a short read all count as unusable rather than best-effort partial.
+    Fail-soft: malformed segments never raise, they just fail the
+    reassembly like any other input that doesn't fit the shape."""
+    try:
+        guid: bytes | None = None
+        chunks: dict[int, bytes] = {}
+        total_len: int | None = None
+        for marker, payload in _iter_segments(data):
+            if marker != _APP1:
+                continue
+            if guid is None and payload.startswith(_XMP_PREFIX):
+                m = _HAS_EXTENDED_XMP_RE.search(payload)
+                if m:
+                    guid = m.group(1).upper()
+            elif payload.startswith(_EXT_XMP_PREFIX):
+                body = payload[len(_EXT_XMP_PREFIX):]
+                if len(body) < _EXT_GUID_LEN + 8:
+                    continue  # too short to carry the length/offset header
+                chunk_guid = body[:_EXT_GUID_LEN].upper()
+                length, offset = struct.unpack(
+                    ">II", body[_EXT_GUID_LEN:_EXT_GUID_LEN + 8])
+                chunk = body[_EXT_GUID_LEN + 8:]
+                if guid is not None and chunk_guid != guid:
+                    continue  # a different packet's leftover chunk: ignore
+                if guid is None:
+                    guid = chunk_guid  # no HasExtendedXMP seen (yet): adopt
+                if length > _MAX_EXTENDED_XMP_BYTES:
+                    return None
+                total_len = length
+                chunks[offset] = chunk  # last chunk at a given offset wins
+        if guid is None or total_len is None or not chunks:
+            return None
+        assembled = bytearray()
+        for offset in sorted(chunks):
+            if offset != len(assembled):
+                return None  # gap or overlap: chunks must tile contiguously
+            assembled += chunks[offset]
+        if len(assembled) != total_len:
+            return None  # short (missing trailing chunk) or over-long
+        return bytes(assembled)
+    except Exception:
+        # Defensive, like every other reader here: a malformed extension
+        # segment must degrade to "no extended XMP", never an exception.
+        return None
 
 
 def _parse_iptc(payload: bytes) -> InMeta:
@@ -283,6 +365,15 @@ def read_jpeg_metadata(data: bytes) -> InMeta:
     XMP wins over IPTC per field. Returns EMPTY for non-JPEG bytes or when no
     in-file metadata is present. Never raises (fail-soft per photo).
 
+    A caption/keywords writer that overflows the main XMP packet's ~64 KB
+    single-APP1-segment ceiling (fauxcasa-cam.5: e.g. a long caption or a
+    large keyword set) spills into ExtendedXMP segments; extended_xmp()
+    reassembles them and this function parses that packet the same way as
+    the main one, filling in whichever of caption/keywords the main packet
+    left empty (the main packet still wins per field when both carry one —
+    same "field-level fallback" shape as the XMP-over-IPTC precedence
+    above, not a wholesale packet replacement).
+
     `data` is the file's bytes — the indexer already holds them (for hashing
     and the scaled decode), so reading metadata adds no extra I/O.
     """
@@ -296,6 +387,14 @@ def read_jpeg_metadata(data: bytes) -> InMeta:
             elif marker == _APP13 and payload.startswith(_PHOTOSHOP_PREFIX):
                 if iptc is EMPTY:
                     iptc = _parse_iptc(payload)
+        if xmp.caption is None or not xmp.keywords:
+            ext = extended_xmp(data)
+            if ext is not None:
+                ext_xmp = _parse_xmp(_XMP_PREFIX + ext)
+                if xmp.caption is None and ext_xmp.caption is not None:
+                    xmp = InMeta(caption=ext_xmp.caption, keywords=xmp.keywords)
+                if not xmp.keywords and ext_xmp.keywords:
+                    xmp = InMeta(caption=xmp.caption, keywords=ext_xmp.keywords)
     except Exception:
         # The segment walker is defensive, but a reader over a whole library
         # must survive even an unforeseen malformation: degrade to whatever

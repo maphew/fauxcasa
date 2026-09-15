@@ -1309,6 +1309,180 @@ def test_inmeta_fail_soft_on_garbage() -> None:
     assert inmeta.read_jpeg_metadata(data2) is inmeta.EMPTY
 
 
+# ---- ExtendedXMP reassembly (fauxcasa-cam.5): a main XMP packet over the
+# ~64 KB single-APP1-segment ceiling spills into extension APP1 segments,
+# tied to the main packet by a shared GUID (xmpNote:HasExtendedXMP on the
+# main side, a per-chunk header on the extension side). ---------------------
+
+_EXT_GUID = b"AB" * 16  # 32 hex-valid chars — a fixture GUID, not a real MD5
+
+
+def _main_xmp_with_note(guid: bytes, extra: str = "") -> bytes:
+    """The main APP1 XMP packet declaring HasExtendedXMP -> guid."""
+    xml = (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+        'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+        'xmlns:xmpNote="http://ns.adobe.com/xmp/note/">'
+        f'<rdf:Description rdf:about="" '
+        f'xmpNote:HasExtendedXMP="{guid.decode()}">{extra}'
+        '</rdf:Description></rdf:RDF></x:xmpmeta>'
+    )
+    return b"http://ns.adobe.com/xap/1.0/\x00" + xml.encode("utf-8")
+
+
+def _ext_app1(guid: bytes, total: int, offset: int, chunk: bytes) -> bytes:
+    """One ExtendedXMP APP1 segment's PAYLOAD (caller injects the marker)."""
+    return (b"http://ns.adobe.com/xmp/extension/\x00" + guid
+            + struct.pack(">II", total, offset) + chunk)
+
+
+def _seg(marker: int, payload: bytes) -> bytes:
+    return bytes([0xFF, marker]) + struct.pack(">H", len(payload) + 2) + payload
+
+
+def _jpeg_with_segments(*payloads: bytes, marker: int = 0xE1) -> bytes:
+    """SOI + one APP1 segment per payload, IN THE GIVEN ORDER, + the rest
+    of a real JPEG — so tests control exact on-disk segment order (needed
+    for the out-of-order-chunks case, where _inject's insert-after-SOI
+    behavior would silently reverse repeated calls)."""
+    jpeg = _jpeg_bytes()
+    assert jpeg[:2] == b"\xff\xd8"
+    return jpeg[:2] + b"".join(_seg(marker, p) for p in payloads) + jpeg[2:]
+
+
+def _face_region_xml(name: str, x: float, y: float, w: float, h: float) -> str:
+    return ('<mwg-rs:Regions xmlns:mwg-rs='
+            '"http://www.metadataworkinggroup.com/schemas/regions/" '
+            'xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#" '
+            'rdf:parseType="Resource"><mwg-rs:RegionList><rdf:Bag>'
+            '<rdf:li rdf:parseType="Resource">'
+            f'<mwg-rs:Name>{name}</mwg-rs:Name><mwg-rs:Type>Face</mwg-rs:Type>'
+            f'<mwg-rs:Area stArea:x="{x}" stArea:y="{y}" stArea:w="{w}" '
+            f'stArea:h="{h}" stArea:unit="normalized"/>'
+            '</rdf:li></rdf:Bag></mwg-rs:RegionList></mwg-rs:Regions>')
+
+
+def test_inmeta_extended_xmp_reassembles_out_of_order_chunks() -> None:
+    """Three chunks arriving in the FILE in a scrambled order (2, 0, 1)
+    still reassemble correctly — reassembly sorts by the declared offset,
+    not file/segment order."""
+    body = b"<x:xmpmeta>" + b"Y" * 300 + b"</x:xmpmeta>"
+    c0, c1, c2 = body[:100], body[100:200], body[200:]
+    jpeg = _jpeg_with_segments(
+        _main_xmp_with_note(_EXT_GUID),
+        _ext_app1(_EXT_GUID, len(body), 200, c2),
+        _ext_app1(_EXT_GUID, len(body), 0, c0),
+        _ext_app1(_EXT_GUID, len(body), 100, c1),
+    )
+    assert inmeta.extended_xmp(jpeg) == body
+
+
+def test_inmeta_extended_xmp_wrong_guid_chunk_ignored() -> None:
+    """A chunk stamped with a DIFFERENT GUID (a leftover from some other
+    packet/file merge) is ignored, not spliced into the result."""
+    body = b"<x:xmpmeta>" + b"Z" * 100 + b"</x:xmpmeta>"
+    other_guid = b"CD" * 16
+    jpeg = _jpeg_with_segments(
+        _main_xmp_with_note(_EXT_GUID),
+        _ext_app1(other_guid, 9999, 0, b"not part of this packet at all!"),
+        _ext_app1(_EXT_GUID, len(body), 0, body),
+    )
+    assert inmeta.extended_xmp(jpeg) == body
+
+
+def test_inmeta_extended_xmp_missing_chunk_is_none() -> None:
+    """A gap (a chunk never arrived) -> None, not a truncated best-effort
+    result — a hole in the middle of an XMP packet is not valid XML
+    anyway, so failing closed is the only safe behavior."""
+    body = b"<x:xmpmeta>" + b"W" * 300 + b"</x:xmpmeta>"
+    c0, _c1, c2 = body[:100], body[100:200], body[200:]
+    jpeg = _jpeg_with_segments(
+        _main_xmp_with_note(_EXT_GUID),
+        _ext_app1(_EXT_GUID, len(body), 0, c0),
+        _ext_app1(_EXT_GUID, len(body), 200, c2),  # chunk at offset 100 missing
+    )
+    assert inmeta.extended_xmp(jpeg) is None
+
+
+def test_inmeta_extended_xmp_absent_is_none() -> None:
+    """No HasExtendedXMP note and no extension segments at all: None, not
+    an exception — the common case (most JPEGs have no ExtendedXMP)."""
+    assert inmeta.extended_xmp(_jpeg_bytes()) is None
+    assert inmeta.extended_xmp(b"garbage" * 1000) is None
+
+
+def test_read_jpeg_metadata_fills_caption_from_extended_xmp() -> None:
+    """A caption too long for the main packet spills into ExtendedXMP;
+    read_jpeg_metadata reassembles it and fills the caption the main
+    packet's dc:description omitted (main-packet field wins when both
+    carry one — proved by the keywords side of this same fixture)."""
+    long_caption = "A" * 5000
+    ext_xml = (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+        'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        '<rdf:Description rdf:about="">'
+        f'<dc:description><rdf:Alt><rdf:li xml:lang="x-default">'
+        f'{long_caption}</rdf:li></rdf:Alt></dc:description>'
+        # a keyword ALSO in the extension: must NOT override the main
+        # packet's own (different) keyword below.
+        '<dc:subject><rdf:Bag><rdf:li>from-extension</rdf:li></rdf:Bag>'
+        '</dc:subject>'
+        '</rdf:Description></rdf:RDF></x:xmpmeta>'
+    ).encode("utf-8")
+    jpeg = _jpeg_with_segments(
+        _main_xmp_with_note(_EXT_GUID),
+        _ext_app1(_EXT_GUID, len(ext_xml), 0, ext_xml),
+    )
+    jpeg = _inject(jpeg, 0xE1, _xmp_app1(keywords=("from-main",)))
+    m = inmeta.read_jpeg_metadata(jpeg)
+    assert m.caption == long_caption
+    assert m.keywords == ("from-main",)  # main packet wins per field
+
+
+def test_extended_xmp_end_to_end_faces_and_caption(tmp_path: Path) -> None:
+    """The acceptance case: a >64 KB packet, faces living ONLY in the
+    extension, read end-to-end through read_photo_meta (the indexer's
+    actual entry point) — proving inmeta.extended_xmp +
+    metareader.read_file_meta's extended_xmp fallback compose correctly,
+    not just each in isolation."""
+    import metareader
+    import thumbcache
+    from catalog import Photo
+
+    big_padding = "P" * 70000  # forces the main packet over the JPEG
+    # APP1 ceiling if it were inline; here it's what's split into ext.
+    ext_xml = (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+        'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        '<rdf:Description rdf:about="">'
+        f'<dc:description><rdf:Alt><rdf:li xml:lang="x-default">'
+        f'Family at the beach {big_padding}</rdf:li></rdf:Alt>'
+        '</dc:description>'
+        f'{_face_region_xml("Ada Test", 0.4, 0.35, 0.2, 0.3)}'
+        '</rdf:Description></rdf:RDF></x:xmpmeta>'
+    ).encode("utf-8")
+    assert len(ext_xml) > 65536
+    chunk_size = 60000
+    chunks = [ext_xml[i:i + chunk_size]
+             for i in range(0, len(ext_xml), chunk_size)]
+    ext_segments = [_ext_app1(_EXT_GUID, len(ext_xml), i * chunk_size, c)
+                    for i, c in enumerate(chunks)]
+    jpeg = _jpeg_with_segments(_main_xmp_with_note(_EXT_GUID), *ext_segments)
+
+    path = tmp_path / "big.jpg"
+    path.write_bytes(jpeg)
+    photo = Photo(rel="big.jpg", folder="", name="big.jpg")
+    data, _size, _mtime, _sha, meta, fmeta = thumbcache.read_photo_meta(
+        path, photo)
+    assert data == jpeg
+    assert meta.caption is not None and meta.caption.startswith(
+        "Family at the beach")
+    assert len(fmeta.faces) == 1
+    assert fmeta.faces[0][1] == "Ada Test"
+
+
 # ---- §4 precedence: in-file metadata overrides the ini for JPEG tier-1 ---
 
 def test_index_infile_caption_overrides_ini(tmp_path: Path) -> None:

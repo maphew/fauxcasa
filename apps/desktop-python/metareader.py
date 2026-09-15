@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import logging
 import math
+import struct
 import threading
 from dataclasses import dataclass
 
@@ -259,6 +260,53 @@ def _parse_mwg_faces(xmp: dict[str, str]
     return tuple(faces)
 
 
+def _xmp_bytes_to_tiff_shell(xmp: bytes) -> bytes:
+    """Wrap a raw (unprefixed) XMP packet in a minimal single-IFD TIFF so
+    it can be handed to exiv2.ImageFactory.open/readMetadata — the same
+    machinery every other read in this module already uses.
+
+    Why a TIFF shell and not a JPEG one: a JPEG APP1 segment's length is a
+    16-bit field (max 65533 bytes of payload), which is exactly the
+    constraint that forces ExtendedXMP to exist in the first place — an
+    ExtendedXMP packet is BY DEFINITION over that ceiling, so it could
+    never round-trip through a synthetic single-segment JPEG. TIFF's XMP
+    tag (0x02BC) is a plain byte array with a 32-bit offset/count, no such
+    limit. This is also why this module doesn't call exiv2.XmpParser
+    directly: the installed python-exiv2 binding (0.19.2) exposes
+    XmpParser.encode but not a decode-to-XmpData entry point, so the
+    "open something exiv2 already knows how to read" trick is the
+    available seam, not a preference."""
+    ifd_off = 8
+    entry = struct.pack("<HHI", 0x02BC, 1, len(xmp)) + struct.pack(
+        "<I", ifd_off + 2 + 12 + 4)
+    ifd = struct.pack("<H", 1) + entry + struct.pack("<I", 0)
+    return b"II" + struct.pack("<H", 42) + struct.pack("<I", ifd_off) \
+        + ifd + xmp
+
+
+def _read_extended_xmp(exiv2, extended_xmp: bytes) -> dict[str, str]:
+    """Parse a reassembled ExtendedXMP packet (inmeta.extended_xmp's
+    output — raw, unprefixed) into the same filtered key->toString() dict
+    read_file_meta builds for the main packet. Fail-soft: any failure
+    (including a still-oversized packet the TIFF shell itself can't hold,
+    though that would need a >4 GiB packet) yields an empty dict, never an
+    exception — an unusable extension must not cost the main packet's
+    already-parsed fields."""
+    out: dict[str, str] = {}
+    try:
+        shell = _xmp_bytes_to_tiff_shell(extended_xmp)
+        img = exiv2.ImageFactory.open(shell)
+        img.readMetadata()
+        for d in img.xmpData():
+            k = d.key()
+            if k == _XMP_RATING_KEY or k == _CAPTION_KEY or k == _SUBJECT_KEY \
+                    or k.startswith(_MWG_REGIONLIST):
+                out[k] = d.toString()
+    except Exception:  # noqa: BLE001 — malformed extension: degrade quietly
+        return {}
+    return out
+
+
 # ---- the reader ------------------------------------------------------------
 
 _EXIF_KEYS = frozenset((
@@ -311,9 +359,18 @@ def read_orientation(data: bytes) -> int:
     return 1
 
 
-def read_file_meta(data: bytes) -> FileMeta:
+def read_file_meta(data: bytes, extended_xmp: bytes | None = None) -> FileMeta:
     """date_taken / gps / rating / caption / keywords / faces from one
-    file's bytes. Never raises."""
+    file's bytes. Never raises.
+
+    `extended_xmp`: the reassembled ExtendedXMP packet (inmeta.
+    extended_xmp(data)'s output — raw, unprefixed), when the caller has
+    one. exiv2 does NOT reassemble ExtendedXMP itself (confirmed: neither
+    writing nor reading a split packet round-trips through python-exiv2
+    0.19.2 without this), so the fields it carries are read via a small
+    TIFF-shell trick (_read_extended_xmp) and used to FILL keys the main
+    packet lacks — a field (or a single mwg-rs region, keyed by its own
+    index) present in the main packet always wins over the extension."""
     exiv2 = _module()
     if exiv2 is None or not data:
         return EMPTY
@@ -336,6 +393,9 @@ def read_file_meta(data: bytes) -> FileMeta:
                         or k == _SUBJECT_KEY \
                         or k.startswith(_MWG_REGIONLIST):
                     xmp[k] = d.toString()
+            if extended_xmp:
+                for k, v in _read_extended_xmp(exiv2, extended_xmp).items():
+                    xmp.setdefault(k, v)  # main packet wins per key
     except Exception:  # noqa: BLE001 — hostile bytes: exiv2 raises, we shrug
         return EMPTY
 

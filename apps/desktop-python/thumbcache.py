@@ -441,7 +441,13 @@ def read_photo_meta(src: Path | None, photo):
         data, size, mtime = b"", -1, -1
     sha = hashlib.sha256(data).hexdigest()
     meta = read_jpeg_metadata(data)  # in-file caption/keywords (JPEG)
-    fmeta = read_file_meta(data)     # in-file date/GPS/Rating
+    # ExtendedXMP (fauxcasa-cam.5): a >64 KB XMP packet (a long caption, a
+    # big keyword set, or many face regions) splits across extra APP1
+    # segments; reassemble once here and hand it to both readers so a
+    # field living only in the extension (inmeta.read_jpeg_metadata calls
+    # this again internally, cheaply — extended_xmp() bails fast when
+    # there's nothing to reassemble) still gets read.
+    fmeta = read_file_meta(data, extended_xmp=inmeta.extended_xmp(data))
     return data, size, mtime, sha, meta, fmeta
 
 
