@@ -27,6 +27,14 @@ this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
   the whole current selection in one gesture — pair it with Ctrl+A to
   clear an entire folder, search or Starred scope at once; in the viewer
   it clears just the shown photo (fauxcasa-q6l.20).
+- Faces named inside a photo's own XMP metadata (mwg-rs face regions) are
+  now read and merged with any Picasa `.picasa.ini` face regions by
+  geometry: a face Picasa already knew about keeps its Picasa identity
+  but takes the in-file name when the file has one; a face Picasa never
+  saw is added and shows up under **People** like any other. Captions and
+  keywords stored inside RAW and TIFF files (not just JPEG) are read too.
+  A caption or keyword set too long for a single JPEG XMP block
+  (ExtendedXMP) is reassembled and read as well (fauxcasa-cam.5).
 
 ### Added (2026-09-14)
 

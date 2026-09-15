@@ -321,13 +321,24 @@ catalog version bump.
   the library either way. Shipped as designed — product-accepted.
 - **In-file metadata coverage**: JPEG captions/keywords via the
   hand-rolled `inmeta.py` (XMP `dc:description`/`dc:subject`, IPTC
-  2:120/2:25), plus capture date / GPS / XMP Rating via `metareader.py`
-  — the python-exiv2 bytes-mode seam ruled by the metadata-library
-  decision (docs/research/metadata-library-decision.md); faces-in-XMP
-  (mwg-rs RegionInfo) is the remaining gap, tracked as fauxcasa-cam.5.
-  Both reads piggyback on the index (the bytes are already in hand for
-  hashing), so a cold walk shows ini-only values until the index fills
-  the in-file ones; warm starts load the merged result from the
+  2:120/2:25), plus capture date / GPS / XMP Rating / faces-in-XMP
+  (mwg-rs RegionInfo) / a library-neutral caption+keywords pair via
+  `metareader.py` — the python-exiv2 bytes-mode seam ruled by the
+  metadata-library decision (docs/research/metadata-library-decision.md,
+  fauxcasa-cam.5/.16). `inmeta.py` also reassembles a JPEG's ExtendedXMP
+  (a >64 KB packet split across extra APP1 segments) so an overflowing
+  caption/keyword set is still read; metareader does the same for faces/
+  rating via a small TIFF-shell trick (python-exiv2 doesn't reassemble
+  ExtendedXMP itself). Non-JPEG containers (TIFF/RAW, PNG, WebP) get
+  caption/keywords from metareader's own read, since `inmeta.py` is
+  JPEG-only. XMP faces merge into the ini-derived `Photo.faces` by rect
+  geometry (IoU >= 0.5 = the same face: ini id/rect kept, XMP name wins
+  when non-empty); an unmatched XMP face is added with contact id
+  `xmp:<name>` (or the ini's unnamed-face sentinel when the XMP region
+  has no name), so it groups under People/search exactly like a Picasa
+  contact. Both reads piggyback on the index (the bytes are already in
+  hand for hashing), so a cold walk shows ini-only values until the index
+  fills the in-file ones; warm starts load the merged result from the
   persisted catalog. In-file wins over the ini per §4 tier-1 (EXIF GPS
   over `geotag=`; XMP Rating 1–5 over bare `star=yes` — stars are a 0–5
   count now, `star=yes` imports as 1). Adopt mode (`--thumbs`) binds an
