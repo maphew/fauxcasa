@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["PySide6", "rawpy", "exiv2", "pillow", "av", "zstandard"]
+# dependencies = ["PySide6", "rawpy", "exiv2", "pillow", "pi-heif", "av", "zstandard"]
 # ///
 """Tracer bullet app (fauxcasa-pzx): a thin but real end-to-end slice of
 the product on the proposed Python + Qt stack.
@@ -4653,6 +4653,11 @@ BUNDLE_RUNTIME_MODULES = (
     "rawpy",
     "exiv2",
     "PIL.Image",
+    # HEIC/HEIF opener (fauxcasa-y5b, pillowload.py): pi_heif ships native
+    # libheif/libde265 binaries alongside its Python code, which
+    # PyInstaller only collects via --collect-all (see the bundle
+    # workflows) — this probe catches a build that forgot the flag.
+    "pi_heif",
     "av",
     "zstandard",
 )
@@ -4663,8 +4668,9 @@ def _bundle_dependency_failures() -> dict[str, str]:
 
     PyInstaller can finish successfully when a build environment omits one
     of these modules: the app then degrades at runtime (missing metadata,
-    RAW/video/PSD support) instead of failing the build. Return only module
-    and exception *type* so CI diagnostics cannot leak paths or file data.
+    RAW/video/PSD/HEIC support) instead of failing the build. Return only
+    module and exception *type* so CI diagnostics cannot leak paths or file
+    data.
     """
     failures: dict[str, str] = {}
     for name in BUNDLE_RUNTIME_MODULES:

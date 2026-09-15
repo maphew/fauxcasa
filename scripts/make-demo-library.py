@@ -840,20 +840,19 @@ def _expected_ingest(records: list[dict], video: dict | None) -> dict:
     picsum photo, per Camera-Odds-and-Ends file (build_camera_odds_and_ends),
     and -- when a video was built -- one row for it (generate_library
     appends that row before returning), so a plain length/sum over
-    `records` already reflects every on-disk media file. The app's EXTS
-    set (catalog.py) excludes .heic/.heif, so those rows are dropped here;
-    write_manifest's "files_written" block keeps them (it counts what was
-    WRITTEN to disk, not what the app will INGEST). `video` is accepted
-    for symmetry with write_manifest's caller but is not otherwise needed
-    -- its row is already in `records`.
+    `records` already reflects every on-disk media file, incl. the
+    Camera-Odds-and-Ends .heic sample: the app's EXTS set (catalog.py)
+    has decoded HEIC/HEIF since fauxcasa-y5b, so nothing is dropped here
+    any more -- `indexed` is every record, same as write_manifest's
+    "files_written" block. `video` is accepted for symmetry with
+    write_manifest's caller but is not otherwise needed -- its row is
+    already in `records`.
 
     Shared verbatim by write_manifest's manifest.json "expected_ingest"
     block and run_verification's sidecar-layer assertions, so the two can
     never drift apart (fauxcasa demo-library review)."""
     del video  # unused: video's row is already folded into `records`
-    NOT_INDEXED_SUFFIXES = (".heic", ".heif")
-    indexed = [r for r in records
-              if not r["file"].lower().endswith(NOT_INDEXED_SUFFIXES)]
+    indexed = records
     stars = sum(1 for r in indexed if r["star"])
     captions = sum(1 for r in indexed if r["caption"])
     faces = sum(r["faces"] for r in indexed)
@@ -906,9 +905,9 @@ def write_manifest(records: list[dict], video: dict | None) -> dict:
     manifest = {
         "generated_by": "scripts/make-demo-library.py",
         "folders": folders,
-        # On-disk counts (every file this script wrote, including the
-        # .heic sample the app does not index -- see "expected_ingest"
-        # below for what the app should actually show). `stars` here is
+        # On-disk counts (every file this script wrote -- since
+        # fauxcasa-y5b this equals "expected_ingest" below exactly, incl.
+        # the Camera-Odds-and-Ends .heic sample). `stars` here is
         # `records`' own star rows verbatim: the video's row (when built)
         # already carries star=True, so no separate "+1 for the video" is
         # added -- that used to double-count it.

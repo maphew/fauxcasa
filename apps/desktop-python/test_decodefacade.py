@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "PySide6", "rawpy", "av", "pillow", "exiv2"]
+# dependencies = ["pytest", "PySide6", "rawpy", "av", "pillow", "pi-heif", "exiv2"]
 # ///
 """Tests for decodefacade.py (fauxcasa-ez2.9 Stage 1): env-based
 transport selection, the sandboxed/in-process/degraded state machine,

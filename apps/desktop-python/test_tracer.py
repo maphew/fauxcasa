@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "PySide6", "pillow", "exiv2", "rawpy", "av", "zstandard"]
+# dependencies = ["pytest", "PySide6", "pillow", "pi-heif", "exiv2", "rawpy", "av", "zstandard"]
 # ///
 """Tests for the tracer's non-GUI layers: catalog scan + metadata,
 thumbnail-cache build/load/bind, and walk-rule parity with
@@ -12870,6 +12870,113 @@ def test_viewer_load_original_psd(tmp_path: Path) -> None:
     assert (img.width(), img.height()) == (48, 64)
 
     broken = _make_psd(tmp_path / "b.psd", truncate=True)
+    assert load_original(str(broken), 0).isNull()
+
+
+# ---- HEIC/HEIF (fauxcasa-y5b): pi-heif via the same Pillow fallback ------
+
+# Committed synthetic fixture (96x64, four solid-color quadrants, EXIF
+# Orientation=1) — see fixtures/heic-smoke/synthetic.heic.txt for
+# provenance and how to regenerate it. Committed rather than generated
+# in-test because Pillow itself cannot ENCODE HEIC without pillow-heif's
+# x265 encoder, which the app deliberately does NOT depend on (GPLv2
+# wheels, docs/research/heic-decode-decision.md); the app's own pi-heif
+# is decode-only.
+_HEIC_FIXTURE = REPO / "fixtures" / "heic-smoke" / "synthetic.heic"
+
+
+def _heic_bytes(broken: bool = False) -> bytes:
+    """The committed fixture's bytes, or the first half only — enough to
+    break libheif's container parse (verified: raises
+    UnidentifiedImageError, never decodes garbage) — the HEIC stand-in
+    for _make_psd's truncate=True, a legitimately undecodable file that
+    must error-tile, never crash the batch."""
+    data = _HEIC_FIXTURE.read_bytes()
+    return data[: len(data) // 2] if broken else data
+
+
+def _assert_heic_quadrants(get_px) -> None:
+    """`get_px(x, y) -> QColor`-shaped probe over the fixture's four
+    solid-color quadrants (see synthetic.heic.txt), lossy-HEVC tolerant
+    (+/-30, matching the PSD/TGA fixtures' tolerance above)."""
+    tl, tr = get_px(5, 5), get_px(90, 5)
+    bl, br = get_px(5, 58), get_px(90, 58)
+    assert abs(tl.red() - 220) < 30 and abs(tl.green() - 40) < 30 \
+        and abs(tl.blue() - 40) < 30                       # top-left: red
+    assert abs(tr.red() - 40) < 30 and abs(tr.green() - 200) < 30 \
+        and abs(tr.blue() - 60) < 30                       # top-right: green
+    assert abs(bl.red() - 40) < 30 and abs(bl.green() - 80) < 30 \
+        and abs(bl.blue() - 220) < 30                       # bottom-left: blue
+    assert abs(br.red() - 230) < 30 and abs(br.green() - 210) < 30 \
+        and abs(br.blue() - 30) < 30                        # bottom-right: yellow
+
+
+def test_heic_extensions_in_both_walkers(tmp_path: Path) -> None:
+    """.heic/.heif join the stills matrix (fauxcasa-y5b) in BOTH EXTS
+    sets, in lockstep, and the walk picks them up case-insensitively —
+    the same walk-parity contract TGA/PSD proved in
+    test_stills_extensions_in_both_walkers."""
+    import catalog
+
+    mtc = _load_mtc()
+    assert {".heic", ".heif"} <= catalog.EXTS
+    assert catalog.EXTS == mtc.EXTS               # the whole lockstep set
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    for name in ("a.HEIC", "b.heif", "c.Heic", "d.HEIF"):
+        (root / name).write_bytes(b"stub")        # walk checks suffix only
+    make_jpeg(root / "e.jpg")
+    walked = [p.name for p in walk_library(root)]
+    assert sorted(walked) == ["a.HEIC", "b.heif", "c.Heic", "d.HEIF", "e.jpg"]
+    script_walk = sorted(p for p in root.rglob("*")
+                         if p.suffix.lower() in mtc.EXTS and p.is_file())
+    assert [p.name for p in script_walk] == walked
+
+
+def test_heic_decodes_through_real_indexer(tmp_path: Path) -> None:
+    """HEIC through the REAL _index_one path: Qt has no HEIF plugin, so
+    the Pillow fallback (pillowload, via pi-heif's opener) must decode
+    all four quadrants color-correct at native size — while a truncated,
+    undecodable HEIC yields the standard zero-length error tile and never
+    sinks the batch."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    (root / "good.heic").write_bytes(_heic_bytes())
+    (root / "broken.heic").write_bytes(_heic_bytes(broken=True))
+    make_jpeg(root / "ok.jpg")
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    ent = {rel: e for rel, e in zip(cache.files, cache.entries)}
+    _o, length, w, h = ent["good.heic"]
+    assert length > 0 and (w, h) == (96, 64)       # never upscaled (< 256px)
+    idx = cache.files.index("good.heic")
+    _assert_heic_quadrants(
+        lambda x, y: _thumb_qimage(cache, idx).pixelColor(x, y))
+    assert ent["broken.heic"][1] == 0              # error tile, by design
+    assert ent["ok.jpg"][1] > 0                    # neighbors unharmed
+
+
+def test_viewer_load_original_heic(tmp_path: Path) -> None:
+    """The viewer's full-decode path (shared by the slideshow prefetch):
+    the fixture renders via the Pillow/pi-heif fallback, the Picasa
+    rotate= turns compose on top exactly like any format, and a
+    truncated HEIC returns a null QImage (fail-soft contract, mirrors
+    test_viewer_load_original_psd)."""
+    _offscreen_app()
+    from viewer import load_original
+
+    good = tmp_path / "g.heic"
+    good.write_bytes(_heic_bytes())
+    img = load_original(str(good), 0)
+    assert (img.width(), img.height()) == (96, 64)
+    _assert_heic_quadrants(img.pixelColor)
+    img = load_original(str(good), 1)              # rotate= composes on top
+    assert (img.width(), img.height()) == (64, 96)
+
+    broken = tmp_path / "b.heic"
+    broken.write_bytes(_heic_bytes(broken=True))
     assert load_original(str(broken), 0).isNull()
 
 

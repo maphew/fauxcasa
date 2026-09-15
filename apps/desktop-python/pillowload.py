@@ -16,6 +16,17 @@ BEFORE Qt can sniff the bytes (rawload module doc), and their branches
 never fall through here, so a TIFF-based RAW container can't be
 "rescued" into a garbled preview by PIL either.
 
+HEIC/HEIF (fauxcasa-y5b) rides the SAME fallback: Qt ships no HEIF
+plugin either, so callers route .heic/.heif by extension straight here,
+exactly like .psd. Pillow itself cannot decode HEIC without a plugin —
+this module registers one lazily via **pi-heif** (PyPI `pi-heif`), not
+pillow-heif: pi-heif wheels bundle only the libheif/libde265 decoder
+(LGPLv3), while pillow-heif's wheels also bundle the x265 ENCODER and
+are GPLv2 as a result (docs/research/heic-decode-decision.md). The
+opener is registered once per process, fail-soft: a build without the
+wheel logs one warning and HEIC/HEIF then error-tile exactly like any
+other still Pillow cannot open.
+
 Orientation is applied exactly once per path, like rawload: Qt's path
 uses setAutoTransform; this path bakes the tag via PIL's exif_transpose
 (a no-op for untagged formats — PSD carries no EXIF Orientation). The
@@ -25,13 +36,22 @@ Threat-model note (docs/decode-threat-model.md): in-process like all
 tracer decode, but a single bytes-in/pixels-out function so the future
 sandboxed decode service slots in behind the same seam. Fail-soft:
 Pillow missing, unreadable bytes, truncated planes — all return a null
-QImage (error tile), never an exception.
+QImage (error tile), never an exception. HEIC/HEIF is a documented
+in-process exception alongside PSD and 16-bit TIFF (libheif/libde265
+have a real CVE history — tracked for sandbox migration under
+fauxcasa-i92).
 """
 
 from __future__ import annotations
 
 import io
+import logging
 import struct
+
+log = logging.getLogger("fauxcasa")
+
+_heif_registered = False
+_heif_import_failed = False
 
 
 def tiff_is_16bit(data: bytes) -> bool:
@@ -106,6 +126,25 @@ def tiff_is_16bit(data: bytes) -> bool:
     return False
 
 
+def _ensure_heif_opener() -> None:
+    """Register pi-heif's Pillow opener lazily, once per process; on
+    failure (missing wheel, native-lib load fault) warn ONCE and leave
+    HEIC/HEIF to fail-soft to the error tile like any other format
+    Pillow cannot open (N7 pattern, mirrors metareader._module)."""
+    global _heif_registered, _heif_import_failed
+    if _heif_registered or _heif_import_failed:
+        return
+    try:
+        from pi_heif import register_heif_opener
+
+        register_heif_opener()
+        _heif_registered = True
+    except Exception as e:  # noqa: BLE001 — ImportError or native-lib faults
+        _heif_import_failed = True
+        log.warning("pi-heif unavailable (%s) — HEIC/HEIF files will "
+                    "error-tile this run", e)
+
+
 def pillow_qimage(data: bytes, max_edge: int | None = None):
     """Decode `data` with Pillow to a QImage (null on ANY failure —
     including Pillow itself being unavailable; the import is lazy so a
@@ -117,6 +156,8 @@ def pillow_qimage(data: bytes, max_edge: int | None = None):
 
     try:
         from PIL import Image, ImageOps
+
+        _ensure_heif_opener()  # no-op after the first call, any outcome
 
         with Image.open(io.BytesIO(data)) as im:
             im = ImageOps.exif_transpose(im)  # the ONE orientation apply

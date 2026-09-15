@@ -35,6 +35,10 @@ this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
   keywords stored inside RAW and TIFF files (not just JPEG) are read too.
   A caption or keyword set too long for a single JPEG XMP block
   (ExtendedXMP) is reassembled and read as well (fauxcasa-cam.5).
+- HEIC/HEIF photos (what recent iPhones save by default) now decode for
+  thumbnails and the viewer, via the same Pillow fallback path already
+  used for Photoshop PSD and 16-bit TIFF files (fauxcasa-y5b). Licensing
+  and sandbox-posture notes: `docs/research/heic-decode-decision.md`.
 
 ### Added (2026-09-14)
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "PySide6", "pillow", "exiv2", "rawpy", "av", "zstandard"]
+# dependencies = ["pytest", "PySide6", "pillow", "pi-heif", "exiv2", "rawpy", "av", "zstandard"]
 # ///
 """End-to-end tests for the decode-sandbox call-site wiring (fauxcasa-ez2.9
 Stage 2): thumbcache._index_one and viewer.load_original_oriented actually

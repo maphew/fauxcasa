@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["PySide6", "rawpy", "exiv2", "pillow", "av", "numpy", "psutil"]
+# dependencies = ["PySide6", "rawpy", "exiv2", "pillow", "pi-heif", "av", "numpy", "psutil"]
 # ///
 """§7 RAW indexing throughput (fauxcasa-ed5.13): measure the tracer's real
 indexer (thumbcache.build_cache) over a synthetic RAW corpus, split into the

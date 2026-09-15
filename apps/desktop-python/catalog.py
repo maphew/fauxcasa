@@ -122,13 +122,14 @@ from videoload import VIDEO_EXTS, is_video_suffix  # noqa: E402
 
 # Must match scripts/make-thumbcache.py EXTS exactly (cache-order parity):
 # the stills set below — the full §5 stills matrix incl. TGA (Qt's qtga
-# plugin decodes it) and PSD (Pillow flattened-composite fallback,
-# fauxcasa-v46.4) — PLUS Picasa's documented 16-vendor RAW extension
+# plugin decodes it), PSD (Pillow flattened-composite fallback,
+# fauxcasa-v46.4), and HEIC/HEIF (pi-heif via the same Pillow fallback,
+# fauxcasa-y5b) — PLUS Picasa's documented 16-vendor RAW extension
 # list (rawload.RAW_EXTS, fauxcasa-v46.1) PLUS Picasa's documented video
 # list (videoload.VIDEO_EXTS, fauxcasa-v46.2) — any change to any part
 # lands in BOTH files or caches stop binding.
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
-        ".webp", ".tga", ".psd"} | RAW_EXTS | VIDEO_EXTS
+        ".webp", ".tga", ".psd", ".heic", ".heif"} | RAW_EXTS | VIDEO_EXTS
 
 INI_NAMES = (".picasa.ini", "Picasa.ini", "picasa.ini")
 

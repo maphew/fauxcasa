@@ -136,6 +136,39 @@ worker pool; none of them changes the cost materially. This means the
 threat model does not constrain the §10 item 12 stack choice — and the
 stack choice cannot weaken the isolation requirement.
 
+## In-process decoders (documented exception)
+
+Three format fallbacks decode in-process today, on all platforms,
+outside the sandboxed worker pool the Decision above prescribes as the
+floor from M1: **PSD** (fauxcasa-v46.4), **16-bit TIFF** (fauxcasa-v46.7)
+and **HEIC/HEIF** (fauxcasa-y5b). All three share one shape: the pinned
+PySide6 build ships no Qt plugin for them (PSD, HEIC/HEIF) or Qt's own
+plugin corrupts the pixels (16-bit TIFF grayscale silently clips to
+white on Linux), so `pillowload.py` decodes the same bytes with Pillow
+instead — for HEIC/HEIF, Pillow itself has no built-in HEIF reader, so
+`pillowload.py` additionally registers **pi-heif**'s opener (PyPI
+`pi-heif`, wrapping libheif 1.23.0 + the libde265 HEVC decoder,
+LGPLv3 — see `docs/research/heic-decode-decision.md` for the licensing
+analysis and why pi-heif was chosen over pillow-heif). This is a
+sandbox-worker gap, not a wasm-adoption gap: none of the three route
+through mechanism B either, they simply never left the UI/index
+process.
+
+The risk is real, not theoretical, for HEIC/HEIF specifically: libde265
+has a public CVE history (heap overflows and out-of-bounds reads in
+malformed-bitstream handling), and it now runs in-process against
+attacker-controlled bytes on every `.heic`/`.heif` file a library
+contains, with the same ambient authority as the rest of the UI/index
+process. PSD and 16-bit TIFF carry the analogous risk for Pillow's own
+PSD/TIFF codecs, already accepted before this bead.
+
+Tracked for migration into the sandboxed worker pool under
+**fauxcasa-i92** (the decode-isolation epic this document belongs to),
+not resolved here: moving these three fallbacks behind the broker/worker
+boundary closes the gap without changing `pillowload.py`'s bytes-in/
+pixels-out interface, which was deliberately kept sandbox-service-shaped
+for exactly this future move (see `pillowload.py`'s module docstring).
+
 ## Verification (becomes CI gates)
 
 - **M1 gate (with decode isolation landing):** a test worker, handed a
