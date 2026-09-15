@@ -7187,6 +7187,16 @@ def test_inject_exif_orientation_app0_ordering() -> None:
         "no JFIF APP0 present: EXIF APP1 splices right after SOI"
     assert rawload._jpeg_has_exif_orientation(injected_no_app0)
 
+    # Shape 3: APP0 marker present but its declared length is malformed
+    # (< 2 — the length field counts itself, so 0/1 is garbage). Must take
+    # the right-after-SOI fallback, not splice between the length bytes.
+    for bad_len in (0, 1):
+        malformed = with_app0[:4] + struct.pack(">H", bad_len) + with_app0[6:]
+        injected_bad = rawload._inject_exif_orientation(malformed, 6)
+        assert injected_bad[:2] == b"\xff\xd8"
+        assert injected_bad[2:4] == b"\xff\xe1", \
+            f"malformed APP0 length {bad_len}: fall back to right after SOI"
+
 
 def test_flip_helpers_garbage_input() -> None:
     """_jpeg_has_exif_orientation and _inject_exif_orientation are fail-soft:

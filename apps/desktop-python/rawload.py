@@ -147,12 +147,14 @@ def _inject_exif_orientation(jpeg: bytes, orientation: int) -> bytes:
     # libjpeg and exiv2 all tolerate APP1-before-APP0, but splice after
     # APP0 instead of blindly right after SOI so the output is strictly
     # conformant too. Falls back to right-after-SOI (old behavior) when
-    # there is no APP0 or its declared length runs past the buffer.
+    # there is no APP0, or its declared length is malformed (< 2, the
+    # same stop condition _jpeg_has_exif_orientation uses) or runs past
+    # the buffer.
     insert_at = 2
     if jpeg[2:4] == b"\xFF\xE0" and len(jpeg) >= 6:
         seg_len = struct.unpack_from(">H", jpeg, 4)[0]
         candidate = 4 + seg_len
-        if candidate <= len(jpeg):
+        if seg_len >= 2 and candidate <= len(jpeg):
             insert_at = candidate
     return jpeg[:insert_at] + seg + jpeg[insert_at:]
 
