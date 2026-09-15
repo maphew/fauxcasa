@@ -1,11 +1,13 @@
-"""Windows sandboxed decode transport (fauxcasa-i92.3, Stage B).
+"""Windows sandboxed decode transport (fauxcasa-i92.3).
 
 Broker-side production home for the machinery proven by
 docs/research/spikes/appcontainer-spawn-spike.py (see bd memory
 win-appcontainer-decode-sandbox for the 6 load-bearing gotchas this
-module encodes). Structured as a class the future pooled DecodeService
-will own; nothing in the app imports this yet (see the design doc,
-docs/design/decode-service.md sections 2 and 4).
+module encodes). `DecodePoolSet` (below) is owned by
+`decodefacade.WinSandboxTransport`, which `decodefacade.DecodeService`
+uses for route="still" decodes whenever the sandbox is up (see the
+design doc, docs/design/decode-service.md sections 2 and 4); thumbcache.py
+also imports `DecodePoolSet` directly for its batch-arena sizing.
 
 Wire shape (design doc sec 2, 2.1-2.3), summarized for this file's
 worker (decodesvc_worker_win.py):

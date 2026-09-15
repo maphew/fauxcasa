@@ -1,7 +1,11 @@
-"""Decode service facade (fauxcasa-ez2.9 Stage 1 -- plumbing only, no
-call-site migration yet; thumbcache._index_one and viewer.
-load_original_oriented keep decoding directly until Stage 2 wires them
-onto this module).
+"""Decode service facade for the sandboxed "still" decode route
+(fauxcasa-ez2.9).
+
+thumbcache._index_one and viewer.load_original_oriented call
+`decodefacade.get_service().decode(path, route="still", ...)` directly,
+guarded by `get_service().state == STATE_SANDBOXED` (those call sites
+own their own crop/edge math; this module owns the sandbox lifecycle
+and the error mapping below that their calls rely on).
 
 `get_service()` returns a process-wide `DecodeService` singleton exposing
 the call-site-facing shape from docs/design/decode-service.md sec 5:
@@ -11,6 +15,10 @@ the call-site-facing shape from docs/design/decode-service.md sec 5:
     svc.decode(path, route="still", edge=0)                    -> QImage
     svc.index(path, top, crop=None, orientation=1, route="still") -> QImage
     svc.poster(path, edge=512)                                 -> QImage
+
+`decode()` is the method real call sites use; `index()` and `poster()`
+are exercised by this module's own tests but have no sandboxed op yet
+(see WinSandboxTransport below) and no real caller today.
 
 DecodeService.decode() is ALWAYS display-upright for route="still",
 regardless of which transport served it (fauxcasa-ez2.9 Stage 2 review
@@ -29,24 +37,27 @@ call sites.
 
 Two transports:
 
-- `InProcessTransport` -- today's decode code paths, duplicated (per the
-  lens plan's "duplicate the minimal calls" instruction, NOT moved: the
-  real call sites migrate in Stage 2). Always available, every platform.
+- `InProcessTransport` -- the same decode code thumbcache.py and
+  viewer.py run directly for every route this facade does not sandbox:
+  RAW, PSD, 16-bit TIFF, video posters, and "still" whenever `state` is
+  not STATE_SANDBOXED (a deliberate duplicate, not a shared helper, so
+  the sandboxed and in-process paths can diverge safely). Always
+  available, every platform.
 - `WinSandboxTransport` (win32 only) -- backed by
-  `decodesvc_win.DecodePoolSet`. Stage 1 scope: only `decode()` for
-  route="still" goes through the sandbox (the worker's `ops` list is
-  `["decode"]` only, decodesvc_worker_win.py); `index()`, `poster()`, and
-  every non-"still" `decode()` route ALWAYS fall back to InProcess in
-  this stage, regardless of sandbox availability -- there is no sandboxed
-  "index"/"poster" op yet to route them to.
+  `decodesvc_win.DecodePoolSet`. Only `decode()` for route="still" goes
+  through the sandbox (the worker's `ops` list is `["decode"]` only,
+  decodesvc_worker_win.py); `index()`, `poster()`, and every non-"still"
+  `decode()` route ALWAYS fall back to InProcess, regardless of sandbox
+  availability -- there is no sandboxed "index"/"poster" op to route
+  them to.
 
 Selection: `FAUXCASA_DECODE_SANDBOX=0|1|require` (env), default "1" on
 win32 outside pytest, "0" everywhere else (`test_tracer.py` additionally
 pins "0" via an autouse fixture, belt-and-suspenders with this default,
 so its 86 build_cache / 29 load_original call sites never spawn a real
-worker once Stage 2 wires them here). `require` means: a failed sandbox
-startup is FATAL (raises `DecodeSandboxRequiredError` so `main()` can
-exit non-zero with a clear message) -- see `main.py --require-sandbox`.
+worker under the test suite). `require` means: a failed sandbox startup
+is FATAL (raises `DecodeSandboxRequiredError` so `main()` can exit
+non-zero with a clear message) -- see `main.py --require-sandbox`.
 
 Error mapping (design doc sec migration plan item 2, "Error mapping"):
     OSError (file open)                -> null, no log (today's contract)
