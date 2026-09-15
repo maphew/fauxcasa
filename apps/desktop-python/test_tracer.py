@@ -15274,7 +15274,7 @@ def test_single_root_offline_message_explains_and_suppresses_badge(
     _offline_root_labels), but it must NOT leave the user looking at an
     empty grid with no explanation (item 5) — _single_root_offline_message
     is that explanation, and _reconcile_online_roots must emit the SAME
-    empty (no-badge) label list _offline_root_labels does, since bead .e
+    empty (no-badge) label list _offline_root_labels does, since fauxcasa-hi2
     item 4 was filed on the two disagreeing."""
     import main
     from catalog import Catalog, Photo

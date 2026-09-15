@@ -1223,11 +1223,11 @@ def _reconcile_online_roots(
         total.ini_changed = True
 
     # fauxcasa-hi2 item 4/6: reuse _offline_root_labels rather than
-    # building a second label list from the `offline` local above, so the
-    # single-root suppression it applies (a single-root library has no
-    # badge to show — see its docstring) can only ever live in ONE place.
-    # `offline` above stays the walk-loop's own online/offline split (its
-    # own docstring explains why: the `roots` fallback for a bare-fixture
+    # deriving a second label list from the `roots`/`online` split above,
+    # so the single-root suppression it applies (a single-root library has
+    # no badge to show — see its docstring) can only ever live in ONE
+    # place. That split stays the walk loop's own concern (the function
+    # docstring explains why: the `roots` fallback for a bare-fixture
     # Catalog that never set `roots`) — it is not reused here because a
     # bare-fixture catalog leaves `catalog.roots` empty, which
     # `_offline_root_labels` reads directly, and `refresh_offline_ids()`
