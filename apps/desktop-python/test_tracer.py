@@ -7480,11 +7480,39 @@ def test_search_haystack_visible_subset_and_reveal(tmp_path: Path) -> None:
 
 
 def test_ready_poll_timer_dies_with_the_run(
-        monkeypatch, library: Path, tmp_path: Path, caplog) -> None:
+        monkeypatch, library: Path, tmp_path: Path, capsys) -> None:
     """After a self-quitting in-process main() run, spinning the (reused)
     QApplication's event loop must fire no stale check_ready — no CRITICAL
-    'uncaught exception' may reach the log."""
-    import logging
+    'uncaught exception' may reach the log.
+
+    Asserts on capsys' stderr mirror (applog's _StderrHandler), NOT caplog:
+    applog sets `log.propagate = False` on the 'fauxcasa' logger, so its
+    records never reach the root handler caplog installs, which would make this
+    guard pass vacuously — the convention note at
+    test_cmd_promote_requires_explicit_library says the same.
+
+    fauxcasa-47f investigated whether this guard was vacuous the same way
+    fauxcasa-9pr's first attempt was. Run ALONE (-k ready_poll_timer_dies)
+    against a main.py with the fauxcasa-q6l.15 parenting reverted (poll =
+    QTimer() instead of QTimer(win)), the caplog form passed 1/1 — vacuous
+    by the same symptom as 9pr. But switching to capsys here (this edit)
+    did NOT flip it red the way it did in 85ee302: it still passes 1/1
+    against the reverted main.py, even with main()'s poll.stop() also
+    removed as a second probe. Root cause is structural, not a
+    caplog-visibility gap: `win` stays alive in Python for the whole test
+    (captured by check_ready's own closure, referenced again inside
+    check_ready via `poll.stop()`), and the widget sweep that actually
+    destroys the C++ GridView the original bug fired into
+    (_isolate_qt_per_test, test_tracer.py) only runs at THIS test's own
+    fixture teardown — after the test body and its assertions have already
+    finished. So nothing this test's body can observe ever gets a deleted
+    GridView to fire into; the caplog->capsys swap is kept anyway as the
+    file's documented convention (and is a strict improvement, since
+    caplog cannot reliably see this logger), but it cannot make this
+    particular guard a real regression test for the cross-test leak by
+    itself. See fauxcasa-xf2 for a possible follow-up that would need to
+    force the same teardown inside the test body to actually exercise the
+    C++-deletion race."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
@@ -7497,16 +7525,16 @@ def test_ready_poll_timer_dies_with_the_run(
         "fauxcasa-tracer", str(library), "--cache-root", str(cache_root),
         "--quit-after-ready", "--finish-build", "--timeout", "30"])
     assert main.main() == 0
+    capsys.readouterr()      # discard the run's own output
 
     # The window is gone; give any leaked 50 ms poll several chances to fire.
-    with caplog.at_level(logging.CRITICAL, logger="fauxcasa"):
-        for _ in range(6):
-            loop = QEventLoop()
-            QTimer.singleShot(60, loop.quit)
-            loop.exec()
-            QCoreApplication.processEvents()
-    stale = [r for r in caplog.records if "uncaught exception" in r.message]
-    assert stale == [], f"stale check_ready fired: {stale}"
+    for _ in range(6):
+        loop = QEventLoop()
+        QTimer.singleShot(60, loop.quit)
+        loop.exec()
+        QCoreApplication.processEvents()
+    err = capsys.readouterr().err
+    assert "uncaught exception" not in err, f"stale check_ready fired: {err}"
 
 
 # ---------------------------------------------------------------------------
@@ -18244,8 +18272,8 @@ def test_abandoned_hard_stop_does_not_fire_after_its_run(
     A rc of 0 is itself proof the run beat its own deadline, so anything
     logging TIMEOUT after that is by definition a deadline that outlived
     its run. Asserts on capsys' stderr mirror (applog's _StderrHandler),
-    NOT caplog: the 'fauxcasa' logger sets propagate=False (applog.py:83)
-    on purpose, and a caplog form of this assertion was measured passing
+    NOT caplog: applog sets `log.propagate = False` on the 'fauxcasa'
+    logger on purpose, and a caplog form of this assertion was measured passing
     against the UNFIXED main.py when run alone — vacuous. Same convention,
     and the same reason, as the note on
     test_cmd_promote_requires_explicit_library: caplog cannot reliably see

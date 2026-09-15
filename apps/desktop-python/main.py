@@ -5173,6 +5173,7 @@ def main() -> int:
 
     code = app.exec()
     poll.stop()  # belt to the parenting suspenders: never fire post-exec
+    decode_sandbox_poll.stop()  # same belt-and-suspenders for the sandbox label poller
     if hard_stop is not None:
         hard_stop.stop()
     win.shutdown()  # reap any in-flight cache build cleanly
