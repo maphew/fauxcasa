@@ -1383,9 +1383,10 @@ class ViewerPage(QWidget):
             # see or name people. Say what the key does today and that
             # tagging is still to come, instead of leaving them to wonder
             # whether the key registered.
-            label, note = next(iter(keymap.PLANNED_FEATURES.items()))
-            self.notice.emit("No Picasa face tags on this photo. "
-                             + keymap.notice(label, note))
+            self.notice.emit(
+                "No Picasa face tags on this photo. " + keymap.notice(
+                    keymap.FACE_TAGGING,
+                    keymap.PLANNED_FEATURES[keymap.FACE_TAGGING]))
             return
         self.faces_visible = not self.faces_visible
         self.update()
@@ -1531,7 +1532,7 @@ class ViewerPage(QWidget):
             # Ctrl-chord check above (pan/hold/locate), per the keymap
             # dispatch-order contract.
             self.info_toggle_requested.emit()
-        elif (msg := keymap.planned(event)) is not None:
+        elif (msg := keymap.planned(event, "viewer")) is not None:
             # LAST, after every live binding: a Picasa chord Fauxcasa knows
             # but has not built yet gets a status-bar notice instead of
             # silence (fauxcasa-s6i).

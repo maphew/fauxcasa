@@ -1666,9 +1666,11 @@ class GridView(QAbstractScrollArea):
 
     def _fall_through(self, event) -> None:
         """No live binding matched. A known-but-unbuilt Picasa chord
-        (keymap.PLANNED_KEYS) becomes a status-bar notice (fauxcasa-s6i);
-        anything else goes to Qt's default handler as before."""
-        msg = keymap.planned(event)
+        (keymap.PLANNED_KEYS["grid"]) becomes a status-bar notice
+        (fauxcasa-s6i); anything else goes to Qt's default handler as
+        before — including PgUp/PgDown, which QAbstractScrollArea pages
+        with, so those are NOT in the grid's planned set."""
+        msg = keymap.planned(event, "grid")
         if msg is not None:
             self.notice.emit(msg)
         else:

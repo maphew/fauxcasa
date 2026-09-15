@@ -11044,30 +11044,62 @@ def test_planned_keys_notice_instead_of_silence(tmp_path: Path) -> None:
     # an unknown key still falls through quietly (no notice spam)
     chord(win.viewer, Qt.Key.Key_Q)
     assert len(got) == before
-    # Help > Keyboard Shortcuts lists the same table under one heading
+    # main-row '+' arrives as Shift+= (exact matching keeps Shift) and
+    # must reach the viewer's zoom-step notice — Picasa's "+/- (not the
+    # numeric keypad)"; the grid says nothing about video keys
+    chord(win.viewer, Qt.Key.Key_Plus, Qt.KeyboardModifier.ShiftModifier)
+    assert "zoom in" in got[-1].lower()
+    gg: list[str] = []
+    win.grid.notice.connect(gg.append)
+    chord(win.grid, Qt.Key.Key_Comma)
+    assert gg == []
+    # PgDown in the grid still reaches QAbstractScrollArea's paging (a
+    # notice there would eat a working key): no notice
+    chord(win.grid, Qt.Key.Key_PageDown)
+    assert gg == []
+    # the one status-bar wording
     assert keymap.notice("Edit mode", "planned for M3 (edit room)") == \
         "Edit mode is not implemented yet — planned for M3 (edit room)."
 
 
-def test_keymap_planned_keys_never_shadow_live_bindings() -> None:
-    """PLANNED_KEYS is consulted only after every live binding, so a chord
-    that a surface ALSO binds would be dead text there. The one tolerated
-    overlap is bare '1' (viewer.zoom_toggle's grandfathered tenant; the
-    planned star-set entry still fires from the grid). Any other overlap
-    means a notice that can never show — fail here, not in the field."""
-    from PySide6.QtGui import QKeySequence
+def test_keymap_planned_keys_never_shadow_live_bindings(tmp_path: Path) -> None:
+    """PLANNED_KEYS[scope] is consulted only after every live binding on
+    that surface, so a chord the surface ALSO binds would be dead text.
+    Live means: DEFAULT_SCHEME exact chords (StandardKey ones compiled
+    through Qt, e.g. Ctrl+A), key_only bare keys under ANY modifier, and
+    every window-level QAction shortcut (those intercept BEFORE the
+    widget's keyPressEvent). Any overlap means a notice that can never
+    show — fail here, not in the field."""
+    from PySide6.QtGui import QAction, QKeySequence
 
     import keymap
+    import main
 
-    live: set[str] = set()
-    for b in keymap.DEFAULT_SCHEME.values():
-        for c in b.chords:
-            live.add(QKeySequence(c).toString())
-    planned = {QKeySequence(c).toString() for c in keymap.PLANNED_KEYS}
-    assert planned & live == {"1"}
-    # every entry parses to exactly one chord (a typo would never match)
-    for c in keymap.PLANNED_KEYS:
-        assert QKeySequence(c).count() == 1, c
+    _offscreen_app()
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    win = main.MainWindow(scan_library(root), None,
+                          cache_dir=None, build_dir=None)
+    window_chords = {sc.toString() for a in win.findChildren(QAction)
+                     for sc in a.shortcuts() if not sc.isEmpty()}
+    for scope, table in keymap.PLANNED_KEYS.items():
+        exact: set[str] = set()
+        bare: set[int] = set()
+        for action, b in keymap.DEFAULT_SCHEME.items():
+            if action.split(".", 1)[0] not in (scope, "app"):
+                continue
+            if b.key_only:
+                bare |= {int(k) for k in keymap._bare_keys(b)}
+            else:
+                exact |= {c.toString() for c in keymap._compiled(b)}
+        for chords in table:
+            assert len(chords) >= 1
+            for c in chords:
+                seq = QKeySequence(c)
+                assert seq.count() == 1, (scope, c)   # a typo never matches
+                assert seq.toString() not in exact, (scope, c)
+                assert seq.toString() not in window_chords, (scope, c)
+                assert int(seq[0].key()) not in bare, (scope, c)
 
 
 def test_viewer_face_rects_wait_for_original(tmp_path: Path) -> None:
@@ -12508,8 +12540,10 @@ def test_help_keyboard_shortcuts_dialog_lists_every_action(
     labels = captured["labels"]
     # live actions, then a heading, then every planned key and keyless
     # planned feature (fauxcasa-s6i) — one table, one source
-    assert len(labels) == (len(keymap.DEFAULT_SCHEME) + 1
-                           + len(keymap.PLANNED_KEYS)
+    distinct = {(label, chords[0])
+                for table in keymap.PLANNED_KEYS.values()
+                for chords, (label, _n) in table.items()}
+    assert len(labels) == (len(keymap.DEFAULT_SCHEME) + 1 + len(distinct)
                            + len(keymap.PLANNED_FEATURES))
     for action in keymap.DEFAULT_SCHEME:
         assert keymap.ACTION_LABELS[action] in labels

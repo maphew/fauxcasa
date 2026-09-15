@@ -2284,8 +2284,13 @@ class MainWindow(QMainWindow):
         # recognises but has not built, and the keyless features a shipped
         # key stands in for — same source the status-bar notices read.
         add_row("— Not yet available —", "")
-        for chord, (label, note) in keymap.PLANNED_KEYS.items():
-            add_row(f"{label} ({note})", chord)
+        seen: set[tuple[str, str]] = set()
+        for planned in keymap.PLANNED_KEYS.values():
+            for chords, (label, note) in planned.items():
+                if (label, chords[0]) in seen:   # shared across surfaces
+                    continue
+                seen.add((label, chords[0]))
+                add_row(f"{label} ({note})", " / ".join(chords))
         for label, note in keymap.PLANNED_FEATURES.items():
             add_row(f"{label} ({note})", "")
         lay.addWidget(table)
