@@ -18,6 +18,11 @@ this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
   the same pinned headers, jump buttons and per-group play as the main
   grid); undated photos land in a trailing "Undated" group
   (fauxcasa-q6l.20).
+- A star-threshold filter (**View > Stars**: Any / 1-5 stars or more)
+  composes with any view — folder, album, search, Starred — instead of
+  needing a dedicated surface for "starred in this folder/search". The
+  status line shows the active threshold (e.g. "Starred ≥3★") so a
+  filtered-empty grid is never a silent no-op (fauxcasa-q6l.20).
 
 ### Added (2026-09-14)
 

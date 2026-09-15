@@ -18625,3 +18625,197 @@ def test_starred_view_header_play_emits_group_items(tmp_path: Path) -> None:
     win._play_group("2026-09")
     assert win._slideshow is not None
     assert win._slideshow.display == [by_name["sep.jpg"]]
+
+
+# ---------------------------------------------------------------------------
+# Scoped star views (fauxcasa-q6l.20), clause (a): the star-threshold
+# predicate (>= N) composes with any view via one choke point,
+# MainWindow._scope_indices, driven by the View > Stars radio menu.
+# ---------------------------------------------------------------------------
+
+def test_star_min_persistence_roundtrip(tmp_path: Path) -> None:
+    """save/load round-trip: 1-5 survive, 0/out-of-range/non-int read as
+    0 (Any) on both sides — view prefs are a convenience, never a gate."""
+    from main import load_star_min, save_star_min
+
+    save_star_min(tmp_path, 3)
+    assert load_star_min(tmp_path) == 3
+    cfg = tmp_path / "config.json"
+    assert json.loads(cfg.read_text())["star_min"] == 3
+
+    save_star_min(tmp_path, 0)                 # default: stored as absent
+    assert "star_min" not in json.loads(cfg.read_text())
+    assert load_star_min(tmp_path) == 0
+
+    save_star_min(None, 4)                     # no state dir: no-op
+    assert load_star_min(None) == 0
+    assert load_star_min(tmp_path / "nowhere") == 0     # missing file
+    cfg.write_text('{"star_min": 9}')                    # out of range
+    assert load_star_min(tmp_path) == 0
+    cfg.write_text('{"star_min": true}')                 # bool, not int
+    assert load_star_min(tmp_path) == 0
+    cfg.write_text("{not json")                           # garbage
+    assert load_star_min(tmp_path) == 0
+
+
+def test_star_min_persists_across_mainwindow_instances(tmp_path: Path) -> None:
+    """Setting the threshold via the View > Stars menu persists it, and a
+    fresh MainWindow over the same state dir starts with it applied."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    cat = scan_library(root)
+    state_dir = tmp_path / "state"
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None,
+                     state_dir=state_dir)
+    win.star_actions[3].trigger()               # "3 stars or more"
+    assert win._star_min == 3
+
+    cat2 = scan_library(root)
+    win2 = MainWindow(cat2, None, cache_dir=None, build_dir=None,
+                      state_dir=state_dir)
+    assert win2._star_min == 3
+    assert win2.star_actions[3].isChecked()
+    assert not win2.star_actions[0].isChecked()
+
+
+def test_star_min_filters_folder_view_keeps_grouping_and_sort(
+        tmp_path: Path) -> None:
+    """Threshold >=3 in the default folder view shows only qualifying
+    photos, still grouped by folder with the folder's remembered sort
+    mode applied — set_filter(None) alone can no longer do both at once,
+    hence set_filter's `default_sort` escape hatch."""
+    _offscreen_app()
+    from grid import SORT_SIZE
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "big.jpg", 256, 192)
+    make_jpeg(root / "f" / "medium.jpg", 128, 96)
+    make_jpeg(root / "f" / "small.jpg", 64, 48)
+    make_jpeg(root / "f" / "tiny.jpg", 16, 12)
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["big.jpg"]].star = 1
+    cat.photos[by_name["medium.jpg"]].star = 3
+    cat.photos[by_name["small.jpg"]].star = 5
+    cat.photos[by_name["tiny.jpg"]].star = 0
+    # Photo.size is normally filled by the thumbcache bind/backfill pass,
+    # not a bare scan_library — set it directly (like date_taken above)
+    # so SORT_SIZE has something real to sort on.
+    for name, size in (("tiny.jpg", 1), ("small.jpg", 2),
+                       ("medium.jpg", 3), ("big.jpg", 4)):
+        cat.photos[by_name[name]].size = size
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.grid.sort_modes["f"] = SORT_SIZE
+    win._set_star_min(3)
+
+    assert len(win.grid.groups) == 1 and win.grid.groups[0].folder == "f"
+    assert win.grid.display == [
+        by_name["small.jpg"], by_name["medium.jpg"]]   # size-ascending
+    assert "≥3★" in win.counts_label.text()
+
+    win._set_star_min(0)                        # "Any" restores everything
+    assert win.grid.display == [
+        by_name["tiny.jpg"], by_name["small.jpg"],
+        by_name["medium.jpg"], by_name["big.jpg"]]
+    assert "★" not in win.counts_label.text()
+
+
+def test_star_min_composes_with_search(tmp_path: Path) -> None:
+    """A star threshold ANDs with the active search term."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "beach_low.jpg")
+    make_jpeg(root / "f" / "beach_high.jpg")
+    make_jpeg(root / "f" / "hill_high.jpg")
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["beach_low.jpg"]].star = 1
+    cat.photos[by_name["beach_high.jpg"]].star = 4
+    cat.photos[by_name["hill_high.jpg"]].star = 4
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._set_star_min(3)
+    win.search.setText("beach")
+    assert win.grid.display == [by_name["beach_high.jpg"]]
+    assert "≥3★" in win.counts_label.text()
+
+    win._set_star_min(0)
+    assert sorted(win.grid.display) == sorted([
+        by_name["beach_low.jpg"], by_name["beach_high.jpg"]])
+
+
+def test_star_min_composes_with_album_view(tmp_path: Path) -> None:
+    """A star threshold ANDs with an album's membership."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    make_jpeg(root / "f" / "b.jpg")
+    (root / "f" / ".picasa.ini").write_text(
+        "[a.jpg]\r\nstar=yes\r\nalbums=cafecafecafecafecafecafecafecafe\r\n"
+        "[b.jpg]\r\nalbums=cafecafecafecafecafecafecafecafe\r\n"
+        "[.album:cafecafecafecafecafecafecafecafe]\r\nname=Best\r\n"
+        "token=cafecafecafecafecafecafecafecafe\r\n"
+    )
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._set_star_min(1)
+    _sidebar_click(win, "album", "cafecafecafecafecafecafecafecafe")
+    assert win.grid.display == [by_name["a.jpg"]]
+    assert "≥1★" in win.counts_label.text()
+
+
+def test_star_min_starred_view_is_max_of_threshold_and_one(
+        tmp_path: Path) -> None:
+    """The Starred collection under threshold N shows star >= max(1, N):
+    a threshold of 1 (or 0/Any) still excludes unstarred photos, and a
+    higher threshold tightens further."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "one.jpg")
+    make_jpeg(root / "f" / "three.jpg")
+    make_jpeg(root / "f" / "unstarred.jpg")
+    cat = scan_library(root)
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["one.jpg"]].star = 1
+    cat.photos[by_name["three.jpg"]].star = 3
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win._set_star_min(1)
+    _sidebar_click(win, "starred", "")
+    assert sorted(win.grid.display) == sorted([
+        by_name["one.jpg"], by_name["three.jpg"]])
+
+    win._set_star_min(3)
+    assert win.grid.display == [by_name["three.jpg"]]
+    assert "≥3★" in win.counts_label.text()
+
+
+def test_star_menu_actions_reflect_current_threshold(tmp_path: Path) -> None:
+    """The View > Stars radio group stays in sync: exactly one action
+    checked, matching _star_min, after a programmatic change."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "f" / "a.jpg")
+    cat = scan_library(root)
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    assert win.star_actions[0].isChecked()
+    assert [a.isChecked() for a in win.star_actions].count(True) == 1
+
+    win._set_star_min(2)
+    assert win.star_actions[2].isChecked()
+    assert [a.isChecked() for a in win.star_actions].count(True) == 1

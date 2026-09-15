@@ -757,7 +757,7 @@ class GridView(QAbstractScrollArea):
         self._notifier.tile_ready.emit()
 
     def set_filter(self, indices: list[int] | None, label: str,
-                   grouper=None) -> None:
+                   grouper=None, default_sort: bool = False) -> None:
         """indices=None -> all visible photos grouped by folder; otherwise
         an explicit display set (album members, stars, search hits).
         Grouping is by folder key (not consecutive runs): with nested
@@ -773,7 +773,14 @@ class GridView(QAbstractScrollArea):
         in insertion order of their first-seen item, so the CALLER controls
         group order by ordering `indices`; every layout/paint/jump/play
         consumer keys off `_Group.folder` generically, so a non-folder key
-        works with no further change (see the field's docstring)."""
+        works with no further change (see the field's docstring).
+
+        `default_sort` opts an EXPLICIT indices list into the per-folder
+        sort_modes pass below that indices=None always gets (fauxcasa-
+        q6l.20 clause a: a star-threshold view over the default folder
+        grouping needs both the threshold-filtered index list AND the
+        remembered per-folder sort mode, and indices=None can no longer
+        do both at once). Ignored when indices is None (already implied)."""
         if self.catalog is None:
             return
         self._hover_idx = -1  # stale index into the OLD self.loc/groups
@@ -782,6 +789,7 @@ class GridView(QAbstractScrollArea):
         if default_view:
             indices = [i for i, p in enumerate(cat.photos)
                        if p.visible or self.reveal]
+            default_sort = True
         if grouper is None:
             grouper = _folder_grouper
         self.filter_label = label
@@ -799,7 +807,7 @@ class GridView(QAbstractScrollArea):
         # view only. Explicit display sets keep their given order (albums =
         # membership order, search/starred/recent = catalog order); the
         # module constants block up top records the scoping rationale.
-        if default_view and self.sort_modes:
+        if default_sort and self.sort_modes:
             for g in self.groups:
                 mode = self.sort_modes.get(g.folder, DEFAULT_SORT_MODE)
                 if mode != DEFAULT_SORT_MODE:
