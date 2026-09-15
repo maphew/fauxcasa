@@ -18460,3 +18460,168 @@ def test_abandoned_hard_stop_does_not_fire_after_its_run(
     err = capsys.readouterr().err
     assert "TIMEOUT after" not in err, \
         f"the abandoned --timeout fired after its run: {err}"
+
+
+# ---------------------------------------------------------------------------
+# Scoped star views (fauxcasa-q6l.20), clause (b): the Starred collection is
+# date-grouped (month buckets, newest first, pinned headers/jump/play like
+# the main grid) instead of one flat unbroken run. set_filter grows an
+# optional `grouper` hook for this; the default per-folder grouping is
+# unchanged (guarded by the pre-existing sort/default-view tests above).
+# ---------------------------------------------------------------------------
+
+def test_set_filter_custom_grouper_overrides_default_folder_grouping(
+        tmp_path: Path) -> None:
+    """The `grouper` hook fully replaces folder grouping: a caller-defined
+    key/title/description collapses two folders into one group, and group
+    ORDER follows first appearance in the caller's `indices` list — the
+    caller controls order, not some grouper-internal iteration."""
+    _offscreen_app()
+    from grid import GridView
+
+    root = tmp_path / "lib"
+    make_jpeg(root / "folder_a" / "img1.jpg")
+    make_jpeg(root / "folder_b" / "img2.jpg")
+    cat = scan_library(root)
+    g = GridView()
+    g.set_data(cat, None)
+    assert len(g.groups) == 2   # default: one group per folder, unchanged
+
+    def one_group(cat, i):
+        return "all", "Everything", "a description"
+
+    g.set_filter(list(range(len(cat.photos))), "custom", grouper=one_group)
+    assert len(g.groups) == 1
+    assert g.groups[0].folder == "all"
+    assert g.groups[0].title == "Everything"
+    assert g.groups[0].description == "a description"
+    assert sorted(g.groups[0].items) == list(range(len(cat.photos)))
+
+    def by_parity(cat, i):
+        key = "odd" if i % 2 else "even"
+        return key, key, None
+
+    g.set_filter([1, 0], "parity", grouper=by_parity)   # odd's index first
+    assert [grp.folder for grp in g.groups] == ["odd", "even"]
+
+
+def _dated_starred_library(root: Path) -> None:
+    """Synthetic multi-month library for the date-grouped Starred tests —
+    no real Picasa data."""
+    make_jpeg(root / "f" / "sep.jpg")
+    make_jpeg(root / "f" / "aug.jpg")
+    make_jpeg(root / "f" / "jul.jpg")
+    make_jpeg(root / "f" / "nodate.jpg")
+
+
+def _star_all_with_dates(cat: Catalog) -> dict[str, int]:
+    """Star every photo in `cat` and assign _dated_starred_library's month
+    spread via direct field mutation (mtime stays -1/unindexed and
+    date_taken stays None on nodate.jpg, so it sinks to Undated exactly
+    like a real never-backfilled photo would)."""
+    by_name = {p.name: i for i, p in enumerate(cat.photos)}
+    cat.photos[by_name["sep.jpg"]].date_taken = "2026-09-05T10:00:00"
+    cat.photos[by_name["aug.jpg"]].date_taken = "2026-08-20T10:00:00"
+    cat.photos[by_name["jul.jpg"]].date_taken = "2026-07-01T10:00:00"
+    for i in by_name.values():
+        cat.photos[i].star = 1
+    return by_name
+
+
+def test_starred_view_is_date_grouped_newest_first(tmp_path: Path) -> None:
+    """The Starred collection groups by month, newest month first, with a
+    genuinely dateless photo sinking into a trailing 'Undated' group (spec
+    §5, fauxcasa-q6l.20 clause b)."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    _dated_starred_library(root)
+    cat = scan_library(root)
+    by_name = _star_all_with_dates(cat)
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    _sidebar_click(win, "starred", "")
+
+    assert [g.title for g in win.grid.groups] == [
+        "September 2026", "August 2026", "July 2026", "Undated"]
+    assert [g.folder for g in win.grid.groups] == [
+        "2026-09", "2026-08", "2026-07", "undated"]
+    assert win.grid.groups[0].items == [by_name["sep.jpg"]]
+    assert win.grid.groups[1].items == [by_name["aug.jpg"]]
+    assert win.grid.groups[2].items == [by_name["jul.jpg"]]
+    assert win.grid.groups[-1].items == [by_name["nodate.jpg"]]
+
+
+def test_starred_view_jump_next_folder_steps_month_groups(
+        tmp_path: Path) -> None:
+    """jump_next_folder/jump_prev_folder — Picasa's folder-boundary jump
+    buttons — step between the Starred collection's MONTH groups exactly
+    as they step between folders in the default view (pure group-index/y
+    logic, agnostic to what a group's key means). Enough photos per month
+    to force real scroll overflow (_jump_grid's own convention above)."""
+    _offscreen_app()
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    months = [(0, "2026-09-05T10:00:00"), (1, "2026-08-20T10:00:00"),
+              (2, "2026-07-01T10:00:00")]
+    for mi, _stamp in months:
+        for k in range(8):
+            make_jpeg(root / "f" / f"m{mi}p{k:02d}.jpg")
+    cat = scan_library(root)
+    for mi, stamp in months:
+        for k in range(8):
+            i = next(j for j, p in enumerate(cat.photos)
+                     if p.name == f"m{mi}p{k:02d}.jpg")
+            cat.photos[i].date_taken = stamp
+            cat.photos[i].star = 1
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.resize(400, 300)
+    _sidebar_click(win, "starred", "")
+    g = win.grid
+    assert len(g.groups) == 3
+    assert g.content_h > g.viewport().height()   # real overflow, like _jump_grid
+
+    sb = g.verticalScrollBar()
+    assert sb.value() == 0
+    g.jump_next_folder()
+    assert sb.value() == g.groups[1].y
+    g.jump_next_folder()
+    assert sb.value() == g.groups[2].y
+    g.jump_prev_folder()                 # exactly at a group top: step back
+    assert sb.value() == g.groups[1].y
+
+
+def test_starred_view_header_play_emits_group_items(tmp_path: Path) -> None:
+    """Clicking the header play glyph on a MONTH group in the Starred
+    collection emits play_group with that group's own key, and
+    MainWindow._play_group starts the slideshow over exactly that group's
+    items (fauxcasa-q6l.16's per-group play, extended to date groups)."""
+    _offscreen_app()
+    from grid import HEADER_H, PAD
+    from main import MainWindow
+
+    root = tmp_path / "lib"
+    _dated_starred_library(root)
+    cat = scan_library(root)
+    by_name = _star_all_with_dates(cat)
+
+    win = MainWindow(cat, None, cache_dir=None, build_dir=None)
+    win.resize(500, 400)
+    win.show()
+    _sidebar_click(win, "starred", "")
+    g = win.grid
+
+    emitted: list[str] = []
+    g.play_group.connect(emitted.append)
+    w = g.viewport().width()
+    top = g.verticalScrollBar().value()
+    glyph0 = g._header_glyph_rect(g.groups[0].y - top, w)
+    _header_click(g, glyph0.center().x(), glyph0.center().y())
+    assert emitted == ["2026-09"]
+
+    win._play_group("2026-09")
+    assert win._slideshow is not None
+    assert win._slideshow.display == [by_name["sep.jpg"]]

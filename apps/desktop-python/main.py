@@ -44,6 +44,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 T0 = time.perf_counter()
@@ -150,6 +151,7 @@ from grid import (  # noqa: E402
     SORT_MODES,
     CompositeThumbCache,
     GridView,
+    _date_sort_key,
     folder_key,
 )
 import icons  # noqa: E402
@@ -247,6 +249,36 @@ def recent_indices(catalog: Catalog, reveal: bool,
         return idxs
     known.sort(key=lambda im: im[1], reverse=True)
     return sorted(i for i, _m in known[:RECENT_FALLBACK_K])
+
+
+def _order_starred_newest_first(cat: Catalog, idxs: list[int]) -> list[int]:
+    """Newest-first ordering for the date-grouped Starred collection
+    (fauxcasa-q6l.20 clause b, spec §5): reuses cam.9's date_taken/mtime
+    fallback substrate (grid._date_sort_key, the same one per-folder date
+    sort uses) so ordering and grouping agree. Dated photos (date_taken,
+    or mtime when date_taken is absent) sort descending by that key;
+    genuinely dateless photos (no date_taken, no usable mtime) keep their
+    incoming catalog order and sink after every dated photo, landing in
+    the trailing Undated group (see _starred_grouper)."""
+    dated = [i for i in idxs if _date_sort_key(cat.photos[i])[0] == 0]
+    undated = [i for i in idxs if _date_sort_key(cat.photos[i])[0] != 0]
+    dated.sort(key=lambda i: _date_sort_key(cat.photos[i]), reverse=True)
+    return dated + undated
+
+
+def _starred_grouper(cat: Catalog, i: int) -> tuple[str, str, str | None]:
+    """set_filter `grouper` for the Starred collection (fauxcasa-q6l.20
+    clause b): month buckets ('YYYY-MM', title "September 2026") from the
+    same date substrate _order_starred_newest_first sorts by, so grouping
+    and ordering agree; genuinely dateless photos share one trailing
+    'undated' bucket titled "Undated". No description (the header already
+    paints the per-group count; repeating it there would be redundant)."""
+    sort_key = _date_sort_key(cat.photos[i])
+    if sort_key[0] != 0:
+        return "undated", "Undated", None
+    stamp = datetime.strptime(sort_key[1][:7], "%Y-%m")
+    return stamp.strftime("%Y-%m"), stamp.strftime("%B %Y"), None
+
 
 APP_DIR = Path(__file__).resolve().parent
 REPO = APP_DIR.parents[1]
@@ -3486,7 +3518,8 @@ class MainWindow(QMainWindow):
         if kind == "starred":
             idxs = [i for i, p in enumerate(cat.photos)
                     if (p.visible or self.grid.reveal) and p.star]
-            self.grid.set_filter(idxs, "Starred")
+            idxs = _order_starred_newest_first(cat, idxs)
+            self.grid.set_filter(idxs, "Starred", grouper=_starred_grouper)
             self._show_counts("Starred", len(idxs))
         elif kind == "recent":
             idxs = self._recent_indices()

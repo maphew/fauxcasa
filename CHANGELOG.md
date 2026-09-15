@@ -12,6 +12,13 @@ Changes since the `tracer-test-v1` preview (2026-08-10, commit `553d31a`).
 The `v0.1.0-rc2` release candidate (2026-09-13) contains everything in
 this section; see `docs/releases/v0.1.0.md` for the full user-facing notes.
 
+### Added (2026-09-15)
+
+- Starred Photos is now date-grouped (month buckets, newest first, with
+  the same pinned headers, jump buttons and per-group play as the main
+  grid); undated photos land in a trailing "Undated" group
+  (fauxcasa-q6l.20).
+
 ### Added (2026-09-14)
 
 - Screenshot gallery in the README and release notes, made from a demo

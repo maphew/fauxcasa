@@ -81,6 +81,20 @@ def folder_key(catalog: Catalog, root_id: str, rel: str) -> str:
     return f"{root_id}/{rel}" if rel else root_id
 
 
+def _folder_grouper(cat: Catalog, i: int) -> tuple[str, str, str | None]:
+    """Default set_filter grouping for catalog index `i`: by folder
+    (fauxcasa-q6l.20 clause b introduced the grouper hook on set_filter;
+    this function is exactly its pre-existing inline behavior, so the
+    default folder view is unchanged byte-for-byte). Returns
+    (group_key, title, description) — see set_filter's `grouper` param."""
+    photo = cat.photos[i]
+    f = folder_key(cat, photo.root_id, photo.folder)
+    folder = cat.folders.get(f)
+    title = folder.title if folder is not None else f
+    desc = folder.description if folder is not None else None
+    return f, title, desc
+
+
 class CompositeThumbCache:
     """Catalog-index facade over N independent per-root fcaches.
 
@@ -499,6 +513,13 @@ class _HeaderRule(QWidget):
 
 @dataclass
 class _Group:
+    # Group identity key: a folder key by default, but any set_filter
+    # `grouper` may substitute a different key (e.g. "YYYY-MM"/"undated"
+    # for the date-grouped Starred collection, fauxcasa-q6l.20 clause b).
+    # Every consumer of this field (play_group, scroll_to_folder, the
+    # per-folder sort_modes lookup, jump_prev/next_folder via group INDEX
+    # only) treats it as an opaque group key, not necessarily a real
+    # folder path.
     folder: str
     title: str
     items: list[int]  # catalog/cache indices
@@ -735,7 +756,8 @@ class GridView(QAbstractScrollArea):
         self.done.put((self.generation, idx, None))
         self._notifier.tile_ready.emit()
 
-    def set_filter(self, indices: list[int] | None, label: str) -> None:
+    def set_filter(self, indices: list[int] | None, label: str,
+                   grouper=None) -> None:
         """indices=None -> all visible photos grouped by folder; otherwise
         an explicit display set (album members, stars, search hits).
         Grouping is by folder key (not consecutive runs): with nested
@@ -743,7 +765,15 @@ class GridView(QAbstractScrollArea):
         around its subfolders' blocks, which would split the parent into
         several same-title groups. Display order is therefore a
         display-level regrouping of cache order; items carry their
-        catalog indices so decode mapping is unaffected."""
+        catalog indices so decode mapping is unaffected.
+
+        `grouper(cat, catalog_index) -> (group_key, title, description)`
+        overrides the default per-folder grouping (fauxcasa-q6l.20 clause
+        b: the date-grouped Starred collection passes one). Groups appear
+        in insertion order of their first-seen item, so the CALLER controls
+        group order by ordering `indices`; every layout/paint/jump/play
+        consumer keys off `_Group.folder` generically, so a non-folder key
+        works with no further change (see the field's docstring)."""
         if self.catalog is None:
             return
         self._hover_idx = -1  # stale index into the OLD self.loc/groups
@@ -752,20 +782,18 @@ class GridView(QAbstractScrollArea):
         if default_view:
             indices = [i for i, p in enumerate(cat.photos)
                        if p.visible or self.reveal]
+        if grouper is None:
+            grouper = _folder_grouper
         self.filter_label = label
-        by_folder: dict[str, _Group] = {}
+        by_key: dict[str, _Group] = {}
         for i in indices:
-            photo = cat.photos[i]
-            f = folder_key(cat, photo.root_id, photo.folder)
-            g = by_folder.get(f)
+            key, title, desc = grouper(cat, i)
+            g = by_key.get(key)
             if g is None:
-                folder = cat.folders.get(f)
-                title = folder.title if folder is not None else f
-                desc = folder.description if folder is not None else None
-                g = by_folder[f] = _Group(folder=f, title=title, items=[],
-                                          description=desc)
+                g = by_key[key] = _Group(folder=key, title=title, items=[],
+                                         description=desc)
             g.items.append(i)
-        self.groups = list(by_folder.values())
+        self.groups = list(by_key.values())
         # Per-folder sort modes (fauxcasa-q6l.11): reorder each group's
         # DISPLAY slice — never the catalog — on the folder-grouped default
         # view only. Explicit display sets keep their given order (albums =
