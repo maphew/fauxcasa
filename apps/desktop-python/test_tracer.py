@@ -1411,6 +1411,39 @@ def test_inmeta_extended_xmp_absent_is_none() -> None:
     assert inmeta.extended_xmp(b"garbage" * 1000) is None
 
 
+def test_inmeta_extended_xmp_rejects_over_max_bytes() -> None:
+    """A chunk header declaring a total length over
+    _MAX_EXTENDED_XMP_BYTES is rejected outright (None) — a hostile
+    length field must not drive an allocation anywhere near that size."""
+    jpeg = _jpeg_with_segments(
+        _main_xmp_with_note(_EXT_GUID),
+        _ext_app1(_EXT_GUID, inmeta._MAX_EXTENDED_XMP_BYTES + 1, 0, b"x"))
+    assert inmeta.extended_xmp(jpeg) is None
+
+
+def test_inmeta_extended_xmp_inconsistent_total_length_is_none() -> None:
+    """Two chunks (same GUID) that DISAGREE on the packet's declared total
+    length is corrupt/mixed input — rejected, not resolved by picking
+    either value."""
+    jpeg = _jpeg_with_segments(
+        _main_xmp_with_note(_EXT_GUID),
+        _ext_app1(_EXT_GUID, 100, 0, b"a" * 50),
+        _ext_app1(_EXT_GUID, 200, 50, b"b" * 50))
+    assert inmeta.extended_xmp(jpeg) is None
+
+
+def test_inmeta_extended_xmp_overlapping_chunks_is_none() -> None:
+    """Two chunks whose declared offsets overlap (the second starts before
+    the first ends) fail the contiguous-tiling check — a gap and an
+    overlap are both 'doesn't fit the shape', not a best-effort splice."""
+    body = b"<x:xmpmeta>" + b"Q" * 100 + b"</x:xmpmeta>"
+    jpeg = _jpeg_with_segments(
+        _main_xmp_with_note(_EXT_GUID),
+        _ext_app1(_EXT_GUID, len(body), 0, body[:60]),
+        _ext_app1(_EXT_GUID, len(body), 50, body[50:]))  # overlaps [50,60)
+    assert inmeta.extended_xmp(jpeg) is None
+
+
 def test_read_jpeg_metadata_fills_caption_from_extended_xmp() -> None:
     """A caption too long for the main packet spills into ExtendedXMP;
     read_jpeg_metadata reassembles it and fills the caption the main
@@ -1619,7 +1652,11 @@ def test_apply_photo_meta_merges_xmp_faces_by_geometry(tmp_path: Path) -> None:
     >= 0.5) keeps the ini rect + contact id but takes the XMP display name
     (in-file wins tier-1); a second ini region with nothing overlapping it
     stays untouched; a THIRD, non-overlapping XMP region is ADDED with an
-    'xmp:<name>' contact id. The report records the resolution."""
+    'xmp:<name>' contact id. Both the name-fill and the add are GAP-FILLS
+    (the ini face was unnamed; the added face has no ini counterpart at
+    all) — fauxcasa-cam.17's no-flood rule means NEITHER is reported (see
+    test_apply_photo_meta_faces_replacement_reported for the case that
+    IS)."""
     import metareader
     import picasa_db
 
@@ -1650,10 +1687,120 @@ def test_apply_photo_meta_merges_xmp_faces_by_geometry(tmp_path: Path) -> None:
     rect2, cid2, name2 = p.faces[2]
     assert rect2 == pytest.approx((0.075, 0.075, 0.125, 0.125))
     assert (cid2, name2) == ("xmp:Xmp New", "Xmp New")
+    assert not [e for e in cat.report.entries
+               if e.kind == "infile_override" and e.detail.startswith("faces:")]
+
+
+def test_apply_photo_meta_faces_replacement_reported(tmp_path: Path) -> None:
+    """The ONE case faces DO get reported: an ini face that already has a
+    resolvable display name (via [Contacts2]) is renamed by a DIFFERENT
+    XMP name — a genuine conflict, not a gap-fill — producing exactly one
+    infile_override entry shaped like the other fields' ('ini "X" ->
+    in-file "Y"')."""
+    import metareader
+
+    root = tmp_path / "lib"
+    rect = (0.40, 0.40, 0.60, 0.60)
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(), faces=[("Robert", 0.50, 0.50, 0.20, 0.20)])
+    (root / "p.jpg").parent.mkdir(parents=True, exist_ok=True)
+    (root / "p.jpg").write_bytes(data)
+    (root / ".picasa.ini").write_text(
+        f"[p.jpg]\r\nfaces=rect64({_rect64(*rect)}),cccccccccccccccc\r\n"
+        "[Contacts2]\r\ncccccccccccccccc=Bob;;\r\n")
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    p = next(ph for ph in cat.photos if ph.rel == "p.jpg")
+    assert len(p.faces) == 1
+    _rect, cid, name = p.faces[0]
+    assert (cid, name) == ("cccccccccccccccc", "Robert")
     entries = [e for e in cat.report.entries
               if e.kind == "infile_override" and e.detail.startswith("faces:")]
     assert len(entries) == 1
-    assert "merged 1" in entries[0].detail and "added 1" in entries[0].detail
+    assert 'ini "Bob" -> in-file "Robert"' in entries[0].detail
+
+
+def test_infile_override_no_flood_many_xmp_only_faces(tmp_path: Path) -> None:
+    """fauxcasa-cam.17 no-flood rule, the scenario that motivated it:
+    Picasa's 'write faces to XMP' option strips faces= from the ini
+    entirely once it's on, so EVERY faced photo becomes a pure XMP gap-
+    fill (no ini match at all) — five such photos must produce ZERO
+    infile_override entries, not five (which, at real-library scale,
+    would be the "100k entries" flood the rule exists to prevent)."""
+    import metareader
+
+    root = tmp_path / "lib"
+    for i in range(5):
+        data = metareader.embed_test_metadata(
+            _jpeg_bytes(), faces=[(f"Person {i}", 0.5, 0.5, 0.2, 0.2)])
+        (root / f"p{i}.jpg").parent.mkdir(parents=True, exist_ok=True)
+        (root / f"p{i}.jpg").write_bytes(data)
+    cat = scan_library(root)
+    thumbcache.build_cache(cat, tmp_path / "c")
+
+    for i in range(5):
+        p = next(ph for ph in cat.photos if ph.rel == f"p{i}.jpg")
+        assert len(p.faces) == 1 and p.faces[0][2] == f"Person {i}"
+    assert not [e for e in cat.report.entries
+               if e.kind == "infile_override" and e.detail.startswith("faces:")]
+
+
+def test_merge_xmp_faces_iou_boundary_at_0_5() -> None:
+    """The IoU >= 0.5 threshold is a hard boundary: two equal-size squares
+    whose overlap gives IoU just under 0.5 do NOT merge (the XMP face is
+    ADDED instead); just at/over 0.5, they DO (computed via the exact
+    two-equal-squares IoU formula (s-d)/(s+d), not hardcoded floats, so
+    the test pins the threshold itself rather than one lucky fixture)."""
+    from catalog import Photo
+    import thumbcache as tc
+
+    s = 0.2
+
+    def rects_for_iou(target_iou: float):
+        d = s * (1.0 - target_iou) / (1.0 + target_iou)
+        ini = (0.4 - s / 2, 0.4 - s / 2, 0.4 + s / 2, 0.4 + s / 2)
+        xmp = (0.4 + d - s / 2, 0.4 - s / 2, 0.4 + d + s / 2, 0.4 + s / 2)
+        return ini, xmp
+
+    ini_rect, xmp_rect_under = rects_for_iou(0.499)
+    assert tc._face_iou(ini_rect, xmp_rect_under) < 0.5
+    p_under = Photo(rel="p.jpg", folder="", name="p.jpg",
+                    faces=((ini_rect, "cccccccccccccccc", None),))
+    tc._merge_xmp_faces(p_under, [(xmp_rect_under, "Xmp Under")], None)
+    assert len(p_under.faces) == 2  # no match found: ADDED
+
+    ini_rect2, xmp_rect_over = rects_for_iou(0.501)
+    assert tc._face_iou(ini_rect2, xmp_rect_over) >= 0.5
+    p_over = Photo(rel="p.jpg", folder="", name="p.jpg",
+                   faces=((ini_rect2, "cccccccccccccccc", None),))
+    tc._merge_xmp_faces(p_over, [(xmp_rect_over, "Xmp Over")], None)
+    assert len(p_over.faces) == 1  # matched: MERGED
+    assert p_over.faces[0][2] == "Xmp Over"
+
+
+def test_apply_photo_meta_faces_idempotent_no_duplicate_report() -> None:
+    """Calling apply_photo_meta twice with the SAME fmeta (e.g. a re-index
+    of an unchanged file) renames the face once, reports it once, and the
+    second call is a no-op — never a duplicate infile_override entry nor
+    a second (spurious) rename."""
+    from catalog import ImportReport, Photo
+    import metareader
+    import thumbcache as tc
+
+    rect = (0.4, 0.4, 0.6, 0.6)
+    photo = Photo(rel="p.jpg", folder="", name="p.jpg",
+                 faces=((rect, "cccccccccccccccc", "Bob"),))
+    fmeta = metareader.FileMeta(faces=((rect, "Robert"),))
+    report = ImportReport()
+
+    tc.apply_photo_meta(photo, 100, 0, "sha1", inmeta.EMPTY, fmeta, report)
+    assert photo.faces[0][2] == "Robert"
+    assert len(report.entries) == 1
+
+    tc.apply_photo_meta(photo, 100, 0, "sha1", inmeta.EMPTY, fmeta, report)
+    assert photo.faces[0][2] == "Robert"
+    assert len(report.entries) == 1  # unchanged: no duplicate entry
 
 
 def test_apply_photo_meta_xmp_face_noop_when_name_unchanged(
@@ -6868,6 +7015,8 @@ def test_metareader_non_jpeg_carriers() -> None:
         fm = metareader.read_file_meta(data)
         assert fm.date_taken == "2015-03-15T09:30:00", fmt
         assert fm.rating == 2, fmt
+
+
 # ---------------------------------------------------------------------------
 # faces-in-XMP + caption/keywords via metareader (fauxcasa-cam.5): mwg-rs
 # RegionInfo and dc:description/dc:subject, the library-neutral fields that
@@ -6928,13 +7077,18 @@ def test_metareader_faces_garbage_packet_is_empty() -> None:
     assert metareader.read_file_meta(b"") == metareader.EMPTY
 
 
-def test_metareader_faces_capped_at_64() -> None:
-    """A packet carrying 100 valid Face regions yields only 64 — the DoS
-    guard (_FACE_CAP) so a hostile packet cannot balloon the catalog."""
-    faces = [(f"Person {i}", 0.1, 0.1, 0.02, 0.02) for i in range(100)]
+def test_metareader_faces_capped_at_max_faces() -> None:
+    """A packet carrying MAX_FACES+50 valid Face regions yields only
+    MAX_FACES — the DoS guard (decodesvc.MAX_FACES, shared with the future
+    decode sandbox — fauxcasa-cam.5 review fix) so a hostile packet cannot
+    balloon the catalog."""
+    from decodesvc import MAX_FACES
+
+    faces = [(f"Person {i}", 0.1, 0.1, 0.02, 0.02)
+             for i in range(MAX_FACES + 50)]
     data = metareader.embed_test_metadata(_jpeg_bytes(), faces=faces)
     fm = metareader.read_file_meta(data)
-    assert len(fm.faces) == 64
+    assert len(fm.faces) == MAX_FACES
 
 
 def test_metareader_faces_pixel_unit_skipped() -> None:
@@ -6954,6 +7108,171 @@ def test_metareader_faces_pixel_unit_skipped() -> None:
     img.writeMetadata()
     out = bytes(img.io().mmap())
     assert metareader.read_file_meta(out).faces == ()
+
+
+def test_metareader_faces_type_pet_skipped_missing_type_defaults_face() -> None:
+    """mwg-rs:Type == 'Pet' (or any non-Face type) is skipped; a region
+    with NO Type property at all defaults to Face per MWG (both proved in
+    one packet, alongside a real Face region, so the filter can't just be
+    accidentally accepting everything)."""
+    import exiv2  # noqa: PLC0415 (test-only: plant a Type embed_test_metadata
+    # itself never writes anything but "Face")
+
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(),
+        faces=[("Fido", 0.2, 0.2, 0.1, 0.1),      # region 1: will become Pet
+               ("Ada", 0.5, 0.5, 0.1, 0.1),        # region 2: Type removed
+               ("Bob", 0.8, 0.8, 0.1, 0.1)])       # region 3: stays Face
+    img = exiv2.ImageFactory.open(data)
+    img.readMetadata()
+    xmp = img.xmpData()
+    xmp["Xmp.mwg-rs.Regions/mwg-rs:RegionList[1]/mwg-rs:Type"] = "Pet"
+    del xmp["Xmp.mwg-rs.Regions/mwg-rs:RegionList[2]/mwg-rs:Type"]
+    img.writeMetadata()
+    out = bytes(img.io().mmap())
+    fm = metareader.read_file_meta(out)
+    assert [n for _r, n in fm.faces] == ["Ada", "Bob"]
+
+
+def test_metareader_faces_name_only_region_does_not_hide_next(
+        ) -> None:
+    """A region with mwg-rs:Name but no Area at all (malformed/incomplete)
+    is skipped, not treated as 'the RegionList ends here' — a valid
+    region 2 right after it must still be read (review fix: `continue`,
+    not `break`, on a missing stArea:x)."""
+    import exiv2
+
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(), faces=[("Valid Two", 0.5, 0.5, 0.1, 0.1)])
+    img = exiv2.ImageFactory.open(data)
+    img.readMetadata()
+    xmp = img.xmpData()
+    # Insert a Name-only region 1, shifting the valid region to index 2 by
+    # re-writing both entries from scratch (indices are 1-based, in-order).
+    base = exiv2.XmpTextValue()
+    base.setXmpArrayType(exiv2.XmpValue.XmpArrayType.xaBag)
+    xmp2 = img.xmpData()
+    del xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[1]/mwg-rs:Name"]
+    del xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[1]/mwg-rs:Type"]
+    del xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[1]/mwg-rs:Area/stArea:x"]
+    del xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[1]/mwg-rs:Area/stArea:y"]
+    del xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[1]/mwg-rs:Area/stArea:w"]
+    del xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[1]/mwg-rs:Area/stArea:h"]
+    del xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[1]/mwg-rs:Area/stArea:unit"]
+    xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[1]/mwg-rs:Name"] = "Name Only"
+    xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[2]/mwg-rs:Name"] = "Valid Two"
+    xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[2]/mwg-rs:Area/stArea:x"] = "0.5"
+    xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[2]/mwg-rs:Area/stArea:y"] = "0.5"
+    xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[2]/mwg-rs:Area/stArea:w"] = "0.1"
+    xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[2]/mwg-rs:Area/stArea:h"] = "0.1"
+    xmp2["Xmp.mwg-rs.Regions/mwg-rs:RegionList[2]/mwg-rs:Area/stArea:unit"] = \
+        "normalized"
+    img.writeMetadata()
+    out = bytes(img.io().mmap())
+    fm = metareader.read_file_meta(out)
+    assert [n for _r, n in fm.faces] == ["Valid Two"]
+
+
+def test_metareader_caption_takes_first_alternative_of_two_languages() -> None:
+    """exiv2's LangAlt toString() for TWO alternatives joins them as
+    'lang="x-default" <text>, lang="fr-FR" <text>' (confirmed empirically
+    against python-exiv2 0.19.2) — only the first (x-default) text must
+    surface, never the second language's text tacked on after a comma."""
+    import exiv2
+
+    data = metareader.embed_test_metadata(_jpeg_bytes())
+    img = exiv2.ImageFactory.open(data)
+    img.readMetadata()
+    xmp = img.xmpData()
+    xmp["Xmp.dc.description"] = 'lang="x-default" Default text'
+    xmp["Xmp.dc.description"] = 'lang="fr-FR" Texte francais'
+    img.writeMetadata()
+    out = bytes(img.io().mmap())
+    fm = metareader.read_file_meta(out)
+    assert fm.caption == "Default text"
+
+
+def test_metareader_caption_truncated_to_max_caption_bytes() -> None:
+    """A caption longer than MAX_CAPTION_BYTES is cut, on a UTF-8
+    boundary, never raised or dropped entirely (fauxcasa-cam.5 review fix:
+    ExtendedXMP removed the natural size bound a caption used to have)."""
+    from decodesvc import MAX_CAPTION_BYTES
+
+    long_caption = "é" * (MAX_CAPTION_BYTES)  # each char is 2 UTF-8 bytes
+    data = metareader.embed_test_metadata(_jpeg_bytes(), caption=long_caption)
+    fm = metareader.read_file_meta(data)
+    assert fm.caption is not None
+    assert len(fm.caption.encode("utf-8")) <= MAX_CAPTION_BYTES
+    assert long_caption.startswith(fm.caption)  # a clean prefix, no mangling
+
+
+def test_metareader_keywords_capped_at_max_keywords() -> None:
+    from decodesvc import MAX_KEYWORDS
+
+    kws = [f"kw{i}" for i in range(MAX_KEYWORDS + 10)]
+    data = metareader.embed_test_metadata(_jpeg_bytes(), keywords=kws)
+    fm = metareader.read_file_meta(data)
+    assert len(fm.keywords) == MAX_KEYWORDS
+
+
+def test_metareader_extended_xmp_garbage_keeps_main_packet_fields() -> None:
+    """A garbage `extended_xmp` argument (the TIFF-shell parse fails)
+    degrades to the main packet's OWN fields — never an exception, and
+    never a wipe of what the main packet already carried."""
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(), caption="from main packet", rating=4)
+    fm = metareader.read_file_meta(data, extended_xmp=b"not xml at all!!")
+    assert fm.caption == "from main packet"
+    assert fm.rating == 4
+
+
+def test_metareader_faces_orientation_frame_transpose() -> None:
+    """mwg-rs:AppliedToDimensions equal to the STORED dims TRANSPOSED
+    means the writer expressed the region in the DISPLAY frame; the
+    region is rotated back into the stored frame by the inverse
+    orientation. A round-trip through the SAME orientation
+    (cropmap.map_fraction_rect) must reproduce the display-frame rect the
+    writer meant — i.e. the overlay position is unaffected by which frame
+    the writer chose."""
+    from cropmap import map_fraction_rect
+
+    display_rect_meant = (0.40, 0.15, 0.60, 0.35)
+    dl, dt, dr, db = display_rect_meant
+    cx, cy = (dl + dr) / 2, (dt + db) / 2
+    w, h = dr - dl, db - dt
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(64, 48),  # stored 64x48 landscape
+        orientation=6,        # display: 48x64 portrait
+        faces=[("Ada", cx, cy, w, h)],
+        applied_dims=(48, 64))  # TRANSPOSED vs stored (64, 48)
+    fm = metareader.read_file_meta(data)
+    assert len(fm.faces) == 1
+    stored_rect, name = fm.faces[0]
+    assert name == "Ada"
+    back = map_fraction_rect(stored_rect, 6, 0)
+    assert back == pytest.approx(display_rect_meant, abs=1e-6)
+
+
+def test_metareader_faces_orientation_frame_no_transpose_when_matching(
+        ) -> None:
+    """AppliedToDimensions equal to the stored dims AS-IS (no transpose)
+    leaves the region exactly as computed — the common/expected case."""
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(64, 48), orientation=6,
+        faces=[("Ada", 0.5, 0.25, 0.2, 0.2)],
+        applied_dims=(64, 48))  # matches stored, no transpose
+    fm = metareader.read_file_meta(data)
+    assert fm.faces[0][0] == pytest.approx((0.4, 0.15, 0.6, 0.35))
+
+
+def test_metareader_faces_orientation_frame_absent_keeps_as_is() -> None:
+    """No AppliedToDimensions at all: the pre-guard behavior (region used
+    exactly as computed) — the guard must not require the property."""
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(64, 48), orientation=6,
+        faces=[("Ada", 0.5, 0.25, 0.2, 0.2)])
+    fm = metareader.read_file_meta(data)
+    assert fm.faces[0][0] == pytest.approx((0.4, 0.15, 0.6, 0.35))
 
 
 def test_scan_ini_geotag_and_star_count(tmp_path: Path) -> None:
@@ -7830,6 +8149,48 @@ def test_search_haystack_rebuilt_on_cold_index_finish(
     win.search.setText("windswept")             # re-fire textChanged
     assert _hits(win) == {"dunes.jpg"}          # fresh haystacks
     capsys.readouterr()                         # swallow the indexed event
+
+
+def test_people_sidebar_reflects_xmp_faces_on_cold_index_finish(
+        tmp_path: Path) -> None:
+    """fauxcasa-cam.5 review fix: the cold-build branch of
+    _on_index_finished must rebuild the sidebar like _on_backfill_done
+    already does, so an XMP-only face (added by the indexer's §4 merge,
+    fauxcasa-cam.5) shows up under People immediately — no reveal toggle,
+    no relaunch, no separate sidebar-refreshing action needed."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+    from main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    def item_for(win, kind: str, key: str):
+        it = QTreeWidgetItemIterator(win.tree)
+        while it.value():
+            if it.value().data(0, Qt.ItemDataRole.UserRole) == (kind, key):
+                return it.value()
+            it += 1
+        return None
+
+    import metareader
+
+    root = tmp_path / "lib"
+    data = metareader.embed_test_metadata(
+        _jpeg_bytes(), faces=[("Xmp Person", 0.5, 0.5, 0.2, 0.2)])
+    (root / "p.jpg").parent.mkdir(parents=True, exist_ok=True)
+    (root / "p.jpg").write_bytes(data)
+
+    win = MainWindow(scan_library(root), None, cache_dir=None, build_dir=None)
+    assert item_for(win, "person", "Xmp Person") is None  # pre-index: unknown
+
+    result = thumbcache.build_cache(win.catalog, tmp_path / "cache")
+    assert result is not None
+    win._on_index_finished(result, win.catalog, False)  # cold-build finish
+
+    assert item_for(win, "person", "Xmp Person") is not None
+    assert not win.reveal_box.isChecked()  # no reveal toggle needed
 
 
 def test_import_notes_refresh_on_cold_index_finish(
@@ -14275,12 +14636,13 @@ def test_multiroot_two_root_save_load_roundtrip_v13(tmp_path: Path) -> None:
     explicit "R" (fauxcasa-ed5.5: now at the GROUP level, since grouping
     is by (root_id, folder) — see _group_photo_rows), and
     Catalog.roots/library_id survive the reload.
-    (== 14: the newest version-gate test pins the exact value — bumped
-    from 13 by fauxcasa-cam.14 step 4's ini_sigs/contacts_sig fields.)"""
+    (== 15: the newest version-gate test pins the exact value — bumped
+    from 14 by fauxcasa-cam.5's XMP-faces merge, a value-completeness
+    bump, not a schema change.)"""
     import catalog as catmod
     from catalog import Catalog, Folder, Photo
 
-    assert catmod.CATALOG_VERSION == 14
+    assert catmod.CATALOG_VERSION == 15
     root_a, root_b = tmp_path / "a", tmp_path / "b"
     root_a.mkdir()
     root_b.mkdir()
@@ -14613,11 +14975,35 @@ def test_v13_catalog_rejected_after_v14_bump(
     save_catalog(cat, path)
 
     data = _raw_catalog(path)
-    assert data["version"] == catmod.CATALOG_VERSION == 14
+    assert data["version"] == catmod.CATALOG_VERSION == 15
     data.pop("ini_sigs", None)      # a real v13 file never had these
     data.pop("contacts_sig", None)
     data["version"] = 13
     _write_raw_catalog(path, data)  # still zstd-wrapped: v13 always was
+
+    assert load_catalog(path, library) is None
+
+
+def test_v14_catalog_rejected_after_v15_bump(
+        library: Path, tmp_path: Path) -> None:
+    """fauxcasa-cam.5 bumped CATALOG_VERSION 14->15: a genuine pre-bump v14
+    file is STRUCTURALLY identical (the bump is value-completeness — a v14
+    catalog's Photo.faces may lack XMP-only faces/names, not a schema
+    change — see the CATALOG_VERSION comment), so there is no field to
+    strip here; only the version number itself distinguishes it, and that
+    alone is enough to reject and cold-rebuild, same posture as every
+    prior bump."""
+    import catalog as catmod
+
+    cat = scan_library(library)
+    thumbcache.build_cache(cat, tmp_path / "c")
+    path = tmp_path / "catalog.json"
+    save_catalog(cat, path)
+
+    data = _raw_catalog(path)
+    assert data["version"] == catmod.CATALOG_VERSION == 15
+    data["version"] = 14
+    _write_raw_catalog(path, data)  # still zstd-wrapped: v14 always was
 
     assert load_catalog(path, library) is None
 

@@ -42,6 +42,27 @@ downstream merge (catalog/thumbcache) can compare XMP faces and ini faces
 by rect geometry without knowing which store a photo came from. No
 contact ids here — those are a Picasa-catalog concept; a bare (rect,
 name-or-None) pair is the library-neutral shape.
+
+ORIENTATION FRAME — an ASSUMPTION, guarded, not a proven fact: MWG
+Regions 2.0 ties stArea coordinates to a companion
+mwg-rs:AppliedToDimensions (stDim:w/h), and this module ASSUMES writers
+populate that with the file's STORED (unrotated) pixel dimensions — the
+same frame every other rect64-shaped field in this app already uses
+(ini faces=/crop=), so a region would need no adjustment. That
+assumption is NOT yet verified against real Picasa or Wine-oracle XMP
+output (owner-filed follow-up, fauxcasa-uwi — cite its ratified finding
+here once it lands). The guard: when
+AppliedToDimensions is present and its w/h equal the file's stored
+dimensions (exiv2's own pixelWidth()/pixelHeight(), not the display-
+rotated size), a region is used exactly as computed. When it instead
+equals the stored dimensions TRANSPOSED (w<->h, non-square only) — i.e.
+a writer expressed the region in the EXIF-upright DISPLAY frame — the
+region is rotated back into the stored frame by the inverse of the
+file's own Orientation tag (cropmap.map_fraction_rect, the same
+transform the viewer's face overlay and crop bake already use — no new
+math). Absent or matching neither shape: the region is kept AS-IS (the
+pre-guard behavior) and the mismatch is logged at debug, never raised or
+silently dropped.
 """
 
 from __future__ import annotations
@@ -51,6 +72,9 @@ import math
 import struct
 import threading
 from dataclasses import dataclass
+
+from cropmap import map_fraction_rect
+from decodesvc import MAX_CAPTION_BYTES, MAX_FACES, MAX_KEYWORDS
 
 log = logging.getLogger("fauxcasa")
 
@@ -88,7 +112,8 @@ class FileMeta:
     # region with no Type at all — MWG's documented default) and
     # stArea:unit == "normalized" (or absent) regions are included; other
     # types (Pet, BarCode, ...) and pixel-unit regions are skipped. Capped
-    # at _FACE_CAP entries so a hostile packet cannot balloon the catalog.
+    # at decodesvc.MAX_FACES entries so a hostile packet cannot balloon
+    # the catalog (the same cap the future decode sandbox enforces).
     faces: tuple[tuple[tuple[float, float, float, float], str | None], ...] \
         = ()
 
@@ -195,43 +220,139 @@ def _parse_rating(value: str | None) -> int | None:
     return max(0, min(5, r))
 
 
+def _parse_orientation(value: str | None) -> int:
+    """EXIF Orientation string -> 1..8, fail-soft 1 (absent/garbage/out-of-
+    range) — same clamp as read_orientation, duplicated here in string
+    form because read_file_meta collects Orientation into the same exif
+    dict as every other field (one exiv2 open) rather than calling
+    read_orientation (which opens the image a second time)."""
+    if value is None:
+        return 1
+    try:
+        v = int(value.strip())
+    except (ValueError, TypeError):
+        return 1
+    return v if 1 <= v <= 8 else 1
+
+
 def _parse_caption(value: str | None) -> str | None:
-    """dc:description toString() -> the x-default (or only) alternative's
-    text. python-exiv2 renders a LangAlt as ``lang="<code>" <text>``
-    (confirmed against jpeg_full's XMP: docs/research/spikes/
-    metadata-lib-spike.py read_exiv2); a plain (non-LangAlt) value passes
-    through unchanged. Blank -> None."""
+    """dc:description toString() -> the x-default (or first) alternative's
+    text, TRUNCATED to MAX_CAPTION_BYTES (fauxcasa-cam.5: ExtendedXMP
+    removed the natural ~64 KB single-APP1-segment bound a caption used to
+    have, so an 8 MiB packet's caption text must not reach the catalog/
+    search haystack whole).
+
+    python-exiv2 renders a LangAlt with N>=2 alternatives as
+    ``lang="<code>" <text>, lang="<code>" <text>, ...`` (confirmed
+    empirically: see the module's test for two languages) — a single-
+    alternative LangAlt is just ``lang="<code>" <text>`` with no trailing
+    ``, lang="..."``. Strip the leading lang tag, then cut at the first
+    ``, lang="`` boundary so only the FIRST (x-default, since exiv2/most
+    writers list it first) alternative is kept; a plain (non-LangAlt)
+    value has neither marker and passes through unchanged. Blank -> None."""
     if not value:
         return None
     if value.startswith("lang="):
         value = value.split(" ", 1)[-1] if " " in value else ""
+    value = value.split(', lang="')[0]
     value = value.strip()
+    if not value:
+        return None
+    encoded = value.encode("utf-8")
+    if len(encoded) > MAX_CAPTION_BYTES:
+        encoded = encoded[:MAX_CAPTION_BYTES]
+        while encoded:  # never split a multi-byte UTF-8 sequence in half
+            try:
+                value = encoded.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                encoded = encoded[:-1]
+        else:
+            value = ""
     return value or None
 
 
 def _parse_subject(value: str | None) -> tuple[str, ...]:
     """dc:subject toString() -> its comma-joined Bag items, split back out
     (same rendering as _parse_caption's LangAlt: exiv2's Value::toString()
-    joins XMP arrays with ", "). A keyword containing a literal comma is
-    not distinguishable from two keywords — the same limitation the ini
-    keywords= reader (catalog.py) already has."""
+    joins XMP arrays with ", "), capped at MAX_KEYWORDS entries (same
+    ExtendedXMP-removed-the-natural-bound reasoning as the caption cap). A
+    keyword containing a literal comma is not distinguishable from two
+    keywords — the same limitation the ini keywords= reader (catalog.py)
+    already has."""
     if not value:
         return ()
-    return tuple(k.strip() for k in value.split(",") if k.strip())
+    return tuple(k.strip() for k in value.split(",")
+                if k.strip())[:MAX_KEYWORDS]
 
 
-def _parse_mwg_faces(xmp: dict[str, str]
+# EXIF orientation's inverse, by value (fauxcasa-cam.5's AppliedToDimensions
+# frame fix): the 8 EXIF orientation transforms (cropmap.ORIENT_MAP) form a
+# dihedral group; every transform is its own inverse EXCEPT the two 90°
+# rotations, which invert to each other. Applying map_fraction_rect twice
+# with a value and its inverse is the identity (verified in the module's
+# test alongside the transpose-detection fixtures).
+_INVERSE_ORIENTATION = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 8, 7: 7, 8: 6}
+
+_MWG_APPLIED_DIMS = "Xmp.mwg-rs.Regions/mwg-rs:AppliedToDimensions"
+
+
+def _parse_mwg_faces(xmp: dict[str, str], orientation: int = 1,
+                     stored_dims: tuple[int, int] | None = None
                      ) -> tuple[tuple[tuple[float, float, float, float],
                                       str | None], ...]:
     """mwg-rs RegionList (already filtered into `xmp` by read_file_meta) ->
-    (rect, name-or-None) pairs. See FileMeta.faces for the field contract."""
+    (rect, name-or-None) pairs. See FileMeta.faces for the field contract.
+
+    Orientation-frame guard (owner-filed follow-up: verify MWG region
+    frame against the Picasa/Wine oracle, fauxcasa-uwi):
+    MWG Regions 2.0 defines stArea coordinates relative to
+    mwg-rs:AppliedToDimensions (stDim:w/h) — an ASSUMPTION, not yet
+    oracle-verified, that writers populate this with the file's STORED
+    (unrotated) pixel dimensions, matching every other rect64-shaped field
+    in this app (ini faces=/crop=). `stored_dims` is that same-file
+    reference (read_file_meta passes exiv2's own pixelWidth()/
+    pixelHeight(), which reports the raw encoded raster regardless of any
+    Orientation tag). Two outcomes when AppliedToDimensions is PRESENT:
+    it already matches stored_dims (as expected: no adjustment), or it
+    matches stored_dims TRANSPOSED (w<->h, and the file isn't square) —
+    meaning the writer expressed regions in the DISPLAY (EXIF-upright)
+    frame instead, so each region is rotated back into the stored frame
+    by the inverse of the file's own EXIF orientation (reusing
+    cropmap.map_fraction_rect, the same stored<->display transform the
+    viewer's face overlay and crop bake already share — no new math).
+    Absent or inconsistent with EITHER shape: kept as-is (the pre-fix
+    behavior) and logged at debug, never raised or dropped."""
+    transpose = False
+    if stored_dims is not None:
+        aw_raw = xmp.get(f"{_MWG_APPLIED_DIMS}/stDim:w")
+        ah_raw = xmp.get(f"{_MWG_APPLIED_DIMS}/stDim:h")
+        if aw_raw is not None and ah_raw is not None:
+            try:
+                aw, ah = float(aw_raw), float(ah_raw)
+            except (ValueError, TypeError):
+                aw = ah = float("nan")
+            sw, sh = stored_dims
+            if math.isfinite(aw) and math.isfinite(ah):
+                if round(aw) == sw and round(ah) == sh:
+                    pass  # already the stored frame: no adjustment needed
+                elif round(aw) == sh and round(ah) == sw and sw != sh:
+                    transpose = True
+                else:
+                    log.debug(
+                        "mwg-rs AppliedToDimensions %sx%s matches neither "
+                        "stored %dx%d nor its transpose; using regions "
+                        "as-is", aw_raw, ah_raw, sw, sh)
+    inv_orientation = _INVERSE_ORIENTATION.get(orientation, orientation)
+
     faces: list[tuple[tuple[float, float, float, float], str | None]] = []
     for i in range(1, _REGION_INDEX_CAP + 1):
-        if len(faces) >= _FACE_CAP:
+        if len(faces) >= MAX_FACES:
             break
         prefix = f"{_MWG_REGIONLIST}[{i}]/mwg-rs:Area/stArea:"
         if prefix + "x" not in xmp:
-            break  # RegionList is a contiguous Bag: no gaps, so this ends it
+            continue  # a malformed/incomplete region: skip, don't assume
+                      # the RegionList ends here (the index cap terminates)
         region_type = xmp.get(f"{_MWG_REGIONLIST}[{i}]/mwg-rs:Type")
         if region_type is not None and region_type.strip().lower() not in \
                 ("", "face"):
@@ -249,10 +370,13 @@ def _parse_mwg_faces(xmp: dict[str, str]
             continue
         if not all(math.isfinite(v) for v in (x, y, w, h)) or w <= 0 or h <= 0:
             continue
-        left = max(0.0, min(1.0, x - w / 2.0))
-        top = max(0.0, min(1.0, y - h / 2.0))
-        right = max(0.0, min(1.0, x + w / 2.0))
-        bottom = max(0.0, min(1.0, y + h / 2.0))
+        left, top = x - w / 2.0, y - h / 2.0
+        right, bottom = x + w / 2.0, y + h / 2.0
+        if transpose:
+            left, top, right, bottom = map_fraction_rect(
+                (left, top, right, bottom), inv_orientation, 0)
+        left, top = max(0.0, min(1.0, left)), max(0.0, min(1.0, top))
+        right, bottom = max(0.0, min(1.0, right)), max(0.0, min(1.0, bottom))
         if right <= left or bottom <= top:
             continue  # degenerate after clamping (e.g. entirely off-frame)
         name = (xmp.get(f"{_MWG_REGIONLIST}[{i}]/mwg-rs:Name") or "").strip()
@@ -314,6 +438,9 @@ _EXIF_KEYS = frozenset((
     "Exif.Image.DateTime",
     "Exif.GPSInfo.GPSLatitude", "Exif.GPSInfo.GPSLatitudeRef",
     "Exif.GPSInfo.GPSLongitude", "Exif.GPSInfo.GPSLongitudeRef",
+    "Exif.Image.Orientation",  # also read here (not just read_orientation)
+                               # so the faces-in-XMP frame guard doesn't
+                               # need a second exiv2 open for the same bytes
 ))
 _XMP_RATING_KEY = "Xmp.xmp.Rating"
 _ORIENTATION_KEY = "Exif.Image.Orientation"
@@ -321,12 +448,11 @@ _CAPTION_KEY = "Xmp.dc.description"
 _SUBJECT_KEY = "Xmp.dc.subject"
 _MWG_REGIONLIST = "Xmp.mwg-rs.Regions/mwg-rs:RegionList"
 
-# Faces-in-XMP caps (fauxcasa-cam.5): _FACE_CAP bounds the OUTPUT (a
-# hostile packet cannot balloon the catalog); _REGION_INDEX_CAP bounds how
-# far the 1-based mwg-rs:RegionList[N] scan looks before giving up, even
-# when every region is skipped as non-Face/non-normalized (so a packet
-# full of *rejected* regions cannot spin the loop unboundedly either).
-_FACE_CAP = 64
+# _REGION_INDEX_CAP (fauxcasa-cam.5) bounds how far the 1-based
+# mwg-rs:RegionList[N] scan looks before giving up, even when every region
+# is skipped as non-Face/non-normalized/malformed (so a packet full of
+# *rejected* regions cannot spin the loop unboundedly either); the OUTPUT
+# cap is decodesvc.MAX_FACES, shared with the future decode sandbox.
 _REGION_INDEX_CAP = 4096
 
 
@@ -376,6 +502,7 @@ def read_file_meta(data: bytes, extended_xmp: bytes | None = None) -> FileMeta:
         return EMPTY
     exif: dict[str, str] = {}
     xmp: dict[str, str] = {}
+    stored_dims: tuple[int, int] | None = None
     try:
         with _LOCK:
             img = exiv2.ImageFactory.open(data)  # bytes-mode: sniffs the type
@@ -391,11 +518,23 @@ def read_file_meta(data: bytes, extended_xmp: bytes | None = None) -> FileMeta:
                 # that this module has no business holding in memory.
                 if k == _XMP_RATING_KEY or k == _CAPTION_KEY \
                         or k == _SUBJECT_KEY \
-                        or k.startswith(_MWG_REGIONLIST):
+                        or k.startswith(_MWG_REGIONLIST) \
+                        or k.startswith(_MWG_APPLIED_DIMS):
                     xmp[k] = d.toString()
             if extended_xmp:
                 for k, v in _read_extended_xmp(exiv2, extended_xmp).items():
                     xmp.setdefault(k, v)  # main packet wins per key
+            # The container's own raw (unrotated) raster dims — same img,
+            # no second open — for the faces-in-XMP orientation-frame
+            # guard (_parse_mwg_faces). pixelWidth/Height report the
+            # STORED size regardless of any Orientation tag (verified:
+            # tagging orientation=6 on a 64x48 JPEG still reports 64x48).
+            try:
+                w, h = img.pixelWidth(), img.pixelHeight()
+                if w > 0 and h > 0:
+                    stored_dims = (w, h)
+            except Exception:  # noqa: BLE001 — best-effort across formats
+                pass
     except Exception:  # noqa: BLE001 — hostile bytes: exiv2 raises, we shrug
         return EMPTY
 
@@ -412,11 +551,12 @@ def read_file_meta(data: bytes, extended_xmp: bytes | None = None) -> FileMeta:
             and abs(lat) <= 90.0 and abs(lon) <= 180.0:
         gps = (lat, lon)
 
+    orientation = _parse_orientation(exif.get(_ORIENTATION_KEY))
     return FileMeta(date_taken=date_taken, gps=gps,
                     rating=_parse_rating(xmp.get(_XMP_RATING_KEY)),
                     caption=_parse_caption(xmp.get(_CAPTION_KEY)),
                     keywords=_parse_subject(xmp.get(_SUBJECT_KEY)),
-                    faces=_parse_mwg_faces(xmp))
+                    faces=_parse_mwg_faces(xmp, orientation, stored_dims))
 
 
 # ---- test-fixture support ---------------------------------------------------
@@ -440,6 +580,7 @@ def embed_test_metadata(data: bytes, *,
                         keywords: list[str] | None = None,
                         faces: list[tuple[str | None, float, float,
                                           float, float]] | None = None,
+                        applied_dims: tuple[int, int] | None = None,
                         ) -> bytes:
     """Write date/GPS/Rating/caption/keywords/faces INTO image bytes —
     TEST-FIXTURE SUPPORT ONLY.
@@ -468,6 +609,12 @@ def embed_test_metadata(data: bytes, *,
     suggested region). The Bag container itself must exist before any
     indexed sub-key can be assigned (XMP Toolkit error 102 "Indexing
     applied to non-array" otherwise) — built once, on first use.
+
+    applied_dims -> mwg-rs:AppliedToDimensions (stDim:w/h, unit "pixel"):
+    plant it deliberately mismatched from the fixture's real stored pixel
+    size to synthesize the "writer used the DISPLAY frame" case the
+    orientation-frame guard (_parse_mwg_faces) exists for; omit it (the
+    default) to test the "no AppliedToDimensions at all" as-is fallback.
     """
     exiv2 = _module()
     if exiv2 is None:
@@ -497,6 +644,11 @@ def embed_test_metadata(data: bytes, *,
             for kw in keywords:
                 xmp[_SUBJECT_KEY] = kw
         if faces:
+            if applied_dims is not None:
+                aw, ah = applied_dims
+                xmp[f"{_MWG_APPLIED_DIMS}/stDim:w"] = str(aw)
+                xmp[f"{_MWG_APPLIED_DIMS}/stDim:h"] = str(ah)
+                xmp[f"{_MWG_APPLIED_DIMS}/stDim:unit"] = "pixel"
             base = exiv2.XmpTextValue()
             base.setXmpArrayType(exiv2.XmpValue.XmpArrayType.xaBag)
             xmp.add(exiv2.XmpKey(_MWG_REGIONLIST), base)

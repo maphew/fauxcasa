@@ -1735,7 +1735,17 @@ def scan_library(root: Path,
 # these signals close that gap (reconcile_walk's Drift.ini_changed; the
 # contacts_sig check in main._reconcile_online_roots, done ONCE per
 # library, not per root).
-CATALOG_VERSION = 14
+#
+# v15 (fauxcasa-cam.5): the indexer now merges faces-in-XMP into
+# Photo.faces (thumbcache.apply_photo_meta / _merge_xmp_faces) — an XMP
+# name can rename an ini-matched face's display name, or an XMP-only
+# region can be ADDED as a whole new FaceTag. A v14 (or older) catalog was
+# built/persisted before that merge ran, so its Photo.faces may be
+# missing XMP-only faces or carry stale display names entirely; the
+# FaceTag shape itself is unchanged (still (rect, contact_id, name)), so
+# this is a value-completeness bump, not a schema bump — same "no
+# migration, cold-rebuild" posture as v9/v14 above.
+CATALOG_VERSION = 15
 # The last pre-multiroot format (fauxcasa-ed5.7.2, bead .b): load_catalog's
 # ONLY version-compat carve-out, and only when the library has exactly one
 # root (see load_catalog). A fixed number, not "CATALOG_VERSION - 1" — see

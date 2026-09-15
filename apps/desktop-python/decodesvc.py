@@ -9,6 +9,10 @@ MAX_PIXELS, ARENA_BYTES, ...). Real code imports these directly:
 decodesvc_win.py (the Windows sandbox transport), decodefacade.py (its
 error mapping), thumbcache.py (MAX_EDGE), and videostream.py (StreamInfo
 plus the exception types) all build on the types defined here.
+metareader.py and inmeta.py import the MAX_* trusted-side caps
+(MAX_CAPTION_BYTES, MAX_KEYWORDS, MAX_FACES) so the in-file-metadata
+size limits defined here for the sandbox apply today at the exiv2 and
+hand-rolled read sites too (fauxcasa-cam.5).
 
 The abstract `Transport`, `StreamHandle`, and `DecodeService` classes
 below are the ORIGINAL design sketch and are not subclassed by any real

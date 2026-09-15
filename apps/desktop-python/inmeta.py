@@ -43,6 +43,8 @@ import struct
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
+from decodesvc import MAX_CAPTION_BYTES, MAX_KEYWORDS
+
 # JPEG markers we care about (all big-endian, per JFIF/EXIF).
 _SOI = 0xD8
 _EOI = 0xD9
@@ -147,6 +149,26 @@ def _decode(raw: bytes) -> str:
         return raw.decode("latin-1", "replace")
 
 
+def _truncate_caption(text: str | None) -> str | None:
+    """Cut `text` to MAX_CAPTION_BYTES of UTF-8, never splitting a
+    multi-byte sequence (fauxcasa-cam.5: ExtendedXMP removed the natural
+    ~64 KB single-APP1-segment bound a caption used to have, so nothing
+    else stops a hostile packet's multi-MB "caption" from reaching the
+    catalog/search haystack whole)."""
+    if not text:
+        return text
+    encoded = text.encode("utf-8")
+    if len(encoded) <= MAX_CAPTION_BYTES:
+        return text
+    encoded = encoded[:MAX_CAPTION_BYTES]
+    while encoded:
+        try:
+            return encoded.decode("utf-8")
+        except UnicodeDecodeError:
+            encoded = encoded[:-1]
+    return None
+
+
 def _iter_segments(data: bytes):
     """Yield (marker, payload) for each JPEG marker segment up to the start
     of compressed data (SOS) or EOI. Bails silently on anything that isn't a
@@ -190,40 +212,57 @@ def extended_xmp(data: bytes) -> bytes | None:
     packet carries (callers that feed this into an XMP parser add that
     prefix themselves, same as the main-packet payload).
 
-    None when: there is no HasExtendedXMP note in the main packet, no
-    extension segments match its GUID, the declared total length exceeds
-    _MAX_EXTENDED_XMP_BYTES, or the chunks (sorted by their declared
-    offset) don't tile the declared length exactly — a gap, an overlap, or
-    a short read all count as unusable rather than best-effort partial.
-    Fail-soft: malformed segments never raise, they just fail the
-    reassembly like any other input that doesn't fit the shape."""
+    None when: there is no HasExtendedXMP note in the main packet AND no
+    extension chunk to fall back on, no extension segments match the
+    adopted GUID, chunks disagree on the declared total length, that
+    length exceeds _MAX_EXTENDED_XMP_BYTES, or the chunks (sorted by their
+    declared offset) don't tile the declared length exactly — a gap, an
+    overlap, or a short read all count as unusable rather than best-effort
+    partial. Fail-soft: malformed segments never raise, they just fail the
+    reassembly like any other input that doesn't fit the shape.
+
+    GUID resolution is two-pass and UNCONDITIONAL on the main packet: the
+    whole file is scanned for the main XMP APP1's HasExtendedXMP note
+    FIRST, regardless of where the extension segments physically sit
+    (a spec-conformant writer always places the main packet before its
+    extensions, but this reader doesn't depend on that order to find the
+    note); only once that's settled are extension chunks filtered by it.
+    A real limitation, not a "not implemented yet": a file whose main
+    packet carries no HasExtendedXMP note at all (so nothing ties any
+    chunk to "the" packet) falls back to adopting the first extension
+    chunk's own GUID — there is no other signal to use, and a mismatched
+    stray chunk from some other packet still gets rejected by the
+    resulting GUID filter."""
     try:
         guid: bytes | None = None
-        chunks: dict[int, bytes] = {}
-        total_len: int | None = None
         for marker, payload in _iter_segments(data):
-            if marker != _APP1:
-                continue
-            if guid is None and payload.startswith(_XMP_PREFIX):
+            if marker == _APP1 and payload.startswith(_XMP_PREFIX):
                 m = _HAS_EXTENDED_XMP_RE.search(payload)
                 if m:
                     guid = m.group(1).upper()
-            elif payload.startswith(_EXT_XMP_PREFIX):
-                body = payload[len(_EXT_XMP_PREFIX):]
-                if len(body) < _EXT_GUID_LEN + 8:
-                    continue  # too short to carry the length/offset header
-                chunk_guid = body[:_EXT_GUID_LEN].upper()
-                length, offset = struct.unpack(
-                    ">II", body[_EXT_GUID_LEN:_EXT_GUID_LEN + 8])
-                chunk = body[_EXT_GUID_LEN + 8:]
-                if guid is not None and chunk_guid != guid:
-                    continue  # a different packet's leftover chunk: ignore
-                if guid is None:
-                    guid = chunk_guid  # no HasExtendedXMP seen (yet): adopt
-                if length > _MAX_EXTENDED_XMP_BYTES:
-                    return None
+        chunks: dict[int, bytes] = {}
+        total_len: int | None = None
+        for marker, payload in _iter_segments(data):
+            if marker != _APP1 or not payload.startswith(_EXT_XMP_PREFIX):
+                continue
+            body = payload[len(_EXT_XMP_PREFIX):]
+            if len(body) < _EXT_GUID_LEN + 8:
+                continue  # too short to carry the length/offset header
+            chunk_guid = body[:_EXT_GUID_LEN].upper()
+            length, offset = struct.unpack(
+                ">II", body[_EXT_GUID_LEN:_EXT_GUID_LEN + 8])
+            chunk = body[_EXT_GUID_LEN + 8:]
+            if guid is not None and chunk_guid != guid:
+                continue  # a different packet's leftover chunk: ignore
+            if guid is None:
+                guid = chunk_guid  # no HasExtendedXMP note anywhere: adopt
+            if total_len is None:
                 total_len = length
-                chunks[offset] = chunk  # last chunk at a given offset wins
+            elif length != total_len:
+                return None  # chunks disagree on the packet's total length
+            if length > _MAX_EXTENDED_XMP_BYTES:
+                return None
+            chunks[offset] = chunk  # last chunk at a given offset wins
         if guid is None or total_len is None or not chunks:
             return None
         assembled = bytearray()
@@ -404,4 +443,5 @@ def read_jpeg_metadata(data: bytes) -> InMeta:
     keywords = xmp.keywords if xmp.keywords else iptc.keywords
     if caption is None and not keywords:
         return EMPTY
-    return InMeta(caption=caption, keywords=keywords)
+    return InMeta(caption=_truncate_caption(caption),
+                 keywords=keywords[:MAX_KEYWORDS])
