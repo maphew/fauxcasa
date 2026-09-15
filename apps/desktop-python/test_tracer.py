@@ -11044,11 +11044,17 @@ def test_planned_keys_notice_instead_of_silence(tmp_path: Path) -> None:
     # an unknown key still falls through quietly (no notice spam)
     chord(win.viewer, Qt.Key.Key_Q)
     assert len(got) == before
-    # main-row '+' arrives as Shift+= (exact matching keeps Shift) and
-    # must reach the viewer's zoom-step notice — Picasa's "+/- (not the
-    # numeric keypad)"; the grid says nothing about video keys
-    chord(win.viewer, Qt.Key.Key_Plus, Qt.KeyboardModifier.ShiftModifier)
+    # main-row '+' keeps its Shift (exact matching) and the platform
+    # picks the key: Key_Equal on Windows/macOS ("Shift+="), Key_Plus on
+    # X11 ("Shift++"). Both spellings must reach the viewer's zoom-step
+    # notice — Picasa's "+/- (not the numeric keypad)"; the grid says
+    # nothing about video keys
+    shift = Qt.KeyboardModifier.ShiftModifier
+    chord(win.viewer, Qt.Key.Key_Plus, shift)
     assert "zoom in" in got[-1].lower()
+    before = len(got)
+    chord(win.viewer, Qt.Key.Key_Equal, shift)
+    assert len(got) == before + 1 and "zoom in" in got[-1].lower(), got[-1:]
     gg: list[str] = []
     win.grid.notice.connect(gg.append)
     chord(win.grid, Qt.Key.Key_Comma)

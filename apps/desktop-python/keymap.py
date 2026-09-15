@@ -374,8 +374,10 @@ _CONTEXT_LAYERED: frozenset[frozenset[str]] = frozenset({
 # there would EAT a working key — reviewer finding, PR for s6i). Each
 # entry: (chord aliases, (feature label, availability note)); aliases are
 # QKeySequence portable strings, listed because exact matching keeps
-# Shift, so main-row '+' arrives as "Shift++" while keypad '+' (keypad
-# modifier stripped) arrives as "+".
+# Shift and the platform decides the key: main-row '+' arrives as
+# "Shift+=" on Windows/macOS (the '=/+' key is Key_Equal there) but as
+# "Shift++" on X11 (shifted XK_plus), while keypad '+' (keypad modifier
+# stripped) arrives as "+".
 #
 # Not a scheme: a live binding always wins (planned() runs after every
 # matches() call), so a chord here that the same scope also binds — via
@@ -386,7 +388,7 @@ _CONTEXT_LAYERED: frozenset[frozenset[str]] = frozenset({
 # there), '/' is absent (app.search) and Ctrl+D is absent (grid.deselect).
 _M2_STARS = "planned for M2 (star-set keys 0-5)"
 _M3 = "planned for M3 (edit room)"
-_WRITES = "not yet available (writes land in M2)"
+_WRITES = "planned for M2 (library writes)"
 _EVERYWHERE: dict[tuple[str, ...], tuple[str, str]] = {
     ("Ctrl+3",): ("Edit mode", _M3),
     ("Ctrl+R",): ("Rotate clockwise", _M3),
@@ -399,12 +401,12 @@ _EVERYWHERE: dict[tuple[str, ...], tuple[str, str]] = {
     ("4",): ("Set 4 stars", _M2_STARS),
     ("5",): ("Set 5 stars", _M2_STARS),
     ("X",): ("Reject / reverse star", "planned for M2"),
-    ("Ctrl+O",): ("Add folder to library", "not yet available"),
+    ("Ctrl+O",): ("Add folder to library", "planned for a later milestone"),
     ("Ctrl+M",): ("Move to new folder", _WRITES),
     ("Ctrl+N",): ("New album", _WRITES),
     ("Ctrl+T",): ("Add tag", _WRITES),
-    ("Ctrl+E",): ("Export", "not yet available"),
-    ("Ctrl+P",): ("Print", "not yet available"),
+    ("Ctrl+E",): ("Export", "planned for a later milestone"),
+    ("Ctrl+P",): ("Print", "planned for a later milestone"),
 }
 PLANNED_KEYS: dict[str, dict[tuple[str, ...], tuple[str, str]]] = {
     "grid": {
@@ -419,8 +421,8 @@ PLANNED_KEYS: dict[str, dict[tuple[str, ...], tuple[str, str]]] = {
         **_EVERYWHERE,
         ("8",): ("Toggle star (Picasa viewer's 8)",
                  "use Space for now; 8 lands with M2 star machinery"),
-        ("PgUp", "+", "Shift++"): ("Zoom in one step",
-                                   "not yet available; 1 toggles 100%"),
+        ("PgUp", "+", "Shift++", "Shift+="): ("Zoom in one step",
+                                              "not yet available; 1 toggles 100%"),
         ("PgDown", "-"): ("Zoom out one step",
                           "not yet available; 1 toggles 100%"),
         (",",): ("Rewind video", "not yet available; Ctrl+Left skips back 5 s"),
