@@ -260,11 +260,13 @@ def _order_starred_newest_first(cat: Catalog, idxs: list[int]) -> list[int]:
     or mtime when date_taken is absent) sort descending by that key;
     genuinely dateless photos (no date_taken, no usable mtime) keep their
     incoming catalog order and sink after every dated photo, landing in
-    the trailing Undated group (see _starred_grouper)."""
-    dated = [i for i in idxs if _date_sort_key(cat.photos[i])[0] == 0]
-    undated = [i for i in idxs if _date_sort_key(cat.photos[i])[0] != 0]
-    dated.sort(key=lambda i: _date_sort_key(cat.photos[i]), reverse=True)
-    return dated + undated
+    the trailing Undated group (see _starred_grouper). One _date_sort_key
+    call per index (fauxcasa-q6l.20 review nit 11), not three."""
+    keyed = [(i, _date_sort_key(cat.photos[i])) for i in idxs]
+    dated = sorted((ik for ik in keyed if ik[1][0] == 0),
+                   key=lambda ik: ik[1], reverse=True)
+    undated = [ik for ik in keyed if ik[1][0] != 0]
+    return [i for i, _k in dated] + [i for i, _k in undated]
 
 
 def _starred_grouper(cat: Catalog, i: int) -> tuple[str, str, str | None]:
@@ -2380,9 +2382,14 @@ class MainWindow(QMainWindow):
         # QAction shortcut here, same reasoning as info_action's Space/I:
         # a window-level Shift+Space shortcut would fire while typing in
         # the search box. Shift+Space still works per-surface.
-        self.star_clear_action = view_menu.addAction("Clear Star(s)")
         _clear_chords = " / ".join(
             s.toString() for s in keymap.shortcuts("grid.star_clear"))
+        # A QMenu hides QAction tooltips (fauxcasa-q6l.20 review nit 9), so
+        # the tab-separated shortcut-column convention is what actually
+        # makes Shift+Space visible here — no QAction shortcut is bound
+        # (see the note above), this is text only.
+        self.star_clear_action = view_menu.addAction(
+            f"Clear Star(s)\t{_clear_chords}")
         self.star_clear_action.setToolTip(
             f"Clear stars on the current selection ({_clear_chords})")
         self.star_clear_action.triggered.connect(self._menu_clear_stars)
@@ -4292,6 +4299,10 @@ class MainWindow(QMainWindow):
             self.inspector.set_none()
 
     def _refresh_star_count(self) -> None:
+        # Deliberately ignores _star_min (fauxcasa-q6l.20 review nit 8):
+        # this is the sidebar's total-starred FACT (>=1), matching what a
+        # threshold of Any would show; the active view's own >=N★ label
+        # suffix (_label_with_stars) is what discloses the narrower count.
         reveal = self.grid.reveal
         n = sum(1 for p in self.catalog.photos
                 if (p.visible or reveal) and p.star)

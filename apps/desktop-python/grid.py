@@ -81,19 +81,6 @@ def folder_key(catalog: Catalog, root_id: str, rel: str) -> str:
     return f"{root_id}/{rel}" if rel else root_id
 
 
-def _folder_grouper(cat: Catalog, i: int) -> tuple[str, str, str | None]:
-    """Default set_filter grouping for catalog index `i`: by folder
-    (fauxcasa-q6l.20 clause b introduced the grouper hook on set_filter;
-    this function is exactly its pre-existing inline behavior, so the
-    default folder view is unchanged byte-for-byte). Returns
-    (group_key, title, description) — see set_filter's `grouper` param."""
-    photo = cat.photos[i]
-    f = folder_key(cat, photo.root_id, photo.folder)
-    folder = cat.folders.get(f)
-    title = folder.title if folder is not None else f
-    desc = folder.description if folder is not None else None
-    return f, title, desc
-
 
 class CompositeThumbCache:
     """Catalog-index facade over N independent per-root fcaches.
@@ -795,17 +782,35 @@ class GridView(QAbstractScrollArea):
             indices = [i for i, p in enumerate(cat.photos)
                        if p.visible or self.reveal]
             default_sort = True
-        if grouper is None:
-            grouper = _folder_grouper
         self.filter_label = label
         by_key: dict[str, _Group] = {}
-        for i in indices:
-            key, title, desc = grouper(cat, i)
-            g = by_key.get(key)
-            if g is None:
-                g = by_key[key] = _Group(folder=key, title=title, items=[],
-                                         description=desc)
-            g.items.append(i)
+        if grouper is None:
+            # Inline fast path (fauxcasa-q6l.20 review nit 12): the
+            # generic `grouper(cat, i)` indirection below measured ~50%
+            # slower here at 100k photos (10 -> 15 ms) on EVERY
+            # set_filter(None) — i.e. every default-view rebuild — purely
+            # from the extra call + tuple-unpack per item, so the common
+            # case keeps the old direct lookup and only a custom grouper
+            # (date-grouped Starred, clause b) pays the indirection.
+            for i in indices:
+                photo = cat.photos[i]
+                f = folder_key(cat, photo.root_id, photo.folder)
+                g = by_key.get(f)
+                if g is None:
+                    folder = cat.folders.get(f)
+                    title = folder.title if folder is not None else f
+                    desc = folder.description if folder is not None else None
+                    g = by_key[f] = _Group(folder=f, title=title, items=[],
+                                           description=desc)
+                g.items.append(i)
+        else:
+            for i in indices:
+                key, title, desc = grouper(cat, i)
+                g = by_key.get(key)
+                if g is None:
+                    g = by_key[key] = _Group(folder=key, title=title,
+                                             items=[], description=desc)
+                g.items.append(i)
         self.groups = list(by_key.values())
         # Per-folder sort modes (fauxcasa-q6l.11): reorder each group's
         # DISPLAY slice — never the catalog — on the folder-grouped default
