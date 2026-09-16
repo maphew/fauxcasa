@@ -95,10 +95,11 @@ _repo = os.path.dirname(os.path.dirname(_here))
 # save/load catalog.json at all. Wheels only, no system libs.
 _hidden = ["catalog", "grid", "thumbcache", "viewer", "slideshow", "peek",
            "inspector",
-           # librarystate (fauxcasa-4tu): persistence readers/writers split
-           # out of main.py, named here like its siblings above/below even
-           # though main.py imports it directly at module top.
-           "librarystate",
+           # librarystate/cli (fauxcasa-4tu): persistence readers/writers and
+           # argument-parsing/CLI-subcommand code split out of main.py, named
+           # here like their siblings above/below even though main.py
+           # imports both directly at module top.
+           "librarystate", "cli",
            "picasa_db", "applog", "metareader", "exiv2", "rawload", "rawpy",
            "videoload", "av", "pillowload", "PIL", "PIL.Image", "PIL.ImageOps",
            # pi-heif (fauxcasa-y5b): pillowload.pillow_qimage's HEIC/HEIF
