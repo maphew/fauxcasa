@@ -2561,6 +2561,302 @@ def test_spawn_survives_denied_acl_grant(monkeypatch, synthetic_png):
         worker.close()
 
 
+# ---------------------------------------------------------------------------
+# fauxcasa-yfq: sandbox silently degraded on a volume whose ACL refuses the
+# per-SID grant (the dev box's A: ReFS drive). Three pieces: the hello
+# reader keeps the bytes it consumed, spawn() turns a pre-hello death into
+# the real reason, and the worker script is staged under the cache root
+# when its own directory cannot be granted.
+
+_YFQ_NOISE_LINE_1 = "Failed to find real location of C:\\py\\python.exe"
+_YFQ_NOISE_LINE_2 = ("python.exe: can't open file 'X:\\repo\\apps\\desktop-python\\"
+                     "decodesvc_worker_win.py': [Errno 13] Permission denied")
+
+
+def _yfq_stub_code(exit_code: int) -> str:
+    """A fake worker: the gotcha-7 interpreter line, then the interpreter's
+    can't-open-script line (both to stdout, as the real spawn merges
+    stdout+stderr into one pipe), then exit."""
+    return (
+        "import sys\n"
+        f"sys.stdout.buffer.write({_YFQ_NOISE_LINE_1!r}.encode() + b'\\n')\n"
+        f"sys.stdout.buffer.write({_YFQ_NOISE_LINE_2!r}.encode() + b'\\n')\n"
+        "sys.stdout.buffer.flush()\n"
+        f"sys.exit({exit_code})\n"
+    )
+
+
+def test_prehello_death_two_noise_lines_then_exit_2_is_surfaced():
+    """fauxcasa-yfq: a worker that prints TWO diagnostic lines and exits 2
+    before hello used to surface as 'PROTOCOL: incoming control frame
+    1432107587 bytes exceeds MAX_CONTROL_MSG' (the second line's first
+    four bytes read as a length) with the real cause -- the interpreter
+    could not open its script -- discarded. The hello reader must keep
+    the bytes it consumed on the exception, and describe_prehello_death
+    must reassemble them with the rest of the pipe into a message naming
+    the script, the permission error, the exit code and the failed ACL
+    grant. Runs everywhere: a plain subprocess stands in for the
+    AppContainer worker (the reader and the describer are pure)."""
+    worker_script = "X:\\repo\\apps\\desktop-python\\decodesvc_worker_win.py"
+    grant_errors = {"X:\\repo\\apps\\desktop-python":
+                    "SetNamedSecurityInfoW(X:\\repo\\apps\\desktop-python) err=5"}
+    with subprocess.Popen([sys.executable, "-c", _yfq_stub_code(2)],
+                          stdout=subprocess.PIPE) as proc:
+        try:
+            with pytest.raises(DecodeServiceError) as ei:
+                dw._read_hello_frame_tolerant(proc.stdout)
+            leading = getattr(ei.value, "leading_bytes", None)
+            assert leading is not None, "hello reader must attach the bytes it consumed"
+            assert _YFQ_NOISE_LINE_1.encode() in leading
+            proc.wait(timeout=10)
+            assert proc.returncode == 2
+            tail = dw._drain_pipe(proc.stdout, dw.PREHELLO_OUTPUT_LIMIT)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+    output = leading + tail
+    # The second line was split by the 4-byte header read; reassembled
+    # it must be whole again.
+    assert _YFQ_NOISE_LINE_2.encode() in output
+
+    reason = dw.describe_prehello_death(output, proc.returncode, [worker_script], grant_errors)
+    assert "exit code 0x00000002" in reason
+    assert "can't open file" in reason and "Permission denied" in reason
+    assert "could not read the worker script" in reason and worker_script in reason
+    assert "ACL grant failed on: 'X:\\\\repo\\\\apps\\\\desktop-python'" in reason
+    assert "err=5" in reason
+    assert "MAX_CONTROL_MSG" not in reason, "the frame-length red herring must not lead"
+
+
+def test_prehello_death_names_pythonpath_when_that_grant_failed():
+    """fauxcasa-yfq companion: when the failed grant is the worker
+    PYTHONPATH (PySide6 on the ungrantable volume -- the case staging
+    cannot fix), the reason must say so and name the remediation."""
+    site = "X:\\uv\\cache\\env\\Lib\\site-packages"
+    out = b"E {\"fatal\": \"worker-main\", \"error\": \"ModuleNotFoundError('PySide6')\"}\n"
+    reason = dw.describe_prehello_death(out, 1, ["C:\\staged\\decodesvc_worker_win.py"],
+                                        {site: "err=5"}, pythonpath=site)
+    assert "worker PYTHONPATH" in reason
+    assert "UV_CACHE_DIR" in reason and "FAUXCASA_WORKER_PYTHON" in reason
+
+
+def test_hello_reader_still_tolerates_exactly_one_noise_line():
+    """fauxcasa-yfq regression guard for the DECISION not to widen the
+    reader: one gotcha-7 line followed by a real hello still parses (the
+    existing behavior), and the noise count reported is that one line."""
+    stub_code = (
+        "import sys, json, struct\n"
+        f"sys.stdout.buffer.write({_YFQ_NOISE_LINE_1!r}.encode() + b'\\n')\n"
+        "sys.stdout.buffer.flush()\n"
+        "msg = json.dumps({'hello': 1, 'proto': %d, "
+        "'bundle': {'id': 'x', 'version': 'y', 'components': {}}, "
+        "'ops': ['decode'], 'arena_bytes': %d, 'max_pixels': 1}).encode('utf-8')\n"
+        "sys.stdout.buffer.write(struct.pack('<I', len(msg)) + msg)\n"
+        "sys.stdout.buffer.flush()\n"
+    ) % (PROTO, SMALL_ARENA_BYTES)
+    with subprocess.Popen([sys.executable, "-c", stub_code],
+                          stdout=subprocess.PIPE) as proc:
+        try:
+            hello_msg, noise = dw._read_hello_frame_tolerant(proc.stdout)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+    assert hello_msg.get("hello") == 1
+    assert noise == len(_YFQ_NOISE_LINE_1) + 1
+
+
+def test_stage_worker_script_is_content_hashed_and_idempotent(tmp_path, monkeypatch):
+    """fauxcasa-yfq: the staged copy lives under <cache>/sandbox-worker/
+    <sha256[:16]>/, is reused byte-for-byte when the source is unchanged,
+    moves to a NEW hash dir when the source changes (a stale copy is never
+    what gets launched), and day-old hash dirs are pruned."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    src = tmp_path / "decodesvc_worker_win.py"
+    src.write_bytes(b"print('v1')\n")
+
+    first = Path(dw.stage_worker_script(str(src)))
+    assert first.is_file()
+    assert first.name == src.name
+    assert first.parent.parent == tmp_path / "localappdata" / "Fauxcasa" / "cache" / dw.WORKER_STAGING_DIRNAME
+    assert first.read_bytes() == src.read_bytes()
+    assert first.parent.name == hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+
+    again = Path(dw.stage_worker_script(str(src)))
+    assert again == first, "unchanged source must reuse the same staged copy"
+
+    src.write_bytes(b"print('v2')\n")
+    second = Path(dw.stage_worker_script(str(src)))
+    assert second != first, "an edited source must land in a different hash dir"
+    assert second.read_bytes() == b"print('v2')\n"
+    assert first.exists(), "a younger-than-a-day sibling is left for concurrent brokers"
+
+    old = time.time() - dw.WORKER_STAGING_MAX_AGE_SECONDS - 60
+    os.utime(first.parent, (old, old))
+    dw.stage_worker_script(str(src))
+    assert not first.parent.exists(), "a day-old hash dir must be pruned"
+    assert second.exists()
+
+
+def test_stage_worker_script_repairs_a_tampered_copy(tmp_path, monkeypatch):
+    """fauxcasa-yfq: an existing copy whose bytes differ from the source
+    (same hash dir, edited on disk) is overwritten, never launched."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    src = tmp_path / "decodesvc_worker_win.py"
+    src.write_text("print('ok')\n", encoding="utf-8")
+    staged = Path(dw.stage_worker_script(str(src)))
+    staged.write_text("print('tampered')\n", encoding="utf-8")
+    assert Path(dw.stage_worker_script(str(src))) == staged
+    assert staged.read_bytes() == src.read_bytes()
+
+
+def _yfq_stop_before_createprocess(monkeypatch):
+    def _boom_winsta(sid):
+        raise RuntimeError("stop before an actual CreateProcess (test scope)")
+    monkeypatch.setattr(dw, "grant_winsta_desktop", _boom_winsta)
+
+
+@_WINDOWS_ONLY
+def test_spawn_stages_worker_script_when_worker_dir_grant_fails(monkeypatch, tmp_path):
+    """fauxcasa-yfq: when grant_read_execute_once reports a failure for
+    the worker-script directory (and only for it), spawn() must launch
+    from a staged copy under the cache root, grant THAT directory, and
+    record the decision on the worker. Stops before CreateProcess."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setattr(dw, "_staging_logged", set())
+    source = Path(dw.__file__).resolve().with_name("decodesvc_worker_win.py")
+    worker_dir = str(source.parent)
+    granted = []
+
+    def fake_grant(path, sid, inherit=dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT):
+        granted.append(path)
+        if path == worker_dir:
+            return f"SetNamedSecurityInfoW({path}) err=5"
+        return None
+
+    monkeypatch.setattr(dw, "grant_read_execute_once", fake_grant)
+    _yfq_stop_before_createprocess(monkeypatch)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    with pytest.raises(RuntimeError, match="stop before"):
+        worker.spawn()
+
+    assert worker.worker_script_staged is True
+    staged = Path(worker.worker_script_path)
+    staging_root = tmp_path / "localappdata" / "Fauxcasa" / "cache" / dw.WORKER_STAGING_DIRNAME
+    assert staged.parent.parent == staging_root
+    assert staged.read_bytes() == source.read_bytes()
+    assert str(staging_root) in granted, "the staging root must receive the grant"
+    assert worker.grant_errors == {worker_dir: f"SetNamedSecurityInfoW({worker_dir}) err=5"}
+
+
+@_WINDOWS_ONLY
+def test_spawn_launches_from_source_when_every_grant_succeeds(monkeypatch, tmp_path):
+    """fauxcasa-yfq: the staging fallback is ONLY for a refused
+    worker-dir grant -- a normal box keeps launching the source file and
+    writes nothing under sandbox-worker/."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setattr(dw, "grant_read_execute_once", lambda path, sid, inherit=None: None)
+    _yfq_stop_before_createprocess(monkeypatch)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    with pytest.raises(RuntimeError, match="stop before"):
+        worker.spawn()
+    source = Path(dw.__file__).resolve().with_name("decodesvc_worker_win.py")
+    assert worker.worker_script_staged is False
+    assert Path(worker.worker_script_path) == source
+    assert not (tmp_path / "localappdata" / "Fauxcasa" / "cache" / dw.WORKER_STAGING_DIRNAME).exists()
+
+
+@_WINDOWS_ONLY
+def test_spawn_falls_back_to_source_when_staging_root_grant_fails_too(monkeypatch, tmp_path):
+    """fauxcasa-yfq: if the cache root refuses the grant as well (nothing
+    left to try), spawn() launches from the source path and reports both
+    failures rather than raising."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda path, sid, inherit=None: f"SetNamedSecurityInfoW({path}) err=5")
+    _yfq_stop_before_createprocess(monkeypatch)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    with pytest.raises(RuntimeError, match="stop before"):
+        worker.spawn()
+    source = Path(dw.__file__).resolve().with_name("decodesvc_worker_win.py")
+    assert worker.worker_script_staged is False
+    assert Path(worker.worker_script_path) == source
+    assert str(dw.worker_staging_root()) in worker.grant_errors
+
+
+class _YfqFakeChild:
+    """A plain subprocess dressed as decodesvc_win._ChildProcess so spawn()'s
+    pre-hello death handler runs against a real (unsandboxed) process that
+    prints two noise lines and exits 2 -- the observed A:-drive symptom."""
+
+    def __init__(self, proc):
+        self.proc = proc
+        self.pi = dw.PROCESS_INFORMATION()
+        self.pi.hProcess = int(proc._handle)
+        self.pi.hThread = 0
+        self.job = None
+        self.in_file = proc.stdin
+        self.out_file = proc.stdout
+
+    def is_alive(self):
+        return self.proc.poll() is None
+
+    def close(self):
+        self.proc.kill()
+        self.proc.wait(timeout=5)
+        for fh in (self.in_file, self.out_file):
+            try:
+                fh.close()
+            except OSError:
+                pass
+        self.pi = None
+
+
+@_WINDOWS_ONLY
+def test_spawn_reports_prehello_exit_2_as_worker_crashed_with_startup_output(monkeypatch):
+    """fauxcasa-yfq, end to end through spawn(): a child that exits 2
+    after two diagnostic lines must surface as WORKER_CRASHED (not
+    PROTOCOL -- it never spoke the protocol, so its output is not evidence
+    of compromise), with both lines and the failed grant in the message.
+    Everything up to CreateProcess is real except the grant (forced to
+    fail for the worker dir so the fallback path is exercised, and the
+    staging root so the source path is what gets 'launched') and the
+    spawn itself (replaced by the stub)."""
+    source = Path(dw.__file__).resolve().with_name("decodesvc_worker_win.py")
+    worker_dir = str(source.parent)
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda path, sid, inherit=None: f"SetNamedSecurityInfoW({path}) err=5")
+    monkeypatch.setattr(dw, "grant_winsta_desktop",
+                         lambda sid: {"window_station": "granted", "desktop": "granted"})
+    monkeypatch.setattr(dw, "_duplicate_into_child", lambda handle, hprocess: 0)
+    children = []
+
+    def fake_spawn(worker_python, worker_args, sid, pythonpath, extra_env, mem_limit_bytes):
+        proc = subprocess.Popen([sys.executable, "-c", _yfq_stub_code(2)],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        child = _YfqFakeChild(proc)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(dw, "_spawn_appcontainer", fake_spawn)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    try:
+        with pytest.raises(DecodeServiceError) as ei:
+            worker.spawn()
+    finally:
+        for child in children:
+            child.close()
+        worker.close()
+    err = ei.value
+    assert not isinstance(err, ProtocolViolation)
+    assert err.code is ErrorCode.WORKER_CRASHED
+    msg = str(err)
+    assert "exit code 0x00000002" in msg
+    assert _YFQ_NOISE_LINE_1 in msg
+    assert "can't open file" in msg and "Permission denied" in msg
+    assert worker_dir in msg and "err=5" in msg
+    assert not msg.startswith("PROTOCOL")
+
+
 class _FakeWinDecodePool:
     """Stand-in for decodesvc_win.WinDecodePool used to test DecodePoolSet's
     lease/borrow semantics WITHOUT spawning any real worker -- runs on

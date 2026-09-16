@@ -156,6 +156,12 @@ def _read_frame(fh: Any) -> dict:
     if payload is None:
         raise DecodeServiceError(
             ErrorCode.WORKER_CRASHED, "control pipe closed mid-frame")
+    return _decode_frame_payload(payload)
+
+
+def _decode_frame_payload(payload: bytes) -> dict:
+    """Parse one already-framed control payload; shared by the strict
+    _read_frame and the hello-tolerant reader's strict retry."""
     try:
         obj = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError) as e:
@@ -169,6 +175,23 @@ def _read_frame(fh: Any) -> dict:
     if not isinstance(obj, dict):
         raise ProtocolViolation(f"control frame is not a JSON object: {type(obj).__name__}")
     return obj
+
+
+def _drain_pipe(fh: Any, limit: int) -> bytes:
+    """Read whatever is left on `fh` up to `limit` bytes or EOF. Only safe
+    to call once the writer is known to be gone (the worker process has
+    exited and the broker closed its own copy of the write end at spawn),
+    otherwise this would block like any pipe read. Never raises."""
+    buf = bytearray()
+    try:
+        while len(buf) < limit:
+            chunk = fh.read(min(4096, limit - len(buf)))
+            if not chunk:
+                break
+            buf += chunk
+    except OSError:
+        pass
+    return bytes(buf)
 
 
 def _write_frame(fh: Any, obj: dict) -> None:
@@ -224,11 +247,24 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
     way ASCII noise presents), discard through the next newline (bounded)
     and retry the strict framing exactly once more. Two bounded attempts,
     no scanning; a payload that FRAMES but doesn't parse as a hello is a
-    protocol violation, never noise (see inline comment)."""
+    protocol violation, never noise (see inline comment).
+
+    fauxcasa-yfq: every exception raised here carries the raw bytes
+    consumed so far as `exc.leading_bytes`, so spawn() can reassemble the
+    worker's real startup output (these bytes plus whatever is still in
+    the pipe once the worker has exited) instead of reporting the second
+    noise line's first four bytes as a frame length. The ONE-line
+    tolerance itself is deliberately unchanged: a worker that is still
+    alive after two unframeable lines is not a known-good case, and
+    widening the pre-hello tolerance for it would loosen the parser for
+    every spawn to explain a failure that spawn() can explain better by
+    looking at the exit code."""
     header = _read_exact(fh, 4)
     if header is None:
-        raise DecodeServiceError(
+        exc = DecodeServiceError(
             ErrorCode.WORKER_CRASHED, "control pipe closed before any bytes (worker died before hello)")
+        exc.leading_bytes = b""
+        raise exc
     (length,) = struct.unpack("<I", header)
     consumed = bytearray(header)
     # Any 4 bytes drawn entirely from printable ASCII text (as this box's
@@ -242,8 +278,10 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
     if length <= MAX_CONTROL_MSG:
         payload = _read_exact(fh, length)
         if payload is None:
-            raise DecodeServiceError(
+            exc = DecodeServiceError(
                 ErrorCode.WORKER_CRASHED, "control pipe closed mid-frame while reading the first frame")
+            exc.leading_bytes = bytes(consumed)
+            raise exc
         consumed += payload
         # FIX 4 (P2) + Codex review PR110 (P2): ANYTHING that framed
         # successfully is worker protocol bytes, never gotcha-7 noise --
@@ -262,15 +300,21 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
         except (UnicodeDecodeError, ValueError, RecursionError) as e:
             # Same tuple as _read_frame: hostile capped JSON can raise bare
             # ValueError (huge int literal) or RecursionError (deep nesting).
-            raise ProtocolViolation(
-                f"first framed control message was not valid JSON: {e!r}") from e
+            exc = ProtocolViolation(
+                f"first framed control message was not valid JSON: {e!r}")
+            exc.leading_bytes = bytes(consumed)
+            raise exc from e
         if not isinstance(obj, dict):
-            raise ProtocolViolation(
+            exc = ProtocolViolation(
                 f"first framed control message was not a JSON object: "
                 f"{type(obj).__name__}")
+            exc.leading_bytes = bytes(consumed)
+            raise exc
         if obj.get("hello") != 1:
-            raise ProtocolViolation(
+            exc = ProtocolViolation(
                 f"first framed control message was not a hello handshake: {obj!r}")
+            exc.leading_bytes = bytes(consumed)
+            raise exc
         return obj, 0
 
     noise = bytes(consumed)
@@ -278,26 +322,127 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
         extra = bytearray()
         while b"\n" not in extra:
             if len(noise) + len(extra) >= HELLO_RESYNC_MAX_NOISE:
-                raise ProtocolViolation(
+                exc = ProtocolViolation(
                     f"first {len(noise) + len(extra)} bytes of worker stdout were not "
                     f"a valid hello frame and contained no newline to resync past: "
                     f"{bytes(noise + extra)!r}")
+                exc.leading_bytes = noise + bytes(extra)
+                raise exc
             b = fh.read(1)
             if not b:
-                raise DecodeServiceError(
+                exc = DecodeServiceError(
                     ErrorCode.WORKER_CRASHED,
                     f"control pipe closed while discarding a leading diagnostic "
                     f"line (gotcha 7); {len(noise) + len(extra)} noise bytes so "
                     f"far: {bytes(noise + extra)!r}")
+                exc.leading_bytes = noise + bytes(extra)
+                raise exc
             extra += b
         noise = noise + bytes(extra)
 
-    hello_msg = _read_frame(fh)  # strict retry -- no further tolerance
+    # Strict retry -- no further tolerance. Inlined rather than calling
+    # _read_frame so the 4 header bytes stay attached to any exception as
+    # leading_bytes: when they are really the first 4 characters of a
+    # SECOND diagnostic line (fauxcasa-yfq: "python.exe: can't open file
+    # ..." -> b'pyth'), spawn() needs them to show the line whole.
+    header2 = _read_exact(fh, 4)
+    if header2 is None:
+        exc = DecodeServiceError(
+            ErrorCode.WORKER_CRASHED,
+            "control pipe closed after a leading diagnostic line, before any frame "
+            "(worker died before hello)")
+        exc.leading_bytes = noise
+        raise exc
+    (length2,) = struct.unpack("<I", header2)
+    if length2 > MAX_CONTROL_MSG:
+        exc = ProtocolViolation(
+            f"incoming control frame {length2} bytes exceeds MAX_CONTROL_MSG "
+            f"{MAX_CONTROL_MSG} (after discarding {len(noise)} leading noise bytes)")
+        exc.leading_bytes = noise + header2
+        raise exc
+    payload2 = _read_exact(fh, length2)
+    if payload2 is None:
+        exc = DecodeServiceError(
+            ErrorCode.WORKER_CRASHED, "control pipe closed mid-frame")
+        exc.leading_bytes = noise + header2
+        raise exc
+    try:
+        hello_msg = _decode_frame_payload(payload2)
+    except ProtocolViolation as e:
+        e.leading_bytes = noise + header2 + payload2
+        raise
     if hello_msg.get("hello") != 1:
-        raise ProtocolViolation(
+        exc = ProtocolViolation(
             f"expected hello handshake after discarding {len(noise)} leading "
             f"noise bytes, got {hello_msg!r}")
+        exc.leading_bytes = noise + header2 + payload2
+        raise exc
     return hello_msg, len(noise)
+
+
+# fauxcasa-yfq: how much of a dead worker's remaining stdout/stderr spawn()
+# reads into the error message. Startup diagnostics are a few lines; the
+# cap only guards against a pathological worker that wrote a lot before
+# dying.
+PREHELLO_OUTPUT_LIMIT = 64 * 1024
+
+_PREHELLO_PERMISSION_MARKERS = ("permission denied", "errno 13", "access is denied",
+                                "can't open file", "cannot open file")
+
+
+def describe_prehello_death(output: bytes, exit_code: int | None, worker_args: list[str],
+                            grant_errors: dict[str, str],
+                            pythonpath: str | None = None) -> str:
+    """Turn a worker's pre-hello startup output plus its exit code into the
+    human-readable reason spawn() reports (fauxcasa-yfq). Pure function so
+    the tests can feed it a fake worker's output on any platform.
+
+    `output` is everything the worker wrote before dying (the bytes the
+    hello reader consumed plus whatever _drain_pipe recovered);
+    `grant_errors` is spawn()'s {path: error} map of best-effort ACL
+    grants that failed. When the output shows the interpreter could not
+    open the worker script (the observed symptom on a volume whose ACL
+    refuses the per-SID grant -- ReFS/Dev Drive, or a volume the user
+    does not own), the message names the failed grant as the cause rather
+    than leaving the reader to connect the two."""
+    text = output.decode("utf-8", "replace")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    parts: list[str] = []
+    if exit_code is None:
+        parts.append("worker died before its hello frame")
+    else:
+        parts.append(f"worker exited before its hello frame (exit code {exit_code:#010x})")
+    if lines:
+        shown = lines[:8]
+        joined = " | ".join(shown)
+        if len(lines) > len(shown):
+            joined += f" | ... ({len(lines) - len(shown)} more lines)"
+        parts.append(f"its startup output was: {joined}")
+    else:
+        parts.append("it wrote nothing")
+    lowered = text.lower()
+    permission_hit = any(m in lowered for m in _PREHELLO_PERMISSION_MARKERS)
+    if permission_hit or grant_errors:
+        script = next((a for a in worker_args if a.lower().endswith(".py")), None)
+        if permission_hit and script:
+            parts.append(f"the AppContainer could not read the worker script {script!r}")
+        if grant_errors:
+            failed = "; ".join(f"{p!r}: {err}" for p, err in grant_errors.items())
+            parts.append(
+                "the AppContainer read+execute ACL grant failed on: " + failed
+                + " -- the volume holding that path refuses the per-SID grant "
+                "(typical of a ReFS/Dev Drive or a volume this user does not "
+                "own), so the sandbox cannot read anything there; see "
+                "docs/decode-threat-model.md 'Sandbox degraded on a Dev Drive'")
+            if pythonpath and pythonpath in grant_errors:
+                parts.append(
+                    "that path is the worker PYTHONPATH (PySide6 lives there), "
+                    "which cannot be staged like the worker script; put the uv "
+                    "cache / venv on a grantable volume (e.g. unset UV_CACHE_DIR "
+                    "so it defaults to %LOCALAPPDATA%\\uv) or point "
+                    "FAUXCASA_WORKER_PYTHON at an interpreter whose site-packages "
+                    "is on one")
+    return "; ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +743,7 @@ if sys.platform == "win32":
     ERROR_ALREADY_EXISTS = 183
     HRESULT_ALREADY_EXISTS = 0x800700B7
 
+    WAIT_OBJECT_0 = 0x00000000
     WAIT_TIMEOUT = 0x00000102
     DUPLICATE_SAME_ACCESS = 0x00000002
 
@@ -1149,8 +1295,115 @@ if sys.platform == "win32":
     # optimisation this set exists for silently doesn't apply in the one
     # case it was built for).
     _acl_grant_lock = threading.Lock()
+    # fauxcasa-yfq: paths whose grant failure has already been logged at
+    # WARNING this process (every later failure for the same path is INFO
+    # -- the pool re-tries the grant on each spawn, ~9 per warm()).
+    _acl_grant_warned: set[str] = set()
+    # ... and (sid, path) grants that failed this process, with the error
+    # detail, so the pool's N spawns per warm() pay the OS call once.
+    _acl_grant_failed_this_process: dict[tuple[str, str], str] = {}
+    # ... and worker scripts whose staging has been announced (same idea).
+    _staging_logged: set[str] = set()
 
     ACL_MARKER_MAX_AGE_SECONDS = 30 * 24 * 3600  # 30 days
+
+    def fauxcasa_cache_root() -> Path:
+        """%LOCALAPPDATA%\\Fauxcasa\\cache (falling back to TEMP, then the
+        home dir, when LOCALAPPDATA is unset) -- the same root catalog.py/
+        db3rescue.py use. Shared by the ACL-marker store and the staged
+        worker-script copy (fauxcasa-yfq): both must live on a volume
+        where the user can set ACLs, which the profile drive is."""
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
+        return Path(base) / "Fauxcasa" / "cache"
+
+    # -- Worker-script staging (fauxcasa-yfq) ---------------------------------
+    #
+    # A source checkout on a volume that refuses the per-SID ACL grant
+    # (observed: an A: ReFS drive whose root ACL is Authenticated Users:
+    # Modify with no WRITE_DAC -- SetNamedSecurityInfoW and icacls both
+    # fail err=5 even on a fresh directory the user owns) leaves the
+    # AppContainer unable to open decodesvc_worker_win.py at all: the
+    # interpreter prints "can't open file ...: [Errno 13] Permission
+    # denied" and exits 2 before hello, and the sandbox degrades to
+    # in-process on every run. The frozen bundle never hits this because
+    # its payload sits under Program Files or LOCALAPPDATA, both grantable
+    # (or already readable by ALL APPLICATION PACKAGES). Staging mirrors
+    # that: copy the worker script into the cache root -- which IS
+    # grantable, the ACL markers already live there -- and launch from
+    # the copy.
+    #
+    # Only the one file is copied. decodesvc_worker_win.py is deliberately
+    # self-contained (its module docstring: "this file's import list IS
+    # the sandboxed process's attack surface budget" -- stdlib, ctypes and
+    # PySide6 only, no repo sibling imports), so there is no import
+    # closure to chase. PySide6 itself comes from the worker PYTHONPATH,
+    # which is granted separately; if THAT is on an ungrantable volume
+    # too (a uv cache relocated onto the same drive) staging cannot help
+    # -- copying a few hundred MB of Qt per spawn is not a fallback -- and
+    # spawn() says so in its error instead (see describe_prehello_death).
+    #
+    # The copy is content-hashed: <cache>/sandbox-worker/<sha256[:16]>/
+    # decodesvc_worker_win.py, re-verified byte-for-byte before reuse, so
+    # an edited source is never run from a stale copy. Old hash dirs are
+    # pruned once they are a day old (a concurrent broker may still be
+    # launching from a younger one).
+    WORKER_STAGING_DIRNAME = "sandbox-worker"
+    WORKER_STAGING_MAX_AGE_SECONDS = 24 * 3600
+
+    def worker_staging_root() -> Path:
+        return fauxcasa_cache_root() / WORKER_STAGING_DIRNAME
+
+    def _prune_worker_staging(root: Path, keep: Path) -> None:
+        cutoff = time.time() - WORKER_STAGING_MAX_AGE_SECONDS
+        try:
+            for entry in root.iterdir():
+                if entry == keep or not entry.is_dir():
+                    continue
+                try:
+                    if entry.stat().st_mtime >= cutoff:
+                        continue
+                    for child in entry.iterdir():
+                        child.unlink(missing_ok=True)
+                    entry.rmdir()
+                except OSError:
+                    continue
+        except OSError:
+            pass
+
+    def stage_worker_script(source: str) -> str:
+        """Copy `source` (the worker script) into the content-hashed
+        staging dir under the cache root and return the copy's path.
+        Idempotent: an existing copy with identical bytes is reused; any
+        other content lands in a different hash dir. Raises OSError when
+        the source is unreadable or the cache root is not writable -- the
+        caller falls back to launching from the source path."""
+        src = Path(source)
+        data = src.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()[:16]
+        root = worker_staging_root()
+        dest_dir = root / digest
+        dest = dest_dir / src.name
+        try:
+            if dest.read_bytes() == data:
+                _prune_worker_staging(root, dest_dir)
+                return str(dest)
+        except OSError:
+            pass
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        # Write-then-rename so a concurrent broker never launches a
+        # half-written copy; os.replace is atomic within one volume.
+        tmp = dest_dir / f".{src.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        tmp.write_bytes(data)
+        try:
+            os.replace(tmp, dest)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            # Lost a race with another broker staging the same content;
+            # the winner's copy is byte-identical by construction.
+            if dest.read_bytes() != data:
+                raise
+        _prune_worker_staging(root, dest_dir)
+        return str(dest)
 
     _acl_marker_root_pruned = False
 
@@ -1204,8 +1457,7 @@ if sys.platform == "win32":
         older than 30 days (or for a stale SID) once per process, the
         first time the root is opened (re-review residual item 5)."""
         global _acl_marker_root_pruned
-        base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
-        root = Path(base) / "Fauxcasa" / "cache" / "acl-markers"
+        root = fauxcasa_cache_root() / "acl-markers"
         root.mkdir(parents=True, exist_ok=True)
         if not _acl_marker_root_pruned:
             _acl_marker_root_pruned = True
@@ -1245,6 +1497,7 @@ if sys.platform == "win32":
         sid_str = sid_to_string(sid)
         with _acl_grant_lock:
             _acl_granted_this_process.discard((sid_str, path))
+            _acl_grant_failed_this_process.pop((sid_str, path), None)
             try:
                 _acl_marker_path(path, sid_str).unlink(missing_ok=True)
             except OSError:
@@ -1263,6 +1516,16 @@ if sys.platform == "win32":
         with _acl_grant_lock:
             if key in _acl_granted_this_process:
                 return None
+            # fauxcasa-yfq: a grant that already failed this process fails
+            # again the same way (the volume's ACL is not going to change
+            # between two pool spawns), so return the remembered detail
+            # instead of paying another SetNamedSecurityInfoW round-trip
+            # and another log line per pool member. invalidate_acl_grant()
+            # (the pre-hello-death self-heal) clears this too, so a fixed
+            # ACL is retried on the next spawn after a failure.
+            cached_failure = _acl_grant_failed_this_process.get(key)
+            if cached_failure is not None:
+                return cached_failure
             marker = _acl_marker_path(path, sid_str)
             try:
                 if marker.exists():
@@ -1277,7 +1540,24 @@ if sys.platform == "win32":
                 # handshake below is the real readability proof, and a
                 # Program-Files-class install where ALL APPLICATION
                 # PACKAGES already has RX must still be able to spawn.
-                _log.info("ACL grant best-effort failure on %r for %r: %s", path, sid_str, e)
+                #
+                # fauxcasa-yfq: but say so at WARNING, once per path per
+                # process. At INFO this was invisible while the sandbox
+                # silently degraded on every run from a ReFS/Dev Drive
+                # checkout (the volume refuses the per-SID grant, err=5,
+                # and unlike Program Files nothing else grants the
+                # container read there).
+                if path not in _acl_grant_warned:
+                    _acl_grant_warned.add(path)
+                    _log.warning(
+                        "AppContainer read+execute ACL grant failed on %r for %s: %s "
+                        "-- the sandbox worker will not be able to read this path "
+                        "unless the volume already grants ALL APPLICATION PACKAGES; "
+                        "a spawn that dies before hello will name this as the cause",
+                        path, sid_str, e)
+                else:
+                    _log.info("ACL grant best-effort failure on %r for %r: %s", path, sid_str, e)
+                _acl_grant_failed_this_process[key] = str(e)
                 return str(e)
             _acl_granted_this_process.add(key)
             try:
@@ -1740,6 +2020,11 @@ class WinSandboxWorker:
         self._id_counter = 0
         self.hello: Hello | None = None
         self.hello_noise_bytes = 0  # see _read_hello_frame_tolerant (gotcha 7)
+        # fauxcasa-yfq: what spawn() actually launched (None when frozen)
+        # and whether it came from the staged copy under the cache root.
+        self.grant_errors: dict[str, str] = {}
+        self.worker_script_path: str | None = None
+        self.worker_script_staged = False
         self._arena_handle = None
         self._arena_addr: int | None = None
         self._winsta_grant: dict | None = None
@@ -1843,6 +2128,37 @@ class WinSandboxWorker:
                 if err is not None:
                     self.grant_errors[target_path] = err
 
+            # fauxcasa-yfq: the worker-script dir refused the grant (a
+            # ReFS/Dev Drive checkout) -- launch from a content-hashed
+            # copy under the cache root instead, which the user CAN grant.
+            # See the staging comment block above stage_worker_script for
+            # why only this one file moves and what it cannot fix.
+            if not frozen and worker_dir in self.grant_errors:
+                try:
+                    staged = stage_worker_script(worker_script)
+                    staging_root = str(worker_staging_root())
+                    staging_err = grant_read_execute_once(
+                        staging_root, sid, inherit=SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+                    if staging_err is not None:
+                        self.grant_errors[staging_root] = staging_err
+                        _log.warning(
+                            "worker script staged to %r but that dir refused the ACL "
+                            "grant too (%s); launching from the source path", staged, staging_err)
+                    else:
+                        grant_targets.append((staging_root, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
+                        worker_args = [staged]
+                        self.worker_script_staged = True
+                        if worker_script not in _staging_logged:
+                            _staging_logged.add(worker_script)
+                            _log.warning(
+                                "worker script dir %r refused the AppContainer ACL grant; "
+                                "launching the sandbox worker from a content-hashed copy at %r",
+                                worker_dir, staged)
+                except OSError as e:
+                    _log.warning("could not stage the worker script under %r (%s); "
+                                 "launching from the source path", str(worker_staging_root()), e)
+            self.worker_script_path = worker_args[0] if not frozen else None
+
             winsta_result = grant_winsta_desktop(sid)
             self._winsta_grant = winsta_result
             if winsta_result.get("window_station") != "granted" or winsta_result.get("desktop") != "granted":
@@ -1909,7 +2225,8 @@ class WinSandboxWorker:
                     # preserved unchanged (e.g. WORKER_CRASHED), so an
                     # enriched error here still converts to TIMEOUT correctly
                     # below if the deadline is what actually killed the child.
-                    kernel32.WaitForSingleObject(child.pi.hProcess, 2000)
+                    waited = kernel32.WaitForSingleObject(child.pi.hProcess, 2000)
+                    exited = waited == WAIT_OBJECT_0
                     exit_code = wintypes.DWORD(0)
                     kernel32.GetExitCodeProcess(child.pi.hProcess, ctypes.byref(exit_code))
                     # P2 finding "self-heal for stale markers": a worker
@@ -1922,10 +2239,44 @@ class WinSandboxWorker:
                     # of skipping it a second time.
                     for target_path, _target_inherit in grant_targets:
                         invalidate_acl_grant(target_path, sid)
+                    # fauxcasa-yfq: a worker that has ALREADY EXITED never
+                    # reached the protocol -- whatever it wrote is the
+                    # interpreter's own startup diagnostics, not frames.
+                    # Reassemble them (bytes the hello reader consumed +
+                    # the rest of the pipe, safe to drain now that the
+                    # writer is gone) and report the real cause. On a
+                    # non-zero exit the error is re-coded WORKER_CRASHED:
+                    # PROTOCOL means "evidence of compromise" (kill, count,
+                    # never retry), and an interpreter that could not open
+                    # its script is neither compromised nor worth counting
+                    # as such; WORKER_CRASHED is what every other pre-hello
+                    # death (0xC0000142 etc.) already reports.
+                    leading = getattr(e, "leading_bytes", b"")
+                    if exited:
+                        tail = _drain_pipe(child.out_file, PREHELLO_OUTPUT_LIMIT)
+                        # A worker-dir grant failure that staging worked
+                        # around is no longer a cause; leave it out of
+                        # the blame list (self.grant_errors keeps it).
+                        unresolved = {
+                            p: err for p, err in self.grant_errors.items()
+                            if not (self.worker_script_staged and not frozen and p == worker_dir)}
+                        reason = describe_prehello_death(
+                            leading + tail, exit_code.value, worker_args, unresolved,
+                            pythonpath=worker_pythonpath)
+                        code = ErrorCode.WORKER_CRASHED if exit_code.value != 0 else e.code
+                        # The reader's own detail usually repeats the
+                        # output already shown above; keep a short tail
+                        # of it for correlation, not the whole thing.
+                        reader_detail = e.detail if len(e.detail) <= 200 else e.detail[:200] + "..."
+                        raise DecodeServiceError(
+                            code,
+                            f"{reason} [hello reader: {reader_detail}; exe {worker_python!r}; "
+                            f"pythonpath {worker_pythonpath!r}]") from e
                     raise DecodeServiceError(
                         e.code,
-                        f"{e} [worker exit code {exit_code.value:#010x}; "
-                        f"exe {worker_python!r}; pythonpath {worker_pythonpath!r}]") from e
+                        f"{e} [worker still running after 2s; last exit code query "
+                        f"{exit_code.value:#010x}; exe {worker_python!r}; "
+                        f"pythonpath {worker_pythonpath!r}]") from e
                 self.hello_noise_bytes = noise
                 self.hello = parse_hello(hello_msg, self.arena_bytes)
 
