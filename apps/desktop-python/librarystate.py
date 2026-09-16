@@ -53,6 +53,19 @@ def _config_path(cache_root: Path) -> Path:
     return cache_root / "config.json"
 
 
+def _is_filesystem_root(path: Path) -> bool:
+    """True for anchors such as '/', 'C:\\', and UNC share roots.
+
+    Opening a whole volume as a photo library makes the first-run picker vanish
+    while startup recursively scans the OS tree before the main window exists.
+    """
+    try:
+        p = path.resolve()
+    except OSError:
+        p = path.absolute()
+    return p.parent == p
+
+
 def _remembered_library(cache_root: Path) -> Path | None:
     """The library chosen on a previous (frozen) run, if it still exists on
     disk; a vanished one is ignored so the app re-prompts. Tolerates a
@@ -73,16 +86,6 @@ def _remembered_library(cache_root: Path) -> Path | None:
     p = Path(lib)
     if not p.is_dir():
         return None
-    # Lazy import (not top-level): main.py imports this module near its own
-    # top (before _is_filesystem_root is defined further down in main.py),
-    # so a module-level `from main import _is_filesystem_root` would be a
-    # circular import that fails at load time. _is_filesystem_root itself
-    # stays in main.py (fauxcasa-4tu patch-compatibility rule: it is also
-    # used by _choose_library_from_dialog/_resolve_library, which stay in
-    # main.py) — this import only resolves once main.py has finished
-    # loading, i.e. by the time this function is actually called.
-    from main import _is_filesystem_root
-
     if _is_filesystem_root(p):
         log.warning("ignoring remembered filesystem root library: %s", p)
         return None

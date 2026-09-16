@@ -5,19 +5,6 @@ definitions verbatim; it takes the app's identity (prog/description/
 version text) as parameters rather than importing main.py for them, so
 this module never imports main (main.py imports this module, so the
 reverse would be circular at load time).
-
-_cmd_promote, _cmd_add_root, _cmd_import_picasa_watched, and their small
-helpers are the --promote/--add-root/--import-picasa-watched standalone
-management actions (design §10): each validates its arguments, performs
-one on-disk change via library.py, prints a one-line summary, and returns
-an exit code. _cmd_promote and _cmd_add_root call main._resolve_library
-via a LAZY import inside the function body (not a module-level import) —
-same reasoning as librarystate._remembered_library's lazy import of
-main._is_filesystem_root: main.py imports this module near its own top,
-before _resolve_library is defined further down, so a module-level
-`from main import _resolve_library` would be a circular import that fails
-at load time. _resolve_library itself is never monkeypatched by tests, so
-resolving it at call time (once main.py has fully loaded) is safe.
 """
 
 from __future__ import annotations
@@ -200,65 +187,6 @@ def _parse_image_size_arg(value: str) -> tuple[int, int]:
 # how to browse a single Path. Re-running the app afterwards (implicit
 # legacy open for an un-promoted root, or a future explicit-open path once
 # .g lands) picks up the change.
-
-def _cmd_promote(library_arg: str | None, cache_root: Path) -> int:
-    """--promote: promote the legacy library named by the positional
-    `library` argument in place (design §10). Reuses _resolve_library for
-    the same existence/filesystem-root validation every other invocation
-    gets, so a bad path fails exactly the same way it would on a normal
-    open. An explicit `library` is REQUIRED (same rule
-    _cmd_import_picasa_watched enforces): without one, _resolve_library
-    would silently fall through to _default_library() and promote the
-    built-in sample library in place."""
-    if not library_arg:
-        log.error("--promote requires a library path as the positional "
-                  "argument")
-        return 2
-    from main import _resolve_library  # lazy: see module docstring
-
-    root = _resolve_library(library_arg, cache_root)
-    if root is None:
-        return 2
-    try:
-        cfg = library.promote_library(root, cache_root=cache_root)
-    except Exception as e:
-        log.error("promotion failed (rolled back, %s is still a plain "
-                  "legacy library): %s", root, e)
-        return 2
-    print(f"promoted: library home at {cfg.home}")
-    return 0
-
-
-def _cmd_add_root(library_arg: str | None, cache_root: Path,
-                  new_root: Path) -> int:
-    """--add-root PATH: add PATH as a new watched root to the
-    already-promoted library-home named by the positional `library`
-    argument. Mint + save + fail-soft marker only — no indexing runs here;
-    the new root's empty/mismatched fcache rides the existing bind()
-    mismatch -> reindex path the next time this library is actually
-    opened (design §10: "mint id, append to roots, save library.json, mint
-    a new empty thumbs-<root_id>.fcache -> bind mismatch -> incremental
-    reindex for the new root only")."""
-    from main import _resolve_library  # lazy: see module docstring
-
-    home = _resolve_library(library_arg, cache_root)
-    if home is None:
-        return 2
-    cfg = library.resolve_open_path(home)
-    if cfg.is_legacy:
-        log.error("%s is not a library-home (no .fauxcasa/library.json) — "
-                  "run --promote first", home)
-        return 2
-    try:
-        added = library.add_root(cfg, new_root)
-    except ValueError as e:
-        log.error("cannot add root: %s", e)
-        return 2
-    library.write_root_marker(Path(new_root).resolve(), added.id)  # fail-soft
-    library.save_library(cfg)
-    print(f"added root {added.id} ({added.label}) to {home}")
-    return 0
-
 
 def _read_watched_list_file(path: Path) -> list[Path]:
     """One folder path per line; blank lines and '#'-prefixed comments are

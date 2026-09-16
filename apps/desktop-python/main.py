@@ -193,6 +193,7 @@ from viewer import ViewerPage  # noqa: E402
 from librarystate import (  # noqa: E402
     _config_path,
     _default_window_size,
+    _is_filesystem_root,
     _library_config_path,
     _migrate_library_state,
     _remember_library,
@@ -211,7 +212,6 @@ from librarystate import (  # noqa: E402
 # fauxcasa-4tu stage 2 moved to cli.py: main.<name>/`from main import
 # <name>` compatibility for tests and scripts.
 from cli import (  # noqa: E402
-    _cmd_promote,
     _parse_image_size_arg,
     run_search_probe,
     select_sidebar_view,
@@ -426,19 +426,6 @@ def _default_library() -> Path | None:
     if FROZEN:
         return None
     return REPO / "cache" / "synthetic-library"
-
-
-def _is_filesystem_root(path: Path) -> bool:
-    """True for anchors such as '/', 'C:\\', and UNC share roots.
-
-    Opening a whole volume as a photo library makes the first-run picker vanish
-    while startup recursively scans the OS tree before the main window exists.
-    """
-    try:
-        p = path.resolve()
-    except OSError:
-        p = path.absolute()
-    return p.parent == p
 
 
 def _gui_unavailable() -> bool:
@@ -746,6 +733,61 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
                   "when prompted")
         return None
     return root
+
+
+def _cmd_promote(library_arg: str | None, cache_root: Path) -> int:
+    """--promote: promote the legacy library named by the positional
+    `library` argument in place (design §10). Reuses _resolve_library for
+    the same existence/filesystem-root validation every other invocation
+    gets, so a bad path fails exactly the same way it would on a normal
+    open. An explicit `library` is REQUIRED (same rule
+    _cmd_import_picasa_watched enforces): without one, _resolve_library
+    would silently fall through to _default_library() and promote the
+    built-in sample library in place."""
+    if not library_arg:
+        log.error("--promote requires a library path as the positional "
+                  "argument")
+        return 2
+    root = _resolve_library(library_arg, cache_root)
+    if root is None:
+        return 2
+    try:
+        cfg = library.promote_library(root, cache_root=cache_root)
+    except Exception as e:
+        log.error("promotion failed (rolled back, %s is still a plain "
+                  "legacy library): %s", root, e)
+        return 2
+    print(f"promoted: library home at {cfg.home}")
+    return 0
+
+
+def _cmd_add_root(library_arg: str | None, cache_root: Path,
+                  new_root: Path) -> int:
+    """--add-root PATH: add PATH as a new watched root to the
+    already-promoted library-home named by the positional `library`
+    argument. Mint + save + fail-soft marker only — no indexing runs here;
+    the new root's empty/mismatched fcache rides the existing bind()
+    mismatch -> reindex path the next time this library is actually
+    opened (design §10: "mint id, append to roots, save library.json, mint
+    a new empty thumbs-<root_id>.fcache -> bind mismatch -> incremental
+    reindex for the new root only")."""
+    home = _resolve_library(library_arg, cache_root)
+    if home is None:
+        return 2
+    cfg = library.resolve_open_path(home)
+    if cfg.is_legacy:
+        log.error("%s is not a library-home (no .fauxcasa/library.json) — "
+                  "run --promote first", home)
+        return 2
+    try:
+        added = library.add_root(cfg, new_root)
+    except ValueError as e:
+        log.error("cannot add root: %s", e)
+        return 2
+    library.write_root_marker(Path(new_root).resolve(), added.id)  # fail-soft
+    library.save_library(cfg)
+    print(f"added root {added.id} ({added.label}) to {home}")
+    return 0
 
 
 def read_rss_mb() -> tuple[float, float]:
@@ -3749,7 +3791,7 @@ def main() -> int:
     if args.promote:
         return _cmd_promote(args.library, args.cache_root)
     if args.add_root is not None:
-        return cli._cmd_add_root(args.library, args.cache_root, args.add_root)
+        return _cmd_add_root(args.library, args.cache_root, args.add_root)
     if args.import_picasa_watched is not None:
         return cli._cmd_import_picasa_watched(args.library,
                                               args.import_picasa_watched)
