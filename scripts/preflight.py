@@ -56,11 +56,36 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 TIMEOUT_SECONDS = 10 * 60  # 10 min hard cap per check
+
+
+def _real_sandbox_env(base: dict[str, str], check_name: str) -> dict[str, str]:
+    """fauxcasa-ayh: env for a check that spawns the real Windows decode
+    sandbox. When UV_CACHE_DIR isn't already set in THIS process's
+    environment, pin it to uv's own default location
+    (%LOCALAPPDATA%\\uv\\cache) for this check -- a no-op on CI and on an
+    ordinary dev machine (that already IS uv's default), but it makes the
+    gate deterministic on a box whose uv config points the cache at a
+    Dev Drive/ReFS volume: the AppContainer read+execute grant on the
+    worker's PYTHONPATH (which lives under the uv cache) fails there,
+    degrading test_decodefacade.py's/test_decodesvc_win.py's/
+    test_sandbox_e2e.py's real-sandbox tests (fauxcasa-ayh names the
+    cause loudly instead of a mysterious degrade; this makes the local
+    gate not depend on that box's ambient UV_CACHE_DIR at all)."""
+    env = dict(base)
+    if sys.platform == "win32" and "UV_CACHE_DIR" not in os.environ:
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            env["UV_CACHE_DIR"] = os.path.join(local_appdata, "uv", "cache")
+            print(f"preflight: {check_name}: UV_CACHE_DIR not set -- defaulting to "
+                  f"{env['UV_CACHE_DIR']!r} so the real-sandbox check is deterministic "
+                  "(fauxcasa-ayh)")
+    return env
 
 
 def repo_root() -> Path:
@@ -129,13 +154,14 @@ def checks(root: Path, fast: bool) -> list[dict]:
             "name": "decode-sandbox suite",
             "command": ["uv", "run", "apps/desktop-python/test_decodesvc_win.py", "-q"],
             "cwd": root,
-            "env": {"QT_QPA_PLATFORM": "offscreen"},
+            "env": _real_sandbox_env({"QT_QPA_PLATFORM": "offscreen"}, "decode-sandbox suite"),
         })
         result.append({
             "name": "decode-sandbox e2e (call-site wiring)",
             "command": ["uv", "run", "apps/desktop-python/test_sandbox_e2e.py", "-q"],
             "cwd": root,
-            "env": {"QT_QPA_PLATFORM": "offscreen"},
+            "env": _real_sandbox_env(
+                {"QT_QPA_PLATFORM": "offscreen"}, "decode-sandbox e2e (call-site wiring)"),
             # Windows-only: the module skips every test off win32 (real
             # AppContainer sandbox worker required), so this always exits
             # 0 elsewhere -- listed here anyway so the gate is uniform and
@@ -145,7 +171,7 @@ def checks(root: Path, fast: bool) -> list[dict]:
             "name": "decode-facade suite",
             "command": ["uv", "run", "apps/desktop-python/test_decodefacade.py", "-q"],
             "cwd": root,
-            "env": {"QT_QPA_PLATFORM": "offscreen"},
+            "env": _real_sandbox_env({"QT_QPA_PLATFORM": "offscreen"}, "decode-facade suite"),
         })
     result.append({
         "name": "no beads-jsonl pollution",
@@ -159,8 +185,6 @@ def checks(root: Path, fast: bool) -> list[dict]:
 
 
 def run_check(check: dict) -> dict:
-    import os
-
     env = None
     if check["env"]:
         env = dict(os.environ)

@@ -2295,6 +2295,74 @@ def test_resolve_worker_python_caches_result(monkeypatch):
 
 
 @_WINDOWS_ONLY
+def test_worker_grant_targets_source_layout(monkeypatch, tmp_path):
+    """fauxcasa-ayh: worker_grant_targets() extracted spawn()'s source-
+    layout grant-target computation (base interpreter dir, worker
+    PYTHONPATH, worker script dir) -- three distinct dirs must become
+    three recursive-inherit targets, a duplicate collapses (preserving
+    first-seen order), and a None pythonpath (frozen case, exercised
+    elsewhere) is skipped rather than producing a bogus target."""
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+
+    base_dir = str(tmp_path / "python-base")
+    pythonpath = str(tmp_path / "site-packages")
+    worker_python = str(Path(base_dir) / "python.exe")
+
+    targets = dw.worker_grant_targets(worker_python, pythonpath)
+    worker_dir = str(Path(dw.__file__).resolve().with_name(
+        "decodesvc_worker_win.py").parent)
+    assert targets == [
+        (base_dir, dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT),
+        (pythonpath, dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT),
+        (worker_dir, dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT),
+    ]
+
+    # A pythonpath equal to base_dir (or worker_dir) must collapse to one
+    # entry, first-seen order preserved.
+    dup_targets = dw.worker_grant_targets(worker_python, base_dir)
+    assert dup_targets == [
+        (base_dir, dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT),
+        (worker_dir, dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT),
+    ]
+
+    # None pythonpath (the frozen resolve_worker_python() shape) must be
+    # skipped, not turned into a target.
+    none_targets = dw.worker_grant_targets(worker_python, None)
+    assert none_targets == [
+        (base_dir, dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT),
+        (worker_dir, dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT),
+    ]
+
+
+@_WINDOWS_ONLY
+def test_preflight_worker_grants_reports_failures(monkeypatch):
+    """fauxcasa-ayh: preflight_worker_grants() issues every grant spawn()
+    would (same targets, same grant_read_execute_once call), BEFORE any
+    spawn attempt, and returns exactly the targets whose grant failed --
+    here only the worker PYTHONPATH, simulating a ReFS/Dev Drive
+    UV_CACHE_DIR that refuses the per-SID grant while the interpreter's
+    own base dir and the worker script dir (e.g. already ALL APPLICATION
+    PACKAGES-granted) succeed."""
+    fake_exe = r"C:\fake\pyenv\python.exe"
+    fake_pythonpath = r"C:\fake\uv-cache\site-packages"
+
+    monkeypatch.setattr(dw, "resolve_worker_python",
+                         lambda: (fake_exe, fake_pythonpath))
+    monkeypatch.setattr(dw, "get_cached_profile_sid", lambda name: "fake-sid")
+
+    def fake_grant(path, sid, inherit=dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT):
+        assert sid == "fake-sid"
+        if path == fake_pythonpath:
+            return "SetNamedSecurityInfoW(...) err=5"
+        return None
+
+    monkeypatch.setattr(dw, "grant_read_execute_once", fake_grant)
+
+    failures = dw.preflight_worker_grants()
+    assert failures == [(fake_pythonpath, "SetNamedSecurityInfoW(...) err=5")]
+
+
+@_WINDOWS_ONLY
 def test_grant_read_execute_once_skips_after_marker(tmp_path, monkeypatch):
     """P1 finding: one-time-per-(SID,dir) ACL grant via an in-process set
     AND an on-disk marker file -- a second call for the same (sid, dir)

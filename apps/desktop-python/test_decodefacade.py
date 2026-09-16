@@ -32,6 +32,36 @@ _WINDOWS_ONLY = pytest.mark.skipif(
     reason="requires spawning a real Windows AppContainer sandbox worker",
 )
 
+
+def _assert_sandbox_grantable() -> None:
+    """fauxcasa-ayh: the 3 real-sandbox tests below spawn an actual
+    AppContainer worker; on a dev box whose UV_CACHE_DIR points at a
+    ReFS/Dev Drive volume, the worker PYTHONPATH grant fails and the
+    worker dies pre-hello, degrading these tests to a mysterious
+    STATE_DEGRADED assertion failure. Call this FIRST so that box fails
+    LOUD and explicit instead, naming the ungrantable path(s) and the
+    fix -- rather than silently skipping (this is exactly the real-
+    sandbox contract these tests exist to exercise).
+
+    A failure on the worker SCRIPT's own directory alone is excluded:
+    spawn() already recovers from that one by staging a content-hashed
+    copy under the cache root (fauxcasa-yfq) -- unlike the interpreter
+    base dir or the PYTHONPATH, neither of which can be staged -- so it
+    is not actually blocking (verified: a real spawn still reaches hello
+    on a checkout whose own directory sits on a ReFS/Dev Drive volume
+    that refuses the grant, the exact situation on this repo's own dev
+    box worktrees)."""
+    import decodesvc_win as dw
+
+    failures = dw.preflight_worker_grants()
+    source_worker_dir = str(Path(dw.__file__).resolve().parent)
+    failures = [(p, e) for p, e in failures if p != source_worker_dir]
+    if failures:
+        detail = "; ".join(f"{p!r}: {err}" for p, err in failures)
+        pytest.fail(
+            "real-sandbox test cannot run: AppContainer read+execute grant "
+            f"failed before spawn on {detail}; {dw.UNGRANTABLE_PYTHONPATH_HINT}")
+
 SYNTHETIC_PNG_2X2_RED = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR42mP4z8DwH4QZYAwAR8oH"
     "+Rq28akAAAAASUVORK5CYII=")
@@ -146,6 +176,38 @@ def test_ensure_started_degrades_on_spawn_failure(monkeypatch):
     svc.ensure_started()
     assert svc.state == df.STATE_DEGRADED
     assert "simulated spawn failure" in svc.reason
+
+
+def test_ensure_started_warns_on_ungrantable_pythonpath(monkeypatch, capsys):
+    """fauxcasa-ayh: ensure_started() must check the worker PYTHONPATH's
+    grantability BEFORE the first spawn attempt -- a ReFS/Dev Drive
+    UV_CACHE_DIR that refuses the AppContainer per-SID grant needs to
+    warn with the actionable fix here, once, rather than leaving the
+    reader to connect a much later pre-hello ModuleNotFoundError:
+    PySide6 worker death back to this cause. The grant is still best-
+    effort (spawn() -> start() below can succeed anyway on an ALL
+    APPLICATION PACKAGES-granted volume), so the warning must NOT
+    degrade the session by itself."""
+    import applog  # noqa: F401 -- side effect: attaches the stderr mirror handler
+    if sys.platform != "win32":
+        pytest.skip("sandbox path is only reached when sys.platform == 'win32'")
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+
+    import decodesvc_win as dw
+
+    fake_path = "X:/fake/site-packages"
+    monkeypatch.setattr(dw, "preflight_worker_grants",
+                         lambda *a, **k: [(fake_path, "err=5")])
+    monkeypatch.setattr(df.WinSandboxTransport, "start", lambda self: None)
+
+    svc = df.get_service()
+    svc.ensure_started()
+
+    assert len(svc.warnings) == 1
+    assert fake_path in svc.warnings[0]
+    assert "UV_CACHE_DIR" in svc.warnings[0]
+    assert "UV_CACHE_DIR" in capsys.readouterr().err
+    assert svc.state != df.STATE_DEGRADED
 
 
 @_WINDOWS_ONLY
@@ -546,6 +608,7 @@ def test_decode_require_mode_mid_session_failure_never_falls_back(
 
 @_WINDOWS_ONLY
 def test_decode_real_sandbox_still(monkeypatch, synthetic_png):
+    _assert_sandbox_grantable()
     monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
     svc = df.get_service()
     img = svc.decode(synthetic_png, route="still", edge=0)
@@ -578,6 +641,7 @@ def test_decode_orientation_parity_sandboxed_vs_in_process(monkeypatch, tmp_path
     (sideways) for this file while WinSandboxTransport returned 32x64
     (upright) -- a concurrent mid-session degrade could hand a caller a
     sideways image with no way to tell."""
+    _assert_sandbox_grantable()
     p = _make_oriented_jpeg(tmp_path / "rotated.jpg", w=64, h=32, orientation=6)
 
     monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "0")
@@ -608,6 +672,7 @@ def test_decode_real_sandbox_warms_full_pool_three_times_in_a_row(monkeypatch):
     exercised (it spawns serially or at most 3 in parallel). Three
     consecutive warms through the real facade must each reach the full
     min(8, cpu_count())+1 member count and state == sandboxed."""
+    _assert_sandbox_grantable()
     from thumbcache import INDEX_WORKERS
 
     monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")

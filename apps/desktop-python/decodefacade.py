@@ -249,6 +249,12 @@ class DecodeService:
     def __init__(self) -> None:
         self.state = STATE_IN_PROCESS
         self.reason = ""
+        # fauxcasa-ayh: non-fatal, user-actionable warnings surfaced
+        # BEFORE the first decode (e.g. a worker PYTHONPATH the
+        # AppContainer grant could not reach) -- distinct from
+        # `self.reason`, which only carries the STATE_DEGRADED cause.
+        # Empty in the common case (grant succeeded, or no sandbox).
+        self.warnings: list[str] = []
         self._in_process = InProcessTransport()
         self._sandbox: WinSandboxTransport | None = None
         self._lock = threading.Lock()
@@ -291,6 +297,45 @@ class DecodeService:
             except Exception:
                 INDEX_WORKERS = 4
             sandbox = WinSandboxTransport(n_batch=INDEX_WORKERS)
+            # fauxcasa-ayh: check grantability of the worker's PYTHONPATH
+            # (and the other spawn() grant targets) BEFORE the first spawn
+            # attempt, so a ReFS/Dev Drive uv cache that refuses the
+            # per-SID grant is reported here -- once, with the actionable
+            # fix -- instead of only surfacing later as a pre-hello
+            # ModuleNotFoundError: PySide6 worker death. Best-effort: the
+            # grant itself is best-effort in spawn() too (an ALL
+            # APPLICATION PACKAGES-granted volume, e.g. Program Files,
+            # still lets the spawn below succeed even when this reports
+            # nothing to fix), and an unexpected exception HERE must not
+            # itself degrade the service -- start() below is the real
+            # readability proof either way.
+            try:
+                import decodesvc_win as dw
+                failures = dw.preflight_worker_grants()
+                # fauxcasa-ayh: a failure on the worker SCRIPT's own
+                # directory alone is not actually blocking -- spawn()
+                # already recovers from it by staging a content-hashed
+                # copy under the cache root (fauxcasa-yfq), unlike the
+                # interpreter base dir or the PYTHONPATH, neither of
+                # which can be staged. Warning about it here with the
+                # UV_CACHE_DIR/FAUXCASA_WORKER_PYTHON hint (aimed
+                # squarely at those two) would be actionable-sounding
+                # but wrong advice for a checkout that merely sits on a
+                # volume the AppContainer cannot be granted on.
+                source_worker_dir = str(Path(dw.__file__).resolve().parent)
+                failures = [(p, e) for p, e in failures if p != source_worker_dir]
+            except Exception as preflight_exc:
+                log.warning(
+                    "decode sandbox: preflight grant check raised %s: %s (continuing to spawn)",
+                    type(preflight_exc).__name__, preflight_exc)
+            else:
+                if failures:
+                    detail = "; ".join(f"{p!r}: {err}" for p, err in failures)
+                    msg = (
+                        "decode sandbox: read+execute grant failed before first decode on "
+                        f"{detail}; {dw.UNGRANTABLE_PYTHONPATH_HINT}")
+                    self.warnings.append(msg)
+                    log.warning(msg)
             try:
                 sandbox.start()
             except Exception as e:

@@ -400,6 +400,17 @@ PREHELLO_OUTPUT_LIMIT = 64 * 1024
 _PREHELLO_PERMISSION_MARKERS = ("permission denied", "errno 13", "access is denied",
                                 "can't open file", "cannot open file")
 
+# fauxcasa-ayh: the actionable fix for a worker PYTHONPATH (PySide6 site-
+# packages) that lives on a volume refusing the AppContainer per-SID grant
+# (ReFS/Dev Drive, typically because UV_CACHE_DIR points there) -- ONE
+# constant so describe_prehello_death's post-mortem message and
+# decodefacade's pre-first-spawn warning (preflight_worker_grants) never
+# drift apart.
+UNGRANTABLE_PYTHONPATH_HINT = (
+    "put the uv cache / venv on a grantable volume (e.g. unset UV_CACHE_DIR "
+    "so it defaults to %LOCALAPPDATA%\\uv) or point FAUXCASA_WORKER_PYTHON "
+    "at an interpreter whose site-packages is on one")
+
 
 def describe_prehello_death(output: bytes, exit_code: int | None, worker_args: list[str],
                             grant_errors: dict[str, str],
@@ -448,11 +459,8 @@ def describe_prehello_death(output: bytes, exit_code: int | None, worker_args: l
             if pythonpath and pythonpath in grant_errors:
                 parts.append(
                     "that path is the worker PYTHONPATH (PySide6 lives there), "
-                    "which cannot be staged like the worker script; put the uv "
-                    "cache / venv on a grantable volume (e.g. unset UV_CACHE_DIR "
-                    "so it defaults to %LOCALAPPDATA%\\uv) or point "
-                    "FAUXCASA_WORKER_PYTHON at an interpreter whose site-packages "
-                    "is on one")
+                    "which cannot be staged like the worker script; "
+                    + UNGRANTABLE_PYTHONPATH_HINT)
     return "; ".join(parts)
 
 
@@ -1783,6 +1791,65 @@ if sys.platform == "win32":
         _resolve_cache[env_py] = result
         return result
 
+    def worker_grant_targets(worker_python: str,
+                              worker_pythonpath: str | None) -> list[tuple[str, int]]:
+        """Compute spawn()'s AppContainer read+execute grant targets
+        (fauxcasa-ayh) for either layout `resolve_worker_python()` can
+        return: frozen (a PyInstaller onedir re-invoking itself as
+        `--decode-worker`) or source (a python.exe base interpreter plus
+        the worker script's own dir). Directories get the recursive
+        inherit flags; the frozen exe FILE itself gets NO_INHERITANCE (it
+        cannot widen read to sibling files). Duplicates are collapsed,
+        preserving first-seen order, and a None `worker_pythonpath` (the
+        frozen case) is skipped.
+
+        Pure computation -- callers still own the known-user-folder
+        refusal (spawn()'s frozen branch) and the actual grant call
+        (grant_read_execute_once), so this costs nothing extra to call
+        before the first spawn (preflight_worker_grants, below)."""
+        if getattr(sys, "frozen", False):
+            meipass = getattr(sys, "_MEIPASS", None)
+            exe_path = str(Path(worker_python).resolve())
+            targets: list[tuple[str, int]] = []
+            if meipass:
+                targets.append((meipass, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
+            targets.append((exe_path, NO_INHERITANCE))
+            return targets
+        worker_script = str(Path(__file__).resolve().with_name("decodesvc_worker_win.py"))
+        worker_dir = str(Path(worker_script).parent)
+        base_dir = str(Path(worker_python).parent)
+        targets = []
+        for d in (base_dir, worker_pythonpath, worker_dir):
+            if d and d not in [t for t, _ in targets]:
+                targets.append((d, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
+        return targets
+
+    def preflight_worker_grants(profile_name: str = PROFILE_NAME) -> list[tuple[str, str]]:
+        """Resolve the worker layout and issue every AppContainer
+        read+execute grant spawn() would issue -- BEFORE the first spawn
+        attempt (fauxcasa-ayh), so a ReFS/Dev Drive uv cache that refuses
+        the per-SID grant is reported as a warning naming the actionable
+        fix rather than only surfacing later as a ModuleNotFoundError:
+        PySide6 pre-hello worker death (describe_prehello_death).
+
+        Returns a list of (path, error_detail) for targets whose grant
+        failed; empty when every target granted (or was already
+        cached/skippable -- an ALL APPLICATION PACKAGES-granted volume,
+        e.g. Program Files, reports no failures here even though this
+        function still issues the same best-effort, non-raising calls
+        grant_read_execute_once always has). Grant failures are
+        non-fatal here exactly as they are in spawn(); resolve_worker_
+        python() errors (e.g. PySide6 not importable) DO propagate --
+        that is a real misconfiguration, not a grantability question."""
+        worker_python, worker_pythonpath = resolve_worker_python()
+        sid = get_cached_profile_sid(profile_name)
+        failures: list[tuple[str, str]] = []
+        for target_path, target_inherit in worker_grant_targets(worker_python, worker_pythonpath):
+            err = grant_read_execute_once(target_path, sid, inherit=target_inherit)
+            if err is not None:
+                failures.append((target_path, err))
+        return failures
+
     def is_appcontainer(token_handle=None) -> bool | str:
         """Query TokenIsAppContainer on the current process's token (used
         broker-side only for diagnostics; the worker does its own copy of
@@ -2120,7 +2187,6 @@ class WinSandboxWorker:
             # that case is already covered by checking meipass itself.
             worker_args = ["--decode-worker"]
             meipass = getattr(sys, "_MEIPASS", None)
-            exe_path = str(Path(sys.executable).resolve())
             recursive_grant_dirs = [meipass] if meipass else []
             for target_dir in recursive_grant_dirs:
                 if is_known_user_folder(target_dir):
@@ -2129,19 +2195,12 @@ class WinSandboxWorker:
                         f"{target_dir!r} is a known user folder (profile "
                         "root/Desktop/Downloads/Documents/Pictures) -- "
                         "move the install elsewhere and retry")
-            grant_targets: list[tuple[str, int]] = []
-            if meipass:
-                grant_targets.append((meipass, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
-            grant_targets.append((exe_path, NO_INHERITANCE))
+            grant_targets = worker_grant_targets(worker_python, worker_pythonpath)
         else:
             worker_script = str(Path(__file__).resolve().with_name("decodesvc_worker_win.py"))
             worker_dir = str(Path(worker_script).parent)
-            base_dir = str(Path(worker_python).parent)
             worker_args = [worker_script]
-            grant_targets = []
-            for d in (base_dir, worker_pythonpath, worker_dir):
-                if d and d not in [t for t, _ in grant_targets]:
-                    grant_targets.append((d, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
+            grant_targets = worker_grant_targets(worker_python, worker_pythonpath)
 
         # P1 finding "Profile/SID race": resolve the SID exactly once per
         # process (module-level cache + lock) -- never call the userenv
