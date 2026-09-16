@@ -73,7 +73,8 @@ HEADER_RULE = QColor(58, 58, 58)     # 1px lighter top rule
 CAPTION_BG = QColor(0, 0, 0, 170)
 CAPTION_FG = QColor(220, 220, 220)
 HINT_FG = QColor(120, 120, 120)
-FIELD_BORDER = QColor(96, 96, 96)    # border for text fields on dark chrome; must stay clearly lighter than WINDOW
+# Border for text fields on dark chrome; must stay clearly apart from WINDOW.
+FIELD_BORDER = QColor(96, 96, 96)
 
 
 def dark_palette() -> QPalette:

@@ -5283,7 +5283,8 @@ def test_dark_palette_search_affordance_roles() -> None:
     R = QPalette.ColorRole
     assert pal.color(R.PlaceholderText) == theme.TEXT_MUTED
     assert pal.color(R.Mid) == theme.FIELD_BORDER
-    assert theme.FIELD_BORDER.lightness() - theme.WINDOW.lightness() >= 60
+    # A contrast floor, not a direction: a light palette flips the sign.
+    assert abs(theme.FIELD_BORDER.lightness() - theme.WINDOW.lightness()) >= 60
 
 
 def test_search_box_announces_itself(search_library: Path) -> None:
