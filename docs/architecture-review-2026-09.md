@@ -40,18 +40,20 @@ change, a star, is stored in Fauxcasa's private cache folder, which the
 spec's own rule N3 says must never happen. The release notes say so
 honestly, but honesty about a gap is not the same as closing it.
 
-The effort went disproportionately into layers nobody sees. About half
-of all code churn in the app directory went into a single 20,000-line
-test file. The Windows-only decode sandbox took roughly 9,400 lines of
-production and test code plus 2,400 lines of design and spike material,
-survived nine recorded operating-system surprises, and today protects
-only the formats with the safest decoders, on the platform the owner does
-not use daily. Five beads and a measurement campaign chased scrolling at
-the smallest thumbnail size on a 4K monitor at 125% scaling over 100,000
-photos, an edge case of an edge case that is still open. A multi-folder
-library model shipped with no menu item to use it. Two thousand lines of
-tooling that report on how AI agents are used live in the product repo
-and run in its CI.
+The effort went disproportionately into layers nobody sees. The
+Windows-only decode sandbox took roughly 9,400 lines of production and
+test code plus 2,400 lines of design and spike material, survived nine
+recorded operating-system surprises, and today protects only the formats
+with the safest decoders, on the platform the owner does not use daily.
+Five beads and a measurement campaign chased scrolling at the smallest
+thumbnail size on a 4K monitor at 125% scaling over 100,000 photos, an
+edge case of an edge case that is still open. A multi-folder library
+model shipped whose only doorway is the first-run Picasa import on
+Windows; there is no menu to add a folder to a library you already have.
+Two thousand lines of tooling that report on how AI agents are used live
+in the product repo and run in its CI. And half of all code churn in the
+app directory went into a single 20,000-line test file: the tests are
+worth having, the single file is not.
 
 None of those were bad work. Each has a document explaining why it was
 done and each was done carefully. The problem is proportion. The spec's
@@ -90,13 +92,14 @@ built the moat; the write side is what makes it a tool.
 proportioned. By lines of production code (app plus scripts) the split is
 roughly 40% plumbing and safety (sandbox, perf harnesses, gates, agent
 tooling), 23% ingest and compatibility (which users do feel, as
-fidelity), 33% user interface and video playback, and 5% documentation
-tooling. By lines added over the history the sandbox alone drew as much
-work as the grid, viewer and sidebar combined once its tests are counted.
-By closed beads the split is closer to even, but the user-facing beads
-were mostly small (a menu, a badge, a key) while the plumbing beads were
-large. Test code equals production code in volume, which is healthy, but
-four fifths of it sits in one file.
+fidelity), 32% user interface and video playback, and 5% documentation
+tooling. By production lines added over the history, the sandbox (5,500)
+drew nearly half as much work as the grid, viewer and sidebar together
+(12,400), for a component that is invisible when it works. By closed
+beads the split is closer to even, but the user-facing beads were mostly
+small (a menu, a badge, a key) while the plumbing beads were large. Test
+code equals production code in volume, which is healthy, but four fifths
+of it sits in one file.
 
 **Does it avoid technical eddies?** No. Section 5 names five. The largest
 is the decode sandbox. The clearest is agent-usage reporting living in the
@@ -129,7 +132,7 @@ and are cited by file and line.
 | Age | first commit 2026-06-11, 97 days |
 | Commits | 497 (179 in June, 56 in July, 35 in August, 227 in September) |
 | Pull requests | 162 |
-| Beads | 220 filed, 198 closed, 16 open, 4 in progress |
+| Beads | 220 filed, 198 closed, 16 open, 4 in progress (before this review's own bead was filed) |
 | App production code (`apps/desktop-python`, excluding tests) | 26,409 lines across 34 modules |
 | App test code | 25,145 lines across 5 files |
 | Scripts | 11,588 lines production, 2,448 lines tests |
@@ -158,20 +161,23 @@ title is approximate (Appendix C).
 | Layer | Production lines | Test lines (current) | Production lines added (history) | Closed beads (approx.) | Do users feel it? |
 |---|---:|---:|---:|---:|---|
 | Grid, viewer, sidebar, tray, slideshow, peek, inspector, keymap, theme, icons | 11,200 | (in `test_tracer.py`) | 12,400 | 60 | Yes, directly |
-| Ingest and compatibility (catalog, thumbcache, library, metareader, inmeta, db3rescue, volumes, filetypes, cropmap, locate, applog, `picasa_db.py`) | 8,600 | 2,600 | 9,700 | 36 | Yes, as fidelity |
+| Ingest and compatibility (catalog, thumbcache, library, metareader, inmeta, db3rescue, volumes, filetypes, cropmap, locate, applog, `picasa_db.py`) | 8,600 | 1,700 | 9,700 | 36 | Yes, as fidelity |
 | Decode sandbox (decodesvc, decodesvc_win, worker, facade) | 5,000 | 4,400 | 5,500 | 10 | No (invisible when it works; visible when it degrades) |
 | Video playback seam (videostream, videoload) | 1,300 | (in `test_tracer.py`) | 1,300 | 3 | Yes |
 | Performance harnesses (bench_scroll, vsync_probe, perf-canary, the Python balloon, synthetic library and thumbcache builders, measurement scripts) | 4,900 | 0 | 5,200 | 14 | No |
 | Agent-usage tooling (delegation-report, daily-report) | 1,700 | 460 | 1,900 | 5 | No |
 | Research, oracle harness, gates (confirm-archive, ingest-parity, oracle-diff, sentinel experiment) | 2,700 | 700 | 2,900 | 45 | Indirectly |
 | Documentation tooling (demo library, gallery, dataset and video fetchers, preflight) | 1,950 | 0 | 2,200 | 4 | Yes, through the docs |
-| `test_tracer.py` alone | 0 | 20,400 | 36,700 added | (tests for the rows above) | No |
+| `test_tracer.py` alone | 0 | 20,400 | 36,700 added | (tests for the rows above; its largest topics are viewer and grid) | Through the rows it tests |
 
-Two numbers stand out. The single test file received 36,702 added lines,
-51% of all lines ever added under `apps/desktop-python`. And the sandbox's
-production code is 19% of the app directory today (5,022 of 26,409
-lines); with its own tests it reached about 10,000 added lines, close to
-the 12,400 added to the grid, viewer and sidebar that every user touches.
+Two numbers stand out, for different reasons. The sandbox's production
+code is 19% of the app directory today (5,022 of 26,409 lines), and its
+5,500 added lines are nearly half the 12,400 added to the grid, viewer
+and sidebar that every user touches. That is the proportion problem. The
+single test file received 36,702 added lines, 51% of all lines ever added
+under `apps/desktop-python`; most of those test the user-facing modules
+(Appendix A.2), so this is not effort hidden from users. It is a shape
+problem, one file for everything, and section 7.1 treats it as such.
 
 ### 3.2 By time
 
@@ -222,7 +228,7 @@ different resolutions, tagging, sorting, collections.
 | Tag (stars, captions, keywords, faces, hide) | yes | stars only, stored in the cache folder, invisible to Picasa | everything else read-only |
 | Fix (rotate, crop, straighten, fill light, one-click fixes, undo) | yes | displays Picasa's crops; no editing | the whole edit room |
 | Share (export with resize, watermark, email) | yes | no | all of it |
-| Organize (albums, move, rename, delete to trash, watched folders) | yes | read-only albums; multi-folder via command line | create/move/delete/rename absent; no add-folder menu |
+| Organize (albums, move, rename, delete to trash, watched folders) | yes | read-only albums; multi-folder only through the Windows first-run import or the command line | create/move/delete/rename absent; no way to add a folder to an existing library from the menus |
 | Import from camera or card | yes | no | M4 |
 | Back up | yes (to disc) | no | M4 |
 
@@ -277,13 +283,15 @@ threat model's stated asset: the archive itself.
 **Why it is an eddy.** The threat model's decision reads "no exceptions
 for simple formats" and "all decoding and metadata parsing of original
 files happens in a sandboxed worker pool, on all three platforms, from
-M1". The implementation is the mirror image. Per
-`thumbcache._index_one` (lines 713 to 766) and
-`viewer.load_original_oriented` (lines 251 to 302), RAW, PSD, 16-bit TIFF,
-HEIC/HEIF and video are routed in-process before the sandbox check, and
-only the remaining stills reach `decodefacade.decode()` (route `"still"`
-only; every other route raises `NotSandboxed`). The scan-time header
-sniff in `catalog._image_size` (line 549) calls `QImageReader` directly.
+M1". The implementation is the mirror image. In
+`thumbcache._index_one` (defined at line 636; the in-process pre-routes
+at 713 to 766, the sandbox check at 767) and
+`viewer.load_original_oriented` (defined at line 196; pre-routes 251 to
+302, sandbox check at 303), RAW, PSD, 16-bit TIFF, HEIC/HEIF and video
+are routed in-process before the sandbox check, and only the remaining
+stills reach `decodefacade.decode()` (route `"still"` only; every other
+route raises `NotSandboxed`). The scan-time header sniff in
+`catalog._image_size` (line 549) calls `QImageReader` directly.
 So the decoders with the loudest recent CVE histories, libde265 behind
 HEIC, LibRaw, FFmpeg via PyAV, and Pillow's PSD and TIFF codecs, all run
 with full authority, while Qt's JPEG and PNG plugins, the most fuzzed
@@ -300,24 +308,41 @@ on.
 **What to do.** Freeze the scope. Keep what exists, it works and is
 tested. Do not build the Linux transport, the RAW/PSD/HEIC/video routes,
 the metadata-in-sandbox move (i92.4), the hostile corpus and fuzz gates
-(i92.5) or any wasm work until the edit room has shipped. Amend the
-threat model's decision paragraph to describe what ships (the "in-process
-decoders (documented exception)" section already lists three of the five
-gaps; add RAW and video and the header sniff, and say Linux has none). If
-Linux parity is wanted later, timebox one week for a bubblewrap wrapper
-around the existing wire protocol in `decodesvc.py`, and stop if it runs
-over. Revisit the whole posture when the app starts accepting files from
-outside the library (device import, M4), because that is when untrusted
-bytes actually arrive.
+(i92.5) or any wasm work until the edit room has shipped.
+
+This asks the owner to revisit a decision he ratified on 2026-08-11
+(fauxcasa-i92.1): the threat model's "all decoding ... on all three
+platforms, from M1", its explicit refusal of an in-process video valve
+("no residual-risk exception is recorded here"), and the spec's mapping of
+decode isolation to the M1 gate. The argument for revisiting is that the
+ratified text does not describe what ships. Video plays today through a
+PyAV worker that is spawned with a plain `subprocess.Popen` and is not
+sandboxed (the AppContainer launcher for it is outstanding i92 work);
+RAW, PSD, HEIC and 16-bit TIFF decode in-process; Linux has nothing. The
+threat model's "in-process decoders (documented exception)" section
+already records three of those five gaps. Amend it to record all five and
+the scan-time header sniff, and let the M1 gate's decode-isolation clause
+read "stills on Windows" rather than imply the full matrix. Recording a
+deviation honestly is the spec's own rule (N7 in spirit); it is not a
+weakening of the requirement, which stands for the day the work resumes.
+
+If Linux parity is wanted before then, timebox one week for a bubblewrap
+wrapper around the existing wire protocol in `decodesvc.py`, and stop if
+it runs over. Revisit the whole posture when the app starts accepting
+files from outside the library (device import, M4), because that is when
+untrusted bytes actually arrive.
 
 ### 5.2 Chasing minimum-zoom scrolling on a 4K monitor at 125%
 
-**Cost.** Beads q6l.14, q6l.26, q6l.27 (still open), q7m, k5p, u8c, ncv,
-5br, gtr, w7x, ed5.10, ed5.13, plus `bench_scroll.py` (635 lines),
+**Cost.** Beads q6l.14, q6l.26, q6l.27 (still in progress), 5br, ed5.10
+and the scroll half of ncv, plus `bench_scroll.py` (635 lines),
 `vsync_probe.py`, `parse-wayland-cadence.py`, `run-balloon-bench.py`,
-three result files under `docs/research/ncv-results/`, a 290-line
+five result files under `docs/research/ncv-results/`, a 290-line
 validation report, and four memories on Wayland compositor cadence,
-headless weston, screen-lock stalls and window occlusion.
+headless weston, screen-lock stalls and window occlusion. The fcache v2
+multi-resolution work (gtr, w7x, q7m, k5p, u8c) is not counted here: it
+is the grid's shipped hi-DPI storage layer, even though its benchmark
+re-baselining rode along with the campaign.
 
 **Bought.** Real knowledge: Qt's raster surface is unthrottled on Mutter,
 so paint interval is not a vsync signal; the honest metric is frame
@@ -334,14 +359,21 @@ corner has consumed five beads and remains open because the definitive
 run needs an idle machine with a real display, which the shared dev box
 rarely is.
 
-**What to do.** Close q6l.27 with the release-note line as its resolution.
-Keep `perf-canary.py` in CI (it is cheap and catches order-of-magnitude
-regressions). Do not start another measurement campaign until either a
-user reports the stutter or reference-class hardware appears. Leave the
-balloons where they are; they are frozen and their CI job is
-path-filtered.
+**What to do.** Not another campaign, and not a caveat either: the scroll
+row is an N4 gate, and the review rejects "documented but open" for N3 in
+section 6.1, so it cannot accept it here. The banded level pick that the
+bead's own design named as the highest-leverage fix landed in PR 125; the
+one thing still owed is a single run of the existing bench on the 4K box
+while it is idle. Run it once. If it passes, close q6l.27. If it does not,
+take the remaining deviation to the spec as an argued amendment to the §7
+scroll row (fractional-DPR minimum zoom as a stated exception, or a
+relaxed budget for it), so the gate and the product agree in writing.
+Either way, keep `perf-canary.py` in CI (cheap, catches order-of-magnitude
+regressions), and start no further measurement work until a user reports
+the stutter or reference-class hardware appears. Leave the balloons where
+they are; they are frozen and their CI job is path-filtered.
 
-### 5.3 A multi-folder library model with no way to use it
+### 5.3 A multi-folder library model with one doorway
 
 **Cost.** `library.py` (945 lines), `volumes.py` (219), a 628-line design
 document, seven sub-beads under ed5.7, a cold-start benchmark, and catalog
@@ -350,18 +382,26 @@ version bumps.
 **Bought.** A library is now a home directory plus N roots with minted
 ids, volume UUIDs, offline tolerance and per-root caches. The field report
 in the spec (watched folders as a treasured feature) says the need is
-real, and the spec's §3 requires it.
+real, and the spec's §3 requires it. One real doorway exists: the
+first-run welcome dialog's "Use Picasa's watched folders" button
+(`main.py:767`, via `library.import_picasa_watched`) mints a multi-root
+library from Picasa's registry list, on Windows only.
 
-**Why it is an eddy.** It shipped with no menu. The release notes say
+**Why it is an eddy.** A person who did not take that button on first
+run, or who runs Linux, or who wants to add one more folder to a library
+they already have, gets nothing in the menus. The release notes say
 "adding a second drive or folder to a library takes a few typed
 instructions that most people will not need". The plumbing arrived a full
-milestone before the two menu items (Add folder, Remove folder) that
-would let a person touch it, and before writes, which matter more.
+milestone before the menu items that would let a person touch it, and
+before writes, which matter more.
 
-**What to do.** Add the two menu items in the 0.3 release (section 9);
-they call functions that already exist. Do not extend the model
-(cross-root move detection, volume self-heal, per-root policies) until
-watching lands in M4.
+**What to do.** Add "Add folder" and "Remove folder" to the Library menu
+in the 0.3 release (section 9). Add folder is small: `library.add_root`
+exists. Remove folder is not: `library.py` has no remove function, and one
+has to retire the root id, drop the per-root cache and keep the id from
+being reused. Do not extend the model beyond that (cross-root move
+detection, volume self-heal, per-root policies) until watching lands in
+M4.
 
 ### 5.4 Agent-usage bookkeeping in the product repository
 
@@ -431,12 +471,21 @@ cache folder forgets the stars. The star toggle also does not exist in the
 slideshow (`slideshow.py` keyPressEvent handles pause, prev, next and exit
 only), although the spec makes the slideshow a triage pass.
 
-The M2 epic (fauxcasa-lgg) was filed on 2026-09-15 with a design bead
-(lgg.1) and a stars-writer bead (lgg.2). The design bead is well specified
+The M2 epic (fauxcasa-lgg) was filed on 2026-09-15, the day the owner
+retired the read-only stance; its design bead (lgg.1) and stars-writer
+bead (lgg.2) followed on 09-16. The design bead is well specified
 (read-modify-write preserving unknown keys, atomic replace, read-back
 verification, drift refusal, freshness interaction, tier-2 placement,
 round-trip fixtures plus oracle differential). It is the right first step.
-It should have been the first step in July.
+
+To be fair about the delay: writes were not merely unscheduled, they were
+prohibited. The spec made M1 a read-only browser, the promotion gate
+forbade write work before M1 exit, and the owner lifted that on
+2026-09-15. The project did what it was told. The review's argument is
+with the plan's proportion, not with the agents' obedience: a read-only
+rung that ran three months, during which the sandbox and the performance
+campaign filled the time a write layer could have used, was too long a
+first step on the trust ladder.
 
 ### 6.2 No edit room
 
@@ -518,18 +567,21 @@ with the script entry kept as a thin wrapper for the documented commands.
 
 ### 7.2 One 5,500-line main.py
 
-`MainWindow` is 2,786 lines with 84 methods; its `__init__` is 540 lines;
+`MainWindow` is 2,786 lines with 81 methods; its `__init__` is 540 lines;
 the sidebar is built inline in a 294-line method and rebuilt by swapping
 in a fresh tree; `main()` is 841 lines of argument parsing, scripted-run
 flags and wiring. Per-library preferences are four load/save pairs at
-module level plus `starstore.py`, all writing the same `config.json`.
+module level plus `starstore.py`, all writing under the same cache-root
+state directory.
 
 Extract three modules: `sidebar.py` (the tree model and view),
-`librarystate.py` (every per-library persisted preference, the stars, and
-the pending-write journal from 8.1, in one place with one atomic writer),
-and `cli.py` (argument parsing and the scripted-run flags). Do it as the
-first step of the write work, because the write layer needs a single home
-anyway and today there is none.
+`librarystate.py` (one home for everything the app persists on a user's
+behalf, with two clearly separated halves: the in-library tier-2 state
+from 8.1, and the machine-local preferences such as window geometry and
+view mode that may stay in the cache), and `cli.py` (argument parsing and
+the scripted-run flags). Do it as the first step of the write work,
+because the write layer needs a single home anyway and today there is
+none.
 
 ### 7.3 Whole-file saves and no action journal
 
@@ -570,14 +622,29 @@ specifies, with the journal from 7.3 folded in:
    write to a temp file in the same directory, `os.replace`, read back and
    re-parse through the existing ingest to verify. Refuse and report if
    the file's size or mtime changed since we read it.
-2. **Tier-2 native state.** `library_state_dir` already exists per
-   library. Native state Picasa has no home for lives there in
-   human-readable files: exact star counts, reject flags, album order,
-   manual sort order, ignored faces.
+2. **Tier-2 native state, inside the library.** Not in the cache.
+   Today's `library_state_dir` is a directory under the cache root
+   (`main.py:641` returns `cache_dir_for(...)`), which is exactly the
+   N3 violation section 6.1 describes, so it cannot be the home for
+   native state. The spec's §3 tiering names the home: per-photo state
+   goes in a per-folder native sidecar next to `.picasa.ini` (one record
+   per photo, merged per record, so a copied folder carries it), and
+   library-level state goes in the library home's `.fauxcasa/` directory
+   that `library.py` already defines. Native state Picasa has no home
+   for lives there in human-readable files: exact star counts, reject
+   flags, album order, manual sort order, ignored faces, the people
+   registry. The file names and the sidecar's exact shape are lgg.1's to
+   decide; the N3 rebuild gate (delete every cache, rescan, zero loss)
+   is what proves the placement right. The cache-root state directory
+   keeps only machine preferences: window geometry, view mode, star
+   threshold, the remembered library. Release 0.2 migrates today's
+   `stars.json` into the library.
 3. **Action journal.** Append-only, one line per user action, fsync'd
-   before the UI acknowledges. Marked applied after the sidecar write
-   verifies. On start, replay unapplied entries. This is the N5 kill-fuzzer
-   substrate and the retry queue for a read-only sidecar.
+   before the UI acknowledges, kept in the library home beside the
+   tier-2 state so it survives a cache wipe. Marked applied after the
+   sidecar write verifies. On start, replay unapplied entries. This is
+   what the N5 kill-fuzzer tests, and it doubles as the retry queue for
+   a read-only sidecar.
 4. **Status surface.** A per-folder health mark (read-only ini, failed
    write, drift refused) in the sidebar and status bar, and the failures
    in the import-notes dialog. N7: nothing fails silently.
@@ -663,18 +730,24 @@ owner actions with everything prepared.
 **0.2, "Your stars are yours" (about 3 weeks, 60% touch).**
 `librarystate.py` with the journal; the sidecar writer; stars, captions,
 keywords and hide written to `.picasa.ini` with read-back verification and
-an oracle differential entry each; star toggle in the slideshow; the
-reject flag on `X` with a Rejected collection (native state); the
-`main.py` and test-file splits (7.1, 7.2). The N7 gate: make a sidecar
-read-only, star a photo, the failure is visible within one action.
+an oracle differential entry each; today's `stars.json` migrated into the
+library; star toggle in the slideshow; the reject flag on `X` with a
+Rejected collection (native state); the `main.py` and test-file splits
+(7.1, 7.2). Two gates. N7: make a sidecar read-only, star a photo, the
+failure is visible within one action. N5, first form: the kill-fuzzer over
+the journal and the writer (seeded action sequences, a kill at random
+points, relaunch, at most the in-flight action lost), because the spec
+names it an M2 deliverable and a journal nobody has killed is not yet
+trustworthy.
 
 **0.3, "Albums and folders" (about 3 weeks, 70% touch).** Create, rename,
 delete albums; add and remove members by drag to the sidebar and by
 context menu; member order in tier-2 state; delete photos to the OS trash
 with a confirmation that names the file's fate; Add folder and Remove
-folder menu items over `library.py`; per-folder sort mode persisted in
-tier-2 state. The N3 gate in CI: delete every cache, rescan, diff the
-user-visible state, zero loss.
+folder menu items over `library.py` (the remove function is new work);
+per-folder sort mode persisted in tier-2 state; the kill-fuzzer extended
+to the new action types. The N3 gate in CI: delete every cache, rescan,
+diff the user-visible state, zero loss.
 
 **0.4, "Fix it" (about 5 weeks, 60% touch).** The recipe renderer for the
 operations Picasa already stored (display parity for rotate, crop,
@@ -688,9 +761,8 @@ presets, quality, text watermark, order-preserving numbering), the email
 preset via `mailto:` and `xdg-email`, an Exports collection, batch rename.
 
 **0.6, "Live in it, part one" (about 4 weeks, 50% touch).** Manual face
-tagging (draw a region, name it) and the in-library people registry; the
-N5 kill-fuzzer in CI; move folder with cross-volume copy-verify-delete;
-per-folder health marks.
+tagging (draw a region, name it) and the in-library people registry; move
+folder with cross-volume copy-verify-delete; per-folder health marks.
 
 After that, the rest of M4 (watching with external-change reconciliation,
 device import, backup sets, the make-permanent metadata writer), then
@@ -745,19 +817,20 @@ XL needs design first.
 | 2 | Owner: family-archive confirmation (existing 6g8) | trust | owner | 6.4 |
 | 3 | Split `test_tracer.py` into `tests/` by module with conftest and per-file CI processes | plumbing | M | 7.1, every later bead |
 | 4 | Extract `librarystate.py`, `sidebar.py`, `cli.py` from `main.py` | plumbing | L | 7.2, 8.1 |
-| 5 | Action journal in `librarystate.py` (append, fsync, replay, applied marks) | trust | M | 8.1 |
-| 6 | Sidecar writer (existing lgg.1 design plus skeleton) | trust | L | 8.1 |
-| 7 | Stars, captions, keywords, hide written to ini with verification and differential (extends lgg.2) | touch | L | 0.2 |
+| 5 | Action journal in the library home (append, fsync, replay, applied marks) | trust | M | 8.1 |
+| 6 | Sidecar writer (existing lgg.1 design plus skeleton) and the in-library native sidecar | trust | L | 8.1 |
+| 7 | Stars, captions, keywords, hide written to ini with verification and differential; `stars.json` migrated into the library (extends lgg.2) | touch | L | 0.2 |
 | 8 | Star toggle in the slideshow; reject flag and Rejected collection | touch | M | 0.2 |
 | 9 | Album create/rename/delete/add/remove with tier-2 order; delete to trash | touch | L | 0.3 |
-| 10 | Add folder and Remove folder menu items over `library.py` | touch | S | 0.3 |
+| 10 | Add folder (over `library.add_root`) and Remove folder (new: root retirement, cache cleanup) menu items | touch | M | 0.3 |
 | 11 | Recipe renderer: display parity for stored Picasa edits, fixture-tested per operation | touch | XL | 0.4 |
 | 12 | Edit room v1 with named undo and Save/Undo Save/Revert | touch | XL | 0.4 |
 | 13 | Export dialog, email preset, Exports collection | touch | L | 0.5 |
 | 14 | Move delegation-report and daily-report out of the repo; drop the CI job (extends nn9) | process | S | 5.4 |
 | 15 | Threat model amendment: describe shipped coverage; freeze sandbox scope until after 0.4 | process | S | 5.1 |
-| 16 | Close q6l.27 with the release-note resolution | process | S | 5.2 |
+| 16 | Run the pending q6l.27 bench once on an idle 4K box; close it or take the deviation to the spec's §7 scroll row as an argued amendment | trust | S | 5.2 |
 | 17 | Bead labels and the 30-day ratio line | process | S | 10 |
+| 18 | N5 kill-fuzzer over the journal and sidecar writer, in CI | trust | M | 0.2 |
 
 Beads 3 and 4 are the only plumbing without a user-visible line of their
 own, and both name their consumers.
@@ -778,7 +851,7 @@ own, and both name their consumers.
 | grid.py | 1,914 | 31 | 2,124 |
 | viewer.py | 1,842 | 33 | 2,061 |
 | thumbcache.py | 1,391 | 33 | 1,705 |
-| videostream.py | 1,067 | 2 | 1,067 |
+| videostream.py | 1,067 | 1 | 1,067 |
 | library.py | 945 | 8 | 1,014 |
 | decodesvc_worker_win.py | 851 | 3 | 853 |
 | metareader.py | 699 | 8 | 751 |
@@ -794,7 +867,7 @@ own, and both name their consumers.
 | tray.py | 344 | 3 | 363 |
 | rawload.py | 295 | 5 | 324 |
 | slideshow.py | 254 | 9 | 274 |
-| the remaining 14 modules | 2,300 | | |
+| the remaining 14 modules | 2,100 | | |
 
 Whole-history churn by top-level area (lines added / deleted):
 `apps/desktop-python` 71,640 / 19,328; `docs` 21,911 / 780; `scripts`
@@ -824,13 +897,13 @@ folder 10, and a long tail.
 
 | Epic | State | Children closed |
 |---|---|---|
-| fauxcasa-cam M1 ingest completion | closed | 22 of 22 |
+| fauxcasa-cam M1 ingest completion | closed | 21 of 21 |
 | fauxcasa-v46 M1 formats | closed | 7 of 7 |
-| fauxcasa-q6l M1 browse UI | open | 26 of 27 (q6l.27 min-zoom open) |
+| fauxcasa-q6l M1 browse UI | open | 26 of 27 (q6l.27 min-zoom in progress) |
 | fauxcasa-ez2 Release 0.1 | in progress | 14 of 15 (ez2.11 native pass open) |
 | fauxcasa-ed5 M1 gates | open | 11 of 13 (multi-root 7 of 7 closed) |
 | fauxcasa-i92 M1 decode isolation | open | i92.3 in progress; i92.4, i92.5 blocked |
-| fauxcasa-lgg M2 writes | open | 0 of 2, filed 2026-09-15 |
+| fauxcasa-lgg M2 writes | open | 0 of 2 (epic filed 2026-09-15, children 09-16) |
 
 ### A.4 What a user can persist in 0.1, and where it goes
 
@@ -880,8 +953,10 @@ bd list --type=epic --status=all
 bd list --status=closed --limit 300
 bd list --status=open --limit 300
 
-# Once labels exist (section 10, rule 3): the 30-day touch ratio
-bd list --status=closed --limit 300 | grep -c '\[touch\]'
+# Once labels exist (section 10, rule 3): beads closed in the last 30 days,
+# all and touch-labelled; the ratio is the second Total over the first
+bd list --status=closed --closed-after "$(date -d '30 days ago' +%F)" --limit 300 | grep '^Total:'
+bd list --status=closed --closed-after "$(date -d '30 days ago' +%F)" --label touch --limit 300 | grep '^Total:'
 
 # Release state
 gh release list --limit 10
@@ -913,8 +988,16 @@ Two haiku-tier scout agents then read `decodefacade.py`, `thumbcache.py`,
 `viewer.py`, `catalog.py`, `main.py`, `starstore.py`, `library.py`,
 `slideshow.py`, `keymap.py` and `inspector.py` and reported the routing,
 persistence and action facts cited in sections 5.1, 6.1 and Appendix A.4
-with line numbers. An opus-tier reviewer checked the draft's factual
-claims against the repository before it was committed.
+with line numbers. An opus-tier reviewer then checked the draft's factual
+claims against the repository and listed its weakest arguments. It found
+twelve factual slips (an epic child count, a double-counted test file
+total, a missing remove-root function, several small counts) and eight
+argument weaknesses, of which the sharpest was that the draft's own
+write-layer design put native state under the cache root, the N3
+violation the draft condemns elsewhere. All are folded into this version.
+Two of its findings were withdrawn on re-check: the undo quotation is in
+the spec (it wraps across a line, which defeated a grep), and the ez2 epic
+has fifteen children, not fourteen.
 
 Limits. Bead classification by title is approximate; the counts in 3.3
 could move by ten in either direction without changing the conclusion.
