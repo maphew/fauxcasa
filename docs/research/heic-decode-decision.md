@@ -68,6 +68,15 @@ default" as a decision to make consciously, not a default that fell out
 of this bead, even though the copyright-license side is clean (LGPLv3
 compatible with AGPLv3).
 
+**Owner decision (maphew, 2026-09-15):** be liberal in what we accept
+and strict in what we emit. Fauxcasa *reads* as many formats as is
+reasonable, patent-encumbered ones included, so HEIC decode via the
+decode-only pi-heif wheel stays on by default. Fauxcasa *writes* only
+unencumbered formats: AVIF (AV1, royalty-free) is the chosen modern
+output format, alongside JPEG/PNG/WebP. No HEIC/HEVC encoder is ever
+bundled; pillow-heif and its libx265 stay excluded. Recorded in beads
+memory as `codec-policy-liberal-read-strict-emit`.
+
 ## 2. PyInstaller bundling
 
 **What we found:** pi-heif's wheel on Windows is a `delvewheel`-repaired
