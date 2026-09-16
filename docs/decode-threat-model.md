@@ -231,7 +231,11 @@ What happens now:
   only, no repo sibling imports, since its import list is the sandbox's
   attack-surface budget), so there is no import closure to chase. This
   mirrors how the frozen bundle already behaves, with its payload under
-  Program Files or `%LOCALAPPDATA%`.
+  Program Files or `%LOCALAPPDATA%`. If the staging directory refuses the
+  grant as well, the copy is still what gets launched (the source
+  directory is known to have refused; an earlier grant on the cache root
+  persists on disk) and the hello handshake decides, as it always has.
+  Only a failure to write the copy falls back to the source path.
 - The **PySide6 site-packages cannot be staged**: it is hundreds of MB of
   Qt, and copying it per spawn is not a fallback. If the uv cache or venv
   is on the same ungrantable volume (for example `UV_CACHE_DIR` pointed at

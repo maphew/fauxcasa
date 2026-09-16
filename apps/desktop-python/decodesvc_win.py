@@ -1346,7 +1346,10 @@ if sys.platform == "win32":
     # decodesvc_worker_win.py, re-verified byte-for-byte before reuse, so
     # an edited source is never run from a stale copy. Old hash dirs are
     # pruned once they are a day old (a concurrent broker may still be
-    # launching from a younger one).
+    # launching from a younger one). Once staged, the copy is what gets
+    # launched even if the staging root's own grant fails too -- only a
+    # failure to WRITE the copy (unreadable source, read-only cache root)
+    # falls back to the source path.
     WORKER_STAGING_DIRNAME = "sandbox-worker"
     WORKER_STAGING_MAX_AGE_SECONDS = 24 * 3600
 
@@ -2139,21 +2142,27 @@ class WinSandboxWorker:
                     staging_root = str(worker_staging_root())
                     staging_err = grant_read_execute_once(
                         staging_root, sid, inherit=SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+                    grant_targets.append((staging_root, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
+                    # Launch from the copy even if the staging root
+                    # refused the grant as well: the source dir is KNOWN
+                    # to have refused, while the cache root's ACL is the
+                    # user's own and any earlier successful grant on it
+                    # persists on disk (the same "access already exists"
+                    # reasoning that keeps a denied grant best-effort).
+                    worker_args = [staged]
+                    self.worker_script_staged = True
                     if staging_err is not None:
                         self.grant_errors[staging_root] = staging_err
                         _log.warning(
-                            "worker script staged to %r but that dir refused the ACL "
-                            "grant too (%s); launching from the source path", staged, staging_err)
-                    else:
-                        grant_targets.append((staging_root, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
-                        worker_args = [staged]
-                        self.worker_script_staged = True
-                        if worker_script not in _staging_logged:
-                            _staging_logged.add(worker_script)
-                            _log.warning(
-                                "worker script dir %r refused the AppContainer ACL grant; "
-                                "launching the sandbox worker from a content-hashed copy at %r",
-                                worker_dir, staged)
+                            "worker script staged to %r but that dir refused the ACL grant "
+                            "too (%s); launching from the copy anyway -- the hello handshake "
+                            "decides", staged, staging_err)
+                    elif worker_script not in _staging_logged:
+                        _staging_logged.add(worker_script)
+                        _log.warning(
+                            "worker script dir %r refused the AppContainer ACL grant; "
+                            "launching the sandbox worker from a content-hashed copy at %r",
+                            worker_dir, staged)
                 except OSError as e:
                     _log.warning("could not stage the worker script under %r (%s); "
                                  "launching from the source path", str(worker_staging_root()), e)

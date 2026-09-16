@@ -2766,10 +2766,14 @@ def test_spawn_launches_from_source_when_every_grant_succeeds(monkeypatch, tmp_p
 
 
 @_WINDOWS_ONLY
-def test_spawn_falls_back_to_source_when_staging_root_grant_fails_too(monkeypatch, tmp_path):
-    """fauxcasa-yfq: if the cache root refuses the grant as well (nothing
-    left to try), spawn() launches from the source path and reports both
-    failures rather than raising."""
+def test_spawn_still_launches_staged_copy_when_staging_root_grant_fails_too(monkeypatch, tmp_path):
+    """fauxcasa-yfq: if the cache root refuses the grant as well, spawn()
+    still launches the staged copy (the source dir is KNOWN to have
+    refused; the cache root's ACL is the user's own and an earlier grant
+    on it persists) and records both failures rather than raising. This
+    is also what keeps test_spawn_survives_denied_acl_grant -- every
+    grant simulated as denied -- spawning a real worker from a checkout
+    on an ungrantable volume."""
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
     monkeypatch.setattr(dw, "grant_read_execute_once",
                          lambda path, sid, inherit=None: f"SetNamedSecurityInfoW({path}) err=5")
@@ -2778,9 +2782,14 @@ def test_spawn_falls_back_to_source_when_staging_root_grant_fails_too(monkeypatc
     with pytest.raises(RuntimeError, match="stop before"):
         worker.spawn()
     source = Path(dw.__file__).resolve().with_name("decodesvc_worker_win.py")
-    assert worker.worker_script_staged is False
-    assert Path(worker.worker_script_path) == source
-    assert str(dw.worker_staging_root()) in worker.grant_errors
+    staging_root = str(dw.worker_staging_root())
+    assert worker.worker_script_staged is True
+    staged = Path(worker.worker_script_path)
+    assert staged != source
+    assert str(staged.parent.parent) == staging_root
+    assert staged.read_bytes() == source.read_bytes()
+    assert str(source.parent) in worker.grant_errors
+    assert staging_root in worker.grant_errors
 
 
 class _YfqFakeChild:
@@ -2818,9 +2827,8 @@ def test_spawn_reports_prehello_exit_2_as_worker_crashed_with_startup_output(mon
     PROTOCOL -- it never spoke the protocol, so its output is not evidence
     of compromise), with both lines and the failed grant in the message.
     Everything up to CreateProcess is real except the grant (forced to
-    fail for the worker dir so the fallback path is exercised, and the
-    staging root so the source path is what gets 'launched') and the
-    spawn itself (replaced by the stub)."""
+    fail everywhere, so the staging path is exercised and both failures
+    are on record) and the spawn itself (replaced by the stub)."""
     source = Path(dw.__file__).resolve().with_name("decodesvc_worker_win.py")
     worker_dir = str(source.parent)
     monkeypatch.setattr(dw, "grant_read_execute_once",
@@ -2853,7 +2861,12 @@ def test_spawn_reports_prehello_exit_2_as_worker_crashed_with_startup_output(mon
     assert "exit code 0x00000002" in msg
     assert _YFQ_NOISE_LINE_1 in msg
     assert "can't open file" in msg and "Permission denied" in msg
-    assert worker_dir in msg and "err=5" in msg
+    # Staging worked around the worker-dir refusal, so that grant is no
+    # longer blamed; the still-unresolved refusals (staging root, base
+    # dir, PYTHONPATH -- every grant was simulated as denied) are.
+    assert worker.worker_script_staged is True
+    assert worker_dir not in msg
+    assert str(dw.worker_staging_root()) in msg and "err=5" in msg
     assert not msg.startswith("PROTOCOL")
 
 
