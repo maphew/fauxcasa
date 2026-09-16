@@ -310,7 +310,11 @@ class IniDocument:
                 ln.text = f"{key}={value}"
                 ln.key = key
                 ln.value = value
-                ln.eol = self.eol
+                # Keep this line's OWN eol (not self.eol): a rewrite only
+                # changes the value bytes, so a mixed-EOL file changes
+                # nothing but the target line's content. Only lines this
+                # method ADDS (new pair, new header, the trailing-EOL
+                # fix below) use the document's majority eol.
                 found = True
         if found:
             return True

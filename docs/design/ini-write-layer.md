@@ -75,8 +75,13 @@ or nothing at end of file). A line is classified once, with the same rules
 the reader uses, as a `header` (`[name]`), a `pair` (`key=value`, split on
 the first `=`, key stripped, value verbatim), or `other` (blank, junk,
 byte-reversed garbage, `[(null)]` contents). Unmodified lines are emitted
-byte-for-byte. Modified and added lines are emitted as `key=value` plus
-the document's end-of-line style.
+byte-for-byte. A rewritten line (an existing key's value changed) is
+emitted as `key=value` plus **that line's own original end-of-line
+bytes** -- a rewrite changes only the value, nothing else, so a
+mixed-EOL file changes no bytes outside the target line. An added line
+(a new key, a new section's header, or the one EOL the "no trailing EOL"
+case adds so an appended line has something to follow) uses the
+document's end-of-line style, since it has no original EOL to keep.
 
 Decisions:
 

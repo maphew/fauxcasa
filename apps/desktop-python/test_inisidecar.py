@@ -119,6 +119,26 @@ def test_apply_set_existing_key_only_that_line_changes():
     assert doc.to_bytes() == b"[a.jpg]\r\nstar=no\r\ncaption=hi\r\n"
 
 
+def test_apply_rewrite_keeps_the_line_own_eol_in_a_mixed_eol_file():
+    # Mostly-CRLF file with one bare-LF line (majority eol is still
+    # "\r\n"); rewriting the LF line's key must change ONLY its value
+    # bytes -- not its eol to the document's majority style, and not any
+    # other line's bytes (design §2: a rewrite is a minimal byte change).
+    raw = b"[a.jpg]\r\nstar=yes\ncaption=hi\r\n[b.jpg]\r\nstar=yes\r\n"
+    doc = ini.IniDocument.from_bytes(raw)
+    assert doc.eol == "\r\n"  # majority is still CRLF
+    [star_line] = [ln for ln in doc.lines if ln.kind == "pair" and ln.key == "star"
+                   and ln.value == "yes" and ln.eol == "\n"]
+    assert star_line is not None  # sanity: the LF line is the one we target
+
+    doc.apply([ini.IniEdit("a.jpg", "star", "no")])
+    out = doc.to_bytes()
+    assert out == b"[a.jpg]\r\nstar=no\ncaption=hi\r\n[b.jpg]\r\nstar=yes\r\n"
+    [rewritten] = [ln for ln in doc.lines if ln.kind == "pair" and ln.key == "star"
+                   and ln.value == "no"]
+    assert rewritten.eol == "\n"  # kept its own original eol, not self.eol
+
+
 def test_apply_set_new_key_inserted_before_trailing_blank():
     raw = b"[a.jpg]\r\nstar=yes\r\n\r\n[b.jpg]\r\nstar=yes\r\n"
     doc = ini.IniDocument.from_bytes(raw)
