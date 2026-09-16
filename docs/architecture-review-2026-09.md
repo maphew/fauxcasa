@@ -12,8 +12,13 @@ the answers.
 Every recommendation here is a proposal under the spec's own rule ("change
 it by arguing, not by silently diverging", `docs/product-spec.md`).
 Follow-up beads get filed after the owner ratifies or amends the
-proposals, not before. Appendix B holds the commands that produced every
-number, so the review can be re-run in three months and compared.
+proposals, not before. **Status: the owner ratified sections 8 to 11 on
+2026-09-16 and the beads in section 11 are filed** (label
+`arch-review-2026-09`, plus one of `touch`, `trust`, `plumbing`,
+`process`). Sections 8 to 11 are therefore the current direction, not a
+proposal; change them by arguing in a bead. Appendix B holds the commands
+that produced every number, so the review can be re-run in three months
+and compared.
 
 Intended readers: the owner, and the agents that will do most of the
 work. Section "Plain-language summary" is for the owner. Sections 8 to 11
@@ -806,34 +811,44 @@ These rules make the drift visible.
 
 ---
 
-## 11. Proposed beads (file after ratification)
+## 11. Beads (ratified and filed 2026-09-16)
 
 Sizes use the gap audit's scale: S hours, M about a day, L several days,
-XL needs design first.
+XL needs design first. Rows 2 and 16 already had beads, so those were
+annotated and labelled rather than duplicated. Rows 5 to 9 and 18 are
+children of the M2 writes epic `lgg`. All eighteen carry the label
+`arch-review-2026-09`:
 
-| # | Title | Label | Size | Serves |
-|---|---|---|---|---|
-| 1 | Publish v0.1.0-rc2 as a pre-release; fix the README link | process | S | 6.5 |
-| 2 | Owner: family-archive confirmation (existing 6g8) | trust | owner | 6.4 |
-| 3 | Split `test_tracer.py` into `tests/` by module with conftest and per-file CI processes | plumbing | M | 7.1, every later bead |
-| 4 | Extract `librarystate.py`, `sidebar.py`, `cli.py` from `main.py` | plumbing | L | 7.2, 8.1 |
-| 5 | Action journal in the library home (append, fsync, replay, applied marks) | trust | M | 8.1 |
-| 6 | Sidecar writer (existing lgg.1 design plus skeleton) and the in-library native sidecar | trust | L | 8.1 |
-| 7 | Stars, captions, keywords, hide written to ini with verification and differential; `stars.json` migrated into the library (extends lgg.2) | touch | L | 0.2 |
-| 8 | Star toggle in the slideshow; reject flag and Rejected collection | touch | M | 0.2 |
-| 9 | Album create/rename/delete/add/remove with tier-2 order; delete to trash | touch | L | 0.3 |
-| 10 | Add folder (over `library.add_root`) and Remove folder (new: root retirement, cache cleanup) menu items | touch | M | 0.3 |
-| 11 | Recipe renderer: display parity for stored Picasa edits, fixture-tested per operation | touch | XL | 0.4 |
-| 12 | Edit room v1 with named undo and Save/Undo Save/Revert | touch | XL | 0.4 |
-| 13 | Export dialog, email preset, Exports collection | touch | L | 0.5 |
-| 14 | Move delegation-report and daily-report out of the repo; drop the CI job (extends nn9) | process | S | 5.4 |
-| 15 | Threat model amendment: describe shipped coverage; freeze sandbox scope until after 0.4 | process | S | 5.1 |
-| 16 | Run the pending q6l.27 bench once on an idle 4K box; close it or take the deviation to the spec's §7 scroll row as an argued amendment | trust | S | 5.2 |
-| 17 | Bead labels and the 30-day ratio line | process | S | 10 |
-| 18 | N5 kill-fuzzer over the journal and sidecar writer, in CI | trust | M | 0.2 |
+```bash
+bd list -l arch-review-2026-09
+```
 
-Beads 3 and 4 are the only plumbing without a user-visible line of their
-own, and both name their consumers.
+| # | Bead | Title | Label | Size | Serves |
+|---|---|---|---|---|---|
+| 1 | qf2 | Publish v0.1.0-rc2 as a pre-release; fix the README link | process | S | 6.5 |
+| 2 | 6g8 | Owner: family-archive confirmation (existing bead, annotated) | trust | owner | 6.4 |
+| 3 | l09 | Split `test_tracer.py` into `tests/` by module with conftest and per-file CI processes | plumbing | M | 7.1, every later bead |
+| 4 | 4tu | Extract `librarystate.py`, `sidebar.py`, `cli.py` from `main.py` | plumbing | L | 7.2, 8.1 |
+| 5 | lgg.3 | Action journal in the library home (append, fsync, replay, applied marks) | trust | M | 8.1 |
+| 6 | lgg.4 | Sidecar writer (existing lgg.1 design plus skeleton) and the in-library native sidecar | trust | L | 8.1 |
+| 7 | lgg.5 | Captions, keywords, hide written to ini with verification and differential; `stars.json` migrated into the library (stars themselves are lgg.2) | touch | L | 0.2 |
+| 8 | lgg.6 | Star toggle in the slideshow; reject flag and Rejected collection | touch | M | 0.2 |
+| 9 | lgg.7 | Album create/rename/delete/add/remove with tier-2 order; delete to trash | touch | L | 0.3 |
+| 10 | 5du | Add folder (over `library.add_root`) and Remove folder (new: root retirement, cache cleanup) menu items | touch | M | 0.3 |
+| 11 | nrh | Recipe renderer: display parity for stored Picasa edits, fixture-tested per operation | touch | XL | 0.4 |
+| 12 | iha | Edit room v1 with named undo and Save/Undo Save/Revert | touch | XL | 0.4 |
+| 13 | 8o1 | Export dialog, email preset, Exports collection | touch | L | 0.5 |
+| 14 | 5vi | Move delegation-report and daily-report out of the repo; drop the CI job (extends nn9) | process | S | 5.4 |
+| 15 | 3d4 | Threat model amendment: describe shipped coverage; freeze sandbox scope until after 0.4 | process | S | 5.1 |
+| 16 | q6l.27 | Run the pending bench once on an idle 4K box; close it or take the deviation to the spec's §7 scroll row as an argued amendment (existing bead, annotated) | trust | S | 5.2 |
+| 17 | g11 | Bead labels and the 30-day ratio line | process | S | 10 |
+| 18 | lgg.8 | N5 kill-fuzzer over the journal and sidecar writer, in CI | trust | M | 0.2 |
+
+Dependencies as filed: 7, 8, 9 and 18 wait on the journal (5) and the
+sidecar writer (6); 6 waits on the lgg.1 design; 7 also waits on lgg.2;
+12 waits on the renderer (11) and the writer (6); 13 waits on 11.
+Everything else is unblocked now. Beads 3 and 4 are the only plumbing
+without a user-visible line of their own, and both name their consumers.
 
 ---
 
