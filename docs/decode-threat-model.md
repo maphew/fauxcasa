@@ -184,6 +184,81 @@ for exactly this future move (see `pillowload.py`'s module docstring).
   versions the decoder bundle so security updates ship without app
   releases.
 
+## Sandbox degraded on a Dev Drive / non-owned volume (operational note)
+
+`decodefacade` logs `decode sandbox failed to start, degrading to
+in-process: ...` and the status bar says the sandbox is off. On Windows the
+usual cause when running from a **source checkout** is the volume the
+checkout sits on, not the code (fauxcasa-yfq, found 2026-09-15 on the dev
+box's `A:` ReFS drive).
+
+What is going on: the AppContainer token only gets read access to a path
+if that path's ACL grants it to the container SID (or to `ALL APPLICATION
+PACKAGES`). At spawn, `decodesvc_win.grant_read_execute_once` adds that ACE
+to three directories: the base interpreter dir, the worker `PYTHONPATH`
+(the PySide6 site-packages) and the directory holding
+`decodesvc_worker_win.py`. The grant is best-effort by design (a Program
+Files install already grants `ALL APPLICATION PACKAGES` and denies
+`WRITE_DAC`, and must still spawn), so on a volume that refuses it, such
+as a Dev Drive / ReFS volume whose root ACL is `Authenticated Users:
+Modify` with no `WRITE_DAC`, or any volume the user does not own,
+`SetNamedSecurityInfoW` fails with `err=5` even on an empty directory the
+user just created, and `icacls /grant` fails the same way. The worker
+process then cannot open its own script: the interpreter prints
+`can't open file ...: [Errno 13] Permission denied` and exits 2 before it
+ever speaks the protocol.
+
+What happens now:
+
+- The grant failure is logged at **WARNING** with the path (once per path
+  per process), not INFO.
+- A worker that exits before its hello frame has its remaining stdout and
+  stderr read into the spawn error, so the reason names the failed grant
+  and the unreadable path instead of the earlier red herring (`PROTOCOL:
+  incoming control frame 1432107587 bytes exceeds MAX_CONTROL_MSG`, which
+  was the second diagnostic line's first four bytes `C:\U` read as a frame
+  length). A non-zero pre-hello exit is reported as `WORKER_CRASHED`, not
+  `PROTOCOL`: the process never processed untrusted input, so nothing it
+  printed is evidence of compromise.
+- When the grant on the **worker-script directory** fails, the broker
+  copies `decodesvc_worker_win.py` to
+  `%LOCALAPPDATA%\Fauxcasa\cache\sandbox-worker\<sha256[:16]>\` (the same
+  root the ACL markers use, always grantable), grants that directory, and
+  launches from the copy. The copy is content-hashed and re-verified byte
+  for byte on every spawn, so an edited source never runs from a stale
+  copy; hash directories a day old are pruned. Only that one file moves:
+  the worker is deliberately self-contained (stdlib, ctypes and PySide6
+  only, no repo sibling imports, since its import list is the sandbox's
+  attack-surface budget), so there is no import closure to chase. This
+  mirrors how the frozen bundle already behaves, with its payload under
+  Program Files or `%LOCALAPPDATA%`. The copy is launched only when the
+  staging directory's own grant succeeds, so staging can only ever swap
+  a directory that refused the grant for one that just accepted it. If
+  the staging directory refuses the grant as well, or the copy cannot be
+  written, the broker stays on the source path: in the Program-Files
+  case (`ALL APPLICATION PACKAGES` already has RX on the source,
+  `WRITE_DAC` denied) that source is readable while a copy under
+  `%LOCALAPPDATA%` without a fresh grant is not. Staging also refuses to
+  run when `LOCALAPPDATA` is unset, since executed code does not belong
+  under the cache root's TEMP/home fallback. The hello handshake decides,
+  as it always has.
+- The **PySide6 site-packages cannot be staged**: it is hundreds of MB of
+  Qt, and copying it per spawn is not a fallback. If the uv cache or venv
+  is on the same ungrantable volume (for example `UV_CACHE_DIR` pointed at
+  the Dev Drive), the sandbox still degrades, and the error now says so
+  and names the fix: put the uv cache / venv on a grantable volume (unset
+  `UV_CACHE_DIR` so it defaults to `%LOCALAPPDATA%\uv`), or set
+  `FAUXCASA_WORKER_PYTHON` to an interpreter whose site-packages is on
+  one. The base interpreter dir is under `%APPDATA%\uv\python` for
+  uv-managed CPython, which is grantable.
+
+None of this affects the threat model's properties: the staged copy is a
+byte-identical file in a directory the container receives read+execute on,
+exactly what the source directory would have received had the grant
+worked, and the pre-hello output is broker-controlled interpreter output
+read only after the worker has exited. `FAUXCASA_DECODE_SANDBOX=require`
+(`--require-sandbox`) still refuses to start rather than degrade.
+
 ## Residual risks (owned, not hidden)
 
 - The OS sandbox itself (kernel syscall surface, win32k on Windows) is
