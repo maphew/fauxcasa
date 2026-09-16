@@ -6,11 +6,9 @@ Fauxcasa 0.1.0 ships with clauses 1 and 2 of the M1 gate automated and
 mostly green (clause 1's N4 budgets are green except for min-zoom
 scrolling on high-DPI displays, tracked as `fauxcasa-q6l.27`; clause 2's
 survey cross-check is green in CI). **Clause 3 — the owner confirmation on
-the family archive below — is still a pending owner action** (tracked as
-`fauxcasa-6g8`) and has not been recorded as of this release. 0.1.0 ships
-without it; the runbook below remains the path to close it, or an owner
-may instead record a dated waiver here explicitly accepting the release
-without clause 3 confirmed.
+the family archive below — was recorded on 2026-09-16** against the
+v0.1.0-rc2 build (see section 4; tracked as `fauxcasa-6g8`, closed). The
+runbook below stays the path for re-confirming on later releases.
 
 Vehicle for the third clause of the M1 gate (docs/product-spec.md, "M1 —
 See your library again"):
@@ -115,4 +113,48 @@ satisfies gate clause 3 for that commit.
 Signed off: <owner> — clause 3 confirmed for this commit.
 ```
 
-*(no confirmations recorded yet)*
+### Confirmation — 2026-09-16
+
+- Commit under test: 269d61f (tag `v0.1.0-rc2`, the published pre-release build)
+- Archive copy prepared: 2026-09-16 (read-only copy, outside repo)
+- [x] Ingest cross-check: `confirm-archive.py` exit 0 — PASS
+- [x] Browse confirmation: all checklist items above
+- Advisory notes: `db3_rows_unjoinable` 1761 (db3 catalog rows with no
+  matching file under the library copy; advisory, expected real-archive
+  residue), `import_report` empty. No contacts.xml in the app-data copy, so
+  `contacts_xml_present` was skipped. All strict classes matched.
+- Redacted cross-check output:
+
+    library: <len=18 sha1=9238b85a>
+    confirm-archive gate (M1 clause 3) over the library above
+    class                   reference  tracer  tier      verdict
+    ----------------------  ---------  ------  --------  -----------------------
+    photos                  237        237     strict    ok
+    folders                 19         19      strict    ok
+    videos                  0          0       strict    ok
+    stashed_originals       0          0       strict    ok
+    starred                 0          0       strict    ok
+    captioned               0          0       strict    ok
+    keyworded               0          0       strict    ok
+    hidden_photos           0          0       strict    ok
+    hidden_folders          0          0       strict    ok
+    rotated                 0          0       strict    ok
+    folder_descriptions     0          0       strict    ok
+    album_memberships       1          1       strict    ok
+    geotagged               0          0       strict    ok
+    face_tags               0          0       strict    ok
+    edit_keys_other         0          0       strict    ok
+    contacts_xml_present    -          -       strict    skipped (source absent)
+    contacts_ini_present    0          0       strict    ok
+    album_definitions       1          1       strict    ok
+    pal_albums_present      0          0       strict    ok
+    db3_video_dims          0          0       strict    ok
+    db3_video_filetype      0          0       strict    ok
+    db3_caption_precedence  0          -       advisory  ok
+    db3_rows_unjoinable     1761       -       advisory  warn
+
+    advisory: import_report is empty
+
+    PASS: every strict class matches between the survey/filesystem reference and the tracer catalog
+
+Signed off: Matt Wilkie — clause 3 confirmed for this commit.
