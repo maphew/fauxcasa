@@ -19475,7 +19475,7 @@ def test_abandoned_hard_stop_does_not_fire_after_its_run(
     still uses the caplog form.)"""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
+    from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
     import main
 
@@ -19490,11 +19490,21 @@ def test_abandoned_hard_stop_does_not_fire_after_its_run(
     # Spin the reused QApplication past that abandoned deadline. A slow
     # runner cannot make this vacuous: it would fail the rc above, loudly,
     # rather than quietly skip the race.
+    #
+    # This must drive app.exec(), NOT a bare QEventLoop() (see the note on
+    # test_ready_poll_timer_dies_with_the_window, whose own spin loop this
+    # was originally copied from): after main.main() has called
+    # QCoreApplication.quit() once (the --quit-after-ready path), Qt leaves
+    # QThreadData::quitNow set, and every later bare QEventLoop().exec() on
+    # this thread returns in well under a millisecond WITHOUT servicing any
+    # pending timer, forever — only QCoreApplication::exec() resets that
+    # flag on entry. A bare-QEventLoop() version of this spin is silently a
+    # no-op no matter how many rounds or how long each singleShot is, so it
+    # stays green whether or not the abandoned hard-stop is actually
+    # disarmed — vacuous against the very bug this test guards.
     for _ in range(45):  # ~2.7 s
-        loop = QEventLoop()
-        QTimer.singleShot(60, loop.quit)
-        loop.exec()
-        QCoreApplication.processEvents()
+        QTimer.singleShot(60, app.quit)
+        app.exec()
     err = capsys.readouterr().err
     assert "TIMEOUT after" not in err, \
         f"the abandoned --timeout fired after its run: {err}"
