@@ -44,6 +44,25 @@ bd close <id>         # Complete work
 bd dolt push          # Push beads data to remote
 ```
 
+### Bead labels (proportion rule)
+
+Every bead carries exactly one of four labels, set at creation
+(`bd create ... --labels=touch`) or with `bd label add <id> <label>`
+(rules 1 to 3 in `docs/architecture-review-2026-09.md` section 10):
+
+- `touch`: a person can see or do something new.
+- `trust`: data safety: verified writes, gates, crash-safety, oracle
+  differentials, sandboxing.
+- `plumbing`: everything else in the product. The description names the
+  `touch` or `trust` bead it serves; if that consumer is not scheduled in
+  the current or next release, the bead waits.
+- `process`: repo, CI, agents, docs about how we work.
+
+Targets per release: at least half of closed beads are `touch`, at most one
+in ten is `process`. Print the 30-day ratio with the one-liner in the
+review's Appendix B ("Beads"). `bd list` searches and reports should treat
+a bead with no such label as a filing error, not a fifth category.
+
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
