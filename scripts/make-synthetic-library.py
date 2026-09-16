@@ -425,6 +425,11 @@ FACES_XMP_MATCH_NAME = "Alice InFile"
 FACES_XMP_ADDED_NAME = "Xmp Only Face"  # no ini counterpart anywhere
 
 
+def _rects_close(a: tuple[float, float, float, float],
+                 b: tuple[float, float, float, float], tol: float = 1e-6) -> bool:
+    return all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
 def _embed_faces_in_xmp(path: Path) -> None:
     """Overlay one mwg-rs RegionInfo XMP region exactly on top of Alice's
     existing ini faces=rect64(_ALICE_FACE_RECT64) region on `path` (IoU
@@ -436,21 +441,44 @@ def _embed_faces_in_xmp(path: Path) -> None:
     lands on the right TOTAL count via the wrong rule would still be
     caught.
 
+    Short-circuits when `path` already carries exactly these two regions
+    (fauxcasa-za8 review round 1): make_extras_library calls this
+    UNCONDITIONALLY, not gated by the photo's own skip-if-exists check
+    (see its call site), specifically so a stale corpus predating this
+    fixture self-heals on a re-run -- but embed_test_metadata still does
+    real exiv2 I/O on every call otherwise, and re-embedding is belt-and-
+    suspenders safe rather than assumed-idempotent: it re-checks the
+    ACTUAL bytes on disk instead of trusting embed_test_metadata's own
+    idempotency fix never regresses.
+
     Lazy metareader/picasa_db import: this is the only --picasa-extras
     step that needs exiv2 (embed_test_metadata raises loudly if it's
     unavailable -- a broken fixture must fail the generator, not degrade
     quietly), so the default / --scale / --benchmark profiles never pay
     for it."""
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "apps" / "desktop-python"))
+    desktop_python = str(Path(__file__).resolve().parent.parent
+                         / "apps" / "desktop-python")
+    if desktop_python not in sys.path:
+        sys.path.insert(0, desktop_python)
     import metareader  # noqa: PLC0415 (deliberate lazy import, see above)
     import picasa_db  # noqa: PLC0415
 
     left, top, right, bottom = picasa_db.parse_rect64(_ALICE_FACE_RECT64)
     x, y = (left + right) / 2, (top + bottom) / 2
     w, h = right - left, bottom - top
+    added_rect = (0.85 - 0.05, 0.15 - 0.05, 0.85 + 0.05, 0.15 + 0.05)
+
+    raw = path.read_bytes()
+    existing = metareader.read_file_meta(raw).faces
+    if len(existing) == 2 \
+            and _rects_close(existing[0][0], (left, top, right, bottom)) \
+            and existing[0][1] == FACES_XMP_MATCH_NAME \
+            and _rects_close(existing[1][0], added_rect) \
+            and existing[1][1] == FACES_XMP_ADDED_NAME:
+        return  # already planted -- no need to touch the file again
+
     data = metareader.embed_test_metadata(
-        path.read_bytes(),
+        raw,
         faces=[
             (FACES_XMP_MATCH_NAME, x, y, w, h),               # overlaps Alice's ini rect
             (FACES_XMP_ADDED_NAME, 0.85, 0.15, 0.10, 0.10),   # far corner, no overlap
@@ -864,7 +892,13 @@ def make_extras_library(root: Path | None = None) -> Path:
     Deterministic and self-contained: photos via make_photo_fast (same
     EXIF scheme as --scale), metadata from the fixed plan above. Existing
     photo files are kept (same skip-if-exists behavior as other profiles);
-    sidecars/manifest are always rewritten so plan edits propagate.
+    sidecars/manifest are always rewritten so plan edits propagate. ONE
+    exception (fauxcasa-za8): the FACES_XMP_REL photo's in-file XMP is
+    always re-checked (_embed_faces_in_xmp), even when the file itself was
+    kept -- a self-heal so a corpus directory generated before this
+    fixture existed still picks it up on a re-run; it short-circuits to a
+    no-op once the regions already match, so re-running against an
+    already-current corpus does not rewrite the file's bytes.
     """
     import json
 

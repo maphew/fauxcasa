@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import logging
 import sys
 import tempfile
 from dataclasses import dataclass, replace
@@ -65,6 +66,14 @@ from typing import Any, Callable
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 sys.path.insert(0, str(REPO / "apps" / "desktop-python"))
+
+# fauxcasa-za8: pillowload registers pi-heif (HEIC/HEIF support) at IMPORT
+# time and logs a WARNING on the shared "fauxcasa" logger when the wheel
+# is absent -- irrelevant noise for a still-image-free (faces-in-XMP is
+# the only pillowload-adjacent import this gate needs) gate whose corpus
+# carries no HEIC fixtures. Set before the thumbcache import below (which
+# pulls pillowload in transitively) so the one-time warning never fires.
+logging.getLogger("fauxcasa").setLevel(logging.ERROR)
 
 import picasa_db  # noqa: E402
 from catalog import Catalog, load_contacts_xml, scan_library  # noqa: E402
@@ -83,6 +92,9 @@ from videoload import VIDEO_EXTS  # noqa: E402
 # docstrings) -- no thumbnail/QImage work, so pulling this in does not
 # drag PySide6/rawpy/zstandard into this otherwise decode-free gate.
 from thumbcache import apply_photo_meta, read_photo_meta  # noqa: E402
+# the reference-side, independently-parsed-from-bytes half of the same
+# class (_faces_in_xmp_reference) -- read_file_meta alone, no thumbcache.
+import metareader  # noqa: E402
 
 
 def _load_generator():
@@ -126,6 +138,13 @@ class Reference:
     # match_name/added_name) so this script never hardcodes a second copy
     # that could drift from what make-synthetic-library.py actually plants.
     faces_in_xmp: dict[str, str]
+    # Independently reparsed from the fixture photo's OWN bytes
+    # (_faces_in_xmp_reference: metareader.read_file_meta, the same exiv2
+    # seam the tracer uses to READ -- never the generator's manifest
+    # ["expected"] claim), so clause (d) below is a genuine second-source
+    # cross-check, not a tautology, and a fixture-embedding regression
+    # (fauxcasa-za8 review round 1) shows up as a REFERENCE failure too.
+    faces_in_xmp_count: int
 
 
 # imagedata.filetype codes for a db3-indexed video clip, derived from
@@ -210,6 +229,29 @@ def _db3_reference(
     return dims, filetypes, precedence
 
 
+def _faces_in_xmp_reference(library: Path, ids: dict[str, str]) -> int:
+    """Independently reparse the fixture photo's OWN XMP bytes for the
+    two mwg-rs regions _embed_faces_in_xmp planted, via metareader.
+    read_file_meta -- the same exiv2 seam the tracer's own read uses, but
+    never the generator's manifest["expected"] claim and never
+    thumbcache's merge logic. Names only (read_file_meta's faces have no
+    contact id -- that is an ini/Picasa concept metareader never sees);
+    the merge-by-geometry / contact-id assertions are the tracer side's
+    job (_tracer_faces_in_xmp). Fail-soft to 0 (never raises): an absent
+    rel/file/manifest entry means this fixture was never planted, which
+    is exactly what clause (c) below exists to catch."""
+    rel = ids.get("rel")
+    if not rel:
+        return 0
+    path = library / rel
+    if not path.is_file():
+        return 0
+    faces = metareader.read_file_meta(path.read_bytes()).faces
+    matched = any(name == ids.get("match_name") for _rect, name in faces)
+    added = any(name == ids.get("added_name") for _rect, name in faces)
+    return int(matched) + int(added)
+
+
 def build_reference(corpus: Path) -> Reference:
     library = corpus / "library"
     # Survey-owned media counts (fauxcasa-ed5.11/4lo): photos_fs/videos_fs/
@@ -250,6 +292,8 @@ def build_reference(corpus: Path) -> Reference:
         db3_video_filetype=db3_video_filetype,
         db3_caption_precedence=db3_caption_precedence,
         faces_in_xmp=manifest.get("faces_in_xmp", {}),
+        faces_in_xmp_count=_faces_in_xmp_reference(
+            library, manifest.get("faces_in_xmp", {})),
     )
 
 
@@ -420,8 +464,17 @@ CLASSES: list[ParityClass] = [
         # matched-by-geometry outcome (ini rect+contact id kept, XMP name
         # wins) and the added outcome (XMP-only region, no ini match), so
         # a merge landing on the right TOTAL via the wrong rule still fails.
+        # reference() reads faces_in_xmp_count -- an INDEPENDENT reparse of
+        # the fixture's own XMP bytes (_faces_in_xmp_reference), not the
+        # generator's manifest["expected"] claim -- so clause (d) below is
+        # a genuine two-source cross-check (a fixture-embedding regression
+        # like the fauxcasa-za8 review round-1 blocker shows up as a
+        # REFERENCE failure here, not just a tracer-side loss). Already 0
+        # (never KeyErrors) on a --corpus predating fauxcasa-za8, via
+        # faces_in_xmp's own .get(..., {}) default -- trips the existing
+        # clause-(c) "corpus does not exercise this class" message.
         "faces_in_xmp",
-        lambda r: r.manifest["expected"]["faces_in_xmp"],
+        lambda r: r.faces_in_xmp_count,
         lambda c, r: _tracer_faces_in_xmp(c, r),
         manifest_key="faces_in_xmp"),
     # ---- geotags: ingested by fauxcasa-cam.9/.10/.11 PR --------------------
@@ -548,8 +601,12 @@ def _tracer_faces_in_xmp(c: Catalog, r: Reference) -> int | None:
     mutate the shared `c` every other class in the table also reads from
     (face_tags/face_tags_named are scan-time-only counts; letting this
     index-time merge land on the shared catalog would desync them).
-    None (never-ingested shape) if the fixture rel is missing from the
-    manifest or the catalog -- a stale --corpus predating fauxcasa-za8."""
+    None if the fixture rel is missing from the manifest or the catalog --
+    a stale --corpus predating fauxcasa-za8, where the reference side
+    (faces_in_xmp_count, via _faces_in_xmp_reference's own rel.get(...)
+    guard) already degrades to 0 and trips the gate's own clause-(c)
+    "corpus does not exercise this class" message rather than a raw
+    KeyError."""
     rel = r.faces_in_xmp.get("rel")
     if not rel:
         return None
