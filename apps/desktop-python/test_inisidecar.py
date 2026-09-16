@@ -35,6 +35,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import inisidecar as ini  # noqa: E402
 
 _REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO / "scripts"))
+
+import picasa_db  # noqa: E402
 
 _WINDOWS_ONLY = pytest.mark.skipif(
     sys.platform != "win32",
@@ -46,14 +49,29 @@ _WINDOWS_ONLY = pytest.mark.skipif(
 # Round-trip: oracle fixtures
 # --------------------------------------------------------------------------
 
-_ORACLE_INIS = sorted(
-    _REPO.glob("fixtures/oracle/*/after/library/**/.picasa.ini"))
+# Every INI_NAMES variant (.picasa.ini, Picasa.ini, picasa.ini), under
+# both before/ and after/ library trees -- not just the after/.picasa.ini
+# slice a first pass might reach for.
+_ORACLE_INIS = sorted({
+    p
+    for tree in ("before", "after")
+    for name in ini.INI_NAMES
+    for p in _REPO.glob(f"fixtures/oracle/*/{tree}/library/**/{name}")
+})
 
 
-def test_oracle_fixtures_present_or_skip():
-    if not _ORACLE_INIS:
-        pytest.skip(
-            "no fixtures/oracle/*/after/library/**/.picasa.ini found")
+def test_oracle_fixtures_present():
+    # SKIP only when fixtures/oracle/ itself is absent (e.g. a sparse
+    # checkout); FAIL when the directory exists but the glob found
+    # nothing -- that is a glob or fixture-layout regression, not an
+    # absent-fixtures situation, and must not silently vanish as zero
+    # collected parametrize cases.
+    oracle_dir = _REPO / "fixtures" / "oracle"
+    if not oracle_dir.is_dir():
+        pytest.skip(f"{oracle_dir} not present in this checkout")
+    assert _ORACLE_INIS, (
+        f"{oracle_dir} exists but no {{.picasa.ini,Picasa.ini,picasa.ini}} "
+        "under before/ or after/ library trees matched")
 
 
 @pytest.mark.parametrize(
@@ -84,6 +102,11 @@ SYNTHETIC_ROUND_TRIP_CASES = {
         b"[a]\r\nk=1\r\n[a]\r\nk=2\r\nk=3\r\n"),
     "blank_lines_between_sections": (
         b"[a]\r\n\r\nk=v\r\n\r\n[b]\r\nk=v\r\n"),
+    "lone_cr_at_eof": b"[a.jpg]\r\nstar=yes\r",
+    "cr_only_file": b"[a]\rfoo\rbar\r",
+    "bom_only_file": b"\xef\xbb\xbf",
+    "empty_file": b"",
+    "cp1252_undefined_byte_no_marker": b"[a]\r\nc=Stra\xdfe\r\nd=\x81\r\n",
 }
 
 
@@ -96,13 +119,25 @@ def test_round_trip_synthetic(raw: bytes):
 
 
 def test_round_trip_records_expected_encoding_branch():
+    # Four distinct tags, not three: the cp1252 branch's own inner
+    # fallback (a byte cp1252 itself rejects) must NOT share a tag with
+    # the utf8=1-marked branch, even though both decode via the same
+    # utf-8+surrogateescape codec (design §3, Opus review finding 2).
     utf8_doc = ini.IniDocument.from_bytes(b"[a]\r\nk=v\r\n")
     assert utf8_doc.encoding == "utf-8"
     marker_doc = ini.IniDocument.from_bytes(
         b"[encoding]\r\nutf8=1\r\n[a]\r\ncaption=caf\xe9\r\n")
-    assert marker_doc.encoding == "utf-8-surrogateescape"
+    assert marker_doc.encoding == "utf-8-marked"
     cp1252_doc = ini.IniDocument.from_bytes(b"[a]\r\ncaption=Stra\xdfe\r\n")
     assert cp1252_doc.encoding == "cp1252"
+    # The fourth branch: no [encoding] marker AND cp1252 itself rejects a
+    # byte (0x81 is undefined in cp1252) -- falls back to utf-8+
+    # surrogateescape same as the marked branch, but for a different
+    # reason, so it gets its own tag.
+    legacy_doc = ini.IniDocument.from_bytes(
+        b"[a]\r\nc=Stra\xdfe\r\nd=\x81\r\n")
+    assert legacy_doc.encoding == "legacy-surrogateescape"
+    assert legacy_doc.to_bytes() == b"[a]\r\nc=Stra\xdfe\r\nd=\x81\r\n"
     bom_doc = ini.IniDocument.from_bytes(b"\xef\xbb\xbf[a]\r\nk=v\r\n")
     assert bom_doc.bom is True
 
@@ -128,8 +163,7 @@ def test_apply_rewrite_keeps_the_line_own_eol_in_a_mixed_eol_file():
     doc = ini.IniDocument.from_bytes(raw)
     assert doc.eol == "\r\n"  # majority is still CRLF
     [star_line] = [ln for ln in doc.lines if ln.kind == "pair" and ln.key == "star"
-                   and ln.value == "yes" and ln.eol == "\n"]
-    assert star_line is not None  # sanity: the LF line is the one we target
+                   and ln.value == "yes" and ln.eol == "\n"]  # sanity: exists
 
     doc.apply([ini.IniEdit("a.jpg", "star", "no")])
     out = doc.to_bytes()
@@ -160,6 +194,86 @@ def test_apply_set_duplicate_sections_and_keys_rewrites_all():
     doc = ini.IniDocument.from_bytes(raw)
     doc.apply([ini.IniEdit("a.jpg", "k", "9")])
     assert doc.to_bytes() == b"[a.jpg]\r\nk=9\r\n[a.jpg]\r\nk=9\r\nk=9\r\n"
+
+
+def test_apply_set_duplicate_sections_key_missing_in_one_run_inserts_there():
+    # A run that already has the key gets it REWRITTEN; a run that
+    # lacks it gets it INSERTED -- every run of the name ends up
+    # carrying key=value, not just the last one (Opus review finding 4).
+    raw = b"[a.jpg]\r\nx=1\r\n[a.jpg]\r\ny=2\r\n"
+    doc = ini.IniDocument.from_bytes(raw)
+    changed = doc.apply([ini.IniEdit("a.jpg", "star", "yes")])
+    assert changed == [("a.jpg", "star")]
+    assert doc.to_bytes() == (
+        b"[a.jpg]\r\nx=1\r\nstar=yes\r\n[a.jpg]\r\ny=2\r\nstar=yes\r\n")
+
+
+def test_apply_set_no_op_when_value_already_matches():
+    # Setting a value that is already set everywhere reports no change
+    # and leaves every byte untouched (Opus review finding 5).
+    raw = b"[a.jpg]\r\nstar=yes\r\n"
+    doc = ini.IniDocument.from_bytes(raw)
+    changed = doc.apply([ini.IniEdit("a.jpg", "star", "yes")])
+    assert changed == []
+    assert doc.to_bytes() == raw
+
+
+def test_apply_set_preserves_original_key_spelling_and_whitespace():
+    # A rewrite touches only the bytes at/after the first "=" (the
+    # reader's own definition of "value"); the key's original spelling
+    # and surrounding whitespace survive untouched (Opus review finding 3).
+    raw = b"[a.jpg]\r\n  Star = yes \r\n"
+    doc = ini.IniDocument.from_bytes(raw)
+    changed = doc.apply([ini.IniEdit("a.jpg", "star", "no")])
+    assert changed == [("a.jpg", "star")]
+    assert doc.to_bytes() == b"[a.jpg]\r\n  Star =no\r\n"
+
+
+def test_apply_set_on_lf_file():
+    raw = b"[a.jpg]\nstar=yes\ncaption=hi\n"
+    doc = ini.IniDocument.from_bytes(raw)
+    assert doc.eol == "\n"
+    doc.apply([ini.IniEdit("a.jpg", "star", "no")])
+    assert doc.to_bytes() == b"[a.jpg]\nstar=no\ncaption=hi\n"
+
+
+def test_apply_set_new_key_and_new_section_after_lone_cr_at_eof():
+    # A file whose last line ends in a bare "\r" (no "\n") is NOT
+    # terminated as far as read_picasa_ini is concerned (it splits only
+    # on "\n"); appending after it must not glue the new line onto the
+    # old value (Opus review finding 1).
+    raw = b"[a.jpg]\r\nstar=yes\r"
+
+    doc = ini.IniDocument.from_bytes(raw)
+    assert doc.to_bytes() == raw  # sanity: unmodified round-trip first
+    doc.apply([ini.IniEdit("a.jpg", "caption", "hi")])
+    out = doc.to_bytes()
+    assert out == b"[a.jpg]\r\nstar=yes\r\ncaption=hi\r\n"
+
+    doc2 = ini.IniDocument.from_bytes(raw)
+    doc2.apply([ini.IniEdit("b.jpg", "star", "yes")])
+    out2 = doc2.to_bytes()
+    assert out2 == b"[a.jpg]\r\nstar=yes\r\n[b.jpg]\r\nstar=yes\r\n"
+
+
+def test_apply_lone_cr_at_eof_reparses_cleanly_via_the_reader(tmp_path):
+    # The bytes inisidecar.py produces must actually parse correctly
+    # through read_picasa_ini, not merely look right -- this is the
+    # regression the Opus review caught: the OLD code produced
+    # b"...star=yes\rcaption=hi\r\n" which the reader parsed as
+    # star="yes\rcaption=hi" with zero anomalies (silently wrong, not a
+    # crash).
+    raw = b"[a.jpg]\r\nstar=yes\r"
+    doc = ini.IniDocument.from_bytes(raw)
+    doc.apply([ini.IniEdit("a.jpg", "caption", "hi")])
+    path = tmp_path / ".picasa.ini"
+    path.write_bytes(doc.to_bytes())
+    parsed = picasa_db.read_picasa_ini(path)
+    sec = parsed.section("a.jpg")
+    assert sec is not None
+    assert sec.get("star") == "yes"
+    assert sec.get("caption") == "hi"
+    assert parsed.anomalies == []
 
 
 def test_apply_remove_deletes_all_occurrences_leaves_header():
@@ -297,14 +411,37 @@ def test_write_edits_refuses_on_drift(tmp_path):
 
 
 @pytest.mark.xfail(strict=True, raises=NotImplementedError)
+def test_write_edits_refuses_on_drift_raced_before_swap(tmp_path, monkeypatch):
+    # design §4 step 6's race: something else rewrites the file in the
+    # gap between our own read (step 3) and the swap (step 7). Hooks
+    # `_before_swap`, the seam write_edits calls right before step 6's
+    # signature re-check, rather than monkeypatching `_atomic_replace`
+    # itself (Opus review finding 6b).
+    path = tmp_path / ".picasa.ini"
+    path.write_bytes(b"[a.jpg]\r\nstar=yes\r\n")
+
+    def _race(raced_path):
+        raced_path.write_bytes(b"[a.jpg]\r\nstar=yes\r\ncaption=raced\r\n")
+
+    monkeypatch.setattr(ini, "_before_swap", _race)
+    with pytest.raises(ini.IniWriteError) as excinfo:
+        ini.write_edits(tmp_path, [ini.IniEdit("a.jpg", "star", "no")])
+    assert excinfo.value.kind == "drift"
+
+
+@pytest.mark.xfail(strict=True, raises=NotImplementedError)
 def test_write_edits_cleans_up_temp_file_on_failure(tmp_path, monkeypatch):
     path = tmp_path / ".picasa.ini"
     path.write_bytes(b"[a.jpg]\r\nstar=yes\r\n")
 
-    def _boom(*args, **kwargs):
+    def _boom(raced_path):
         raise OSError("synthetic failure injected by the test")
 
-    monkeypatch.setattr(ini, "_verify", _boom)
+    # Fails AFTER step 5 creates the temp file but BEFORE the swap (step
+    # 7) -- the case that actually leaves a temp file to clean up; a
+    # post-swap failure has no temp file left by definition (Opus review
+    # note accompanying finding 6a).
+    monkeypatch.setattr(ini, "_before_swap", _boom)
     with pytest.raises(ini.IniWriteError):
         ini.write_edits(tmp_path, [ini.IniEdit("a.jpg", "star", "no")])
     assert list(tmp_path.glob(".picasa.ini.*.tmp")) == []
@@ -352,16 +489,81 @@ def test_write_edits_upgrades_cp1252_to_utf8_when_value_not_encodable(tmp_path):
 
 @pytest.mark.xfail(strict=True, raises=NotImplementedError)
 def test_write_edits_verify_failure_surfaces_as_kind_verify(tmp_path, monkeypatch):
+    # Monkeypatch _atomic_replace (not _verify/_read_back) so DIFFERENT
+    # bytes actually land on disk than the ones write_edits computed --
+    # the REAL post-swap _read_back must catch that itself by re-reading
+    # the file, rather than the test just proving _verify raises when
+    # told to (Opus review finding 6a: the old version of this test
+    # proved nothing).
     path = tmp_path / ".picasa.ini"
     path.write_bytes(b"[a.jpg]\r\nstar=yes\r\n")
 
-    def _corrupt_verify(*args, **kwargs):
-        raise ini.IniWriteError("verify", "synthetic corruption injected by the test")
+    def _write_wrong_bytes(target_path: Path, payload: bytes):
+        corrupted = payload.replace(b"star=no", b"star=CORRUPTED")
+        target_path.write_bytes(corrupted)
+        st = target_path.stat()
+        return (st.st_size, int(st.st_mtime))
 
-    monkeypatch.setattr(ini, "_verify", _corrupt_verify)
+    monkeypatch.setattr(ini, "_atomic_replace", _write_wrong_bytes)
     with pytest.raises(ini.IniWriteError) as excinfo:
         ini.write_edits(tmp_path, [ini.IniEdit("a.jpg", "star", "no")])
     assert excinfo.value.kind == "verify"
+
+
+# --------------------------------------------------------------------------
+# select_ini_variant vs. catalog._select_ini_variant parity
+# --------------------------------------------------------------------------
+
+def test_select_ini_variant_agrees_with_catalog(tmp_path):
+    # inisidecar.select_ini_variant is a deliberate duplicate of
+    # catalog._select_ini_variant (see the INI_NAMES comment in
+    # inisidecar.py) -- the two must never drift apart. catalog.py is
+    # Qt-free at import time (rawload.py/videoload.py defer their
+    # PySide6 imports inside functions), so this imports cleanly under
+    # this file's own pytest-only PEP 723 dependencies; if that ever
+    # changes, skip rather than fail the whole suite.
+    try:
+        import catalog
+    except ImportError as exc:
+        pytest.skip(f"catalog.py not importable here: {exc}")
+
+    # Each variant present alone. Folder names are index-based, not
+    # derived from `name`: INI_NAMES's three spellings differ only by a
+    # leading dot / letter case (".picasa.ini", "Picasa.ini",
+    # "picasa.ini"), which collide on a case-insensitive filesystem
+    # (Windows) if used directly as directory names.
+    for i, name in enumerate(ini.INI_NAMES):
+        folder = tmp_path / f"alone_{i}"
+        folder.mkdir()
+        (folder / name).write_bytes(b"[a]\r\nk=v\r\n")
+        assert (ini.select_ini_variant(folder)
+                == catalog._select_ini_variant(folder))
+
+    # Two variants present together: INI_NAMES priority order must pick
+    # the same one on both sides.
+    both = tmp_path / "two_together"
+    both.mkdir()
+    (both / ini.INI_NAMES[0]).write_bytes(b"[a]\r\nk=v\r\n")
+    (both / ini.INI_NAMES[1]).write_bytes(b"[a]\r\nk=v\r\n")
+    assert (ini.select_ini_variant(both)
+            == catalog._select_ini_variant(both))
+
+    # An unreadable first candidate -- cheap via chmod on POSIX only;
+    # Windows needs a heavier ACL dance not worth it for this parity
+    # check, so skip there.
+    if sys.platform != "win32":
+        unreadable = tmp_path / "unreadable_first"
+        unreadable.mkdir()
+        first = unreadable / ini.INI_NAMES[0]
+        first.write_bytes(b"[a]\r\nk=v\r\n")
+        second = unreadable / ini.INI_NAMES[1]
+        second.write_bytes(b"[a]\r\nk=v\r\n")
+        os.chmod(first, 0o000)
+        try:
+            assert (ini.select_ini_variant(unreadable)
+                    == catalog._select_ini_variant(unreadable))
+        finally:
+            os.chmod(first, 0o644)
 
 
 if __name__ == "__main__":

@@ -217,10 +217,27 @@ class IniDocument:
     (design §2, §3). `appended_eol` records whether `apply()` had to add
     an EOL to a previously-EOL-less last line in order to append after
     it (design §2 "A file whose last line has no EOL gets one added...");
-    this is the one byte changed outside the edited lines themselves."""
+    this is the one byte changed outside the edited lines themselves.
+
+    `encoding` is one of FOUR tags, not three -- the reader's cp1252
+    branch has its own inner fallback, and that fallback reaches the
+    same codec (`utf-8` + `surrogateescape`) as the `utf8=1`-marked
+    branch but for a completely different reason, so the two must not
+    share a tag (design §3):
+    - "utf-8": strict UTF-8 decode succeeded.
+    - "utf-8-marked": UTF-8 failed, `[encoding] utf8=1` is present --
+      the file is legitimately mixed-encoding; surrogateescape keeps
+      every byte.
+    - "cp1252": UTF-8 failed, no marker, cp1252 decoded cleanly.
+    - "legacy-surrogateescape": UTF-8 failed, no marker, AND cp1252
+      itself rejected at least one byte (one of the handful cp1252
+      leaves undefined, e.g. 0x81/0x8D/0x8F/0x90/0x9D) -- this file's
+      true encoding is unknown, not just "old cp1252"; `_upgrade_encoding`
+      treats it much more conservatively than plain "cp1252" (see its
+      docstring)."""
 
     lines: list[Line]
-    encoding: str  # "utf-8" | "utf-8-surrogateescape" | "cp1252"
+    encoding: str  # "utf-8" | "utf-8-marked" | "cp1252" | "legacy-surrogateescape"
     bom: bool
     eol: str  # majority EOL, "\r\n" default for empty/new (see _majority_eol)
     appended_eol: bool = False
@@ -229,14 +246,16 @@ class IniDocument:
     def from_bytes(cls, raw: bytes) -> "IniDocument":
         """Decode `raw` with `read_picasa_ini`'s own three-way policy
         (picasa_db.py:686-697: strict UTF-8, else utf8=1-marked
-        surrogateescape, else cp1252 falling back to surrogateescape) and
-        split into classified physical lines. Reuses
-        `picasa_db._has_utf8_marker` (rather than a second copy of its
-        ASCII-safe `[encoding]` scan) so the two decode policies can
-        never drift apart -- the same reuse rationale as
-        `PicasaIni`/`IniSection` elsewhere in this file. `IniDocument.
-        to_bytes()` is this method's exact inverse; that round-trip is
-        the module's core invariant (design §9)."""
+        surrogateescape, else cp1252 falling back to surrogateescape) --
+        four distinct OUTCOMES though, since the cp1252 branch's own
+        inner fallback is tagged separately from the utf8=1-marked one
+        (see the `IniDocument.encoding` field comment above) -- and split
+        into classified physical lines. Reuses `picasa_db._has_utf8_marker`
+        (rather than a second copy of its ASCII-safe `[encoding]` scan) so
+        the two decode policies can never drift apart -- the same reuse
+        rationale as `PicasaIni`/`IniSection` elsewhere in this file.
+        `IniDocument.to_bytes()` is this method's exact inverse; that
+        round-trip is the module's core invariant (design §9)."""
         bom = raw.startswith(b"\xef\xbb\xbf")
         if bom:
             raw = raw[3:]
@@ -246,14 +265,14 @@ class IniDocument:
         except UnicodeDecodeError:
             if picasa_db._has_utf8_marker(raw):
                 text = raw.decode("utf-8", "surrogateescape")
-                encoding = "utf-8-surrogateescape"
+                encoding = "utf-8-marked"
             else:
                 try:
                     text = raw.decode("cp1252")
                     encoding = "cp1252"
                 except UnicodeDecodeError:
                     text = raw.decode("utf-8", "surrogateescape")
-                    encoding = "utf-8-surrogateescape"
+                    encoding = "legacy-surrogateescape"
 
         lines: list[Line] = []
         for content, eol in _split_physical_lines(text):
@@ -275,7 +294,9 @@ class IniDocument:
         text = "".join(ln.text + ln.eol for ln in self.lines)
         if self.encoding == "utf-8":
             raw = text.encode("utf-8")
-        elif self.encoding == "utf-8-surrogateescape":
+        elif self.encoding in ("utf-8-marked", "legacy-surrogateescape"):
+            # Both decoded via utf-8+surrogateescape (from_bytes), just
+            # for different reasons -- same codec re-encodes both exactly.
             raw = text.encode("utf-8", "surrogateescape")
         elif self.encoding == "cp1252":
             raw = text.encode("cp1252")
@@ -287,66 +308,94 @@ class IniDocument:
 
     def _ensure_trailing_eol(self) -> None:
         """Before appending/inserting at the very end of `self.lines`,
-        give a trailing EOL-less last line one so the new line does not
-        get glued onto it with no separator (design §2's one exception to
-        "we change only the lines we mean to change")."""
-        if self.lines and self.lines[-1].eol == "":
+        give a last line whose `eol` is not a real terminator one, so the
+        new line does not get glued onto it with no separator (design
+        §2's one exception to "we change only the lines we mean to
+        change"). A terminator ends in "\\n"; a bare "" (no EOL at all)
+        or a bare "\\r" run with no following "\\n" (a lone trailing CR --
+        `read_picasa_ini` splits only on "\\n", so a lone CR is NOT a line
+        break to the reader either) both need fixing, not just "" --
+        checking `eol == ""` alone missed the lone-CR case and glued the
+        next line's `key=value` directly onto the previous value."""
+        if self.lines and not self.lines[-1].eol.endswith("\n"):
             self.lines[-1].eol = self.eol
             self.appended_eol = True
 
     def _set(self, section: str, key: str, value: str) -> bool:
-        # Pass 1: rewrite every matching existing pair, in every run of
-        # every section with this name (design §2 "Duplicate sections
-        # and duplicate keys are edited everywhere").
-        current: str | None = None
-        found = False
-        for ln in self.lines:
-            if ln.kind == "header":
-                current = ln.name
-                continue
-            if (ln.kind == "pair" and current is not None
-                    and current.lower() == section.lower()
-                    and ln.key is not None and ln.key.lower() == key.lower()):
-                ln.text = f"{key}={value}"
-                ln.key = key
-                ln.value = value
-                # Keep this line's OWN eol (not self.eol): a rewrite only
-                # changes the value bytes, so a mixed-EOL file changes
-                # nothing but the target line's content. Only lines this
-                # method ADDS (new pair, new header, the trailing-EOL
-                # fix below) use the document's majority eol.
-                found = True
-        if found:
-            return True
+        # Every run of a header matching `section`, in file order, as
+        # (header_index, end_index_exclusive) -- `end` is the next
+        # header's index (of ANY name) or len(self.lines). Captured
+        # up front, before any mutation, so indices stay valid through
+        # pass 1 (mutates Line objects in place, never the list) and
+        # through pass 2 as long as that pass walks runs in REVERSE
+        # order (an insertion into a later run can only shift indices
+        # >= that run's own header index, which is always >= every
+        # earlier run's `end`, by file order -- so earlier runs' indices
+        # are never disturbed by a later run's insertion).
+        header_indices = [i for i, ln in enumerate(self.lines)
+                           if ln.kind == "header"]
+        runs: list[tuple[int, int]] = []
+        for pos, hi in enumerate(header_indices):
+            ln = self.lines[hi]
+            if ln.name is not None and ln.name.lower() == section.lower():
+                end = (header_indices[pos + 1] if pos + 1 < len(header_indices)
+                       else len(self.lines))
+                runs.append((hi, end))
 
-        # Pass 2: key absent everywhere for this section name. Insert
-        # into the section's LAST run if one exists; otherwise append a
-        # brand new section at EOF (design §2 "Placement").
-        last_header_index: int | None = None
-        for i, ln in enumerate(self.lines):
-            if (ln.kind == "header" and ln.name is not None
-                    and ln.name.lower() == section.lower()):
-                last_header_index = i
-        new_line = Line(text=f"{key}={value}", eol=self.eol, kind="pair",
-                         key=key, value=value)
-
-        if last_header_index is None:
+        if not runs:
+            # Section absent entirely: append a brand new section at EOF
+            # (design §2 "Placement").
             self._ensure_trailing_eol()
             self.lines.append(Line(text=f"[{section}]", eol=self.eol,
                                     kind="header", name=section))
-            self.lines.append(new_line)
+            self.lines.append(Line(text=f"{key}={value}", eol=self.eol,
+                                    kind="pair", key=key, value=value))
             return True
 
-        insert_at = last_header_index + 1  # default: right after the header
-        i = last_header_index + 1
-        while i < len(self.lines) and self.lines[i].kind != "header":
-            if self.lines[i].kind == "pair":
-                insert_at = i + 1
-            i += 1
-        if insert_at == len(self.lines):
-            self._ensure_trailing_eol()
-        self.lines.insert(insert_at, new_line)
-        return True
+        changed = False
+
+        # Pass 1: rewrite every matching key in every run (design §2
+        # "Duplicate sections and duplicate keys are edited everywhere").
+        # A rewrite keeps the line's OWN key spelling/whitespace and its
+        # OWN eol -- only the value bytes change (mixed-EOL files change
+        # no bytes outside the target line); only lines pass 2 ADDS use
+        # the document's majority eol, since they have no original to
+        # keep. A rewrite whose new text is byte-identical to the old
+        # (setting a value that is already set) reports no change.
+        runs_missing_key: list[tuple[int, int]] = []
+        for hi, end in runs:
+            found_in_run = False
+            for i in range(hi + 1, end):
+                ln = self.lines[i]
+                if (ln.kind == "pair" and ln.key is not None
+                        and ln.key.lower() == key.lower()):
+                    head, sep, _ = ln.text.partition("=")
+                    new_text = head + sep + value
+                    if new_text != ln.text:
+                        ln.text = new_text
+                        ln.value = value
+                        changed = True
+                    found_in_run = True
+            if not found_in_run:
+                runs_missing_key.append((hi, end))
+
+        # Pass 2: insert the key into every run that lacked it -- EVERY
+        # run of the section's name ends up carrying key=value, not just
+        # the last one (design §2 "edited everywhere" applies to
+        # insertion, not only to rewriting existing occurrences).
+        # Reverse order: see the indices note above.
+        for hi, end in reversed(runs_missing_key):
+            insert_at = hi + 1  # default: right after the header
+            for i in range(hi + 1, end):
+                if self.lines[i].kind == "pair":
+                    insert_at = i + 1
+            if insert_at == len(self.lines):
+                self._ensure_trailing_eol()
+            self.lines.insert(insert_at, Line(text=f"{key}={value}", eol=self.eol,
+                                               kind="pair", key=key, value=value))
+            changed = True
+
+        return changed
 
     def _remove(self, section: str, key: str) -> bool:
         current: str | None = None
@@ -368,12 +417,15 @@ class IniDocument:
 
     def apply(self, edits: Sequence[IniEdit]) -> list[tuple[str, str]]:
         """Apply every edit in order (design §2). `set` (value is not
-        None) rewrites every matching key in every matching section, or
-        inserts once into the section's last run / appends a new section
-        when the key is absent everywhere; `remove` (value is None)
-        deletes every matching pair and leaves the header behind. Returns
-        the `(section, key)` pairs that actually changed something (a
-        `remove` that matched nothing contributes no entry)."""
+        None) rewrites every matching key in every run of every matching
+        section, inserts the key into any run of that section that
+        lacked it, and appends a new section when the name is absent
+        entirely -- EVERY run of the name ends up carrying key=value, not
+        just the last one; `remove` (value is None) deletes every
+        matching pair and leaves the header(s) behind. Returns the
+        `(section, key)` pairs whose bytes actually changed -- a `set`
+        whose value already matches every occurrence, or a `remove` that
+        matched nothing, contributes no entry."""
         changed: list[tuple[str, str]] = []
         for edit in edits:
             edit.validate()
@@ -386,6 +438,17 @@ class IniDocument:
         return changed
 
 
+def _before_swap(path: Path) -> None:
+    """Test seam only, a no-op in production. `write_edits` calls this
+    immediately before step 6's pre-swap signature re-check (right after
+    the temp file from step 5 exists on disk). A test can monkeypatch
+    this to rewrite `path` in place, simulating something else (Picasa,
+    a sync client) writing during our own read-to-swap window, without
+    needing to monkeypatch `_atomic_replace` itself -- exercises the same
+    race step 6 exists to catch."""
+    pass
+
+
 def write_edits(folder: Path, edits: Sequence[IniEdit], *,
                  expected_sig: tuple[int, int] | None = None) -> WriteResult:
     """Design §4 steps 1-9, the writer's only public entry point.
@@ -396,20 +459,63 @@ def write_edits(folder: Path, edits: Sequence[IniEdit], *,
     2. Refuse read-only up front, `kind="readonly"` (`os.access(path,
        os.W_OK)` false for a Windows read-only attribute or a POSIX file
        without owner write; the folder must be writable too, for the
-       temp file).
+       temp file -- and for a to-be-created ini, only the folder is
+       checked, since there is no `path` yet). A Windows DACL denial is
+       not visible to `os.access` and instead surfaces at step 5 or 7 as
+       `kind="io"`; the status mark (design §8) treats both kinds the
+       same way.
     3. Stat before read (`stat_sig` order, catalog.py:724-736); if
        `expected_sig` is given and the fresh stat differs, refuse
-       `kind="drift"` before reading further.
+       `kind="drift"` before reading further. `expected_sig=None` means
+       the caller has no prior signature to compare against -- the
+       journal-replay path (design §7): a journal entry is a desired end
+       state, not a compare-and-swap (the line model already confines
+       the write to our own keys, the spec's per-key last-writer-wins
+       merge), and a crash between the ini write and the next
+       `save_catalog` would otherwise leave a stale `ini_sigs` that
+       refuses every replay forever. `None` skips ONLY this step-3 check;
+       step 6 below still always runs, since it protects against a write
+       racing OUR OWN read-to-swap window, not against a mismatch with
+       the caller's belief.
     4. Decode, classify, apply (`IniDocument.from_bytes` + `.apply`); no
        file is touched yet. Run `_upgrade_encoding` first when an edit's
-       value cannot be encoded by the document's current codec.
+       value cannot be encoded by the document's current codec. Then
+       `_check_payload(doc_before, doc_after, payload, edits)` checks the
+       result IN MEMORY, still before any file is touched: every
+       untouched line is byte-identical between `doc_before` and
+       `doc_after`, every edit landed (present with its new value in
+       every section of that name for a `set`, absent for a `remove`,
+       re-parsed via `picasa_db.read_picasa_ini` on the in-memory
+       `payload`), and the anomaly count did not grow. A mismatch is
+       `kind="verify"` -- raised before step 5, so there is no temp file
+       to clean up for this failure. **No-op fast path**: if `payload ==`
+       the original bytes read at step 3 (design §2 "No-op writes are
+       free"), return success now -- `created=False`,
+       `upgraded_encoding=False`, `sig` the step-3 stat unchanged -- with
+       no temp file, no mtime touch, and no `ini_sigs`/journal-health
+       change for the caller to make beyond marking the entry applied.
     5. Write the temp file via `_atomic_replace`'s temp-write half:
        `<name>.<pid>.tmp` in the same directory, flush, `os.fsync`.
-    6. Re-check the signature against step 3 immediately before the
-       swap; a change means refuse `kind="drift"` and remove the temp.
+    6. Call `_before_swap(path)` (a no-op in production, a test seam),
+       then re-check the file against step 3's read: `os.stat(path).
+       st_mtime_ns` and size, not the coarser whole-second `stat_sig`
+       tuple step 3 itself used (a same-second rewrite needs
+       nanosecond resolution to catch), and when THOSE match too, a byte
+       compare against the bytes step 3/4 actually read (belt-and-braces
+       for a filesystem whose mtime resolution is coarser than a
+       nanosecond in practice). A change on either check means someone
+       wrote in the last few milliseconds: remove the temp, refuse with
+       `kind="drift"`. The window between this check and the swap is
+       accepted under the spec's alternation protocol (§3 Concurrency,
+       `product-spec.md:330-340`).
     7. Swap via `_atomic_replace`'s `os.replace` half, preserving Windows
        attributes and fsync'ing the parent directory on POSIX.
-    8. Verify via `_verify`; a mismatch is `kind="verify"`.
+    8. `_read_back(path, payload)`: read the bytes actually on disk and
+       compare them to `payload` byte-for-byte -- ONLY a byte comparison,
+       since step 4's `_check_payload` already established the edits are
+       semantically correct on these same bytes; a mismatch here means
+       the swap/write itself corrupted bytes (a partial write despite
+       fsync, a filesystem oddity), still `kind="verify"`.
     9. Any `OSError` on the way is `kind="io"`; the temp file is removed
        on every failure path. Returns `WriteResult` with the post-swap
        `stat_sig`, which the caller stores in `catalog.ini_sigs`.
@@ -443,35 +549,70 @@ def _atomic_replace(path: Path, payload: bytes) -> tuple[int, int]:
     raise NotImplementedError("design/ini-write-layer.md §4 steps 5, 7")
 
 
-def _verify(path: Path, payload: bytes, edits: Sequence[IniEdit],
-            anomalies_before: int) -> None:
-    """Design §4 step 8: read `path`'s bytes back and compare them to
-    `payload` byte-for-byte; parse the result with
-    `picasa_db.read_picasa_ini` and confirm every edit landed -- present
-    with the new value in every section of that name for a `set`, absent
-    from every section of that name for a `remove`; confirm
-    `len(ini.anomalies)` did not grow past `anomalies_before`. Raises
-    `IniWriteError(kind="verify")` on any mismatch; the caller
-    (`write_edits`) treats a verify failure the same as any other
-    failure path (temp file already gone by this point; nothing further
-    to clean up on `path` itself, since the swap already completed --
-    the on-disk file is left as-is and the refusal is surfaced so
-    `librarystate` can mark the folder unhealthy, design §8)."""
-    raise NotImplementedError("design/ini-write-layer.md §4 step 8")
+def _check_payload(doc_before: IniDocument, doc_after: IniDocument,
+                    payload: bytes, edits: Sequence[IniEdit]) -> None:
+    """Design §4 step 4's in-memory check, BEFORE any file is touched
+    (no temp file exists yet at this point, so there is nothing to clean
+    up on a failure here beyond simply not proceeding to step 5).
+
+    - Every line `doc_before`/`doc_after` agree neither `apply()` nor
+      `_upgrade_encoding` meant to touch is byte-identical between the
+      two documents (`text` and `eol` both) -- the "we change only the
+      lines we mean to change" invariant, checked against the in-memory
+      model directly rather than by re-reading a file that does not
+      exist yet.
+    - `payload` (== `doc_after.to_bytes()`) parses via
+      `picasa_db.read_picasa_ini` and every edit landed: present with
+      its new value in every section of that name for a `set`, absent
+      from every section of that name for a `remove`.
+    - `len(parsed.anomalies)` did not grow relative to parsing
+      `doc_before`'s own bytes.
+
+    Raises `IniWriteError(kind="verify")` on any mismatch.
+    """
+    raise NotImplementedError("design/ini-write-layer.md §4 step 4 (in-memory check)")
+
+
+def _read_back(path: Path, payload: bytes) -> None:
+    """Design §4 step 8, AFTER the swap: read `path`'s bytes back and
+    compare them to `payload` byte-for-byte. This is ONLY a byte
+    comparison -- `_check_payload` (step 4) already established the
+    edits are semantically correct before the temp file was even
+    written, so a mismatch here means the swap/write itself corrupted
+    bytes (a partial write despite fsync, a filesystem oddity), not that
+    an edit failed to land. Raises `IniWriteError(kind="verify")` on any
+    mismatch; the caller (`write_edits`) treats it the same as any other
+    failure path -- the temp file is already gone by this point (the
+    swap already completed), so there is nothing left to clean up on
+    `path` itself; the on-disk file is left as-is and the refusal is
+    surfaced so `librarystate` can mark the folder unhealthy (design
+    §8)."""
+    raise NotImplementedError("design/ini-write-layer.md §4 step 8 (post-swap read-back)")
 
 
 def _upgrade_encoding(doc: IniDocument) -> None:
-    """Design §3's encoding-upgrade edge rule: when a new edit's value
-    cannot be encoded by `doc.encoding == "cp1252"`, transcode the whole
-    document to UTF-8 in place -- retag `doc.encoding = "utf-8"`, and
-    insert an `[encoding]` section with `utf8=1` as the file's first
-    lines (a header Line plus a pair Line, both using `doc.eol`) unless
-    one is already present. Refuses with `IniWriteError(kind="encoding")`
-    when `doc.encoding == "utf-8-surrogateescape"` reached via the
-    cp1252-decode-failed fallback (`IniDocument.from_bytes`'s inner
-    `except UnicodeDecodeError`) -- those original bytes have no UTF-8
-    meaning to transcode losslessly, so upgrading would silently corrupt
-    them. The caller (`write_edits`) is responsible for setting
+    """Design §3's encoding-upgrade edge rule.
+
+    - `doc.encoding == "cp1252"` (clean legacy file): when a new edit's
+      value cannot be encoded by cp1252, transcode the whole document to
+      UTF-8 in place -- retag `doc.encoding = "utf-8"`, and insert an
+      `[encoding]` section with `utf8=1` as the file's first lines (a
+      header Line plus a pair Line, both using `doc.eol`) unless one is
+      already present. An ASCII value never triggers this (cp1252 is a
+      superset of ASCII), regardless of tag.
+    - `doc.encoding == "legacy-surrogateescape"` (the file already
+      contains at least one byte cp1252 itself rejects, e.g.
+      0x81/0x8D/0x8F/0x90/0x9D -- see the `IniDocument.encoding` field
+      comment): refuses with `IniWriteError(kind="encoding")` for ANY
+      non-ASCII value, not merely one cp1252 cannot encode. This file's
+      true encoding is already unknown -- transcoding it under an
+      assumed encoding would risk corrupting the undecoded byte(s)
+      silently, so no non-ASCII value is safe to write into it, even one
+      that happens to be cp1252-encodable.
+    - `doc.encoding in ("utf-8", "utf-8-marked")`: never upgrades: both
+      already accept any value via `surrogateescape`/plain UTF-8 encode.
+
+    The caller (`write_edits`) is responsible for setting
     `WriteResult.upgraded_encoding=True` when this function actually
     changes `doc.encoding`, and for logging it (design §3: "this is the
     one case where every line changes")."""

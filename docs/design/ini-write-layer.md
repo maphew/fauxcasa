@@ -98,10 +98,19 @@ Decisions:
   argue**: the alternative, edit the last occurrence only, is smaller but
   leaves a first-wins reader (Windows `GetPrivateProfileString`) seeing the
   old value.
-- **Placement**: a new key goes after the last `pair` of the section's
-  last run, before any trailing blank or junk lines. A new section is
-  appended at the end of the file. Section order is arbitrary to Picasa
-  (format doc line 12), so appending is compatible and keeps diffs small.
+- **Placement**: after a `set`, *every* run of the named section carries
+  exactly that `key=value`: runs that had the key are rewritten in place,
+  runs that lacked it get the pair inserted after their last `pair` line,
+  before any trailing blank or junk lines. This keeps the duplicate rule
+  honest for a first-wins reader too (a key added only to the last run
+  would be invisible to it). A new section is appended at the end of the
+  file. Section order is arbitrary to Picasa (format doc line 12), so
+  appending is compatible and keeps diffs small.
+- **No-op writes are free**: if the emitted bytes equal the bytes read,
+  `write_edits` returns success without creating a temp file, touching
+  the mtime, or disturbing `ini_sigs`. Starring an already-starred photo
+  and every journal replay of an entry that already landed cost nothing
+  and trigger no rescan.
 - **Values are literal**: no quoting, no escaping, `=` allowed in values.
   A value containing `\r` or `\n`, a key containing `=` or starting with
   `[`, or a section name containing `]` is refused before any file is
@@ -119,9 +128,9 @@ is the writer's too, and the writer records which branch it took:
 
 | Read branch | Write with | Notes |
 |---|---|---|
-| strict UTF-8 succeeded | `utf-8` | byte-exact; BOM, if present, is kept as the first line's prefix |
+| strict UTF-8 succeeded | `utf-8` | byte-exact; a BOM is recorded as a document flag and re-emitted, never treated as part of the first line |
 | UTF-8 failed, `[encoding] utf8=1` present | `utf-8` + `surrogateescape` | every original byte survives; our new values are plain UTF-8 |
-| UTF-8 failed, no marker | `cp1252` | byte-exact where cp1252's map is total |
+| UTF-8 failed, no marker | `cp1252` | byte-exact where cp1252's map is total; when even cp1252 rejects a byte the document is tagged `legacy-surrogateescape`, distinct from the marked branch above, and any non-ASCII new value is refused (`kind="encoding"`) |
 
 Two edge rules:
 
@@ -157,7 +166,10 @@ Steps, in order, each with its failure kind:
    is `.picasa.ini` and `created=True`.
 2. **Refuse read-only up front** (`kind="readonly"`). `os.access(path, W_OK)`
    is false for a Windows read-only attribute and for a POSIX file without
-   owner write; the folder must also be writable for the temp file.
+   owner write; the folder must also be writable for the temp file, and
+   for a to-be-created ini only the folder is checked. A Windows DACL
+   denial is not visible to `os.access` and surfaces at step 5 or 7 as
+   `kind="io"`; the status mark treats both kinds the same way.
    Measured on the dev box: `os.replace` onto a read-only target fails with
    `WinError 5`, while on POSIX it would silently succeed because the
    directory permits it. Refusing on both makes N7's test ("make a sidecar
@@ -167,20 +179,36 @@ Steps, in order, each with its failure kind:
    signature is taken before the bytes are read, never after. If
    `expected_sig` is given and differs from the fresh stat, refuse with
    `kind="drift"` before reading further. `librarystate` passes the
-   catalog's `ini_sigs` entry for the folder, so a Picasa-side edit since
-   the last scan is caught here, not overwritten.
-4. **Decode, classify, apply** (sections 2 and 3). No file is touched yet.
+   catalog's `ini_sigs` entry for the folder for a live user action, so a
+   Picasa-side edit since the last scan is caught here, not overwritten.
+   A journal replay passes `expected_sig=None`: a journal entry is a
+   desired end state, not a compare-and-swap, and the line model already
+   confines the write to our own keys (the spec's per-key last-writer-wins
+   merge, §3 Concurrency). Otherwise a crash between the ini write and
+   the next `save_catalog` would leave a stale `ini_sigs` that refuses
+   every replay forever.
+4. **Decode, classify, apply** (sections 2 and 3), then **check the
+   payload in memory before any file is touched**: every line not in the
+   edit set is byte-identical to the original (the only allowed extra
+   byte is the trailing EOL of section 2); `read_picasa_ini` over the
+   payload bytes shows every edit landed in every run of its section (or
+   absent, for removals) and the anomaly count did not grow. A failure
+   here is `kind="verify"` and costs nothing, which is the point: a
+   placement or encoding bug becomes a refusal, never a corrupt file. If
+   the payload equals the original bytes, return success now (no-op).
 5. **Write the temp file** `<name>.<pid>.tmp` in the same directory
    (the `_write_library_config` idiom, `main.py:450`), `flush`, then
    `os.fsync` on the file. The §7 row says durable means fsync'd; every
    existing writer in the tree skips this (none of `starstore.py:83`,
    `library.py:436`, `catalog.py:2044` fsync), which is fine for caches and
    wrong for the user's own state.
-6. **Re-check the signature** against step 3 immediately before the swap;
-   a change means someone wrote in the last few milliseconds: remove the
-   temp, refuse with `kind="drift"`. The window between this check and the
-   swap is accepted under the spec's alternation protocol (§3 Concurrency,
-   `product-spec.md:330-340`).
+6. **Re-check the file** against step 3 immediately before the swap,
+   using `st_mtime_ns` and size (the catalog's second-granularity `stat_sig`
+   is too coarse for a same-second rewrite) and, when they match, a byte
+   compare against the bytes read; a change means someone wrote in the
+   last few milliseconds: remove the temp, refuse with `kind="drift"`. The
+   window between this check and the swap is accepted under the spec's
+   alternation protocol (§3 Concurrency, `product-spec.md:330-340`).
 7. **Swap** with `os.replace`. On Windows the target's attributes are
    captured before the swap and re-applied after it: measured on the dev
    box, replacing a hidden+system `.picasa.ini` succeeds but leaves the
@@ -189,11 +217,10 @@ Steps, in order, each with its failure kind:
    fsync'd after the swap; Windows has no directory fsync (measured:
    `EACCES`), and `MoveFileEx` with replace is the journaling filesystem's
    own atomic rename.
-8. **Verify** (`kind="verify"`): read the bytes back and compare to the
-   payload; parse with `read_picasa_ini` and confirm every edit landed in
-   every section of that name (or is absent, for removals); confirm the
-   anomaly count did not grow. The result carries the post-swap
-   `stat_sig`, which is the value the caller stores in `catalog.ini_sigs`.
+8. **Read back** (`kind="verify"`): the bytes on disk must equal the
+   payload (the parse-level checks already ran in step 4 on the same
+   bytes). The result carries the post-swap `stat_sig`, which is the
+   value the caller stores in `catalog.ini_sigs`.
 9. Any `OSError` on the way is `kind="io"`; the temp file is removed on
    every failure path. `IniWriteError` carries `kind`, `path`, and a
    `detail` string that is safe to show in the UI and to log: paths and
@@ -227,6 +254,16 @@ our own write on the next warm start.
   in-memory catalog update, journal applied mark. The in-memory update
   happens only after the write verifies, so the grid never shows a star
   the disk does not have (N7).
+- **Drift recovery is folder-local**, not a library rebuild. `main.py`'s
+  answer to `Drift.ini_changed` is a full rescan only for a single-root,
+  non-adopt library; for multi-root and adopt-mode catalogs it keeps the
+  indexed snapshot and only posts a notice (`main.py:2803-2818`), so
+  `ini_sigs` would never refresh and a pending entry would stay wedged.
+  On a `drift` refusal `librarystate` therefore re-reads that one
+  folder's ini through `catalog._read_folder_ini`, refreshes its
+  `ini_sigs` entry and the in-memory `Photo` fields (per-key
+  last-writer-wins, with the surfaced reconciliation note §3 asks for),
+  and retries the pending entry once with the fresh signature.
 
 ## 6. Tier-2 native state placement
 
@@ -239,7 +276,7 @@ names (section 6.1). Placement:
 
 | State | File | Notes |
 |---|---|---|
-| exact star count 0..5, reject flag, per-photo sort key, ignored faces | `<folder>/.fauxcasa.json`, one object per photo file name | travels with a folder copy; `star=yes` in the ini stays authoritative for zero versus non-zero (§3 star authority) |
+| exact star count 0..5, reject flag, per-photo sort key, ignored faces | `<folder>/.fauxcasa.json`, one record per photo, keyed by file name and carrying the photo's content hash | travels with a folder copy; `star=yes` in the ini stays authoritative for zero versus non-zero (§3 star authority); the hash lets reconcile follow an OS-level rename or move (N6 gate a) the way the catalog already does |
 | album order, manual folder sort mode, people registry, watch config | `<home>/.fauxcasa/<name>.json` | library-level; `library.py:40` already defines the directory |
 | window geometry, view mode, star threshold, remembered library | `library_state_dir` (cache root) | machine preferences, disposable |
 
@@ -248,8 +285,16 @@ read, temp, fsync, drift check, swap, read-back), through a JSON document
 instead of a line model; the atomic-swap core is one shared function. The
 record for a photo is replaced, never the file's other records, so a
 Picasa-era folder copy that carries two different `.fauxcasa.json`s merges
-by file name. Format: `{"format": 1, "photos": {"IMG_0001.jpg": {"stars":
-3}}}`, sorted keys, indent 1, UTF-8, `\n`. **⚖ argue**: the file name
+by file name, and a record whose hash matches a photo now living under
+another name is re-attached to it on reconcile. Format: `{"format": 1,
+"photos": {"IMG_0001.jpg": {"hash": "<hex>", "stars": 3}}}`, sorted keys,
+indent 1, UTF-8, `\n`. The catalog keeps a freshness signature for the
+native sidecar exactly as it does for the ini (`native_sigs` beside
+`ini_sigs`, same stat-before-read rule), so a folder copied in with its
+own `.fauxcasa.json` is noticed on reconcile; without that the placement
+would buy nothing. The file joins the release-notes inventory too; of
+everything Fauxcasa writes it is the one that lands in the user's own
+photo folders. **⚖ argue**: the file name
 hard-codes the provisional project name, against the `project-name-provisional`
 rule; it is one constant (`NATIVE_SIDECAR_NAME`) next to `LIBRARY_DIR`,
 and a rename is a one-line migration plus a rescan. Picking a neutral name
@@ -268,8 +313,10 @@ Entry: `{"seq": 17, "ts": "2026-09-16T21:04:11Z", "action": "star",
 "root_id": "1a2b3c4d", "rel": "2010/IMG_0001.jpg", "value": 3}`. Applied
 marks are their own appended lines, `{"seq": 17, "applied": true}`, never
 an edit of an earlier line. On start, `librarystate` replays every entry
-without an applied mark, in `seq` order, through the same writer; a
-`readonly` or `drift` refusal leaves the entry pending and marks the
+without an applied mark, in `seq` order, through the same writer with
+`expected_sig=None` (section 4 step 3), so an entry that already landed
+is a free no-op and one that did not is applied per key; a `readonly`
+or `io` refusal leaves the entry pending and marks the
 folder's health (section 8), so the journal is also the retry queue the
 review asks for. When every entry is applied and the file exceeds 256 KiB,
 it is rotated by writing an empty journal with the atomic swap. The
