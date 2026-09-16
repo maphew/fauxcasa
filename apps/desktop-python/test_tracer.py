@@ -19150,6 +19150,145 @@ def test_theme_dark_palette_sets_expected_roles() -> None:
         assert pal.color(disabled, role) == theme.TEXT_MUTED
 
 
+def test_light_palette_roles() -> None:
+    """apply_scheme("light") repoints every theme.X module global at the
+    light table (fauxcasa-6y0); build_palette() reads those live, so a
+    palette built right after picks up light colors, and one built after
+    switching back to "dark" returns to today's values. Restores "dark"
+    in a finally so later tests see today's colors regardless of
+    ordering/failure."""
+    _offscreen_app()
+    import theme
+    from PySide6.QtGui import QPalette
+
+    try:
+        theme.apply_scheme("light")
+        pal = theme.build_palette()
+        R = QPalette.ColorRole
+        assert pal.color(R.Window).getRgb()[:3] == (240, 240, 240)
+        assert theme.WINDOW.getRgb()[:3] == (240, 240, 240)
+        assert theme.TEXT.getRgb()[:3] == (28, 28, 28)
+        assert theme.TEXT.lightness() < theme.WINDOW.lightness()
+
+        theme.apply_scheme("dark")
+        pal2 = theme.build_palette()
+        assert pal2.color(R.Window).getRgb()[:3] == (24, 24, 24)
+        assert theme.WINDOW.getRgb()[:3] == (24, 24, 24)
+        assert theme.TEXT.getRgb()[:3] == (220, 220, 220)
+    finally:
+        theme.apply_scheme("dark")
+
+
+def test_grid_aliases_follow_scheme() -> None:
+    """grid.BACKGROUND (module __getattr__, fauxcasa-6y0) tracks
+    theme.WINDOW live under both schemes — the fix that replaced the old
+    import-time snapshot (and the same fix applied to tray.py/viewer.py,
+    which had the identical bug)."""
+    _offscreen_app()
+    import theme
+    import grid
+
+    try:
+        assert grid.BACKGROUND.getRgb() == theme.WINDOW.getRgb()
+        theme.apply_scheme("light")
+        assert grid.BACKGROUND.getRgb() == theme.WINDOW.getRgb()
+        assert grid.BACKGROUND.getRgb()[:3] == (240, 240, 240)
+    finally:
+        theme.apply_scheme("dark")
+
+
+def test_resolve_scheme_matrix() -> None:
+    """resolve_scheme's mode x os-scheme table (fauxcasa-6y0): "light"/
+    "dark" are explicit overrides and ignore the OS scheme entirely;
+    "system" maps Qt.ColorScheme.Light -> "light", Dark -> "dark", and
+    Unknown -> "dark" (today's look, so offscreen tests — which never
+    report a real OS scheme — are unchanged)."""
+    from PySide6.QtCore import Qt
+
+    import theme
+
+    for os_scheme in (Qt.ColorScheme.Light, Qt.ColorScheme.Dark,
+                      Qt.ColorScheme.Unknown):
+        assert theme.resolve_scheme("light", os_scheme) == "light"
+        assert theme.resolve_scheme("dark", os_scheme) == "dark"
+    assert theme.resolve_scheme("system", Qt.ColorScheme.Light) == "light"
+    assert theme.resolve_scheme("system", Qt.ColorScheme.Dark) == "dark"
+    assert theme.resolve_scheme("system", Qt.ColorScheme.Unknown) == "dark"
+
+
+def test_theme_menu_and_persistence(search_library: Path, monkeypatch) -> None:
+    """View > Theme (fauxcasa-6y0): an exclusive System/Light/Dark radio
+    group, "system" checked by default, driving theme.apply_mode plus
+    persistence through _save_theme_mode/_load_theme_mode — monkeypatched
+    here to a plain dict so the test never touches the real per-user
+    config.json. _set_theme_mode/_toggle_theme keep the radio group in
+    sync and apply the QApplication palette; restores "dark" in a
+    finally."""
+    import main
+    import theme
+
+    store: dict[str, str] = {}
+    monkeypatch.setattr(main, "_load_theme_mode",
+                        lambda cache_root: store.get("theme", "system"))
+    monkeypatch.setattr(
+        main, "_save_theme_mode",
+        lambda cache_root, mode: store.__setitem__("theme", mode))
+    try:
+        win = _search_win(search_library)
+        assert win.theme_mode == "system"
+        assert win.theme_menu is not None
+        assert len(win.theme_actions) == 3
+        assert [a.data() for a in win.theme_actions] == \
+            ["system", "light", "dark"]
+        assert [a.data() for a in win.theme_actions if a.isChecked()] == \
+            ["system"]
+
+        from PySide6.QtGui import QPalette
+        from PySide6.QtWidgets import QApplication
+
+        win.show()  # grab() below needs an actual paint
+        QApplication.instance().processEvents()
+
+        win._set_theme_mode("light")
+        QApplication.instance().processEvents()
+        assert QApplication.instance().palette().color(
+            QPalette.ColorRole.Window).getRgb()[:3] == (240, 240, 240)
+        assert theme.current_scheme() == "light"
+        assert store["theme"] == "light"
+        assert [a.data() for a in win.theme_actions if a.isChecked()] == \
+            ["light"]
+        # Qt resolves a QSS palette(…) function against the QApplication
+        # palette AT setStyleSheet() time and CACHES it (Opus review
+        # finding): the search box's border would stay the OLD scheme's
+        # FIELD_BORDER forever without _refresh_theme's clear-then-
+        # reset-the-same-sheet trick. Probe the actual rendered pixel at
+        # the box's left edge, not just the sheet text, so a regression
+        # that re-breaks the cache (e.g. skipping the clear step) fails
+        # this test even though the sheet STRING never changes.
+        h = win.search.height()
+        border_px = win.search.grab().toImage().pixelColor(0, h // 2)
+        assert border_px.getRgb()[:3] == theme.FIELD_BORDER.getRgb()[:3]
+
+        win._toggle_theme()
+        assert theme.current_scheme() == "dark"
+        assert store["theme"] == "dark"
+        assert [a.data() for a in win.theme_actions if a.isChecked()] == \
+            ["dark"]
+    finally:
+        theme.apply_scheme("dark")
+
+
+def test_theme_toggle_shortcut_from_keymap(search_library: Path) -> None:
+    """The View > Theme > Toggle Light/Dark action's real QAction
+    shortcuts come from the keymap (fauxcasa-6y0) — never hard-coded,
+    the same rule app.play/app.info follow."""
+    import keymap
+
+    win = _search_win(search_library)
+    assert win.theme_toggle_menu_action.shortcuts() == \
+        keymap.shortcuts("app.theme_toggle")
+
+
 def test_grid_empty_text_paints_only_when_set(tmp_path: Path) -> None:
     """An empty display paints nothing extra when empty_text is unset
     (the default — main.py picks per-view copy) and the given text,

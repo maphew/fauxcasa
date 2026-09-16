@@ -37,12 +37,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import theme
 from catalog import Photo, format_date_taken, format_file_size, format_geotag
 
 PANEL_WIDTH = 280  # sizeHint only — the owning splitter owns actual size.
 
-_NAME_STYLE = "color: #888;"
-_STATE_STYLE = "color: #888; padding: 12px;"
+
+def _name_style() -> str:
+    """QSS for a row's NAME label ("Name", "Folder", ...), read from
+    theme.TEXT_MUTED at call time so a theme switch (fauxcasa-6y0) is
+    picked up by the next set_photo() — refresh_style() re-applies it to
+    already-built rows too."""
+    return f"color: {theme.TEXT_MUTED.name()};"
+
+
+def _state_style() -> str:
+    """QSS for the empty/multi-select state label; see _name_style."""
+    return f"color: {theme.TEXT_MUTED.name()}; padding: 12px;"
 
 
 def _rows_for(photo: Photo, album_names: list[str]) -> list[tuple[str, str]]:
@@ -145,7 +156,7 @@ class InspectorPanel(QWidget):
         # shown instead of the row form.
         self._state_label = QLabel("No photo selected")
         self._state_label.setTextFormat(Qt.TextFormat.PlainText)
-        self._state_label.setStyleSheet(_STATE_STYLE)
+        self._state_label.setStyleSheet(_state_style())
         self._state_label.setWordWrap(True)
         body_lay.addWidget(self._state_label)
 
@@ -190,7 +201,7 @@ class InspectorPanel(QWidget):
         self._clear_rows()
         for name, value in _rows_for(photo, album_names):
             name_label = QLabel(name)
-            name_label.setStyleSheet(_NAME_STYLE)
+            name_label.setStyleSheet(_name_style())
             value_label = QLabel(value)
             # Catalog values are USER-AUTHORED (captions, keywords, people
             # and album names, file/folder names): a QLabel in the default
@@ -202,6 +213,18 @@ class InspectorPanel(QWidget):
                 Qt.TextInteractionFlag.TextSelectableByMouse)
             self._form.addRow(name_label, value_label)
         self._form_widget.show()
+
+    def refresh_style(self) -> None:
+        """Re-apply the muted-text QSS to already-built labels after a
+        theme switch (fauxcasa-6y0 MainWindow._refresh_theme): a QSS
+        color baked into a stylesheet string, unlike a QPalette role,
+        doesn't repaint itself on setPalette() alone."""
+        self._state_label.setStyleSheet(_state_style())
+        for row in range(self._form.rowCount()):
+            item = self._form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.setStyleSheet(_name_style())
 
     # ---------- internals ----------
 

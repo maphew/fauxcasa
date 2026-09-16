@@ -467,6 +467,51 @@ def _remember_library(cache_root: Path, library: Path) -> None:
             pass
 
 
+def _load_theme_mode(cache_root: Path) -> str:
+    """The user's theme MODE ("system"/"light"/"dark") from the same
+    per-user config.json as _remembered_library, default "system"
+    (fauxcasa-6y0). Tolerates a missing/garbage config or an unrecognized
+    value the same way _remembered_library does — theme choice is a
+    convenience, not a gate."""
+    try:
+        data = json.loads(_config_path(cache_root).read_text())
+    except (OSError, ValueError):
+        return "system"
+    if not isinstance(data, dict):
+        return "system"
+    mode = data.get("theme")
+    if mode not in theme.MODES:
+        return "system"
+    return mode
+
+
+def _save_theme_mode(cache_root: Path, mode: str) -> None:
+    """Persist the theme MODE, merging into the existing config.json (same
+    read-modify-write-via-temp-sibling-and-os.replace idiom as
+    _remember_library, so a concurrent reader never sees a half-written
+    file) without disturbing the 'library' key or any other key already
+    there. Best-effort: a write failure must never abort the session."""
+    cfg = _config_path(cache_root)
+    tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
+    try:
+        data = json.loads(cfg.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["theme"] = mode
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, cfg)
+    except OSError as e:
+        log.warning("could not remember theme choice: %s", e)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 # Per-folder sort modes (fauxcasa-q6l.11) — DURABLE-HOME DECISION
 # (2026-07-02): a per-folder sort mode is a VIEW preference of a read-only
 # app, so it lives MACHINE-LOCAL in a per-LIBRARY config.json inside that
@@ -844,7 +889,7 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
-    app.setPalette(theme.dark_palette())
+    theme.apply_mode(app, _load_theme_mode(cache_root))
     app.setWindowIcon(app_icon())  # the picker dialog is our first window
     # Backstop: an in-process headless platform (e.g. forced offscreen with a
     # DISPLAY present) still can't show a modal — keep this post-construction
@@ -1782,6 +1827,19 @@ class _BuildBridge(QObject):
     scan_done = Signal(object)
 
 
+# Toolbar search box QSS (fauxcasa-e2y, palette-role — no literal colors —
+# so it holds under both themes). ONE spelling, used at construction and
+# by _refresh_theme (fauxcasa-6y0): Qt resolves a stylesheet's palette(…)
+# functions against the QApplication palette AT setStyleSheet() TIME and
+# caches the result, so a later app.setPalette() (a runtime theme switch)
+# would otherwise leave this one widget a stale-colored island — clearing
+# the sheet and re-setting the SAME text forces Qt to re-resolve it.
+_SEARCH_BOX_QSS = (
+    "QLineEdit { border: 1px solid palette(mid); border-radius: 3px;"
+    " padding: 2px 4px; background: palette(base); color: palette(text); }"
+    " QLineEdit:focus { border: 1px solid palette(highlight); }")
+
+
 class MainWindow(QMainWindow):
     def __init__(self, catalog: Catalog, thumbs: ThumbCache | None,
                  cache_dir: Path | None, build_dir: Path | None,
@@ -1854,6 +1912,12 @@ class MainWindow(QMainWindow):
         self.cache_root = cache_root or (
             cache_dir.parent if cache_dir is not None else _default_cache_root()
         )
+        # Theme MODE (fauxcasa-6y0): "system" (default)/"light"/"dark",
+        # from the same per-user config.json as _remembered_library. Only
+        # STORED here — main() already applied the scheme (theme.
+        # apply_mode) before this window exists; the View > Theme submenu
+        # (_build_theme_menu) reads this for its initial checked state.
+        self.theme_mode = _load_theme_mode(self.cache_root)
         self.adopt = adopt
         self.ready_reported = False
         self.build_failed = False
@@ -2015,19 +2079,16 @@ class MainWindow(QMainWindow):
         _search_chords = " / ".join(
             s.toString() for s in keymap.shortcuts("app.search"))
         self.search_glyph_action.setToolTip(f"Search ({_search_chords})")
-        self.search.setStyleSheet(
-            "QLineEdit { border: 1px solid palette(mid); border-radius: 3px;"
-            " padding: 2px 4px; background: palette(base); color: palette(text); }"
-            " QLineEdit:focus { border: 1px solid palette(highlight); }")
+        self.search.setStyleSheet(_SEARCH_BOX_QSS)
         bar.addWidget(self.search)
         bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
         bar.addWidget(QLabel("Zoom"))
         # Small/large picture glyphs bracket the slider (ez2.14) — a
         # non-interactive visual cue, like the "Zoom" label beside them.
-        zoom_small = QLabel()
-        zoom_small.setPixmap(
+        self.zoom_small_label = QLabel()
+        self.zoom_small_label.setPixmap(
             icons.make_icon("zoom_small", theme.TEXT_MUTED).pixmap(12, 12))
-        bar.addWidget(zoom_small)
+        bar.addWidget(self.zoom_small_label)
         self.zoom = QSlider(Qt.Orientation.Horizontal)
         self.zoom.setRange(64, 256)
         self.zoom.setValue(160)
@@ -2042,10 +2103,10 @@ class MainWindow(QMainWindow):
         self.zoom.valueChanged.connect(
             lambda _v: self._zoom_timer.start())
         bar.addWidget(self.zoom)
-        zoom_large = QLabel()
-        zoom_large.setPixmap(
+        self.zoom_large_label = QLabel()
+        self.zoom_large_label.setPixmap(
             icons.make_icon("zoom_large", theme.TEXT_MUTED).pixmap(16, 16))
-        bar.addWidget(zoom_large)
+        bar.addWidget(self.zoom_large_label)
         bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
         self.reveal_box = QCheckBox("Show hidden")
         self.reveal_box.setToolTip(
@@ -2418,6 +2479,9 @@ class MainWindow(QMainWindow):
         self.star_clear_action.triggered.connect(self._menu_clear_stars)
 
         view_menu.addSeparator()
+        self.theme_menu = self._build_theme_menu(view_menu)
+
+        view_menu.addSeparator()
         view_menu.addAction(self.play_action)   # toolbar's "Play" action
 
         help_menu = self.help_menu = menubar.addMenu("&Help")
@@ -2489,6 +2553,111 @@ class MainWindow(QMainWindow):
             self._apply_view(kind, key)
         self.grid.scroll_to_fraction(frac)   # best-effort scroll restore
         self.grid.setFocus()
+
+    # Menu text for each theme-mode radio action (fauxcasa-6y0).
+    THEME_MENU_LABELS: dict[str, str] = {
+        "system": "&System",
+        "light": "&Light",
+        "dark": "&Dark",
+    }
+
+    def _build_theme_menu(self, view_menu: QMenu) -> QMenu:
+        """The View > Theme submenu (fauxcasa-6y0): an exclusive radio
+        group over theme.MODES, the current self.theme_mode checked,
+        copying _build_star_menu's durable-reference pattern
+        (self.theme_menu, self.theme_actions — tests must never
+        re-discover these through findChildren, the pyside-findchildren-
+        wrapper-heisenbug memory). A fourth entry after a separator
+        toggles light/dark directly; its chord text is derived from the
+        keymap (never hard-coded) so it stays truthful if the binding
+        ever changes."""
+        menu = view_menu.addMenu("&Theme")
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self.theme_actions: list[QAction] = []
+        for mode in theme.MODES:
+            act = menu.addAction(self.THEME_MENU_LABELS[mode])
+            act.setCheckable(True)
+            act.setChecked(mode == self.theme_mode)
+            act.setData(mode)
+            group.addAction(act)
+            act.triggered.connect(
+                lambda _checked=False, mode=mode: self._set_theme_mode(mode))
+            self.theme_actions.append(act)
+        menu.addSeparator()
+        # A real QAction shortcut (unlike star_clear_action's text-only
+        # Shift+Space, which a bare-modifier chord CANNOT be — it would
+        # eat keystrokes while typing in the search box): Ctrl+Shift+D is
+        # a modifier chord, safe as a window-level shortcut, so it is
+        # both DISPLAYED (tab-separated, same textual convention as
+        # star_clear_action) and actually BOUND here. self.addAction
+        # keeps it firing even if the View menu is never opened.
+        _toggle_chords = " / ".join(
+            s.toString() for s in keymap.shortcuts("app.theme_toggle"))
+        self.theme_toggle_menu_action = menu.addAction(
+            f"Toggle Light/Dark\t{_toggle_chords}")
+        self.theme_toggle_menu_action.setShortcuts(
+            keymap.shortcuts("app.theme_toggle"))
+        self.theme_toggle_menu_action.triggered.connect(self._toggle_theme)
+        self.addAction(self.theme_toggle_menu_action)
+        return menu
+
+    def _set_theme_mode(self, mode: str) -> None:
+        """Apply + persist the theme MODE (fauxcasa-6y0): sync the View >
+        Theme radio group itself — same direct/programmatic-call-safe
+        pattern as _set_star_min, so a keyboard toggle or a test driving
+        this directly still leaves the menu agreeing with reality —
+        apply the resolved scheme to the QApplication palette, and
+        refresh every piece of chrome that doesn't read theme.X live."""
+        for act in self.theme_actions:
+            act.setChecked(act.data() == mode)
+        self.theme_mode = mode
+        _save_theme_mode(self.cache_root, mode)
+        app = QApplication.instance()
+        theme.apply_mode(app, mode)
+        self._refresh_theme()
+
+    def _toggle_theme(self) -> None:
+        """Ctrl+Shift+D / View > Theme > Toggle Light/Dark (fauxcasa-6y0):
+        flips between explicit "light" and "dark" from the CURRENT
+        EFFECTIVE scheme (theme.current_scheme()), not the mode — so
+        toggling while on "system" picks the opposite of whatever the OS
+        is showing right now, landing on an explicit override either
+        way, matching the bead's "from an effective light go to dark,
+        from dark go to light" rule."""
+        self._set_theme_mode(
+            "dark" if theme.current_scheme() == "light" else "light")
+
+    def _refresh_theme(self) -> None:
+        """Re-paint every piece of chrome that was built FROM theme.X at
+        construction time rather than read live (fauxcasa-6y0): the
+        toolbar glyphs (icons.py bakes a color into the QIcon's pixmap,
+        so re-setting each one is the only way to repaint them), the
+        search box's palette-role stylesheet (Qt resolves a QSS
+        palette(…) function against the QApplication palette AT
+        setStyleSheet() time and caches it — clearing then re-applying
+        the SAME sheet forces a re-resolve against the new palette), the
+        sidebar (rebuilt wholesale, which repaints its own icons.make_icon
+        calls), and the inspector's QSS-styled labels. Finally repaints
+        every top-level widget so the custom-painted surfaces (grid,
+        viewer, tray — all read theme.X live in their own paintEvent)
+        redraw with the new colors on the very next frame."""
+        self.open_action.setIcon(icons.make_icon("library", theme.TEXT))
+        self.back_action.setIcon(icons.make_icon("back", theme.TEXT))
+        self.play_action.setIcon(icons.make_icon("play", theme.PLAY))
+        self.search_glyph_action.setIcon(
+            icons.make_icon("search", theme.TEXT_MUTED))
+        self.search.setStyleSheet("")
+        self.search.setStyleSheet(_SEARCH_BOX_QSS)
+        self.zoom_small_label.setPixmap(
+            icons.make_icon("zoom_small", theme.TEXT_MUTED).pixmap(12, 12))
+        self.zoom_large_label.setPixmap(
+            icons.make_icon("zoom_large", theme.TEXT_MUTED).pixmap(16, 16))
+        self.info_action.setIcon(icons.make_icon("info", theme.TEXT))
+        self._rebuild_sidebar()
+        self.inspector.refresh_style()
+        for w in QApplication.topLevelWidgets():
+            w.update()
 
     def _step_zoom(self, delta: int) -> None:
         """Zoom In/Out menu actions step the SAME slider the toolbar
@@ -5155,7 +5324,7 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
-    app.setPalette(theme.dark_palette())
+    theme.apply_mode(app, _load_theme_mode(args.cache_root))
     # App-wide default: every top-level (message boxes, the File Types
     # dialog, ...) inherits it; MainWindow/slideshow/peek also set it
     # explicitly so a window built outside main() (tests) carries it too.
@@ -5203,6 +5372,18 @@ def main() -> int:
         win.resize(*args.window_size)
     win.show()
     win.grid.setFocus()  # only really lands once the window is mapped
+
+    # Follow a LIVE OS light/dark flip (fauxcasa-6y0) — but only while the
+    # user's theme MODE is "system" (win.theme_mode); an explicit Light/
+    # Dark override must never be silently undone by the OS switching
+    # under it. Subscribed once, here, after the window exists (win.
+    # _refresh_theme touches window chrome that isn't built yet earlier).
+    def _on_os_color_scheme_changed(_scheme) -> None:
+        if win.theme_mode == "system":
+            theme.apply_mode(app, "system")
+            win._refresh_theme()
+
+    app.styleHints().colorSchemeChanged.connect(_on_os_color_scheme_changed)
 
     # P3 finding: a MID-SESSION degrade (decodefacade.DecodeService.
     # decode() flips state -> "degraded" on a per-file spawn/OSError/
