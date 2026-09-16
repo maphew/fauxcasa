@@ -6,6 +6,7 @@
 #   "pillow",
 #   "piexif",
 #   "av",
+#   "exiv2",
 # ]
 # ///
 """Tests for confirm-archive.py (fauxcasa-ed5.8, M1 gate clause 3 vehicle).
