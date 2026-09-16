@@ -41,6 +41,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv run scripts/test_picasa_db.py -q
       - run: uv run scripts/test_confirm_archive.py -q
+      # fauxcasa-lgg.1: pure stdlib, no Qt -- ini write-layer skeleton
+      - run: uv run apps/desktop-python/test_inisidecar.py -q
 
   ingest-parity:
     strategy:
