@@ -4655,8 +4655,9 @@ BUNDLE_RUNTIME_MODULES = (
     "PIL.Image",
     # HEIC/HEIF opener (fauxcasa-y5b, pillowload.py): pi_heif ships native
     # libheif/libde265 binaries alongside its Python code, which
-    # PyInstaller only collects via --collect-all (see the bundle
-    # workflows) — this probe catches a build that forgot the flag.
+    # PyInstaller collects via the spec's `pi_heif` hiddenimport and its
+    # binary-dependency walker (see fauxcasa-tracer.spec) — this probe
+    # catches a build that silently lost it.
     "pi_heif",
     "av",
     "zstandard",
