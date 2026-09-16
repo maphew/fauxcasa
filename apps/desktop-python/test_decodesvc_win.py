@@ -2363,6 +2363,102 @@ def test_preflight_worker_grants_reports_failures(monkeypatch):
 
 
 @_WINDOWS_ONLY
+def test_preflight_worker_grants_refuses_known_user_folder_without_granting(
+        monkeypatch, tmp_path):
+    """fauxcasa-ayh review finding 1 (BLOCKER): preflight_worker_grants()
+    must refuse a recursive grant target sitting inside a known user
+    folder exactly like spawn() does -- reporting it as a failure
+    ("refused: known user folder") WITHOUT ever calling
+    grant_read_execute_once for it. Before this fix, preflight ran the
+    real grant (writing the on-disk marker) BEFORE spawn() ever got a
+    chance to refuse: a frozen onedir build whose sys._MEIPASS sits
+    under the profile root/Desktop/Downloads would have had its
+    recursive RX ACE granted by a plain preflight check alone."""
+    fake_meipass = str(tmp_path / "Desktop" / "app" / "_internal")
+    fake_exe = str(tmp_path / "Desktop" / "app" / "fauxcasa.exe")
+    monkeypatch.setattr(dw, "resolve_worker_python", lambda: (fake_exe, None))
+    monkeypatch.setattr(dw, "get_cached_profile_sid", lambda name: "fake-sid")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", fake_meipass, raising=False)
+    monkeypatch.setattr(dw, "is_known_user_folder", lambda path: path == fake_meipass)
+
+    called = []
+    monkeypatch.setattr(
+        dw, "grant_read_execute_once",
+        lambda path, sid, inherit=dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT:
+        called.append(path) or None)
+
+    failures = dw.preflight_worker_grants()
+
+    assert failures == [(fake_meipass, "refused: known user folder")]
+    assert called == [str(Path(fake_exe).resolve())], (
+        "the exe FILE (NO_INHERITANCE) is exempt from the refusal and must "
+        "still be granted; only the recursive meipass target is refused")
+
+
+@_WINDOWS_ONLY
+def test_blocking_failures_drop_stageable_worker_dir(monkeypatch):
+    """fauxcasa-ayh review finding 2: a worker-dir-only preflight failure
+    is NOT blocking when the staging root itself grants -- spawn()
+    recovers from exactly this via stage_worker_script (fauxcasa-yfq),
+    so blocking_worker_grant_failures() must drop it."""
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    source_worker_dir = str(Path(dw.__file__).resolve().parent)
+    monkeypatch.setattr(dw, "preflight_worker_grants",
+                         lambda: [(source_worker_dir, "SetNamedSecurityInfoW(...) err=5")])
+    monkeypatch.setattr(dw, "get_cached_profile_sid", lambda name: "fake-sid")
+
+    staging_calls = []
+
+    def fake_grant(path, sid, inherit=dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT):
+        staging_calls.append(path)
+        return None  # staging root grants fine
+
+    monkeypatch.setattr(dw, "grant_read_execute_once", fake_grant)
+
+    assert dw.blocking_worker_grant_failures() == []
+    assert staging_calls == [str(dw.worker_staging_root())]
+
+
+@_WINDOWS_ONLY
+def test_blocking_failures_keep_worker_dir_when_staging_root_ungrantable(monkeypatch):
+    """fauxcasa-ayh review finding 7: if the staging root ITSELF refuses
+    the grant, staging cannot save the worker either -- the worker-dir
+    failure must stay reported, not be silently dropped."""
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    source_worker_dir = str(Path(dw.__file__).resolve().parent)
+    monkeypatch.setattr(dw, "preflight_worker_grants",
+                         lambda: [(source_worker_dir, "SetNamedSecurityInfoW(...) err=5")])
+    monkeypatch.setattr(dw, "get_cached_profile_sid", lambda name: "fake-sid")
+    monkeypatch.setattr(
+        dw, "grant_read_execute_once",
+        lambda path, sid, inherit=dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT:
+        "SetNamedSecurityInfoW(...) err=5")
+
+    assert dw.blocking_worker_grant_failures() == [
+        (source_worker_dir, "SetNamedSecurityInfoW(...) err=5")]
+
+
+@_WINDOWS_ONLY
+def test_blocking_failures_keep_everything_when_frozen(monkeypatch):
+    """fauxcasa-ayh review finding 2: when frozen, sys._MEIPASS is not a
+    separate "worker script dir" spawn() can substitute a staged copy
+    for -- nothing gets dropped, and the staging-root grant is never
+    even attempted."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    fake_meipass = r"C:\fake\bundle\_internal"
+    monkeypatch.setattr(dw, "preflight_worker_grants",
+                         lambda: [(fake_meipass, "SetNamedSecurityInfoW(...) err=5")])
+    called = []
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda *a, **k: called.append(a) or None)
+
+    assert dw.blocking_worker_grant_failures() == [
+        (fake_meipass, "SetNamedSecurityInfoW(...) err=5")]
+    assert called == [], "frozen path must never attempt the staging-root grant"
+
+
+@_WINDOWS_ONLY
 def test_grant_read_execute_once_skips_after_marker(tmp_path, monkeypatch):
     """P1 finding: one-time-per-(SID,dir) ACL grant via an in-process set
     AND an on-disk marker file -- a second call for the same (sid, dir)

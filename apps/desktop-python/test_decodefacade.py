@@ -43,19 +43,16 @@ def _assert_sandbox_grantable() -> None:
     fix -- rather than silently skipping (this is exactly the real-
     sandbox contract these tests exist to exercise).
 
-    A failure on the worker SCRIPT's own directory alone is excluded:
-    spawn() already recovers from that one by staging a content-hashed
-    copy under the cache root (fauxcasa-yfq) -- unlike the interpreter
-    base dir or the PYTHONPATH, neither of which can be staged -- so it
-    is not actually blocking (verified: a real spawn still reaches hello
-    on a checkout whose own directory sits on a ReFS/Dev Drive volume
-    that refuses the grant, the exact situation on this repo's own dev
-    box worktrees)."""
+    fauxcasa-ayh review finding 2: uses decodesvc_win.blocking_worker_
+    grant_failures() -- the SAME helper decodefacade.ensure_started()
+    calls -- rather than a second copy of the "is a worker-script-dir
+    failure actually blocking" rule (that rule needs the staging-root
+    grant check too, review finding 7; duplicating it here previously
+    also got the frozen case wrong, since sys._MEIPASS can equal this
+    module's own directory)."""
     import decodesvc_win as dw
 
-    failures = dw.preflight_worker_grants()
-    source_worker_dir = str(Path(dw.__file__).resolve().parent)
-    failures = [(p, e) for p, e in failures if p != source_worker_dir]
+    failures = dw.blocking_worker_grant_failures()
     if failures:
         detail = "; ".join(f"{p!r}: {err}" for p, err in failures)
         pytest.fail(
@@ -187,7 +184,8 @@ def test_ensure_started_warns_on_ungrantable_pythonpath(monkeypatch, capsys):
     PySide6 worker death back to this cause. The grant is still best-
     effort (spawn() -> start() below can succeed anyway on an ALL
     APPLICATION PACKAGES-granted volume), so the warning must NOT
-    degrade the session by itself."""
+    degrade the session by itself -- state must reach STATE_SANDBOXED
+    (start() is stubbed to succeed), not merely "not degraded"."""
     import applog  # noqa: F401 -- side effect: attaches the stderr mirror handler
     if sys.platform != "win32":
         pytest.skip("sandbox path is only reached when sys.platform == 'win32'")
@@ -196,7 +194,7 @@ def test_ensure_started_warns_on_ungrantable_pythonpath(monkeypatch, capsys):
     import decodesvc_win as dw
 
     fake_path = "X:/fake/site-packages"
-    monkeypatch.setattr(dw, "preflight_worker_grants",
+    monkeypatch.setattr(dw, "blocking_worker_grant_failures",
                          lambda *a, **k: [(fake_path, "err=5")])
     monkeypatch.setattr(df.WinSandboxTransport, "start", lambda self: None)
 
@@ -207,7 +205,30 @@ def test_ensure_started_warns_on_ungrantable_pythonpath(monkeypatch, capsys):
     assert fake_path in svc.warnings[0]
     assert "UV_CACHE_DIR" in svc.warnings[0]
     assert "UV_CACHE_DIR" in capsys.readouterr().err
-    assert svc.state != df.STATE_DEGRADED
+    assert svc.state == df.STATE_SANDBOXED
+
+
+def test_ensure_started_no_warning_when_nothing_blocking(monkeypatch, capsys):
+    """fauxcasa-ayh: the sibling of the test above -- when blocking_
+    worker_grant_failures() reports nothing (the common case: every
+    grant target succeeded, or the only failure was staging-recoverable),
+    ensure_started() must not warn at all."""
+    import applog  # noqa: F401 -- side effect: attaches the stderr mirror handler
+    if sys.platform != "win32":
+        pytest.skip("sandbox path is only reached when sys.platform == 'win32'")
+    monkeypatch.setenv("FAUXCASA_DECODE_SANDBOX", "1")
+
+    import decodesvc_win as dw
+
+    monkeypatch.setattr(dw, "blocking_worker_grant_failures", lambda *a, **k: [])
+    monkeypatch.setattr(df.WinSandboxTransport, "start", lambda self: None)
+
+    svc = df.get_service()
+    svc.ensure_started()
+
+    assert svc.warnings == []
+    assert "UV_CACHE_DIR" not in capsys.readouterr().err
+    assert svc.state == df.STATE_SANDBOXED
 
 
 @_WINDOWS_ONLY

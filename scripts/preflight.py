@@ -64,6 +64,9 @@ from pathlib import Path
 TIMEOUT_SECONDS = 10 * 60  # 10 min hard cap per check
 
 
+_sandbox_env_note_printed = False
+
+
 def _real_sandbox_env(base: dict[str, str], check_name: str) -> dict[str, str]:
     """fauxcasa-ayh: env for a check that spawns the real Windows decode
     sandbox. When UV_CACHE_DIR isn't already set in THIS process's
@@ -76,15 +79,25 @@ def _real_sandbox_env(base: dict[str, str], check_name: str) -> dict[str, str]:
     degrading test_decodefacade.py's/test_decodesvc_win.py's/
     test_sandbox_e2e.py's real-sandbox tests (fauxcasa-ayh names the
     cause loudly instead of a mysterious degrade; this makes the local
-    gate not depend on that box's ambient UV_CACHE_DIR at all)."""
+    gate not depend on that box's ambient UV_CACHE_DIR at all).
+
+    Called once per real-sandbox check (three times total today), but
+    the note is printed at most ONCE per preflight run -- it is the same
+    fact each time, not one worth repeating per check (review finding 5)."""
+    global _sandbox_env_note_printed
     env = dict(base)
     if sys.platform == "win32" and "UV_CACHE_DIR" not in os.environ:
         local_appdata = os.environ.get("LOCALAPPDATA")
         if local_appdata:
             env["UV_CACHE_DIR"] = os.path.join(local_appdata, "uv", "cache")
-            print(f"preflight: {check_name}: UV_CACHE_DIR not set -- defaulting to "
-                  f"{env['UV_CACHE_DIR']!r} so the real-sandbox check is deterministic "
-                  "(fauxcasa-ayh)")
+            if not _sandbox_env_note_printed:
+                _sandbox_env_note_printed = True
+                print(
+                    f"preflight: UV_CACHE_DIR not set -- defaulting the real-sandbox "
+                    f"checks ({check_name} and others) to {env['UV_CACHE_DIR']!r} so "
+                    "they're deterministic (fauxcasa-ayh); if your uv cache is "
+                    "configured elsewhere via uv.toml, the first run here re-downloads "
+                    "wheels -- set UV_CACHE_DIR explicitly to keep yours")
     return env
 
 

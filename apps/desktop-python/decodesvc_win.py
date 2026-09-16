@@ -1824,6 +1824,36 @@ if sys.platform == "win32":
                 targets.append((d, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
         return targets
 
+    def check_grant_targets_safe(targets: list[tuple[str, int]]) -> None:
+        """Raise the same RuntimeError spawn() has always raised (P2
+        finding "frozen grant scope") for the FIRST target in `targets`
+        that would receive a RECURSIVE (SUB_CONTAINERS_AND_OBJECTS_
+        INHERIT) grant and sits inside a known user folder (profile
+        root/Desktop/Downloads/Documents/Pictures) -- widening the
+        AppContainer's read to the rest of the user's files is never
+        acceptable. A NO_INHERITANCE target (the frozen exe's own FILE)
+        is exempt: it cannot widen read to sibling files. No-op when
+        every target is safe.
+
+        Shared by BOTH callers (fauxcasa-ayh review finding 1 -- the
+        blocker): spawn() calls this on its frozen-branch grant_targets
+        exactly where it raised before (test_spawn_refuses_frozen_grant_
+        on_known_user_folder must still see `called == []`, i.e. the
+        refusal fires before any grant_read_execute_once call), and
+        preflight_worker_grants() (below) calls this PER TARGET so it
+        can report a refusal as a failure and keep checking the rest,
+        instead of the bug this closes: preflight silently issuing the
+        recursive grant (and writing its on-disk marker) before spawn()
+        ever got a chance to refuse."""
+        for target_path, target_inherit in targets:
+            if (target_inherit == SUB_CONTAINERS_AND_OBJECTS_INHERIT
+                    and is_known_user_folder(target_path)):
+                raise RuntimeError(
+                    f"refusing to grant AppContainer read+execute: "
+                    f"{target_path!r} is a known user folder (profile "
+                    "root/Desktop/Downloads/Documents/Pictures) -- "
+                    "move the install elsewhere and retry")
+
     def preflight_worker_grants(profile_name: str = PROFILE_NAME) -> list[tuple[str, str]]:
         """Resolve the worker layout and issue every AppContainer
         read+execute grant spawn() would issue -- BEFORE the first spawn
@@ -1840,15 +1870,64 @@ if sys.platform == "win32":
         grant_read_execute_once always has). Grant failures are
         non-fatal here exactly as they are in spawn(); resolve_worker_
         python() errors (e.g. PySide6 not importable) DO propagate --
-        that is a real misconfiguration, not a grantability question."""
+        that is a real misconfiguration, not a grantability question.
+
+        fauxcasa-ayh review finding 1 (blocker): a target that spawn()
+        would REFUSE to grant (check_grant_targets_safe -- a recursive
+        target inside a known user folder) is reported as a failure
+        here too, WITHOUT ever calling grant_read_execute_once for it --
+        this must never be the thing that widens the AppContainer's
+        read to the rest of the user's files just because it ran before
+        spawn()."""
         worker_python, worker_pythonpath = resolve_worker_python()
         sid = get_cached_profile_sid(profile_name)
         failures: list[tuple[str, str]] = []
         for target_path, target_inherit in worker_grant_targets(worker_python, worker_pythonpath):
+            try:
+                check_grant_targets_safe([(target_path, target_inherit)])
+            except RuntimeError:
+                failures.append((target_path, "refused: known user folder"))
+                continue
             err = grant_read_execute_once(target_path, sid, inherit=target_inherit)
             if err is not None:
                 failures.append((target_path, err))
         return failures
+
+    def blocking_worker_grant_failures() -> list[tuple[str, str]]:
+        """preflight_worker_grants(), filtered to the failures that would
+        actually BLOCK a real spawn (fauxcasa-ayh review finding 2).
+
+        When NOT frozen, drop a failure on the worker SCRIPT's own
+        directory ALONE: spawn() already recovers from that one by
+        staging a content-hashed copy under the cache root
+        (stage_worker_script/worker_staging_root, fauxcasa-yfq) --
+        unlike the interpreter base dir or the worker PYTHONPATH, which
+        cannot be staged. But (review finding 7) that drop is only safe
+        when the staging root ITSELF grants: if %LOCALAPPDATA% is also
+        ungrantable, staging cannot save the worker either, and the
+        worker-dir failure is real and must stay reported.
+
+        When frozen, nothing is dropped: sys._MEIPASS is not a separate
+        "worker script dir" that spawn() can substitute a staged copy
+        for -- it IS the payload directory being granted, so a failure
+        on it is unconditionally blocking."""
+        failures = preflight_worker_grants()
+        if getattr(sys, "frozen", False) or not failures:
+            return failures
+        try:
+            source_worker_dir = str(Path(__file__).resolve().parent)
+        except OSError:
+            return failures
+        if not any(p == source_worker_dir for p, _ in failures):
+            return failures
+        sid = get_cached_profile_sid(PROFILE_NAME)
+        staging_err = grant_read_execute_once(
+            str(worker_staging_root()), sid, inherit=SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+        if staging_err is not None:
+            # Staging root itself refuses the grant too -- the worker-dir
+            # failure is real; keep it in the list.
+            return failures
+        return [(p, e) for p, e in failures if p != source_worker_dir]
 
     def is_appcontainer(token_handle=None) -> bool | str:
         """Query TokenIsAppContainer on the current process's token (used
@@ -2186,16 +2265,14 @@ class WinSandboxWorker:
             # place" layout with no distinct payload subfolder) -- and
             # that case is already covered by checking meipass itself.
             worker_args = ["--decode-worker"]
-            meipass = getattr(sys, "_MEIPASS", None)
-            recursive_grant_dirs = [meipass] if meipass else []
-            for target_dir in recursive_grant_dirs:
-                if is_known_user_folder(target_dir):
-                    raise RuntimeError(
-                        f"refusing to grant AppContainer read+execute: "
-                        f"{target_dir!r} is a known user folder (profile "
-                        "root/Desktop/Downloads/Documents/Pictures) -- "
-                        "move the install elsewhere and retry")
+            # fauxcasa-ayh review finding 1: the refusal itself now lives
+            # in check_grant_targets_safe (shared with preflight_worker_
+            # grants) -- called on the SAME grant_targets this branch
+            # always used (meipass RECURSIVE + the exe FILE NO_INHERITANCE,
+            # of which only the former is ever checked), so this raises
+            # in exactly the same place, before any grant is issued.
             grant_targets = worker_grant_targets(worker_python, worker_pythonpath)
+            check_grant_targets_safe(grant_targets)
         else:
             worker_script = str(Path(__file__).resolve().with_name("decodesvc_worker_win.py"))
             worker_dir = str(Path(worker_script).parent)
