@@ -216,6 +216,8 @@ from librarystate import (  # noqa: E402
 from cli import (  # noqa: E402
     _cmd_promote,
     _parse_image_size_arg,
+    run_search_probe,
+    select_sidebar_view,
 )
 
 import applog  # noqa: E402
@@ -1855,7 +1857,7 @@ class MainWindow(QMainWindow):
         # Set by _on_scan_done when the background walk raised (Codex
         # cross-vendor review finding 2): the synchronous cold path let
         # that exception propagate out of main() and crash the process —
-        # never a fake READY. This flag is how main()'s check_ready tells
+        # never a fake READY. This flag is how cli.ScriptedRun.check_ready tells
         # a failed deferred walk apart from a genuinely empty, successful
         # one (both leave the placeholder catalog in place).
         self._scan_failed = False
@@ -2214,7 +2216,7 @@ class MainWindow(QMainWindow):
             # Codex cross-vendor review finding 2: the synchronous cold
             # path let a scan exception propagate out of main() and crash
             # the process (never a fake READY, always a nonzero exit for
-            # scripted runs). _scan_failed is how main()'s check_ready
+            # scripted runs). _scan_failed is how cli.ScriptedRun.check_ready
             # tells this apart from a genuinely empty, successful walk —
             # both leave the placeholder catalog in win.catalog. An
             # interactive run isn't killed outright (the window already
@@ -4157,79 +4159,6 @@ class MainWindow(QMainWindow):
             self._peek_page.dismiss()
 
 
-def run_search_probe(win: MainWindow, spec: str) -> list[dict]:
-    """§7 search-latency probe (fauxcasa-ed5.4): drive each comma-separated
-    query through the live search box exactly as its final keystroke would
-    (setText -> textChanged -> _search_changed, synchronously) and print one
-    machine-readable {"event": "search", "query", "ms", "hits"} line per
-    query for the CI/dev harness. `ms` is _search_changed end to end (see
-    its docstring comment for what that covers). The box is cleared between
-    queries — a repeated identical query would otherwise not re-fire
-    textChanged — and left empty afterwards. Blank segments are skipped, so
-    a trailing comma is harmless."""
-    events: list[dict] = []
-    for q in (t.strip() for t in spec.split(",")):
-        if not q:
-            continue
-        win.search.setText("")
-        win.search.setText(q)
-        ev = {"event": "search", "query": q,
-              "ms": round(win.last_search_ms, 3),
-              "hits": win.last_search_hits}
-        print(json.dumps(ev), flush=True)
-        events.append(ev)
-    win.search.setText("")
-    return events
-
-
-def select_sidebar_view(win: MainWindow, spec: str) -> bool:
-    """Select a sidebar view exactly as a click on its tree item would
-    (scripted-run screenshot flag --view). SPEC is 'all', 'starred',
-    'recent', 'unnamed', 'album:<name-or-uid>', 'person:<name>', or
-    'folder:<rel-path>' — the part before ':' (or the whole string, for
-    the colon-less kinds) is matched against a tree item's (kind, key)
-    UserRole payload set up in _rebuild_sidebar/_build_sidebar. An album
-    matches by UID OR by its resolved display name (win.catalog.albums
-    [uid].name), since a human would rather type "Best Of" than a hex
-    token; person/folder match the key exactly (case-sensitive). Drives
-    win._sidebar_clicked(item, 0) so the tree highlights too, exactly
-    like a real click — not just win._apply_view, which leaves the tree
-    selection stale. Returns False for an unknown kind or a spec with no
-    matching item; the caller (check_ready) decides how to fail a
-    scripted run on that."""
-    kind, _, key = spec.partition(":")
-    if kind not in ("all", "starred", "recent", "unnamed",
-                    "album", "person", "folder"):
-        return False
-    matches = []
-    it = QTreeWidgetItemIterator(win.tree)
-    while it.value():
-        item = it.value()
-        it += 1
-        data = item.data(0, Qt.ItemDataRole.UserRole)
-        if data is None or data[0] != kind:
-            continue
-        item_key = data[1]
-        if kind == "album":
-            album = win.catalog.albums.get(item_key)
-            if item_key != key and not (album is not None
-                                        and album.name == key):
-                continue
-        elif item_key != key:
-            continue
-        matches.append(item)
-    if len(matches) != 1:
-        # Picasa permits two albums with one display name, and a name
-        # could equal another album's uid: refuse to guess which the
-        # caller meant rather than screenshot the wrong one.
-        if matches:
-            log.error("--view %r is ambiguous: %d sidebar items match",
-                      spec, len(matches))
-        return False
-    win._sidebar_clicked(matches[0], 0)
-    return True
-
-
 BUNDLE_RUNTIME_MODULES = (
     "PySide6.QtWidgets",
     # QtMultimedia ships from PySide6-Addons for QAudioSink ONLY (video
@@ -4646,27 +4575,6 @@ def main() -> int:
     win.show()
     win.grid.setFocus()  # only really lands once the window is mapped
 
-    # P3 finding: a MID-SESSION degrade (decodefacade.DecodeService.
-    # decode() flips state -> "degraded" on a per-file spawn/OSError/
-    # queue.Empty failure, well after the READY-time snapshot below) must
-    # still update the status-bar label -- N7 "never silent" applies for
-    # the whole session, not just at startup. check_ready's scripted
-    # `poll` timer is stopped once an interactive run's instrumentation is
-    # done, so this uses its OWN long-lived timer instead.
-    def _sync_decode_sandbox_label() -> None:
-        if decode_svc.state == "degraded" and not win.decode_sandbox_label.isVisible():
-            log.error("decode sandbox degraded: %s", decode_svc.reason)
-            win.decode_sandbox_label.setText(
-                f"Decoding is not sandboxed on this machine: "
-                f"{decode_svc.reason}  ")
-            win.decode_sandbox_label.setToolTip(decode_svc.reason)
-            win.decode_sandbox_label.setVisible(True)
-
-    decode_sandbox_poll = QTimer(win)
-    decode_sandbox_poll.setInterval(1000)
-    decode_sandbox_poll.timeout.connect(_sync_decode_sandbox_label)
-    decode_sandbox_poll.start()
-
     if cold_scan_needed:
         # Non-blocking first run (fauxcasa-q6l.13): the window is already
         # painted (empty) — start the deferred walk now, off the startup
@@ -4675,313 +4583,20 @@ def main() -> int:
         # the build it chains into) land.
         win._start_cold_scan(cache_dir)
 
-    # READY instrumentation (§7 cold start): poll until every visible
-    # tile is decoded, then report cold start + RSS on stdout.
-    state = {"scrolled": False, "shot": False, "opened": False,
-             "probed": False, "scan_failure_handled": False,
-             "viewed": False, "searched": False, "selected": False,
-             "info_set": False, "played": False, "faced": False}
-    # A scripted probe (any of the three) implies quit — same set the hard
-    # timeout below arms on; reused by check_ready's scan-failure gate
-    # (fauxcasa-q6l.13, Codex cross-vendor review finding 2).
-    scripted_run = (args.screenshot is not None or args.quit_after_ready
-                    or args.search_probe is not None)
-
-    def may_quit() -> bool:
-        if not args.finish_build:
-            return True
-        if win.index_busy():
-            return False
-        if win.build_failed:
-            # --finish-build promised a cache; a failed build must not
-            # masquerade as a green run.
-            log.error("cache build failed under --finish-build")
-            app.exit(1)
-            return False
-        return True
-
-    def check_ready() -> None:
-        if win._scan_failed:
-            # Codex cross-vendor review finding 2: never let a failed
-            # deferred walk report a fake READY against the still-empty
-            # placeholder catalog — _on_scan_done already surfaced the
-            # failure via the activity row/status bar/log. A scripted
-            # probe gets an immediate nonzero exit here (mirrors the crash
-            # an unhandled scan exception caused on the old synchronous
-            # path, just without waiting out the full --timeout); a plain
-            # interactive run simply stays open with the window it already
-            # has — not killed outright, since unlike the old path the
-            # window exists and is otherwise usable.
-            if scripted_run and not state["scan_failure_handled"]:
-                state["scan_failure_handled"] = True
-                log.error("cold scan failed — exiting nonzero, no READY")
-                app.exit(1)
-            return
-        # fauxcasa-q6l.13: while the deferred cold scan is still in flight
-        # the grid is genuinely empty (0 items), so all_visible_decoded()
-        # would trivially read True and fire READY against the EMPTY
-        # placeholder catalog — never once the real one lands. Hold READY
-        # until the walk lands (this does NOT block the event loop; the
-        # walk runs on its own thread and the window is already painted
-        # and responsive), same as the pre-existing "wait for visible
-        # tiles to decode" gate this joins for the async BUILD that
-        # follows.
-        # The "visible tiles decoded" gate is about the GRID page. Once a
-        # scripted --open has switched to the viewer, the grid is hidden and
-        # never paints, so it never requests decodes; if the cold build
-        # lands AFTER the viewer opened (READY can fire before "indexed"),
-        # set_thumbs() makes every visible tile undecoded again and this
-        # gate would hold the poll forever (a bare TIMEOUT, seen ~1 in 5
-        # runs locally and on CI's native-smoke leg). Apply it only while
-        # the grid page is current.
-        grid_current = win.pages.currentWidget() is not win.viewer
-        if win._cold_scan_pending or (
-                grid_current and not win.grid.all_visible_decoded()):
-            return
-        if not win.ready_reported:
-            win.ready_reported = True
-            cold_ms = (time.perf_counter() - T0) * 1000.0
-            rss, hwm = read_rss_mb()
-            # §7 catalog-size row (fauxcasa-ed5.3): the persisted
-            # catalog.json's on-disk bytes, normalized per photo. 0 = not
-            # yet persisted (a cold build writes it when the index lands).
-            # fauxcasa-ed5.5 re-baselined the budget to <=100 B/photo fully
-            # indexed (spec §10 item 20) and met it honestly: catalog.json
-            # is now zstd level 3 over folder-grouped compact JSON (see
-            # catalog.save_catalog and docs/research/catalog-size-analysis.md)
-            # — st_size already reflects that compression, so this field
-            # continues to measure the file honestly, just a smaller one.
-            try:
-                cat_bytes = cat_path.stat().st_size
-            except OSError:
-                cat_bytes = 0
-            print("READY", flush=True)
-            # fauxcasa-ez2.9 Stage 1, item 6: one line right after READY,
-            # every run (CI's --require-sandbox smoke asserts state ==
-            # "sandboxed" on this exact key). Logged via applog too, and
-            # "degraded" additionally gets a persistent status-bar note
-            # (N7: never silent) -- "in-process" (non-Windows, or
-            # FAUXCASA_DECODE_SANDBOX=0) is a softer log-only note.
-            print(json.dumps({"event": "decode-sandbox",
-                              "state": decode_svc.state,
-                              "reason": decode_svc.reason}), flush=True)
-            if decode_svc.state == "degraded":
-                _sync_decode_sandbox_label()
-            elif decode_svc.state == "in-process":
-                log.info("decode sandbox: in-process (%s)", decode_svc.reason)
-            else:
-                log.info("decode sandbox: sandboxed")
-            # fauxcasa-q6l.13: win.catalog, not the outer `catalog` closed
-            # over above — on the non-blocking cold-scan path that outer
-            # binding is the EMPTY placeholder forever, while win.catalog
-            # is swapped in place by reload_data once the deferred walk
-            # lands (_on_scan_done). Reading win.catalog means READY
-            # reports whatever is actually live at the moment first paint
-            # settled — 0 on a still-scanning NAS-scale library (honest:
-            # the walk isn't done yet), the real counts when the walk
-            # already landed by then (small/warm-adjacent libraries).
-            # "version" (+ "git_sha" only on a stamped build) rides the
-            # existing keys so a perf/CI record says WHICH build produced
-            # the numbers (rel-0.1 identity). Consumers read keys by name
-            # (scripts/perf-canary.py), so an added key is additive.
-            print(json.dumps({
-                "event": "ready",
-                "version": __version__,
-                **({"git_sha": GIT_SHA} if GIT_SHA else {}),
-                "cold_start_ms": round(cold_ms),
-                "prep_ms": round(prep_ms),
-                "warm": warm,
-                "photos": len(win.catalog.photos),
-                "visible_photos": win.catalog.visible_count,
-                "folders": len(win.catalog.folders),
-                "albums": len(win.catalog.albums),
-                "catalog_bytes": cat_bytes,
-                "catalog_bytes_per_photo": round(
-                    cat_bytes / max(1, len(win.catalog.photos)), 1),
-                "vm_rss_mb": round(rss, 1),
-                "vm_hwm_mb": round(hwm, 1),
-            }), flush=True)
-            if args.quit_after_ready and args.screenshot is None \
-                    and args.scroll_to is None and args.open is None \
-                    and args.search_probe is None and args.view is None \
-                    and args.search is None and args.select is None \
-                    and not args.info and not args.play \
-                    and not args.faces and may_quit():
-                app.quit()
-                return
-        if args.search_probe is not None and not state["probed"]:
-            # §7 search probe (fauxcasa-ed5.4): run once, right after READY,
-            # then fall through to the normal scripted-quit path below —
-            # --search-probe implies quit (see the bottom of check_ready).
-            state["probed"] = True
-            run_search_probe(win, args.search_probe)
-        # Scripted-run screenshot flags: view -> search -> select -> info ->
-        # scroll_to -> open -> faces -> play -> (loading waits) -> screenshot. Each
-        # step sets its state flag and returns once so the viewport gets a
-        # poll cycle to decode (same pattern scroll_to always used).
-        if args.view is not None and not state["viewed"]:
-            state["viewed"] = True
-            if not select_sidebar_view(win, args.view):
-                log.error("--view: no sidebar item matches %r", args.view)
-                print(json.dumps({"event": "view", "ok": False,
-                                  "spec": args.view}), flush=True)
-                app.exit(1)
-                return
-            kind, _, key = args.view.partition(":")
-            print(json.dumps({
-                "event": "view", "ok": True, "kind": kind, "key": key,
-                "shown": len(win.grid.display),
-            }), flush=True)
-            return  # let the new view's viewport decode
-        if args.search is not None and not state["searched"]:
-            state["searched"] = True
-            win.search.setText(args.search)
-            print(json.dumps({
-                "event": "view", "ok": True, "kind": "search",
-                "key": args.search, "shown": len(win.grid.display),
-            }), flush=True)
-            return
-        if args.select is not None and not state["selected"]:
-            state["selected"] = True
-            display = win.grid.display
-            if display:
-                pos = max(0, min(len(display) - 1, args.select))
-                win.grid._select(display[pos])
-                win.grid._ensure_visible(display[pos])
-            print(json.dumps({
-                "event": "view", "ok": True, "kind": "select",
-                "key": str(args.select), "shown": len(display),
-            }), flush=True)
-            return
-        if args.info and not state["info_set"]:
-            state["info_set"] = True
-            win.info_action.setChecked(True)  # opens the inspector
-            return
-        if args.scroll_to is not None and not state["scrolled"]:
-            state["scrolled"] = True
-            win.grid.scroll_to_fraction(args.scroll_to)
-            return  # wait for the new viewport to decode
-        if args.open is not None and not state["opened"]:
-            state["opened"] = True
-            display = win.grid.display
-            if display:
-                pos = max(0, min(len(display) - 1, args.open))
-                win._open_viewer(display[pos], display, pos)
-            return
-        if args.faces and not state["faced"]:
-            # Face boxes come from the catalog, not the decoded original,
-            # so this need not wait for the viewer's load; toggle_faces is
-            # a no-op unless the viewer is current on a face-tagged photo.
-            state["faced"] = True
-            win.viewer.toggle_faces()
-            if not win.viewer.faces_visible:
-                # Same contract as a --view miss: a screenshot promised to
-                # show face boxes must not quietly come out without them.
-                log.error("--faces: the viewer is not on a face-tagged photo "
-                          "(pair it with --open N on one that is)")
-                print(json.dumps({"event": "view", "ok": False,
-                                  "kind": "faces", "key": ""}), flush=True)
-                app.exit(1)
-                return
-            print(json.dumps({"event": "view", "ok": True, "kind": "faces",
-                              "key": "", "shown": 1}), flush=True)
-            return
-        if args.play and not state["played"]:
-            state["played"] = True
-            win._start_slideshow()  # no-op (no _slideshow surface) if empty
-            return
-        if state["opened"] and win.viewer.loading:
-            # Let the original finish loading before the shot — but never
-            # wait forever: a wedged decode used to turn a scripted
-            # --open/--screenshot run into a bare TIMEOUT with no diagnosis.
-            # Bounded wait, then shoot whatever is painted and say why.
-            state["open_wait"] = state.get("open_wait", 0) + 1
-            if state["open_wait"] * poll.interval() < OPEN_WAIT_MS:
-                return
-            dec = getattr(win.viewer, "_decoder", None)
-            log.error(
-                "viewer original still loading after %d ms (decoder alive=%s,"
-                " queued jobs=%d) — taking the screenshot anyway",
-                OPEN_WAIT_MS, bool(dec is not None and dec.is_alive()),
-                win.viewer._jobs.qsize())
-            win.viewer.loading = False
-        if state["played"] and win._slideshow is not None \
-                and win._slideshow.loading:
-            # Same bounded-wait pattern as the viewer original above, for
-            # the slideshow's own first-slide decode.
-            state["play_wait"] = state.get("play_wait", 0) + 1
-            if state["play_wait"] * poll.interval() < OPEN_WAIT_MS:
-                return
-            dec = getattr(win._slideshow, "_decoder", None)
-            log.error(
-                "slideshow original still loading after %d ms (decoder "
-                "alive=%s, queued jobs=%d) — taking the screenshot anyway",
-                OPEN_WAIT_MS, bool(dec is not None and dec.is_alive()),
-                win._slideshow._jobs.qsize())
-            win._slideshow.loading = False
-        if not may_quit():
-            return  # --finish-build: hold the quit for the cache build
-        if args.screenshot is not None and not state["shot"]:
-            state["shot"] = True
-            # --play's surface is its own top-level window (slideshow.py
-            # module docstring) — grab THAT, not the main window it sits
-            # on top of, once it is actually up.
-            shot_target = win
-            if state["played"] and win._slideshow is not None \
-                    and win._slideshow.isVisible():
-                shot_target = win._slideshow
-            if shot_target.grab().save(str(args.screenshot)):
-                log.info("screenshot: %s", args.screenshot)
-            else:
-                log.error("FAILED to save screenshot to %s", args.screenshot)
-                app.exit(1)
-                return
-            app.quit()
-        elif args.quit_after_ready or args.search_probe is not None:
-            app.quit()
-        else:
-            poll.stop()  # interactive run: instrumentation is done
-
-    # Parented to the window it polls (fauxcasa-q6l.15): check_ready
-    # dereferences win.grid, and the timeout connection forms a Python
-    # reference cycle (poll -> check_ready -> poll) that kept the orphan
-    # timer alive past main()'s return — an in-process caller (the test
-    # suite) that later deleted the window got a stale fire into a deleted
-    # GridView (rediscovered independently three times before the fix).
-    poll = QTimer(win)
-    poll.setObjectName("ready-poll")
-    poll.setInterval(50)
-    poll.timeout.connect(check_ready)
-    poll.start()
-    # Hard stop for scripted runs: a stuck decode must fail loudly, not
-    # hang CI or masquerade as success.
-    #
-    # Parented and stopped below for the same reason as the poll timer
-    # above (fauxcasa-9pr, the case q6l.15 missed): a bare
-    # QTimer.singleShot belongs to no object and nothing cancels it, so a
-    # run that finishes INSIDE its own deadline leaves the deadline armed
-    # in the shared QApplication. Whichever later in-process run happened
-    # to be in app.exec() when it fired was killed with exit 1 and a log
-    # line quoting the dead run's timeout and state — an ubuntu-only
-    # tracer failure on main, and a latent flake everywhere else.
-    hard_stop = None
-    if scripted_run:
-        def on_timeout() -> None:
-            log.error("TIMEOUT after %ss — ready=%s state=%s",
-                      args.timeout, win.ready_reported, state)
-            app.exit(1)
-
-        hard_stop = QTimer(win)
-        hard_stop.setObjectName("scripted-hard-stop")
-        hard_stop.setSingleShot(True)
-        hard_stop.timeout.connect(on_timeout)
-        hard_stop.start(int(args.timeout * 1000))
+    # The check_ready() scripted-run state machine (fauxcasa-4tu stage 2,
+    # commit 3): cli.ScriptedRun owns the ready-poll/decode-sandbox-poll/
+    # hard-stop QTimers and the READY-instrumentation state that used to be
+    # a closure over main()'s own locals. start()/stop() bracket app.exec()
+    # so every timer this run owns is parented to `win` and explicitly
+    # stopped before shutdown (fauxcasa-q6l.15, fauxcasa-9pr).
+    scripted = cli.ScriptedRun(
+        win, app, args, decode_svc=decode_svc, t0=T0, prep_ms=prep_ms,
+        cat_path=cat_path, warm=warm, version=__version__, git_sha=GIT_SHA,
+        open_wait_ms=OPEN_WAIT_MS, read_rss_mb=read_rss_mb)
+    scripted.start()
 
     code = app.exec()
-    poll.stop()  # belt to the parenting suspenders: never fire post-exec
-    decode_sandbox_poll.stop()  # same belt-and-suspenders for the sandbox label poller
-    if hard_stop is not None:
-        hard_stop.stop()
+    scripted.stop()  # belt to the parenting suspenders: never fire post-exec
     win.shutdown()  # reap any in-flight cache build cleanly
     rss, hwm = read_rss_mb()
     print(json.dumps({"event": "exit", "vm_rss_mb": round(rss, 1),
