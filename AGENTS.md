@@ -240,6 +240,12 @@ a prompt.
 
 ## Architecture Overview
 
+**Steering document:** `docs/architecture-review-2026-09.md` (the
+September 2026 proportion-and-balance review) says where effort has gone,
+what is frozen, what comes next and in what order, and the bead-labelling
+rules that keep the balance visible. Read its sections 8 to 11 before
+picking up a bead; re-run its Appendix B quarterly.
+
 The shipping app lives under `apps/desktop-python/` (Python + PySide6/Qt),
 layered catalog -> thumbcache -> grid/viewer/sidebar. Verified by reading
 each module's own docstring and by grepping actual call sites, since a few
