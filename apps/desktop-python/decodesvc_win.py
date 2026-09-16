@@ -327,6 +327,7 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
                     f"a valid hello frame and contained no newline to resync past: "
                     f"{bytes(noise + extra)!r}")
                 exc.leading_bytes = noise + bytes(extra)
+                exc.unframed = True
                 raise exc
             b = fh.read(1)
             if not b:
@@ -336,6 +337,7 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
                     f"line (gotcha 7); {len(noise) + len(extra)} noise bytes so "
                     f"far: {bytes(noise + extra)!r}")
                 exc.leading_bytes = noise + bytes(extra)
+                exc.unframed = True
                 raise exc
             extra += b
         noise = noise + bytes(extra)
@@ -345,6 +347,13 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
     # leading_bytes: when they are really the first 4 characters of a
     # SECOND diagnostic line (fauxcasa-yfq: "python.exe: can't open file
     # ..." -> b'pyth'), spawn() needs them to show the line whole.
+    #
+    # `exc.unframed = True` marks the exceptions where the worker never
+    # produced a single well-formed length prefix -- the only ones spawn()
+    # may re-code as WORKER_CRASHED after a non-zero exit. Anything that
+    # FRAMED (a plausible length followed by a bogus or non-hello body)
+    # is protocol bytes and keeps its PROTOCOL code even if the worker
+    # then exits: that is the evidence-of-compromise case (review round 1).
     header2 = _read_exact(fh, 4)
     if header2 is None:
         exc = DecodeServiceError(
@@ -352,6 +361,7 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
             "control pipe closed after a leading diagnostic line, before any frame "
             "(worker died before hello)")
         exc.leading_bytes = noise
+        exc.unframed = True
         raise exc
     (length2,) = struct.unpack("<I", header2)
     if length2 > MAX_CONTROL_MSG:
@@ -359,6 +369,7 @@ def _read_hello_frame_tolerant(fh: Any) -> tuple[dict, int]:
             f"incoming control frame {length2} bytes exceeds MAX_CONTROL_MSG "
             f"{MAX_CONTROL_MSG} (after discarding {len(noise)} leading noise bytes)")
         exc.leading_bytes = noise + header2
+        exc.unframed = True
         raise exc
     payload2 = _read_exact(fh, length2)
     if payload2 is None:
@@ -413,7 +424,7 @@ def describe_prehello_death(output: bytes, exit_code: int | None, worker_args: l
     else:
         parts.append(f"worker exited before its hello frame (exit code {exit_code:#010x})")
     if lines:
-        shown = lines[:8]
+        shown = [ln if len(ln) <= 300 else ln[:300] + "..." for ln in lines[:8]]
         joined = " | ".join(shown)
         if len(lines) > len(shown):
             joined += f" | ... ({len(lines) - len(shown)} more lines)"
@@ -1312,7 +1323,14 @@ if sys.platform == "win32":
         home dir, when LOCALAPPDATA is unset) -- the same root catalog.py/
         db3rescue.py use. Shared by the ACL-marker store and the staged
         worker-script copy (fauxcasa-yfq): both must live on a volume
-        where the user can set ACLs, which the profile drive is."""
+        where the user can set ACLs, which the profile drive is.
+
+        The TEMP / home fallbacks exist for the marker store, where a
+        misplaced file costs one repeated ACL call. Staging puts EXECUTED
+        code under this root, so stage_worker_script() refuses to run
+        unless LOCALAPPDATA itself resolved (cache_root_is_localappdata)
+        -- a world-writable TEMP is not a place to launch the worker
+        from (review round 1, item 12)."""
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
         return Path(base) / "Fauxcasa" / "cache"
 
@@ -1346,12 +1364,17 @@ if sys.platform == "win32":
     # decodesvc_worker_win.py, re-verified byte-for-byte before reuse, so
     # an edited source is never run from a stale copy. Old hash dirs are
     # pruned once they are a day old (a concurrent broker may still be
-    # launching from a younger one). Once staged, the copy is what gets
-    # launched even if the staging root's own grant fails too -- only a
-    # failure to WRITE the copy (unreadable source, read-only cache root)
-    # falls back to the source path.
+    # launching from a younger one). The copy is launched ONLY when the
+    # staging root's own grant succeeds; if that grant fails too, or the
+    # copy cannot be written, spawn stays on the source path (see the
+    # comment at the call site in spawn()).
     WORKER_STAGING_DIRNAME = "sandbox-worker"
     WORKER_STAGING_MAX_AGE_SECONDS = 24 * 3600
+
+    def cache_root_is_localappdata() -> bool:
+        """True when fauxcasa_cache_root() resolved from LOCALAPPDATA rather
+        than the TEMP/home fallbacks -- the precondition for staging."""
+        return bool(os.environ.get("LOCALAPPDATA"))
 
     def worker_staging_root() -> Path:
         return fauxcasa_cache_root() / WORKER_STAGING_DIRNAME
@@ -1379,7 +1402,12 @@ if sys.platform == "win32":
         Idempotent: an existing copy with identical bytes is reused; any
         other content lands in a different hash dir. Raises OSError when
         the source is unreadable or the cache root is not writable -- the
-        caller falls back to launching from the source path."""
+        caller falls back to launching from the source path. Refuses
+        (OSError) when the cache root did not resolve from LOCALAPPDATA:
+        executed code does not go under a TEMP/home fallback."""
+        if not cache_root_is_localappdata():
+            raise OSError("LOCALAPPDATA is unset; refusing to stage executed code "
+                          "under the TEMP/home cache-root fallback")
         src = Path(source)
         data = src.read_bytes()
         digest = hashlib.sha256(data).hexdigest()[:16]
@@ -1388,6 +1416,12 @@ if sys.platform == "win32":
         dest = dest_dir / src.name
         try:
             if dest.read_bytes() == data:
+                # Touch on reuse so the day-old prune means "unused for
+                # a day", not "written a day ago".
+                try:
+                    os.utime(dest_dir, None)
+                except OSError:
+                    pass
                 _prune_worker_staging(root, dest_dir)
                 return str(dest)
         except OSError:
@@ -2025,7 +2059,6 @@ class WinSandboxWorker:
         self.hello_noise_bytes = 0  # see _read_hello_frame_tolerant (gotcha 7)
         # fauxcasa-yfq: what spawn() actually launched (None when frozen)
         # and whether it came from the staged copy under the cache root.
-        self.grant_errors: dict[str, str] = {}
         self.worker_script_path: str | None = None
         self.worker_script_staged = False
         self._arena_handle = None
@@ -2055,6 +2088,10 @@ class WinSandboxWorker:
 
         worker_python, worker_pythonpath = resolve_worker_python()
         frozen = getattr(sys, "frozen", False)
+        # Source-dispatch only; stay None when frozen so the staging and
+        # blame-list checks below never depend on short-circuit ordering.
+        worker_script: str | None = None
+        worker_dir: str | None = None
         if frozen:
             # fauxcasa-ez2.9 Stage 1 (P0 finding): the worker is THIS SAME
             # exe re-invoked as `<exe> --decode-worker` -- main.py dispatches
@@ -2126,6 +2163,8 @@ class WinSandboxWorker:
             # Program-Files-class install where ALL APPLICATION PACKAGES
             # already has RX must still spawn even if WRITE_DAC is denied.
             self.grant_errors = {}
+            self.worker_script_staged = False
+            self.worker_script_path = None
             for target_path, target_inherit in grant_targets:
                 err = grant_read_execute_once(target_path, sid, inherit=target_inherit)
                 if err is not None:
@@ -2136,36 +2175,55 @@ class WinSandboxWorker:
             # copy under the cache root instead, which the user CAN grant.
             # See the staging comment block above stage_worker_script for
             # why only this one file moves and what it cannot fix.
-            if not frozen and worker_dir in self.grant_errors:
+            #
+            # Staging is eager (on the grant failure itself, not after a
+            # first pre-hello death) but only takes effect when the
+            # staging root's OWN grant succeeds, so it can only ever swap
+            # a directory that refused the grant for one that just
+            # accepted it. The Program-Files-class case the best-effort
+            # rule exists for -- ALL APPLICATION PACKAGES already has RX on
+            # the source, WRITE_DAC denied -- therefore either launches a
+            # copy the container was just granted (fine) or, if the cache
+            # root refused too, stays on the readable source. Launching
+            # the copy after a refused staging grant was wrong: a non-None
+            # error means SetNamedSecurityInfoW failed just now, and the
+            # copy under LOCALAPPDATA has no AAP ACE to fall back on
+            # (review round 1). A reactive variant (stage only on the
+            # retry after a permission-flavoured death) would need
+            # cross-spawn state and cost every ReFS user one failed spawn
+            # per process for no extra safety once this rule holds.
+            if worker_dir is not None and worker_dir in self.grant_errors:
                 try:
                     staged = stage_worker_script(worker_script)
                     staging_root = str(worker_staging_root())
                     staging_err = grant_read_execute_once(
                         staging_root, sid, inherit=SUB_CONTAINERS_AND_OBJECTS_INHERIT)
-                    grant_targets.append((staging_root, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
-                    # Launch from the copy even if the staging root
-                    # refused the grant as well: the source dir is KNOWN
-                    # to have refused, while the cache root's ACL is the
-                    # user's own and any earlier successful grant on it
-                    # persists on disk (the same "access already exists"
-                    # reasoning that keeps a denied grant best-effort).
-                    worker_args = [staged]
-                    self.worker_script_staged = True
                     if staging_err is not None:
                         self.grant_errors[staging_root] = staging_err
-                        _log.warning(
-                            "worker script staged to %r but that dir refused the ACL grant "
-                            "too (%s); launching from the copy anyway -- the hello handshake "
-                            "decides", staged, staging_err)
-                    elif worker_script not in _staging_logged:
-                        _staging_logged.add(worker_script)
-                        _log.warning(
-                            "worker script dir %r refused the AppContainer ACL grant; "
-                            "launching the sandbox worker from a content-hashed copy at %r",
-                            worker_dir, staged)
+                        refused_key = f"{worker_script}|staging-refused"
+                        if refused_key not in _staging_logged:
+                            _staging_logged.add(refused_key)
+                            _log.warning(
+                                "worker script staged to %r but %r refused the ACL grant too "
+                                "(%s); launching from the source path -- the hello handshake "
+                                "decides", staged, staging_root, staging_err)
+                    else:
+                        grant_targets.append((staging_root, SUB_CONTAINERS_AND_OBJECTS_INHERIT))
+                        worker_args = [staged]
+                        self.worker_script_staged = True
+                        if worker_script not in _staging_logged:
+                            _staging_logged.add(worker_script)
+                            _log.warning(
+                                "worker script dir %r refused the AppContainer ACL grant; "
+                                "launching the sandbox worker from a content-hashed copy at %r",
+                                worker_dir, staged)
                 except OSError as e:
-                    _log.warning("could not stage the worker script under %r (%s); "
-                                 "launching from the source path", str(worker_staging_root()), e)
+                    refused_key = f"{worker_script}|staging-failed"
+                    if refused_key not in _staging_logged:
+                        _staging_logged.add(refused_key)
+                        _log.warning("could not stage the worker script under %r (%s); "
+                                     "launching from the source path",
+                                     str(worker_staging_root()), e)
             self.worker_script_path = worker_args[0] if not frozen else None
 
             winsta_result = grant_winsta_desktop(sid)
@@ -2253,14 +2311,20 @@ class WinSandboxWorker:
                     # interpreter's own startup diagnostics, not frames.
                     # Reassemble them (bytes the hello reader consumed +
                     # the rest of the pipe, safe to drain now that the
-                    # writer is gone) and report the real cause. On a
-                    # non-zero exit the error is re-coded WORKER_CRASHED:
-                    # PROTOCOL means "evidence of compromise" (kill, count,
-                    # never retry), and an interpreter that could not open
-                    # its script is neither compromised nor worth counting
-                    # as such; WORKER_CRASHED is what every other pre-hello
-                    # death (0xC0000142 etc.) already reports.
+                    # writer is gone) and report the real cause. When the
+                    # reader never saw a well-formed length prefix
+                    # (`e.unframed`) AND the exit was non-zero, the error
+                    # is re-coded WORKER_CRASHED: PROTOCOL means "evidence
+                    # of compromise" (kill, count, never retry), and an
+                    # interpreter that could not open its script is
+                    # neither compromised nor worth counting as such;
+                    # WORKER_CRASHED is what every other pre-hello death
+                    # (0xC0000142 etc.) already reports. A FRAMED bogus or
+                    # non-hello first message keeps PROTOCOL whatever the
+                    # exit code -- that is protocol bytes gone wrong, the
+                    # very case PROTOCOL exists for (review round 1).
                     leading = getattr(e, "leading_bytes", b"")
+                    unframed = getattr(e, "unframed", False)
                     if exited:
                         tail = _drain_pipe(child.out_file, PREHELLO_OUTPUT_LIMIT)
                         # A worker-dir grant failure that staging worked
@@ -2268,24 +2332,30 @@ class WinSandboxWorker:
                         # the blame list (self.grant_errors keeps it).
                         unresolved = {
                             p: err for p, err in self.grant_errors.items()
-                            if not (self.worker_script_staged and not frozen and p == worker_dir)}
+                            if not (self.worker_script_staged and p == worker_dir)}
                         reason = describe_prehello_death(
                             leading + tail, exit_code.value, worker_args, unresolved,
                             pythonpath=worker_pythonpath)
-                        code = ErrorCode.WORKER_CRASHED if exit_code.value != 0 else e.code
+                        code = (ErrorCode.WORKER_CRASHED
+                                if unframed and exit_code.value != 0 else e.code)
                         # The reader's own detail usually repeats the
                         # output already shown above; keep a short tail
                         # of it for correlation, not the whole thing.
                         reader_detail = e.detail if len(e.detail) <= 200 else e.detail[:200] + "..."
-                        raise DecodeServiceError(
-                            code,
-                            f"{reason} [hello reader: {reader_detail}; exe {worker_python!r}; "
-                            f"pythonpath {worker_pythonpath!r}]") from e
-                    raise DecodeServiceError(
-                        e.code,
-                        f"{e} [worker still running after 2s; last exit code query "
-                        f"{exit_code.value:#010x}; exe {worker_python!r}; "
-                        f"pythonpath {worker_pythonpath!r}]") from e
+                        msg = (f"{reason} [hello reader: {reader_detail}; exe {worker_python!r}; "
+                               f"pythonpath {worker_pythonpath!r}]")
+                    else:
+                        code = e.code
+                        msg = (f"{e} [worker still running after 2s; last exit code query "
+                               f"{exit_code.value:#010x}; exe {worker_python!r}; "
+                               f"pythonpath {worker_pythonpath!r}]")
+                    # Keep the TYPE in step with the code: a PROTOCOL error
+                    # must stay a ProtocolViolation so WinDecodePool.decode's
+                    # `except ProtocolViolation` (count, kill, no retry)
+                    # catches it rather than the generic branch.
+                    if code is ErrorCode.PROTOCOL:
+                        raise ProtocolViolation(msg) from e
+                    raise DecodeServiceError(code, msg) from e
                 self.hello_noise_bytes = noise
                 self.hello = parse_hello(hello_msg, self.arena_bytes)
 

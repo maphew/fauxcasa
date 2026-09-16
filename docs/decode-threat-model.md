@@ -231,11 +231,17 @@ What happens now:
   only, no repo sibling imports, since its import list is the sandbox's
   attack-surface budget), so there is no import closure to chase. This
   mirrors how the frozen bundle already behaves, with its payload under
-  Program Files or `%LOCALAPPDATA%`. If the staging directory refuses the
-  grant as well, the copy is still what gets launched (the source
-  directory is known to have refused; an earlier grant on the cache root
-  persists on disk) and the hello handshake decides, as it always has.
-  Only a failure to write the copy falls back to the source path.
+  Program Files or `%LOCALAPPDATA%`. The copy is launched only when the
+  staging directory's own grant succeeds, so staging can only ever swap
+  a directory that refused the grant for one that just accepted it. If
+  the staging directory refuses the grant as well, or the copy cannot be
+  written, the broker stays on the source path: in the Program-Files
+  case (`ALL APPLICATION PACKAGES` already has RX on the source,
+  `WRITE_DAC` denied) that source is readable while a copy under
+  `%LOCALAPPDATA%` without a fresh grant is not. Staging also refuses to
+  run when `LOCALAPPDATA` is unset, since executed code does not belong
+  under the cache root's TEMP/home fallback. The hello handshake decides,
+  as it always has.
 - The **PySide6 site-packages cannot be staged**: it is hundreds of MB of
   Qt, and copying it per spawn is not a fallback. If the uv cache or venv
   is on the same ungrantable volume (for example `UV_CACHE_DIR` pointed at

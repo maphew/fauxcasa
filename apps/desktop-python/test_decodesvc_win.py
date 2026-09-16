@@ -2547,7 +2547,20 @@ def test_spawn_survives_denied_acl_grant(monkeypatch, synthetic_png):
     already read (e.g. a Program-Files-class install) must not block
     spawn() -- the hello handshake is the real readability proof. Forces
     EVERY grant_read_execute_once call to report a (fake) failure and
-    confirms a real worker still spawns, hellos, and decodes."""
+    confirms a real worker still spawns, hellos, and decodes.
+
+    fauxcasa-yfq: the premise is that the container can ALREADY read the
+    worker-script dir (a prior real grant persists on disk). From a
+    checkout on a volume that refuses the grant outright (the dev box's
+    A: ReFS drive) that premise is false -- nothing can make the source
+    readable, and with every grant simulated denied the staging fallback
+    correctly stays on the source path -- so the test skips there rather
+    than asserting something the host cannot provide."""
+    worker_dir = str(Path(dw.__file__).resolve().parent)
+    real_err = dw.grant_read_execute_once(worker_dir, dw.create_or_derive_profile(dw.PROFILE_NAME))
+    if real_err is not None:
+        pytest.skip(f"worker dir {worker_dir!r} refuses the AppContainer ACL grant "
+                    f"({real_err}); the 'access already exists' premise does not hold here")
     monkeypatch.setattr(dw, "grant_read_execute_once",
                          lambda path, sid, inherit=None: "simulated denial (access already exists)")
     worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
@@ -2665,6 +2678,7 @@ def test_hello_reader_still_tolerates_exactly_one_noise_line():
     assert noise == len(_YFQ_NOISE_LINE_1) + 1
 
 
+@_WINDOWS_ONLY  # stage_worker_script lives inside decodesvc_win's win32 block
 def test_stage_worker_script_is_content_hashed_and_idempotent(tmp_path, monkeypatch):
     """fauxcasa-yfq: the staged copy lives under <cache>/sandbox-worker/
     <sha256[:16]>/, is reused byte-for-byte when the source is unchanged,
@@ -2697,6 +2711,7 @@ def test_stage_worker_script_is_content_hashed_and_idempotent(tmp_path, monkeypa
     assert second.exists()
 
 
+@_WINDOWS_ONLY  # stage_worker_script lives inside decodesvc_win's win32 block
 def test_stage_worker_script_repairs_a_tampered_copy(tmp_path, monkeypatch):
     """fauxcasa-yfq: an existing copy whose bytes differ from the source
     (same hash dir, edited on disk) is overwritten, never launched."""
@@ -2766,15 +2781,15 @@ def test_spawn_launches_from_source_when_every_grant_succeeds(monkeypatch, tmp_p
 
 
 @_WINDOWS_ONLY
-def test_spawn_still_launches_staged_copy_when_staging_root_grant_fails_too(monkeypatch, tmp_path):
-    """fauxcasa-yfq: if the cache root refuses the grant as well, spawn()
-    still launches the staged copy (the source dir is KNOWN to have
-    refused; the cache root's ACL is the user's own and an earlier grant
-    on it persists) and records both failures rather than raising. This
-    is also what keeps test_spawn_survives_denied_acl_grant -- every
-    grant simulated as denied -- spawning a real worker from a checkout
-    on an ungrantable volume."""
+def test_spawn_stays_on_source_when_staging_root_grant_fails_too(monkeypatch, tmp_path):
+    """fauxcasa-yfq (review round 1): staging only takes effect when the
+    staging root's OWN grant succeeds. If it fails too, spawn() keeps the
+    source path -- in the Program-Files case (ALL APPLICATION PACKAGES
+    already has RX on the source, WRITE_DAC denied) the source is
+    readable while a copy under LOCALAPPDATA without a fresh grant is
+    not -- and records both failures rather than raising."""
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setattr(dw, "_staging_logged", set())
     monkeypatch.setattr(dw, "grant_read_execute_once",
                          lambda path, sid, inherit=None: f"SetNamedSecurityInfoW({path}) err=5")
     _yfq_stop_before_createprocess(monkeypatch)
@@ -2783,13 +2798,31 @@ def test_spawn_still_launches_staged_copy_when_staging_root_grant_fails_too(monk
         worker.spawn()
     source = Path(dw.__file__).resolve().with_name("decodesvc_worker_win.py")
     staging_root = str(dw.worker_staging_root())
-    assert worker.worker_script_staged is True
-    staged = Path(worker.worker_script_path)
-    assert staged != source
-    assert str(staged.parent.parent) == staging_root
-    assert staged.read_bytes() == source.read_bytes()
+    assert worker.worker_script_staged is False
+    assert Path(worker.worker_script_path) == source
     assert str(source.parent) in worker.grant_errors
     assert staging_root in worker.grant_errors
+
+
+@_WINDOWS_ONLY
+def test_spawn_does_not_stage_without_localappdata(monkeypatch, tmp_path):
+    """fauxcasa-yfq (review round 1, item 12): executed code never goes
+    under the cache root's TEMP/home fallback -- with LOCALAPPDATA unset,
+    staging is refused and spawn() stays on the source path."""
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setenv("TEMP", str(tmp_path / "temp"))
+    monkeypatch.setattr(dw, "_staging_logged", set())
+    source = Path(dw.__file__).resolve().with_name("decodesvc_worker_win.py")
+    monkeypatch.setattr(dw, "grant_read_execute_once",
+                         lambda path, sid, inherit=None:
+                         "err=5" if path == str(source.parent) else None)
+    _yfq_stop_before_createprocess(monkeypatch)
+    worker = dw.WinSandboxWorker(arena_bytes=SMALL_ARENA_BYTES)
+    with pytest.raises(RuntimeError, match="stop before"):
+        worker.spawn()
+    assert worker.worker_script_staged is False
+    assert Path(worker.worker_script_path) == source
+    assert not (tmp_path / "temp" / "Fauxcasa" / "cache" / dw.WORKER_STAGING_DIRNAME).exists()
 
 
 class _YfqFakeChild:
@@ -2820,17 +2853,15 @@ class _YfqFakeChild:
         self.pi = None
 
 
-@_WINDOWS_ONLY
-def test_spawn_reports_prehello_exit_2_as_worker_crashed_with_startup_output(monkeypatch):
-    """fauxcasa-yfq, end to end through spawn(): a child that exits 2
-    after two diagnostic lines must surface as WORKER_CRASHED (not
-    PROTOCOL -- it never spoke the protocol, so its output is not evidence
-    of compromise), with both lines and the failed grant in the message.
-    Everything up to CreateProcess is real except the grant (forced to
-    fail everywhere, so the staging path is exercised and both failures
-    are on record) and the spawn itself (replaced by the stub)."""
-    source = Path(dw.__file__).resolve().with_name("decodesvc_worker_win.py")
-    worker_dir = str(source.parent)
+def _yfq_spawn_with_fake_child(monkeypatch, tmp_path, stub_code: str):
+    """Run WinSandboxWorker.spawn() with everything up to CreateProcess
+    real except: every ACL grant simulated as denied (so the staging path
+    is exercised and, since the staging root refuses too, the source path
+    is what gets 'launched'), winsta granted, the arena dup stubbed, and
+    the AppContainer spawn replaced by a plain subprocess running
+    `stub_code`. Returns (worker, raised exception)."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setattr(dw, "_staging_logged", set())
     monkeypatch.setattr(dw, "grant_read_execute_once",
                          lambda path, sid, inherit=None: f"SetNamedSecurityInfoW({path}) err=5")
     monkeypatch.setattr(dw, "grant_winsta_desktop",
@@ -2839,7 +2870,7 @@ def test_spawn_reports_prehello_exit_2_as_worker_crashed_with_startup_output(mon
     children = []
 
     def fake_spawn(worker_python, worker_args, sid, pythonpath, extra_env, mem_limit_bytes):
-        proc = subprocess.Popen([sys.executable, "-c", _yfq_stub_code(2)],
+        proc = subprocess.Popen([sys.executable, "-c", stub_code],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         child = _YfqFakeChild(proc)
         children.append(child)
@@ -2854,20 +2885,66 @@ def test_spawn_reports_prehello_exit_2_as_worker_crashed_with_startup_output(mon
         for child in children:
             child.close()
         worker.close()
-    err = ei.value
+    return worker, ei.value
+
+
+@_WINDOWS_ONLY
+def test_spawn_reports_prehello_exit_2_as_worker_crashed_with_startup_output(monkeypatch, tmp_path):
+    """fauxcasa-yfq, end to end through spawn(): a child that exits 2
+    after two UNFRAMEABLE diagnostic lines must surface as WORKER_CRASHED
+    (not PROTOCOL -- it never produced a frame, so its output is not
+    evidence of compromise), with both lines and the failed grants in the
+    message."""
+    source = Path(dw.__file__).resolve().with_name("decodesvc_worker_win.py")
+    worker_dir = str(source.parent)
+    worker, err = _yfq_spawn_with_fake_child(monkeypatch, tmp_path, _yfq_stub_code(2))
     assert not isinstance(err, ProtocolViolation)
     assert err.code is ErrorCode.WORKER_CRASHED
     msg = str(err)
     assert "exit code 0x00000002" in msg
     assert _YFQ_NOISE_LINE_1 in msg
     assert "can't open file" in msg and "Permission denied" in msg
-    # Staging worked around the worker-dir refusal, so that grant is no
-    # longer blamed; the still-unresolved refusals (staging root, base
-    # dir, PYTHONPATH -- every grant was simulated as denied) are.
-    assert worker.worker_script_staged is True
-    assert worker_dir not in msg
-    assert str(dw.worker_staging_root()) in msg and "err=5" in msg
+    # Every grant was denied, including the staging root, so spawn stayed
+    # on the source path and the worker dir IS still to blame.
+    assert worker.worker_script_staged is False
+    assert worker_dir in msg and "err=5" in msg
     assert not msg.startswith("PROTOCOL")
+
+
+@_WINDOWS_ONLY
+def test_spawn_keeps_protocol_for_framed_bogus_hello_then_exit_1(monkeypatch, tmp_path):
+    """fauxcasa-yfq (review round 1, item 3): a first message that FRAMES
+    (well-formed length prefix) but is not a hello, followed by a non-zero
+    exit, is protocol bytes gone wrong -- the evidence-of-compromise case.
+    The exit code must NOT downgrade it to WORKER_CRASHED (which would buy
+    it a free respawn and a crashes += 1 in WinDecodePool.decode); it
+    stays a ProtocolViolation with code PROTOCOL, while still carrying
+    the exit code and startup output for the log."""
+    stub_code = (
+        "import sys, json, struct\n"
+        "msg = json.dumps({'op': 'not_a_hello', 'x': 1}).encode('utf-8')\n"
+        "sys.stdout.buffer.write(struct.pack('<I', len(msg)) + msg)\n"
+        "sys.stdout.buffer.flush()\n"
+        "sys.exit(1)\n"
+    )
+    _worker, err = _yfq_spawn_with_fake_child(monkeypatch, tmp_path, stub_code)
+    assert isinstance(err, ProtocolViolation)
+    assert err.code is ErrorCode.PROTOCOL
+    msg = str(err)
+    assert msg.startswith("PROTOCOL")
+    assert "exit code 0x00000001" in msg
+    assert "not_a_hello" in msg
+
+
+@_WINDOWS_ONLY
+def test_spawn_keeps_protocol_for_unframed_noise_then_exit_0(monkeypatch, tmp_path):
+    """fauxcasa-yfq companion: the WORKER_CRASHED re-code needs BOTH an
+    unframeable first message AND a non-zero exit. Two noise lines then a
+    clean exit 0 is not a crash; the reader's PROTOCOL code stands."""
+    _worker, err = _yfq_spawn_with_fake_child(monkeypatch, tmp_path, _yfq_stub_code(0))
+    assert isinstance(err, ProtocolViolation)
+    assert err.code is ErrorCode.PROTOCOL
+    assert "exit code 0x00000000" in str(err)
 
 
 class _FakeWinDecodePool:
