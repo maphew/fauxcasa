@@ -86,6 +86,11 @@ _DARK: dict[str, QColor] = {
     "CAPTION_FG": QColor(220, 220, 220),
     "HINT_FG": QColor(120, 120, 120),
     "FIELD_BORDER": QColor(96, 96, 96),    # border for text fields; must stay clearly apart from WINDOW
+    # QPalette.HighlightedText (build_palette): text drawn ON TOP of the
+    # ACCENT highlight fill, e.g. a selected menu row. Plain white on
+    # ACCENT is only 3.40:1 (Opus review, fauxcasa-6y0) — this near-black
+    # clears that comfortably on both schemes.
+    "HIGHLIGHT_TEXT": QColor(24, 24, 24),
 }
 
 _LIGHT: dict[str, QColor] = {
@@ -100,12 +105,22 @@ _LIGHT: dict[str, QColor] = {
     "ACCENT": _DARK["ACCENT"],
     "ACCENT_SOFT": _DARK["ACCENT_SOFT"],
     "HOVER_OUTLINE": QColor(0, 0, 0, 102),
-    "PLAY": _DARK["PLAY"],
+    # PLAY is CHROME here (the group-header play button on HEADER_BG, the
+    # toolbar Play action on SURFACE) — unlike PLAY_WHITE below, which is
+    # drawn over a photo. The dark scheme's PLAY (80,200,80) only reaches
+    # 1.67:1 against light HEADER_BG/SURFACE; this darker green clears
+    # 4.2-4.4:1 (Opus review, fauxcasa-6y0).
+    "PLAY": QColor(30, 120, 50),
     "PLAY_WHITE": _DARK["PLAY_WHITE"],  # drawn over photos, not chrome
     "STAR": _DARK["STAR"],
     "STAR_OUTLINE": _DARK["STAR_OUTLINE"],
     "GEOTAG": _DARK["GEOTAG"],
-    "ERROR_TILE": QColor(226, 178, 178),
+    # grid.py's _draw_error_tile fills this, then draws the broken-image
+    # glyph outline and the filename label in theme.TEXT_MUTED/theme.TEXT
+    # respectively (theme.TEXT for the filename since fauxcasa-6y0's Opus
+    # review — the old TEXT_MUTED pairing only reached 2.94:1). This value
+    # keeps >=3:1 against TEXT_MUTED (3.57:1) too, for the glyph outline.
+    "ERROR_TILE": QColor(236, 200, 200),
     "PLACEHOLDER": QColor(204, 204, 204),
     "HIDDEN_VEIL": QColor(255, 255, 255, 120),
     "HEADER_BG": QColor(226, 226, 226),
@@ -113,9 +128,16 @@ _LIGHT: dict[str, QColor] = {
     "HEADER_RULE": QColor(200, 200, 200),
     "CAPTION_BG": QColor(255, 255, 255, 180),
     "CAPTION_FG": QColor(28, 28, 28),
-    "HINT_FG": QColor(140, 140, 140),
-    "FIELD_BORDER": QColor(160, 160, 160),
+    "HINT_FG": QColor(120, 120, 120),
+    "FIELD_BORDER": QColor(130, 130, 130),
+    "HIGHLIGHT_TEXT": QColor(28, 28, 28),
 }
+
+# Both tables MUST name exactly the same keys — apply_scheme()'s
+# globals().update() only ever repoints an EXISTING module attribute
+# (never adds one), and build_palette()'s src[key] lookups below assume
+# every key it asks for exists in whichever table was picked.
+assert set(_LIGHT) == set(_DARK), "theme scheme tables must share every key"
 
 SCHEMES = ("dark", "light")
 
@@ -140,7 +162,8 @@ TEXT_MUTED = _DARK["TEXT_MUTED"]
 TEAL = _DARK["TEAL"]             # icon tile
 ACCENT = _DARK["ACCENT"]           # icon sun: selection / current
 ACCENT_SOFT = _DARK["ACCENT_SOFT"]  # translucent gutter fill
-HOVER_OUTLINE = _DARK["HOVER_OUTLINE"]  # 40% white — hover-only chrome
+HOVER_OUTLINE = _DARK["HOVER_OUTLINE"]  # hover-only chrome; dark default is
+# 40% white, but this differs per scheme (light is 40% black) — see _LIGHT
 
 # ---- semantic ---------------------------------------------------------
 PLAY = _DARK["PLAY"]          # actionable play glyph (group-header button)
@@ -162,6 +185,7 @@ HINT_FG = _DARK["HINT_FG"]
 # Border for text fields on chrome; must stay clearly apart (in either
 # direction) from WINDOW — lighter in dark mode, darker in light mode.
 FIELD_BORDER = _DARK["FIELD_BORDER"]
+HIGHLIGHT_TEXT = _DARK["HIGHLIGHT_TEXT"]  # QPalette.HighlightedText, on ACCENT
 
 
 def current_scheme() -> str:
@@ -174,25 +198,28 @@ def apply_scheme(name: str) -> None:
     (fauxcasa-6y0). Uses globals().update() rather than assigning new
     names, so it can only ever change the VALUE behind an existing
     `theme.X` — paint code and tests that read theme.X pick up the new
-    color on their next paint/assert with no code change, and a stray key
-    typo in a scheme table can never silently create a new module
-    attribute."""
+    color on their next paint/assert with no code change. (The
+    both-tables-share-every-key invariant is asserted once, at module
+    load, right after _LIGHT/_DARK are defined — see above.)"""
     global _current_scheme
     if name not in SCHEMES:
         raise ValueError(f"unknown scheme: {name!r}")
-    table = _DARK if name == "dark" else _LIGHT
-    assert set(table) <= set(globals()), "scheme table defines an unknown name"
-    globals().update(table)
+    globals().update(_DARK if name == "dark" else _LIGHT)
     _current_scheme = name
 
 
 def build_palette(name: str | None = None) -> QPalette:
-    """A Fusion-style QPalette built from the CURRENT constants above (or
-    from `name`'s scheme, if given — apply_scheme(name) runs first so the
-    two never disagree), so stock Qt widgets (menus, the sidebar tree,
-    toolbar buttons, tooltips) read as part of the same app as the
+    """A Fusion-style QPalette, so stock Qt widgets (menus, the sidebar
+    tree, toolbar buttons, tooltips) read as part of the same app as the
     custom-painted grid/viewer/tray (fauxcasa-ez2.4 UX audit; scheme
-    switching added fauxcasa-6y0). Only meaningful under
+    switching added fauxcasa-6y0). PURE with respect to the CURRENTLY
+    APPLIED scheme: given a name, it reads straight from that scheme's
+    _DARK/_LIGHT table and does NOT call apply_scheme — so
+    theme.build_palette("light") can preview a palette without silently
+    flipping every theme.X global (and the tests/paint code reading
+    them) out from under the caller. With no name, it builds from the
+    CURRENT theme.X globals (today's applied scheme) — that reflects
+    apply_scheme()'s last call, same as before. Only meaningful under
     QApplication.setStyle("Fusion") — other native styles largely ignore
     a custom QPalette. Sets the Active/Inactive roles the audit's
     screenshots actually exercise (Window/WindowText/Base/AlternateBase/
@@ -201,46 +228,49 @@ def build_palette(name: str | None = None) -> QPalette:
     offline sidebar row dims instead of vanishing into the surface. Also
     sets PlaceholderText and Mid so the toolbar search box reads as an
     editable field rather than empty chrome (fauxcasa-e2y)."""
-    if name is not None:
-        apply_scheme(name)
+    if name is not None and name not in SCHEMES:
+        raise ValueError(f"unknown scheme: {name!r}")
+    src = (_DARK if name == "dark" else _LIGHT) if name is not None \
+        else globals()
+
+    def c(key: str) -> QColor:
+        return src[key]
+
     pal = QPalette()
-    pal.setColor(QPalette.ColorRole.Window, WINDOW)
-    pal.setColor(QPalette.ColorRole.WindowText, TEXT)
-    pal.setColor(QPalette.ColorRole.Base, BASE)
-    pal.setColor(QPalette.ColorRole.AlternateBase, ALT_BASE)
-    pal.setColor(QPalette.ColorRole.Text, TEXT)
-    pal.setColor(QPalette.ColorRole.Button, SURFACE)
-    pal.setColor(QPalette.ColorRole.ButtonText, TEXT)
-    pal.setColor(QPalette.ColorRole.Highlight, ACCENT)
-    # Dark keeps WINDOW (near-black) as HighlightedText, matching the
-    # original dark_palette() exactly. Light would put near-white WINDOW
-    # text on the ACCENT orange highlight — too close in luminance to
-    # ACCENT's own warm fill — so light uses plain white instead
-    # (fauxcasa-6y0).
-    pal.setColor(QPalette.ColorRole.HighlightedText,
-                 WINDOW if _current_scheme == "dark" else QColor(255, 255, 255))
-    pal.setColor(QPalette.ColorRole.Link, TEAL)
-    pal.setColor(QPalette.ColorRole.ToolTipBase, SURFACE)
-    pal.setColor(QPalette.ColorRole.ToolTipText, TEXT)
-    pal.setColor(QPalette.ColorRole.PlaceholderText, TEXT_MUTED)
-    pal.setColor(QPalette.ColorRole.Mid, FIELD_BORDER)
+    pal.setColor(QPalette.ColorRole.Window, c("WINDOW"))
+    pal.setColor(QPalette.ColorRole.WindowText, c("TEXT"))
+    pal.setColor(QPalette.ColorRole.Base, c("BASE"))
+    pal.setColor(QPalette.ColorRole.AlternateBase, c("ALT_BASE"))
+    pal.setColor(QPalette.ColorRole.Text, c("TEXT"))
+    pal.setColor(QPalette.ColorRole.Button, c("SURFACE"))
+    pal.setColor(QPalette.ColorRole.ButtonText, c("TEXT"))
+    pal.setColor(QPalette.ColorRole.Highlight, c("ACCENT"))
+    # HIGHLIGHT_TEXT (fauxcasa-6y0 Opus review): plain white on ACCENT was
+    # only 3.40:1; both schemes now name their own near-black value.
+    pal.setColor(QPalette.ColorRole.HighlightedText, c("HIGHLIGHT_TEXT"))
+    pal.setColor(QPalette.ColorRole.Link, c("TEAL"))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, c("SURFACE"))
+    pal.setColor(QPalette.ColorRole.ToolTipText, c("TEXT"))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, c("TEXT_MUTED"))
+    pal.setColor(QPalette.ColorRole.Mid, c("FIELD_BORDER"))
 
     disabled = QPalette.ColorGroup.Disabled
     for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
                  QPalette.ColorRole.ButtonText):
-        pal.setColor(disabled, role, TEXT_MUTED)
+        pal.setColor(disabled, role, c("TEXT_MUTED"))
     return pal
 
 
 def dark_palette() -> QPalette:
-    """Thin wrapper kept for existing call sites/tests: apply the dark
-    scheme and return its QPalette."""
-    return build_palette("dark")
-
-
-def light_palette() -> QPalette:
-    """Apply the light scheme and return its QPalette (fauxcasa-6y0)."""
-    return build_palette("light")
+    """NOT pure, unlike build_palette(name=...): applies the dark scheme
+    (so every theme.X module global — read directly by grid/viewer/tray
+    paint code and by tests such as test_theme_dark_palette_sets_
+    expected_roles, which asserts pal.color(...) against theme.WINDOW
+    etc. right after calling this) then returns its QPalette. Kept for
+    those existing call sites/tests; main.py itself no longer calls this
+    (theme.apply_mode is the app-startup/switch entry point)."""
+    apply_scheme("dark")
+    return build_palette()
 
 
 MODES = ("system", "light", "dark")

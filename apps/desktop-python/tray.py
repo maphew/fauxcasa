@@ -72,6 +72,12 @@ def __getattr__(name):
     return getattr(theme, theme_name)
 
 
+def __dir__():
+    # PEP 562's other half: without this, dir(tray) / tab-completion never
+    # lists the alias names since they aren't real module attributes.
+    return sorted(set(globals()) | set(_THEME_ALIASES))
+
+
 class SelectionTray(QWidget):
     """The tray strip: Hold/Clear buttons, the held-thumbnail bar, and
     the readout label (text is computed by the owner — MainWindow knows

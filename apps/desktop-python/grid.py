@@ -320,6 +320,12 @@ def __getattr__(name):
     return getattr(theme, theme_name)
 
 
+def __dir__():
+    # PEP 562's other half: without this, dir(grid) / tab-completion never
+    # lists the alias names since they aren't real module attributes.
+    return sorted(set(globals()) | set(_THEME_ALIASES))
+
+
 # Width (px) of the play-glyph hit area at the right end of every group header
 # (fauxcasa-q6l.16). Chosen to be comfortably clickable while leaving enough
 # label space; constant so hit-test and draw use the same geometry.
@@ -330,12 +336,13 @@ HEADER_PLAY_W = 22
 # at a glance); the CURRENT item gets the stronger 3px border; a current
 # item the user Ctrl-toggled OUT of the set keeps a dashed focus cue so
 # keyboard navigation never goes invisible.
-# ACCENT/HOVER_OUTLINE are identical in both schemes (see theme.py), so
-# these pens don't need to be rebuilt on a scheme switch.
+# ACCENT is identical in both schemes (see theme.py), so these three
+# pens don't need to be rebuilt on a scheme switch — but HOVER_OUTLINE is
+# NOT (dark: white@102, light: black@102), so PEN_HOVER is built fresh at
+# each paint (~1497) instead of being a module constant here.
 PEN_SELECTED = QPen(theme.ACCENT, 2)
 PEN_CURRENT = QPen(theme.ACCENT, 3)
 PEN_FOCUS = QPen(theme.ACCENT, 1, Qt.PenStyle.DashLine)
-PEN_HOVER = QPen(theme.HOVER_OUTLINE, 1)
 # How far the selection halo (soft fill + outline) reaches into the PAD
 # gutter around a tile (fauxcasa-ez2.4): PAD is 8, so 4 leaves each tile's
 # own half of the gutter without ever touching its neighbor's.
@@ -1483,8 +1490,11 @@ class GridView(QAbstractScrollArea):
             # (dashed focus cue if Ctrl-toggled out of the set); an
             # unselected hovered tile gets a plain hover ring
             # (fauxcasa-ez2.4 UX audit: the old 1px hairline was too faint
-            # to read at a glance, and hover had no feedback at all). Pens
-            # are module constants — no per-tile allocation.
+            # to read at a glance, and hover had no feedback at all).
+            # PEN_SELECTED/CURRENT/FOCUS are module constants (ACCENT is
+            # shared by both schemes) — no per-tile allocation for those;
+            # the hover pen is built here, per paint, since HOVER_OUTLINE
+            # itself differs between schemes (fauxcasa-6y0).
             if is_cur:
                 painter.setPen(PEN_CURRENT if in_sel else PEN_FOCUS)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1494,7 +1504,7 @@ class GridView(QAbstractScrollArea):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(r.adjusted(-1, -1, 1, 1))
             elif idx == self._hover_idx:
-                painter.setPen(PEN_HOVER)
+                painter.setPen(QPen(theme.HOVER_OUTLINE, 1))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(r.adjusted(-1, -1, 0, 0))
 
@@ -1575,7 +1585,11 @@ class GridView(QAbstractScrollArea):
         """An undecodable entry (fauxcasa-ez2.4 UX audit: used to be a
         flat maroon square with no other information) — the fill, plus a
         simple broken-image glyph and the elided filename so the tile at
-        least says WHICH photo failed."""
+        least says WHICH photo failed. The filename reads in theme.TEXT
+        (not TEXT_MUTED, fauxcasa-6y0 Opus review): the light ERROR_TILE
+        vs TEXT_MUTED pairing only cleared 2.94:1, under the 3:1 floor;
+        the glyph outline stays TEXT_MUTED, which the retuned ERROR_TILE
+        clears at 3.57:1."""
         painter.fillRect(r, theme.ERROR_TILE)
         pad = max(6, r.width() // 6)
         frame = QRect(r.x() + pad, r.y() + pad,
@@ -1587,7 +1601,7 @@ class GridView(QAbstractScrollArea):
             painter.drawRect(frame)
             painter.drawLine(frame.topLeft(), frame.center())
             painter.drawLine(frame.center(), frame.bottomRight())
-        painter.setPen(theme.TEXT_MUTED)
+        painter.setPen(theme.TEXT)
         fm = painter.fontMetrics()
         label = fm.elidedText(name, Qt.TextElideMode.ElideMiddle,
                               max(0, r.width() - 8))

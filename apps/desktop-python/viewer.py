@@ -108,6 +108,12 @@ def __getattr__(name):
     return getattr(theme, theme_name)
 
 
+def __dir__():
+    # PEP 562's other half: without this, dir(viewer) / tab-completion
+    # never lists the alias names since they aren't real module attributes.
+    return sorted(set(globals()) | set(_THEME_ALIASES))
+
+
 # Bottom caption/info bar height (fauxcasa-ez2.4 UX audit: the viewer used
 # to fit the photo into the FULL widget height, so the semi-transparent
 # bar could cover the bottom of the image — see _caption_h/paintEvent).
@@ -132,8 +138,8 @@ SEEK_STEP_US = 5_000_000    # Ctrl+Left / Ctrl+Right skip (±5 s)
 # otherwise — theme.TEXT_MUTED at 40% alpha, matching HOVER_OUTLINE's
 # "hover-only chrome" alpha convention (theme.py) rather than a fresh
 # literal. A function, not a module constant: TEXT_MUTED itself differs
-# between schemes (unlike ACCENT/HOVER_OUTLINE), so this must be read at
-# paint time (fauxcasa-6y0) to follow a live scheme switch.
+# between schemes (unlike ACCENT, which is shared — fauxcasa-6y0), so
+# this must be read at paint time to follow a live scheme switch.
 CHEVRON_MARGIN = 80
 
 
@@ -1848,8 +1854,9 @@ class ViewerPage(QWidget):
 
     def _paint_chevrons(self, painter: QPainter, w: int, h: int) -> None:
         """Hover-revealed prev/next chevrons (ez2.14): painted only while
-        _hover_prev/_hover_next is set (mouseMoveEvent), in CHEVRON_FG —
-        theme.TEXT_MUTED at 40% alpha."""
+        _hover_prev/_hover_next is set (mouseMoveEvent), in _chevron_fg()
+        — theme.TEXT_MUTED at 40% alpha, read live so it follows a scheme
+        switch."""
         if not (self._hover_prev or self._hover_next):
             return
         painter.setPen(Qt.PenStyle.NoPen)

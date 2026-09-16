@@ -4023,6 +4023,35 @@ def test_remember_library_preserves_filetypes_exclusions(tmp_path: Path) -> None
     assert filetypes.load_excluded_exts(cache_root, lib) == excluded
 
 
+def test_save_theme_mode_preserves_other_config_keys(tmp_path: Path) -> None:
+    """main._save_theme_mode (fauxcasa-6y0), like _remember_library, must
+    merge into config.json rather than overwrite it — both now share the
+    extracted _config_update helper. Seed the file with a 'library' key
+    and an arbitrary other key (standing in for filetypes.
+    save_excluded_exts's own entry) written directly, call the real
+    _save_theme_mode, and confirm every pre-existing key survives and
+    'theme' lands."""
+    import json
+
+    import main
+
+    cache_root = tmp_path / "cr"
+    cache_root.mkdir()
+    cfg = main._config_path(cache_root)
+    cfg.write_text(json.dumps({
+        "library": str(tmp_path / "lib"),
+        "excluded_exts": [".bmp", ".gif"],
+    }))
+
+    main._save_theme_mode(cache_root, "light")
+
+    data = json.loads(cfg.read_text())
+    assert data["library"] == str(tmp_path / "lib")
+    assert data["excluded_exts"] == [".bmp", ".gif"]
+    assert data["theme"] == "light"
+    assert main._load_theme_mode(cache_root) == "light"
+
+
 def test_remember_library_oserror_is_soft(tmp_path: Path, capsys) -> None:
     """_remember_library (fauxcasa-7e5) is best-effort: an unwritable cache
     root — here its parent is a regular file, so mkdir raises NotADirectoryError
@@ -19226,6 +19255,8 @@ def test_theme_menu_and_persistence(search_library: Path, monkeypatch) -> None:
     finally."""
     import main
     import theme
+    from PySide6.QtGui import QPalette
+    from PySide6.QtWidgets import QApplication
 
     store: dict[str, str] = {}
     monkeypatch.setattr(main, "_load_theme_mode",
@@ -19233,6 +19264,7 @@ def test_theme_menu_and_persistence(search_library: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         main, "_save_theme_mode",
         lambda cache_root, mode: store.__setitem__("theme", mode))
+    win = None
     try:
         win = _search_win(search_library)
         assert win.theme_mode == "system"
@@ -19242,9 +19274,6 @@ def test_theme_menu_and_persistence(search_library: Path, monkeypatch) -> None:
             ["system", "light", "dark"]
         assert [a.data() for a in win.theme_actions if a.isChecked()] == \
             ["system"]
-
-        from PySide6.QtGui import QPalette
-        from PySide6.QtWidgets import QApplication
 
         win.show()  # grab() below needs an actual paint
         QApplication.instance().processEvents()
@@ -19275,7 +19304,9 @@ def test_theme_menu_and_persistence(search_library: Path, monkeypatch) -> None:
         assert [a.data() for a in win.theme_actions if a.isChecked()] == \
             ["dark"]
     finally:
-        theme.apply_scheme("dark")
+        theme.apply_mode(QApplication.instance(), "dark")
+        if win is not None:
+            win.hide()
 
 
 def test_theme_toggle_shortcut_from_keymap(search_library: Path) -> None:
@@ -19287,6 +19318,73 @@ def test_theme_toggle_shortcut_from_keymap(search_library: Path) -> None:
     win = _search_win(search_library)
     assert win.theme_toggle_menu_action.shortcuts() == \
         keymap.shortcuts("app.theme_toggle")
+
+
+def test_refresh_theme_preserves_selected_view(search_library: Path) -> None:
+    """_refresh_theme()'s _rebuild_sidebar() call must be bracketed with
+    _selected_view()/_reselect_view() like every other rebuild call site
+    (_toggle_reveal, _toggle_folder_view, ...) — Opus review blocker:
+    without the bracket, switching theme (or the OS flipping scheme at
+    sunset via colorSchemeChanged) silently reset the current view back
+    to All photos (fauxcasa-6y0)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+
+    import theme
+
+    try:
+        win = _search_win(search_library)
+        it = QTreeWidgetItemIterator(win.tree)
+        folder_item = None
+        while it.value():
+            data = it.value().data(0, Qt.ItemDataRole.UserRole)
+            if data is not None and data[0] == "folder":
+                folder_item = it.value()
+                break
+            it += 1
+        assert folder_item is not None, "search_library has no folder item"
+        win._sidebar_clicked(folder_item, 0)
+        before = win._selected_view()
+        assert before[0] == "folder"
+
+        win._refresh_theme()
+        assert win._selected_view() == before
+
+        win._set_theme_mode("light")
+        assert win._selected_view() == before
+    finally:
+        theme.apply_mode(QApplication.instance(), "dark")
+
+
+def test_on_os_color_scheme_changed_respects_mode(
+        search_library: Path) -> None:
+    """MainWindow._on_os_color_scheme_changed (fauxcasa-6y0), the
+    QStyleHints.colorSchemeChanged slot: in "system" mode it re-resolves
+    against the real app.styleHints().colorScheme() (offscreen always
+    reports Unknown -> "dark" — see resolve_scheme), so calling it from
+    "light" flips to "dark"; in an explicit "light"/"dark" mode it must
+    be a complete no-op, leaving the scheme untouched. Called directly
+    (a bound-method slot, not a closure) rather than faking a real
+    QStyleHints signal emission."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    import theme
+
+    try:
+        win = _search_win(search_library)
+
+        win.theme_mode = "system"
+        theme.apply_scheme("light")
+        win._on_os_color_scheme_changed(Qt.ColorScheme.Dark)
+        assert theme.current_scheme() == "dark"
+
+        win.theme_mode = "light"
+        theme.apply_scheme("light")
+        win._on_os_color_scheme_changed(Qt.ColorScheme.Dark)
+        assert theme.current_scheme() == "light"  # untouched: not "system"
+    finally:
+        theme.apply_mode(QApplication.instance(), "dark")
 
 
 def test_grid_empty_text_paints_only_when_set(tmp_path: Path) -> None:

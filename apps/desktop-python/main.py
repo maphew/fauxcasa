@@ -432,20 +432,17 @@ def _is_filesystem_root(path: Path) -> bool:
     return p.parent == p
 
 
-def _remember_library(cache_root: Path, library: Path) -> None:
-    """Persist the chosen library so the next no-arg (double-click) launch
-    reopens it. Best-effort: a write failure must never abort the launch.
-    Writes via a per-process temp sibling + os.replace so a second frozen
-    instance launching concurrently can never read a half-written (torn)
-    config — it sees either the old file or the whole new one.
-
-    Reads the existing doc first and only overwrites the 'library' key —
-    filetypes.save_excluded_exts persists per-library File Types
-    exclusions in this same config.json (see filetypes.py's
-    preserved-keys contract), and a blind overwrite here would wipe them
-    on every library switch. Fail-soft on a garbage/missing file: keep
-    whatever raw keys survive parsing, same posture as
-    _remembered_library and save_excluded_exts."""
+def _config_update(cache_root: Path, key: str, value) -> OSError | None:
+    """Shared atomic merge-one-key-into-config.json idiom (fauxcasa-6y0,
+    extracted from _remember_library): read the existing doc first (a
+    missing/garbage file fails soft to {}) and set only KEY — a blind
+    overwrite would wipe whatever else lives in this same per-user
+    config.json (e.g. filetypes.save_excluded_exts's own keys, this
+    module's other key). Writes via a per-process temp sibling +
+    os.replace so a second frozen instance launching concurrently can
+    never read a half-written (torn) config — it sees either the old
+    file or the whole new one. Returns the OSError on a write failure
+    (never raised — callers decide how to log it) or None on success."""
     cfg = _config_path(cache_root)
     tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
     try:
@@ -454,17 +451,26 @@ def _remember_library(cache_root: Path, library: Path) -> None:
         data = {}
     if not isinstance(data, dict):
         data = {}
-    data["library"] = str(library)
+    data[key] = value
     try:
         cache_root.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(data))
         os.replace(tmp, cfg)
     except OSError as e:
-        log.warning("could not remember library choice: %s", e)
         try:
             tmp.unlink()
         except OSError:
             pass
+        return e
+    return None
+
+
+def _remember_library(cache_root: Path, library: Path) -> None:
+    """Persist the chosen library so the next no-arg (double-click) launch
+    reopens it. Best-effort: a write failure must never abort the launch."""
+    err = _config_update(cache_root, "library", str(library))
+    if err is not None:
+        log.warning("could not remember library choice: %s", err)
 
 
 def _load_theme_mode(cache_root: Path) -> str:
@@ -472,7 +478,10 @@ def _load_theme_mode(cache_root: Path) -> str:
     per-user config.json as _remembered_library, default "system"
     (fauxcasa-6y0). Tolerates a missing/garbage config or an unrecognized
     value the same way _remembered_library does — theme choice is a
-    convenience, not a gate."""
+    convenience, not a gate. Called only from main() (never from
+    MainWindow.__init__, which takes the already-resolved mode as a
+    kwarg instead — a test/tool building a MainWindow with cache_root=
+    None must never read the developer's own real config.json)."""
     try:
         data = json.loads(_config_path(cache_root).read_text())
     except (OSError, ValueError):
@@ -486,30 +495,12 @@ def _load_theme_mode(cache_root: Path) -> str:
 
 
 def _save_theme_mode(cache_root: Path, mode: str) -> None:
-    """Persist the theme MODE, merging into the existing config.json (same
-    read-modify-write-via-temp-sibling-and-os.replace idiom as
-    _remember_library, so a concurrent reader never sees a half-written
-    file) without disturbing the 'library' key or any other key already
+    """Persist the theme MODE, merging into the existing config.json
+    without disturbing the 'library' key or any other key already
     there. Best-effort: a write failure must never abort the session."""
-    cfg = _config_path(cache_root)
-    tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
-    try:
-        data = json.loads(cfg.read_text())
-    except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    data["theme"] = mode
-    try:
-        cache_root.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data))
-        os.replace(tmp, cfg)
-    except OSError as e:
-        log.warning("could not remember theme choice: %s", e)
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+    err = _config_update(cache_root, "theme", mode)
+    if err is not None:
+        log.warning("could not remember theme choice: %s", err)
 
 
 # Per-folder sort modes (fauxcasa-q6l.11) — DURABLE-HOME DECISION
@@ -1854,7 +1845,8 @@ class MainWindow(QMainWindow):
                  contacts_path: Path | None = None,
                  cfg: library.LibraryConfig | None = None,
                  contacts_sig: tuple[int, int] | None = None,
-                 state_dir: Path | None = None):
+                 state_dir: Path | None = None,
+                 theme_mode: str = "system"):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
@@ -1912,12 +1904,16 @@ class MainWindow(QMainWindow):
         self.cache_root = cache_root or (
             cache_dir.parent if cache_dir is not None else _default_cache_root()
         )
-        # Theme MODE (fauxcasa-6y0): "system" (default)/"light"/"dark",
-        # from the same per-user config.json as _remembered_library. Only
-        # STORED here — main() already applied the scheme (theme.
-        # apply_mode) before this window exists; the View > Theme submenu
-        # (_build_theme_menu) reads this for its initial checked state.
-        self.theme_mode = _load_theme_mode(self.cache_root)
+        # Theme MODE (fauxcasa-6y0): "system" (default)/"light"/"dark". A
+        # constructor KWARG, not read here via _load_theme_mode(self.
+        # cache_root) — a caller with no cache_root (most tests) would
+        # otherwise fall back to _default_cache_root() and read the
+        # DEVELOPER'S OWN real config.json (Opus review). main() is the
+        # only production caller and already resolved + applied the
+        # scheme (theme.apply_mode) before this window exists; this is
+        # only STORED here, for the View > Theme submenu
+        # (_build_theme_menu) to show its initial checked state.
+        self.theme_mode = theme_mode
         self.adopt = adopt
         self.ready_reported = False
         self.build_failed = False
@@ -2654,10 +2650,37 @@ class MainWindow(QMainWindow):
         self.zoom_large_label.setPixmap(
             icons.make_icon("zoom_large", theme.TEXT_MUTED).pixmap(16, 16))
         self.info_action.setIcon(icons.make_icon("info", theme.TEXT))
+        # _rebuild_sidebar() rebuilds the tree wholesale (it repaints its
+        # own icons.make_icon calls) and, left alone, drops the current
+        # selection back to All photos — every OTHER call site brackets it
+        # with _selected_view()/_reselect_view() (_toggle_reveal,
+        # _toggle_folder_view, ...) and a theme switch is no exception, or
+        # the OS flipping scheme at sunset (colorSchemeChanged) would
+        # silently reset whatever folder/album/search the user was in.
+        kind, key = self._selected_view()
         self._rebuild_sidebar()
+        self._reselect_view(kind, key)
         self.inspector.refresh_style()
+        # GridView is a QAbstractScrollArea: its viewport is a separate
+        # child widget with its own paint surface, so the top-level
+        # update() loop below does not reach it on its own.
+        self.grid.viewport().update()
         for w in QApplication.topLevelWidgets():
             w.update()
+
+    def _on_os_color_scheme_changed(self, _scheme) -> None:
+        """QStyleHints.colorSchemeChanged slot (fauxcasa-6y0), connected
+        once in main() after this window exists. A bound method rather
+        than a closure: Qt auto-disconnects a signal from a QObject
+        method when that QObject is deleted (a closure over `win` would
+        keep firing into a half-torn-down window), and a test can call
+        this directly instead of needing to fake styleHints() emitting a
+        real signal. Only follows the OS while the user's theme MODE is
+        "system" — an explicit Light/Dark override must never be
+        silently undone by the OS switching under it."""
+        if self.theme_mode == "system":
+            theme.apply_mode(QApplication.instance(), "system")
+            self._refresh_theme()
 
     def _step_zoom(self, delta: int) -> None:
         """Zoom In/Out menu actions step the SAME slider the toolbar
@@ -5324,7 +5347,13 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
-    theme.apply_mode(app, _load_theme_mode(args.cache_root))
+    # Resolved ONCE here (the per-user config.json read) and threaded
+    # through to MainWindow as a kwarg (fauxcasa-6y0 Opus review):
+    # MainWindow.__init__ itself must never call _load_theme_mode, or a
+    # caller with no cache_root (most tests) would read the developer's
+    # own real config.json via _default_cache_root().
+    theme_mode = _load_theme_mode(args.cache_root)
+    theme.apply_mode(app, theme_mode)
     # App-wide default: every top-level (message boxes, the File Types
     # dialog, ...) inherits it; MainWindow/slideshow/peek also set it
     # explicitly so a window built outside main() (tests) carries it too.
@@ -5362,7 +5391,8 @@ def main() -> int:
                      excluded_exts=excluded_exts,
                      thumbs_path=args.thumbs, db3_dir=db3_dir,
                      contacts_path=contacts_path, cfg=cfg,
-                     contacts_sig=contacts_sig, state_dir=state_dir)
+                     contacts_sig=contacts_sig, state_dir=state_dir,
+                     theme_mode=theme_mode)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
@@ -5373,17 +5403,11 @@ def main() -> int:
     win.show()
     win.grid.setFocus()  # only really lands once the window is mapped
 
-    # Follow a LIVE OS light/dark flip (fauxcasa-6y0) — but only while the
-    # user's theme MODE is "system" (win.theme_mode); an explicit Light/
-    # Dark override must never be silently undone by the OS switching
-    # under it. Subscribed once, here, after the window exists (win.
-    # _refresh_theme touches window chrome that isn't built yet earlier).
-    def _on_os_color_scheme_changed(_scheme) -> None:
-        if win.theme_mode == "system":
-            theme.apply_mode(app, "system")
-            win._refresh_theme()
-
-    app.styleHints().colorSchemeChanged.connect(_on_os_color_scheme_changed)
+    # Follow a LIVE OS light/dark flip (fauxcasa-6y0): win._on_os_color_
+    # scheme_changed is a no-op unless the user's theme MODE is "system".
+    # Subscribed once, here, after the window exists (_refresh_theme
+    # touches window chrome that isn't built yet earlier).
+    app.styleHints().colorSchemeChanged.connect(win._on_os_color_scheme_changed)
 
     # P3 finding: a MID-SESSION degrade (decodefacade.DecodeService.
     # decode() flips state -> "degraded" on a per-file spawn/OSError/
