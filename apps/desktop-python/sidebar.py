@@ -9,7 +9,8 @@ working unmodified. Sidebar takes the owning MainWindow (`win`) and
 operates on its attributes instead; MainWindow keeps one-line delegating
 methods with the original names (`_sidebar_clicked`, `_set_folder_sort`,
 `_folders_root_menu`, `_folder_sort_menu`, `_refresh_recent_count`,
-`_people_counts`, `_build_sidebar`, `_rebuild_sidebar`, `_new_sidebar_tree`)
+`_people_counts`, `_sidebar_menu`, `_build_sidebar`, `_rebuild_sidebar`,
+`_new_sidebar_tree`)
 so `win._x(...)` calls and Qt signal connections that name `self._x` still
 resolve.
 

@@ -33,6 +33,10 @@ scripts/make-thumbcache.py and adopt via --thumbs.
 
 Persistence readers/writers (per-user config, per-library view prefs,
 window geometry, stars) live in librarystate.py — see its docstring.
+Argument parsing, the standalone subcommands and the scripted-run state
+machine (ScriptedRun) live in cli.py; the folder/albums/people sidebar
+lives in sidebar.py (fauxcasa-4tu). main.py re-exports the moved names
+tests and scripts reach as `main.<name>`.
 """
 
 from __future__ import annotations
@@ -71,7 +75,6 @@ if sys.argv[1:] == ["--decode-worker"]:
     sys.exit(decodesvc_worker_win.worker_entrypoint())
 
 from PySide6.QtCore import (
-    QByteArray,
     QObject,
     QProcess,
     QSize,
@@ -85,7 +88,6 @@ from PySide6.QtGui import (
     QIcon,
     QKeySequence,
     QPainter,
-    QPalette,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -190,7 +192,7 @@ from viewer import ViewerPage  # noqa: E402
 # surface tests and scripts rely on when they reach for main.<name> or
 # `from main import <name>` — no other call site in this file should
 # import librarystate a second time.
-from librarystate import (  # noqa: E402
+from librarystate import (  # noqa: E402,F401  (re-export surface for tests and scripts)
     _config_path,
     _default_window_size,
     _is_filesystem_root,
@@ -211,7 +213,7 @@ from librarystate import (  # noqa: E402
 # Same re-export contract as the librarystate block above, for the names
 # fauxcasa-4tu stage 2 moved to cli.py: main.<name>/`from main import
 # <name>` compatibility for tests and scripts.
-from cli import (  # noqa: E402
+from cli import (  # noqa: E402,F401  (re-export surface for tests and scripts)
     _parse_image_size_arg,
     run_search_probe,
     select_sidebar_view,
@@ -219,7 +221,7 @@ from cli import (  # noqa: E402
 # Same re-export contract again, for the names fauxcasa-4tu stage 3 moved
 # to sidebar.py. ElidingLabel is NOT here: it stays defined in main.py
 # (MainWindow's status-bar labels use it too, not just the sidebar).
-from sidebar import (  # noqa: E402
+from sidebar import (  # noqa: E402,F401  (re-export surface for tests and scripts)
     _OFFLINE_DRIVE_NAME_MAX_CHARS,
     _offline_root_labels,
     _plain_tooltip,
