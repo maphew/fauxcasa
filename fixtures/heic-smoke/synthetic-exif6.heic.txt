@@ -32,7 +32,9 @@ Verified by the generating script on every run:
   - pi-heif standalone decode is 96x64 (as stored -- nothing rotated)
   - pi-heif in Pillow-plugin mode reports info["original_orientation"]
     == 6 with the live EXIF tag reset to 1
-  - metareader.read_orientation (exiv2, raw bytes) reports 6
+  - metareader.read_orientation (exiv2, raw bytes) reports 6 -- this is
+    the value pillowload.heic_manual_orientation applies (not pi-heif's,
+    which may be XMP-sourced; see synthetic-xmp6.heic.txt)
 
 Expected display after the fauxcasa-zq9 fix: 64x96, quadrants rotated
 exactly as synthetic-rot6.heic's — displayed top-left is the stored

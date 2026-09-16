@@ -759,8 +759,10 @@ def _index_one(src: Path | None, photo, idx: int, levels: list[int]):
             # no-ops for HEIC; libheif applies the container's own irot/
             # imir transform while decoding instead (fauxcasa-y5b), and
             # for a file with NO such transform pillow_qimage applies
-            # pi-heif's stashed original_orientation itself
-            # (fauxcasa-zq9). Either way `img` arrives display-upright.
+            # metareader.read_orientation(data) itself, the same EXIF-only
+            # value the viewer reports (fauxcasa-zq9; pillowload.
+            # heic_manual_orientation). Either way `img` arrives
+            # display-upright.
             img = pillow_qimage(data, top)
         elif (not from_preview and src is not None
               and decodefacade.get_service().state

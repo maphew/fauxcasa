@@ -292,10 +292,13 @@ def load_original_oriented(path: str, rotate: int,
                 # always no-ops for HEIC; libheif applies the container's
                 # own irot/imir transform while decoding instead
                 # (fauxcasa-y5b), and for a file with NO such transform
-                # pillow_qimage applies pi-heif's stashed
-                # original_orientation itself (fauxcasa-zq9). Either way
-                # `img` is display-upright and `orientation` below stays
-                # the raw exiv2 tag, never re-applied here.
+                # pillow_qimage applies metareader.read_orientation(data)
+                # itself -- the SAME EXIF-only value `orientation` above
+                # holds, so pixels and the reported orientation the crop
+                # bake and face overlay map through can never disagree
+                # (fauxcasa-zq9; pillowload.heic_manual_orientation).
+                # Either way `img` is display-upright and `orientation`
+                # is never re-applied here.
                 img = pillow_qimage(data)
             elif decodefacade.get_service().state == decodefacade.STATE_SANDBOXED:
                 # STILL route through the decode sandbox (fauxcasa-ez2.9
