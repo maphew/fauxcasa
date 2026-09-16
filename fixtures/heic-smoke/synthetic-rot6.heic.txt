@@ -72,7 +72,9 @@ apps/desktop-python/metareader.read_orientation:
 Purpose: proves pillowload.pillow_qimage's HEIC path is upright by way
 of libheif's native container-transform handling, NOT PIL's
 exif_transpose (which is always a no-op for HEIC -- pi-heif resets the
-EXIF tag to 1 before exif_transpose ever runs). See pillowload.py's
-module docstring for the known limitation this does NOT cover: an HEIC
-whose rotation lives ONLY in EXIF, with no irot/imir in the container,
-still decodes sideways.
+EXIF tag to 1 before exif_transpose ever runs). Since fauxcasa-zq9 it is
+also the double-rotation guard: pi-heif still reports
+original_orientation=6 for this file, and pillow_qimage must NOT apply
+it on top of the irot -- heif_container_transform() reads True here.
+The EXIF-only sibling (rotation in EXIF, no irot/imir) is
+synthetic-exif6.heic; see its .txt.

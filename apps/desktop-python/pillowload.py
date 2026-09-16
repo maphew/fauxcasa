@@ -38,14 +38,56 @@ to 1 at open time (pi_heif/as_plugin.py's set_orientation(), called
 automatically in Pillow-plugin mode), so exif_transpose is always a
 no-op for HEIC specifically; libheif applies the container's own irot/
 imir transform boxes while decoding instead, before pixels ever reach
-PIL. KNOWN LIMITATION (not fixed here, tracked as fauxcasa-zq9, P4): an
-HEIC whose rotation lives ONLY in an EXIF Orientation tag, with no
-irot/imir in the container (not the common case — most encoders write
-both, and Apple's HEIC shape uses irot/imir) decodes SIDEWAYS: pi-heif
-neutralises the tag by design, and libheif has no container transform
-to apply, so no orientation signal survives either path. The two paths
-(Qt's autoTransform vs. this module's exif_transpose/libheif-native
-handling) are alternatives, never composed.
+PIL.
+
+HEIC orientation, two signals, applied at most ONCE (fauxcasa-zq9):
+
+  1. Container transform (`irot`/`imir` item properties in `iprp`/
+     `ipco`, bound to the primary item through `ipma`). libheif applies
+     these itself during decode -- the pixels PIL receives are already
+     display-upright and `im.size` is the post-transform size. Most
+     encoders (Apple included) write BOTH this and an EXIF Orientation
+     tag describing the same turn; for those files EXIF must be
+     ignored or the image would be double-rotated.
+  2. EXIF Orientation alone (no irot/imir bound to the primary item).
+     libheif has nothing to rotate, so the coded plane comes out as
+     stored -- sideways for a rotated capture. pi-heif's opener has by
+     then already reset the live tag to 1, so pillow_qimage re-reads the
+     ORIGINAL bytes with metareader.read_orientation (exiv2, EXIF tag
+     274 only, fail-soft 1) and applies that value with the same
+     transpose table exif_transpose uses.
+
+     Why exiv2 and not pi-heif's own `im.info["original_orientation"]`:
+     that key (set_orientation's return value, stashed by
+     as_plugin._init_from_heif_file) is NOT purely the EXIF tag --
+     pi_heif.misc._get_orientation falls through to an XMP
+     `tiff:Orientation` when EXIF is absent or 1, so it can be XMP-
+     sourced. The viewer (viewer.load_original_oriented) reports
+     metareader.read_orientation(data) as the file's orientation and
+     crop_qimage_upright / the face overlay map STORED-frame rects
+     through it; if this module rotated by an XMP value the viewer
+     reports as 1, those rects would land on rotated pixels. Invariant:
+     the value applied here IS the value read_orientation reports for
+     the same bytes, or nothing is applied. A HEIC whose only
+     orientation is XMP therefore decodes as stored (a known, deliberate
+     gap, consistent across grid, viewer and overlay); pi-heif's
+     original_orientation is kept as a debug-log cross-check only.
+
+How pillow_qimage tells the two apart: pi-heif's C surface exposes no
+"transforms applied" flag and no untransformed (`ispe`) size, and a
+size comparison could not distinguish an `irot` of 180 or an `imir`
+anyway (neither swaps the axes). So heif_container_transform() sniffs
+the container's own boxes -- ftyp -> meta -> pitm (primary item id),
+iprp/ipco (the property list, 1-based), ipma (which properties bind to
+which item) -- and reports True when an `irot` with a non-zero angle or
+any `imir` is bound to the primary item. It is a pure header parse in
+the tiff_is_16bit mould: never raises, and returns None (treated as
+"unknown, trust libheif, do not apply EXIF") for anything it cannot
+parse, so a malformed container can degrade to the pre-zq9 behavior
+but never to a double rotation. Rule: EXIF is applied only when the
+sniff says definitively False. The two paths (Qt's autoTransform vs.
+this module's exif_transpose/libheif-native handling) are alternatives,
+never composed.
 
 Threat-model note (docs/decode-threat-model.md): in-process like all
 tracer decode, but a single bytes-in/pixels-out function so the future
@@ -141,6 +183,188 @@ def tiff_is_16bit(data: bytes) -> bool:
     return False
 
 
+def _iso_boxes(data: bytes, start: int, end: int):
+    """Yield (type, payload_start, box_end) for each ISO BMFF box in
+    data[start:end]. Handles 64-bit `largesize` and size==0 (to end).
+    Stops silently (no raise) at a truncated or nonsensical header."""
+    off = start
+    while off + 8 <= end:
+        size, typ = struct.unpack_from(">I4s", data, off)
+        hdr = 8
+        if size == 1:
+            if off + 16 > end:
+                return
+            size = struct.unpack_from(">Q", data, off + 8)[0]
+            hdr = 16
+        elif size == 0:
+            size = end - off
+        if size < hdr or off + size > end:
+            return
+        yield typ, off + hdr, off + size
+        off += size
+
+
+def _ipma_lookup(data: bytes, s: int, e: int,
+                 item_id: int) -> list[int] | None:
+    """Property indices bound to `item_id` in the ipma box whose payload
+    is data[s:e], or None when the item has no entry there OR the box is
+    truncated/shrunken. Every read is bounded by `e`: a damaged ipma must
+    read as None, never as a verdict built from whatever bytes happen to
+    follow it."""
+    if s + 8 > e:
+        return None
+    version = data[s]
+    flags = data[s + 3]
+    entry_count = struct.unpack_from(">I", data, s + 4)[0]
+    p = s + 8
+    id_len = 2 if version < 1 else 4
+    idx_len = 2 if flags & 1 else 1
+    for _ in range(entry_count):
+        if p + id_len + 1 > e:
+            return None
+        this_id = struct.unpack_from(">H" if id_len == 2 else ">I", data, p)[0]
+        p += id_len
+        count = data[p]
+        p += 1
+        if p + count * idx_len > e:
+            return None
+        idxs = []
+        for _ in range(count):
+            if idx_len == 2:
+                idxs.append(struct.unpack_from(">H", data, p)[0] & 0x7FFF)
+            else:
+                idxs.append(data[p] & 0x7F)
+            p += idx_len
+        if this_id == item_id:
+            return idxs
+    return None
+
+
+def heif_container_transform(data: bytes) -> bool | None:
+    """Does this HEIF/HEIC's PRIMARY item carry a container-level
+    orientation transform (an `irot` with a non-zero angle, or any
+    `imir`) that libheif applies itself while decoding?
+
+    True  -> yes: pixels out of libheif are already upright; any EXIF
+             Orientation tag describes the SAME turn and must be ignored.
+    False -> definitively no: nothing bound to the primary item rotates
+             or mirrors, so an EXIF Orientation tag is the only signal
+             and pillow_qimage must apply it.
+    None  -> could not tell (not a HEIF `ftyp`, no `meta`/`pitm`/`ipma`,
+             truncated boxes). Callers treat None like True -- trusting
+             libheif alone reproduces the pre-zq9 behavior, whereas
+             guessing False risks a double rotation.
+
+    Pure header parse (no decode, never raises), modelled on
+    tiff_is_16bit: ftyp -> meta (FullBox: 4-byte version/flags before
+    its children) -> pitm (primary item_ID, 16-bit for version 0, else
+    32-bit) + iprp/ipco (the property list, indexed 1-based in ipma
+    order) + ipma (per-item property index lists; `flags & 1` selects
+    16-bit indices, of which the top bit is `essential`). Item-level
+    `clap` (clean aperture) is deliberately not counted: it crops, it
+    does not orient. Only the primary item is inspected -- that is the
+    one pi-heif hands to Pillow (HeifFile.primary_index). Known
+    limitation: a grid-derived primary whose irot/imir is bound only to
+    its TILE items (not to the grid item itself) reports False here, and
+    the caller would then apply EXIF on top of libheif's tile-level turn.
+    No such file exists in the corpus; the common encoders bind the
+    transform to the primary."""
+    try:
+        if len(data) < 16 or data[4:8] != b"ftyp":
+            return None
+        meta = None
+        for typ, pstart, pend in _iso_boxes(data, 0, len(data)):
+            if typ == b"meta":
+                meta = (pstart + 4, pend)  # skip FullBox version/flags
+                break
+        if meta is None:
+            return None
+        primary = None
+        # (type, payload_start, payload_end), indexed 1-based by ipma
+        props: list[tuple[bytes, int, int]] = []
+        ipmas: list[tuple[int, int]] = []     # a file may carry several
+        for typ, pstart, pend in _iso_boxes(data, *meta):
+            if typ == b"pitm":
+                if pstart + 6 > pend:
+                    return None
+                version = data[pstart]
+                if version == 0:
+                    primary = struct.unpack_from(">H", data, pstart + 4)[0]
+                else:
+                    if pstart + 8 > pend:
+                        return None
+                    primary = struct.unpack_from(">I", data, pstart + 4)[0]
+            elif typ == b"iprp":
+                for t2, s2, e2 in _iso_boxes(data, pstart, pend):
+                    if t2 == b"ipco":
+                        props = list(_iso_boxes(data, s2, e2))
+                    elif t2 == b"ipma":
+                        ipmas.append((s2, e2))
+        if primary is None or not ipmas:
+            return None
+        bound = None
+        for s, e in ipmas:
+            bound = _ipma_lookup(data, s, e, primary)
+            if bound is not None:
+                break
+        if bound is None:
+            return None                       # primary bound in no ipma
+        for idx in bound:
+            if idx == 0:
+                continue                      # spec: 0 = "no property" filler
+            if idx > len(props):
+                return None                   # out-of-range: malformed
+            ptype, pstart, pend = props[idx - 1]
+            if ptype == b"imir":
+                return True
+            if ptype == b"irot":
+                if pend <= pstart:
+                    return None               # zero-length irot: malformed
+                if data[pstart] & 0x3:
+                    return True
+        return False
+    except (struct.error, IndexError, OverflowError):
+        return None
+
+
+def heic_manual_orientation(data: bytes,
+                            pi_heif_original: int | None = None) -> int:
+    """The orientation (1..8) pillow_qimage must apply BY HAND to a
+    HEIC/HEIF that pi-heif just opened, or 1 for "apply nothing".
+
+    Decision, in order (module docstring, "HEIC orientation, two
+    signals"):
+      - heif_container_transform(data) is True or None -> 1. libheif
+        already applied a container transform, or we cannot prove it
+        did not; applying anything on top risks a double rotation.
+      - otherwise -> metareader.read_orientation(data): exiv2's EXIF
+        tag 274 read of the ORIGINAL bytes (pi-heif's in-process reset
+        to 1 never touches them), fail-soft 1. This is the SAME call
+        viewer.load_original_oriented reports as the file's orientation,
+        which is the whole point: crop_qimage_upright and the face
+        overlay map stored-frame rects through that reported value, so
+        the pixels must be rotated by it and nothing else.
+
+    `pi_heif_original` (im.info["original_orientation"]) is accepted for
+    a debug-level cross-check only. It disagrees with the EXIF read
+    exactly when pi-heif sourced it from XMP tiff:Orientation (its
+    misc._get_orientation falls through to XMP when EXIF is absent or
+    1); such a file is left as stored, on purpose, so grid, viewer and
+    overlay agree. Never raises: metareader is fail-soft and the sniff
+    never raises."""
+    if heif_container_transform(data) is not False:
+        return 1
+    from metareader import read_orientation
+
+    exif = read_orientation(data)
+    if pi_heif_original not in (None, exif):
+        log.debug("HEIC orientation: pi-heif reports %r (EXIF or XMP), "
+                  "exiv2 EXIF reads %r -- applying the EXIF value so the "
+                  "viewer's reported orientation and the pixels agree",
+                  pi_heif_original, exif)
+    return exif
+
+
 def _ensure_heif_opener() -> None:
     """Register pi-heif's Pillow opener, once per process (no-op on every
     call after the first, any outcome); on failure (missing wheel,
@@ -198,15 +422,36 @@ def pillow_qimage(data: bytes, max_edge: int | None = None):
             # set_orientation() at open time (pi_heif/as_plugin.py),
             # which RESETS the EXIF Orientation tag to 1 unconditionally
             # whenever one is present, so this exif_transpose is always
-            # a no-op for HEIC. Uprightness instead comes from libheif
+            # a no-op for HEIC. Uprightness normally comes from libheif
             # itself applying the HEIF container's own irot/imir
             # transform boxes while DECODING, before pixels ever reach
-            # PIL. Known gap (not fixed here, tracked as fauxcasa-zq9, P4):
-            # an HEIC whose rotation lives ONLY in EXIF, with no irot/
-            # imir in the container, decodes SIDEWAYS -- pi-heif
-            # neutralises the tag by design and libheif has nothing to
-            # rotate, so no orientation signal survives to correct it.
+            # PIL -- see the HEIC block below for the EXIF-only case.
             im = ImageOps.exif_transpose(im)
+            # HEIC/HEIF, EXIF-only rotation (fauxcasa-zq9). The
+            # "original_orientation" key exists only when pi-heif's
+            # plugin opened the image; its presence gates the HEIC block,
+            # its VALUE is never applied (it may be XMP-sourced -- module
+            # docstring, "HEIC orientation, two signals"). The applied
+            # value is heic_manual_orientation(): exiv2's EXIF-only read
+            # of the ORIGINAL bytes, and only when the container sniff
+            # says DEFINITIVELY that no irot/imir is bound to the primary
+            # item -- True or None ("both present" / "can't tell") leaves
+            # libheif's output alone, so the common Apple shape is never
+            # rotated twice.
+            if "original_orientation" in im.info:
+                manual = heic_manual_orientation(
+                    data, im.info.get("original_orientation"))
+                method = {
+                    2: Image.Transpose.FLIP_LEFT_RIGHT,
+                    3: Image.Transpose.ROTATE_180,
+                    4: Image.Transpose.FLIP_TOP_BOTTOM,
+                    5: Image.Transpose.TRANSPOSE,
+                    6: Image.Transpose.ROTATE_270,
+                    7: Image.Transpose.TRANSVERSE,
+                    8: Image.Transpose.ROTATE_90,
+                }.get(manual)                 # same table as exif_transpose
+                if method is not None:
+                    im = im.transpose(method)
             # Normalise high-bit-depth integer modes before any conversion:
             # convert('RGB') clips values > 255 for 'I' and 'I;*' modes
             # rather than scaling them, so a 16-bit grayscale sample of

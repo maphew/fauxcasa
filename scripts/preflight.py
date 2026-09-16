@@ -17,6 +17,8 @@ Checks (derived from .github/workflows/tests.yml and tracer.yml):
   - uv run scripts/test_picasa_db.py -q
   - uv run scripts/test_confirm_archive.py -q
   - uv run scripts/check-ingest-parity.py
+  - uv run scripts/make-heic-exif-only-fixture.py --check
+    (fauxcasa-zq9 HEIC orientation fixtures pinned; instant)
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_inmeta_datasets.py -q
     (dataset-gated: self-skips cleanly when cache/test-datasets/ isn't
     fetched, so always safe here)
@@ -94,6 +96,17 @@ def checks(root: Path, fast: bool) -> list[dict]:
             "command": ["uv", "run", "scripts/check-ingest-parity.py"],
             "cwd": root,
             "env": None,
+        },
+        {
+            "name": "heic orientation fixtures pinned",
+            "command": ["uv", "run", "scripts/make-heic-exif-only-fixture.py",
+                        "--check"],
+            "cwd": root,
+            "env": None,
+            # fauxcasa-zq9: rebuilds synthetic-exif6.heic from synthetic.heic
+            # and compares bytes, and structurally verifies synthetic-xmp6
+            # .heic (no irot/imir, pi-heif vs exiv2 orientation split), so
+            # a drifted or hand-edited fixture fails loudly. Instant.
         },
         {
             "name": "dataset-gated metadata tests",

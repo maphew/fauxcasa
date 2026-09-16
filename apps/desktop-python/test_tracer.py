@@ -13104,6 +13104,226 @@ def test_heic_container_rotation_decodes_upright_exif_reports_raw_tag(
     assert abs(br.red() - 40) < 30 and abs(br.green() - 200) < 30  # green
 
 
+# ---- HEIC EXIF-only rotation (fauxcasa-zq9) -------------------------------
+
+_HEIC_ROT6 = REPO / "fixtures" / "heic-smoke" / "synthetic-rot6.heic"
+_HEIC_EXIF6 = REPO / "fixtures" / "heic-smoke" / "synthetic-exif6.heic"
+_HEIC_XMP6 = REPO / "fixtures" / "heic-smoke" / "synthetic-xmp6.heic"
+
+
+def _assert_heic_rotated_quadrants(img) -> None:
+    """The displayed layout BOTH rotated fixtures must produce: the 96x64
+    quadrant plane turned 90 deg clockwise into 64x96 -- TL blue, TR
+    red, BL yellow, BR green (synthetic-rot6.heic.txt), +/-30 lossy
+    tolerance like _assert_heic_quadrants."""
+    assert (img.width(), img.height()) == (64, 96)
+    tl, tr = img.pixelColor(5, 5), img.pixelColor(59, 5)
+    bl, br = img.pixelColor(5, 91), img.pixelColor(59, 91)
+    assert abs(tl.red() - 40) < 30 and abs(tl.blue() - 220) < 30   # blue
+    assert abs(tr.red() - 220) < 30 and abs(tr.green() - 40) < 30  # red
+    assert abs(bl.red() - 230) < 30 and abs(bl.green() - 210) < 30  # yellow
+    assert abs(br.red() - 40) < 30 and abs(br.green() - 200) < 30  # green
+
+
+def test_heif_container_transform_sniff() -> None:
+    """heif_container_transform is the seam that decides whether
+    pillow_qimage may apply pi-heif's original_orientation: True for the
+    Apple shape (irot bound to the primary item), False for the
+    EXIF-only and untagged fixtures (nothing bound rotates), None for
+    anything it cannot parse -- and None must NEVER become an apply,
+    because "can't tell" plus EXIF would double-rotate a both-present
+    file whose ipma we merely failed to read."""
+    from pillowload import heif_container_transform
+
+    rot6 = _HEIC_ROT6.read_bytes()
+    exif6 = _HEIC_EXIF6.read_bytes()
+    plain = _HEIC_FIXTURE.read_bytes()
+    assert heif_container_transform(rot6) is True
+    assert heif_container_transform(exif6) is False
+    assert heif_container_transform(plain) is False
+    # The two fixtures differ ONLY in the one EXIF SHORT the generator
+    # patched (scripts/make-heic-exif-only-fixture.py): same container.
+    assert len(exif6) == len(plain)
+    assert sum(a != b for a, b in zip(exif6, plain)) == 1
+    # Unparseable -> None, never a raise, never False.
+    assert heif_container_transform(b"") is None
+    assert heif_container_transform(b"\x00" * 64) is None
+    assert heif_container_transform(rot6[:300]) is None    # meta truncated
+    assert heif_container_transform(rot6[:40]) is None     # ftyp only
+    # A corrupted ipma (primary item's property list gone) on the rot6
+    # bytes must read as None, not False: the irot is still in ipco but
+    # we can no longer prove it is bound, so the caller must not apply
+    # EXIF on top of whatever libheif did.
+    idx = rot6.find(b"ipma")
+    broken = bytearray(rot6)
+    broken[idx - 4:idx] = struct.pack(">I", 8)              # ipma size -> empty
+    assert heif_container_transform(bytes(broken)) is None
+    # A zero-length irot payload (box size 8) must not read the NEXT
+    # box's first byte as its angle: None, not a verdict.
+    idx = rot6.find(b"irot")
+    broken = bytearray(rot6)
+    broken[idx - 4:idx] = struct.pack(">I", 8)
+    assert heif_container_transform(bytes(broken)) is None
+    # XMP-only fixture: same container shape as synthetic.heic -> False.
+    assert heif_container_transform(_HEIC_XMP6.read_bytes()) is False
+
+
+def test_heic_manual_orientation_decision() -> None:
+    """heic_manual_orientation is the ONE value pillow_qimage rotates a
+    HEIC by, and it must equal metareader.read_orientation(data) for
+    that file or be 1 -- the viewer reports read_orientation as the
+    file's orientation and maps stored-frame crop/face rects through it,
+    so pixels rotated by anything else would desync from those rects.
+      exif6: no transform, EXIF 6            -> 6 (== exiv2)
+      rot6:  irot bound, EXIF 6, pi-heif 6   -> 1 (libheif did it)
+      xmp6:  no transform, XMP 6, EXIF absent -> 1 (pi-heif says 6; exiv2
+             says 1; we side with exiv2, on purpose -- review round 1)
+      garbage                                 -> 1 (sniff None)"""
+    from metareader import read_orientation
+    from pillowload import heic_manual_orientation
+
+    for path, want in ((_HEIC_EXIF6, 6), (_HEIC_ROT6, 1), (_HEIC_XMP6, 1)):
+        data = path.read_bytes()
+        got = heic_manual_orientation(data, 6)   # pi-heif reports 6 for all
+        assert got == want, path.name
+        assert got in (1, read_orientation(data)), path.name
+    assert heic_manual_orientation(b"", 6) == 1
+    assert heic_manual_orientation(b"\x00" * 64, 8) == 1
+    # The pi-heif value is a cross-check only: passing None or a
+    # disagreeing number changes nothing about the decision.
+    assert heic_manual_orientation(_HEIC_EXIF6.read_bytes(), None) == 6
+    assert heic_manual_orientation(_HEIC_EXIF6.read_bytes(), 3) == 6
+
+
+def test_heic_xmp_only_orientation_left_as_stored(
+        tmp_path: Path, monkeypatch) -> None:
+    """The XMP-only shape (synthetic-xmp6.heic.txt): XMP tiff:Orientation
+    =6, NO EXIF, no irot/imir. pi-heif's misc._get_orientation falls
+    through to XMP, so info["original_orientation"] is 6 -- but exiv2's
+    EXIF-only read_orientation is 1, and that is what the viewer
+    reports. Applying pi-heif's 6 would rotate the pixels under a
+    reported orientation of 1 (review round 1 should-fix). So every
+    path leaves this file AS STORED: 96x64, quadrants in stored
+    positions, and the viewer's (pixels, orientation) pair agrees with
+    itself. Indexer + viewer + InProcessTransport, same sandboxed stub
+    as the y5b tests."""
+    _offscreen_app()
+    _patch_sandboxed_service(monkeypatch)
+    from io import BytesIO
+    from PIL import Image
+    import decodefacade
+    from metareader import read_orientation
+    from pillowload import pillow_qimage
+    from viewer import load_original, load_original_oriented
+
+    data = _HEIC_XMP6.read_bytes()
+    with Image.open(BytesIO(data)) as im:
+        assert im.info.get("original_orientation") == 6   # XMP-sourced
+        assert im.getexif().get(0x0112) is None            # no EXIF at all
+    assert read_orientation(data) == 1
+    img = pillow_qimage(data)
+    assert (img.width(), img.height()) == (96, 64)
+    _assert_heic_quadrants(img.pixelColor)
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    (root / "xmp6.heic").write_bytes(data)
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    _o, length, w, h = dict(zip(cache.files, cache.entries))["xmp6.heic"]
+    assert length > 0 and (w, h) == (96, 64)
+    _assert_heic_quadrants(
+        lambda x, y: _thumb_qimage(cache, 0).pixelColor(x, y))
+    img, orientation = load_original_oriented(str(root / "xmp6.heic"), rotate=0)
+    assert orientation == 1 and (img.width(), img.height()) == (96, 64)
+    _assert_heic_quadrants(img.pixelColor)
+    _assert_heic_quadrants(load_original(str(root / "xmp6.heic"), 0).pixelColor)
+    _assert_heic_quadrants(decodefacade.InProcessTransport().decode(
+        str(root / "xmp6.heic"), route="still", edge=0).pixelColor)
+
+
+def test_heic_exif_only_rotation_decodes_upright(tmp_path: Path) -> None:
+    """(a) The EXIF-only shape (synthetic-exif6.heic.txt): a real EXIF
+    Orientation=6 and NO irot/imir. libheif has nothing to rotate and
+    pi-heif has reset the live tag to 1, so before fauxcasa-zq9 this
+    came out 96x64 sideways. pillow_qimage now applies pi-heif's
+    info["original_orientation"] because heif_container_transform says
+    definitively False -- the result is the SAME 64x96 layout the irot
+    fixture produces. Also covers the viewer path: load_original_oriented
+    still reports the raw exiv2 tag (6) alongside the upright pixels,
+    exactly as for the rot6 fixture, so crop/face math is unchanged."""
+    _offscreen_app()
+    from metareader import read_orientation
+    from pillowload import pillow_qimage
+    from viewer import load_original_oriented
+
+    data = _HEIC_EXIF6.read_bytes()
+    assert read_orientation(data) == 6
+    _assert_heic_rotated_quadrants(pillow_qimage(data))
+    thumb = pillow_qimage(data, 32)                    # indexer-style bound
+    assert (thumb.width(), thumb.height()) == (21, 32)
+
+    path = tmp_path / "exif6.heic"
+    path.write_bytes(data)
+    img, orientation = load_original_oriented(str(path), rotate=0)
+    assert orientation == 6
+    _assert_heic_rotated_quadrants(img)
+
+
+def test_heic_both_present_not_double_rotated() -> None:
+    """(b) The Apple shape (irot AND EXIF=6) must be untouched by the zq9
+    apply: pi-heif still reports original_orientation=6 for it, so the
+    ONLY thing standing between this file and a 180-degree double turn
+    is heif_container_transform returning True. Pin the pixels, not just
+    the size (a second 90 would keep 64x96 and only move the colors)."""
+    _offscreen_app()
+    from io import BytesIO
+    from pillowload import pillow_qimage
+    from PIL import Image
+
+    data = _HEIC_ROT6.read_bytes()
+    with Image.open(BytesIO(data)) as im:
+        assert im.info.get("original_orientation") == 6   # the trap is live
+        assert im.getexif().get(0x0112) == 1              # neutered, as documented
+    _assert_heic_rotated_quadrants(pillow_qimage(data))
+    _assert_heic_rotated_quadrants(pillow_qimage(_HEIC_EXIF6.read_bytes()))
+
+
+def test_heic_orientation_parity_indexer_viewer_facade(
+        tmp_path: Path, monkeypatch) -> None:
+    """(c) Thumbnail path (thumbcache._index_one), viewer path
+    (viewer.load_original) and the facade's InProcessTransport must agree,
+    per file AND across the two rotated fixtures: identical dims, and the
+    displayed quadrant colors of the EXIF-only file match the irot file
+    pixel-for-pixel within lossy tolerance on every path. Same sandboxed
+    stub as the y5b tests so the HEIC pre-route is what decoded here."""
+    _offscreen_app()
+    _patch_sandboxed_service(monkeypatch)
+    import decodefacade
+    from viewer import load_original
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    (root / "rot6.heic").write_bytes(_HEIC_ROT6.read_bytes())
+    (root / "exif6.heic").write_bytes(_HEIC_EXIF6.read_bytes())
+    cat = scan_library(root)
+    cache = thumbcache.load_cache(
+        thumbcache.build_cache(cat, tmp_path / "c").path)
+    ent = {rel: e for rel, e in zip(cache.files, cache.entries)}
+    for name in ("rot6.heic", "exif6.heic"):
+        _o, length, w, h = ent[name]
+        assert length > 0 and (w, h) == (64, 96), name   # thumb: upright dims
+        _assert_heic_rotated_quadrants(
+            _thumb_qimage(cache, cache.files.index(name)))
+        _assert_heic_rotated_quadrants(load_original(str(root / name), 0))
+        # The facade's in-process still route: Qt yields null for HEIC,
+        # the pillow_qimage fallback runs -- same orientation contract.
+        transport = decodefacade.InProcessTransport()
+        _assert_heic_rotated_quadrants(
+            transport.decode(str(root / name), route="still", edge=0))
+
+
 def test_file_types_cache_key_and_walk_seam(tmp_path: Path) -> None:
     """The File Types choice folds into cache identity exactly like
     ScanFilter.cache_key: the default choice keys "" (existing cache dirs
