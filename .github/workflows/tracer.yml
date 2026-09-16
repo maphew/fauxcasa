@@ -48,7 +48,7 @@ jobs:
         run: uv run scripts/fetch-test-datasets.py iptc-reference
       - name: Dataset-gated metadata tests
         run: uv run apps/desktop-python/test_inmeta_datasets.py -q
-      - name: Unit tests
+      - name: Unit tests (one pytest process per file)
         run: uv run apps/desktop-python/test_tracer.py
       - name: Generate a smoke library
         shell: bash

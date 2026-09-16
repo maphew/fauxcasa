@@ -83,6 +83,11 @@ uv run scripts/check-ingest-parity.py
 uv run scripts/perf-canary.py
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_inmeta_datasets.py -q   # self-skips without cache/test-datasets (uv run scripts/fetch-test-datasets.py)
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py              # tracer.yml runs it without -q
+# thin wrapper (fauxcasa-l09): one pytest process per apps/desktop-python/tests/test_*.py;
+# run one file directly with:
+# QT_QPA_PLATFORM=offscreen uv run --with pytest --with PySide6 --with pillow --with pi-heif \
+#   --with exiv2 --with rawpy --with av --with zstandard python -m pytest apps/desktop-python/tests/test_x.py
+# Adding a test means adding it to the matching tests/test_<module>_*.py, not to test_tracer.py itself.
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_sandbox_e2e.py -q       # tracer.yml, Windows leg only
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q
 

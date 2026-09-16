@@ -32,10 +32,12 @@ promotion epic when promotion starts.
 1. **M1 gate green.** The §9 M1 gate (N4 budgets on the 100k synthetic
    library, survey cross-check zero-loss, owner confirmation on the family
    archive) passes. Promotion never front-runs the milestone it closes.
-2. **Name and home.** The code moves out of `apps/desktop-python/` into the
-   product's real home (final path decided at promotion; `apps/` implies a
-   sibling experiment that no longer exists). One rename commit, history
-   preserved (`git mv`).
+2. ~~**Name and home.** The code moves out of `apps/desktop-python/` into
+   the product's real home (final path decided at promotion; `apps/`
+   implies a sibling experiment that no longer exists). One rename commit,
+   history preserved (`git mv`).~~ **Dropped 2026-09-16** (fauxcasa-l09,
+   arch review section 7.4): the directory name is fine, the rename buys
+   users nothing.
 3. **APP_NAME honored everywhere.** The spec's name note says the app name
    is a single swappable constant. Audit: window titles, cache directory
    names (`cache/tracer-cache/`), config keys, bundle/installer names, CI
@@ -51,12 +53,14 @@ promotion epic when promotion starts.
    application" paragraph is replaced by product framing. The deliberate
    tracer-shortcuts section converts to beads (each shortcut either
    graduates to a tracked debt or is closed as product-accepted).
-6. **CI renamed and preserved.** `tracer.yml` (and its job/artifact names)
+6. ~~**CI renamed and preserved.** `tracer.yml` (and its job/artifact names)
    follows the rename; the gate matrix (ubuntu + windows) carries over
-   unchanged. Bundle smoke stays green through the move.
-7. **Test suite carried whole.** `test_tracer.py` moves and keeps passing.
-   Splitting the monolith is *not* a promotion criterion — it's ordinary
-   refactoring, allowed before or after.
+   unchanged. Bundle smoke stays green through the move.~~ **Dropped
+   2026-09-16** (fauxcasa-l09, arch review section 7.4): tied to item 2's
+   rename, dropped for the same reason.
+7. **Test suite split by module.** Tests live in `apps/desktop-python/tests/`
+   split by module under test with a shared `conftest.py`, run one pytest
+   process per file; done 2026-09-16 (fauxcasa-l09).
 8. **Beads bookkeeping.** A promotion epic exists; per-file/-surface renames
    and the checklist above are its children; the tracer README's shortcut
    list is reconciled against open beads so nothing labeled "shortcut" is
@@ -101,9 +105,14 @@ Status against the gate checklist:
   replaced with product framing, and the "Deliberate tracer shortcuts"
   section is now "Known simplifications (tracked)", each item tagged with
   its bead or `product-accepted`.
-- **Items 2 (rename out of `apps/desktop-python/`), 4 (`tr()` i18n
-  externalization pass), 6 (CI rename), and 7 (test suite carried whole)**
-  — deferred to the 0.2 promotion PR. Nothing in 0.1 depends on them.
+- **Item 4 (`tr()` i18n externalization pass)** — deferred; scheduled with
+  the main.py split (fauxcasa-4tu).
+- **Items 2 (rename out of `apps/desktop-python/`) and 6 (CI rename)** —
+  dropped 2026-09-16 (fauxcasa-l09, arch review section 7.4): the directory
+  name is fine, the rename buys users nothing.
+- **Item 7 (test suite carried whole)** — done 2026-09-16: split into
+  `apps/desktop-python/tests/` by module under test with a shared
+  `conftest.py`, one pytest process per file (fauxcasa-l09).
 
 **Waiver of the same-PR rule (Sequencing note, above).** That rule ties the
 rename (item 2) and the README flip (item 5) to one PR, so no commit range
