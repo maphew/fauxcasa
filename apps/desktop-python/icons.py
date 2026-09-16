@@ -137,6 +137,19 @@ def _draw_zoom_large(painter: QPainter, color: QColor) -> None:
     painter.drawRoundedRect(QRectF(2, 2, 12, 12), 1.2, 1.2)
 
 
+def _draw_search(painter: QPainter, color: QColor) -> None:
+    # Magnifier: a circle in the upper-left ~60% of the box, a short
+    # diagonal handle running to the lower-right corner.
+    pen = painter.pen()
+    pen.setColor(color)
+    pen.setWidthF(1.6)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawEllipse(QRectF(1.5, 1.5, 8, 8))
+    painter.drawLine(QPointF(8.2, 8.2), QPointF(13.5, 13.5))
+
+
 _GLYPHS = {
     "library": _draw_library,
     "back": _draw_back,
@@ -149,6 +162,7 @@ _GLYPHS = {
     "clock": _draw_clock,
     "zoom_small": _draw_zoom_small,
     "zoom_large": _draw_zoom_large,
+    "search": _draw_search,
 }
 
 

@@ -1996,6 +1996,19 @@ class MainWindow(QMainWindow):
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(360)
         self.search.textChanged.connect(self._search_changed)
+        # fauxcasa-e2y: on the dark palette the plain QLineEdit read as
+        # empty toolbar space (owner finding in the rc2 manual pass) — no
+        # PlaceholderText role and no frame contrast from Fusion. Give it
+        # a minimum width, a magnifier glyph, and a border scoped to this
+        # widget only (palette roles, so it also holds under a future
+        # light palette — fauxcasa-6y0).
+        self.search.setMinimumWidth(220)
+        self.search_glyph_action = self.search.addAction(
+            icons.make_icon("search", theme.TEXT_MUTED),
+            QLineEdit.ActionPosition.LeadingPosition)
+        self.search.setStyleSheet(
+            "QLineEdit { border: 1px solid palette(mid); border-radius: 3px;"
+            " padding: 2px 4px; background: palette(base); color: palette(text); }")
         bar.addWidget(self.search)
         bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
         bar.addWidget(QLabel("Zoom"))

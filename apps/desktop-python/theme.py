@@ -73,6 +73,7 @@ HEADER_RULE = QColor(58, 58, 58)     # 1px lighter top rule
 CAPTION_BG = QColor(0, 0, 0, 170)
 CAPTION_FG = QColor(220, 220, 220)
 HINT_FG = QColor(120, 120, 120)
+FIELD_BORDER = QColor(96, 96, 96)    # border for text fields on dark chrome; must stay clearly lighter than WINDOW
 
 
 def dark_palette() -> QPalette:
@@ -85,7 +86,9 @@ def dark_palette() -> QPalette:
     screenshots actually exercise (Window/WindowText/Base/AlternateBase/
     Text/Button/ButtonText/Highlight/HighlightedText/Link/ToolTipBase/
     ToolTipText) plus the Disabled group, so a disabled action or an
-    offline sidebar row dims instead of vanishing into the dark surface."""
+    offline sidebar row dims instead of vanishing into the dark surface.
+    Also sets PlaceholderText and Mid so the toolbar search box reads as
+    an editable field rather than empty chrome (fauxcasa-e2y)."""
     pal = QPalette()
     pal.setColor(QPalette.ColorRole.Window, WINDOW)
     pal.setColor(QPalette.ColorRole.WindowText, TEXT)
@@ -99,6 +102,8 @@ def dark_palette() -> QPalette:
     pal.setColor(QPalette.ColorRole.Link, TEAL)
     pal.setColor(QPalette.ColorRole.ToolTipBase, SURFACE)
     pal.setColor(QPalette.ColorRole.ToolTipText, TEXT)
+    pal.setColor(QPalette.ColorRole.PlaceholderText, TEXT_MUTED)
+    pal.setColor(QPalette.ColorRole.Mid, FIELD_BORDER)
 
     disabled = QPalette.ColorGroup.Disabled
     for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,

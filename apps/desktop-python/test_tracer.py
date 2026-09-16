@@ -5267,6 +5267,44 @@ def test_search_degenerate_queries(search_library: Path) -> None:
     win.search.setText("beach -")              # half-typed negation: ignored
     assert _hits(win) == {"sunset.jpg", "dunes.jpg"}
     assert "Search" in win.counts_label.text()
+
+
+def test_dark_palette_search_affordance_roles() -> None:
+    """dark_palette() sets PlaceholderText/Mid so the toolbar search box
+    has visible placeholder text and a frame that reads against WINDOW —
+    FIELD_BORDER itself must stay clearly lighter than WINDOW
+    (fauxcasa-e2y: the field was reading as empty toolbar space)."""
+    _offscreen_app()
+    from PySide6.QtGui import QPalette
+
+    import theme
+
+    pal = theme.dark_palette()
+    R = QPalette.ColorRole
+    assert pal.color(R.PlaceholderText) == theme.TEXT_MUTED
+    assert pal.color(R.Mid) == theme.FIELD_BORDER
+    assert theme.FIELD_BORDER.lightness() - theme.WINDOW.lightness() >= 60
+
+
+def test_search_box_announces_itself(search_library: Path) -> None:
+    """The search box carries a minimum width, a leading magnifier glyph,
+    and a border stylesheet scoped to itself (palette roles, so it also
+    holds under a future light palette) — the fix for the owner's rc2
+    finding that the search field read as empty toolbar space
+    (fauxcasa-e2y). Durable references only (win.search,
+    win.search_glyph_action) — no findChildren re-discovery, a known
+    shiboken wrapper heisenbug in this repo."""
+    win = _search_win(search_library)
+
+    assert win.search.minimumWidth() >= 220
+    style = win.search.styleSheet()
+    assert "border" in style
+    assert "palette(mid)" in style
+    assert not win.search_glyph_action.icon().isNull()
+    assert win.search_glyph_action in win.search.actions()
+    assert "-term excludes" in win.search.placeholderText()
+
+
 def test_grid_decodes_dpr_scaled_v2_level(tmp_path: Path) -> None:
     """fauxcasa-q7m: the grid's decode worker reads the v2 level chosen by the
     DPR-scaled native edge, then caps the tile to that edge. At native 256
