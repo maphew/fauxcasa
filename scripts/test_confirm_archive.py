@@ -6,6 +6,7 @@
 #   "pillow",
 #   "piexif",
 #   "av",
+#   "exiv2",
 # ]
 # ///
 """Tests for confirm-archive.py (fauxcasa-ed5.8, M1 gate clause 3 vehicle).
@@ -47,6 +48,7 @@ def _load(name: str, filename: str):
 
 ca = _load("confirm_archive", "confirm-archive.py")
 msl = _load("make_synthetic_library", "make-synthetic-library.py")
+cip = _load("check_ingest_parity", "check-ingest-parity.py")
 
 import catalog
 import picasa_db
@@ -654,6 +656,29 @@ def test_db3_join_survives_case_mismatch(scanned):
     by_name = {r.name: r for r in ca.compare(ref, mutated).rows}
     assert by_name["db3_video_dims"].verdict == "ok"
     assert by_name["db3_video_filetype"].verdict == "ok"
+
+
+# --------------------------------------------------------------------------
+# 14. Generator re-run into the same root stays parity-gate-green
+# (fauxcasa-za8 review round 1)
+# --------------------------------------------------------------------------
+
+
+def test_regenerating_extras_corpus_in_place_keeps_ingest_parity_green(
+        tmp_path: Path) -> None:
+    """make_extras_library() must be safe to call twice into the SAME
+    root -- e.g. `check-ingest-parity.py --keep` or a developer re-running
+    the generator over an existing cache/synthetic-library-extras/. Before
+    the fix, embed_test_metadata's non-idempotent XMP write meant the
+    SECOND generator run silently wiped the faces_in_xmp fixture's XMP
+    faces (photo00.jpg oscillating between 2 and 0 XMP regions by run
+    parity), and check-ingest-parity.py's gate failed the second run with
+    a phantom 'faces_in_xmp: ingest loss -- reference 2, tracer 0' --
+    a regression in the FIXTURE, not the tracer it was meant to guard."""
+    root = tmp_path / "corpus"
+    msl.make_extras_library(root)
+    msl.make_extras_library(root)  # regenerate in place, same root
+    assert cip.run_gate(root) == 0
 
 
 if __name__ == "__main__":

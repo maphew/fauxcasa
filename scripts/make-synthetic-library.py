@@ -5,6 +5,7 @@
 #   "pillow",
 #   "piexif",
 #   "av",
+#   "exiv2",
 # ]
 # ///
 """Generate a synthetic photo library at cache/synthetic-library/ for
@@ -50,7 +51,12 @@ flush) db3 mirror would: both video clips (imagedata filetype 0x08/0x09,
 THUMBINDEX_FILE_TYPES in picasa_db.py), three stills with dims, one photo
 whose db3 caption fills an ini gap, and one whose db3 caption
 diverges from its ini caption (the two §4 precedence outcomes exercised by
-check-ingest-parity.py's db3_caption_precedence class).
+check-ingest-parity.py's db3_caption_precedence class), plus an mwg-rs
+RegionInfo XMP overlay (fauxcasa-za8) on top of Beach Day's photo00.jpg —
+one region exactly overlapping its existing ini faces= rect (the
+merge-by-geometry MATCH path, thumbcache._merge_xmp_faces) and a second,
+non-overlapping XMP-only region (the ADDED path) — exercised by
+check-ingest-parity.py's faces_in_xmp class.
 The corpus ships a manifest.json of ground-truth expected counts.
 The default / --scale / --benchmark outputs are byte-for-byte unchanged
 by this profile (existing benchmark caches bind to library digests).
@@ -59,6 +65,7 @@ by this profile (existing benchmark caches bind to library digests).
 import argparse
 import random
 import struct
+import sys
 from pathlib import Path
 
 import piexif
@@ -404,6 +411,82 @@ ALBUM_UNKNOWN = "d4e5f60718293a4b5c6d7e8f90a1b2c3"  # albums= refs, no def anywh
 
 EXTRAS_DBID = "0164eaeacdd4046f5c1e44522fe44527"  # synthetic, forensicir shape
 
+# faces-in-XMP fixture (fauxcasa-za8): a named constant, not a repeated
+# literal, so the ini faces= line below and the XMP overlay computed from
+# it (_embed_faces_in_xmp) can never drift apart. This is CONTACT_ALICE's
+# rect64 on Beach Day's photo00.jpg (decodes to left=0.2481, top=0.3586,
+# right=0.3486, bottom=0.5196 -- picasa_db.parse_rect64).
+_ALICE_FACE_RECT64 = "3f845bcb59418507"
+FACES_XMP_REL = "2009-07-04 Beach Day/photo00.jpg"
+# Differs from Alice's ini/[Contacts2] display name on purpose: exercises
+# the "in-file XMP name wins tier-1 over the ini name" half of
+# thumbcache._merge_xmp_faces' matched-by-geometry path.
+FACES_XMP_MATCH_NAME = "Alice InFile"
+FACES_XMP_ADDED_NAME = "Xmp Only Face"  # no ini counterpart anywhere
+
+
+def _rects_close(a: tuple[float, float, float, float],
+                 b: tuple[float, float, float, float], tol: float = 1e-6) -> bool:
+    return all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
+def _embed_faces_in_xmp(path: Path) -> None:
+    """Overlay one mwg-rs RegionInfo XMP region exactly on top of Alice's
+    existing ini faces=rect64(_ALICE_FACE_RECT64) region on `path` (IoU
+    1.0, comfortably over thumbcache._merge_xmp_faces' 0.5 match
+    threshold -- the MATCHED path) plus a second, non-overlapping
+    XMP-only region with no ini counterpart at all (the ADDED path).
+    fauxcasa-za8: the ingest-parity gate's faces_in_xmp class exercises
+    both in one photo, not just a raw face-count delta, so a merge that
+    lands on the right TOTAL count via the wrong rule would still be
+    caught.
+
+    Short-circuits when `path` already carries exactly these two regions
+    (fauxcasa-za8 review round 1): make_extras_library calls this
+    UNCONDITIONALLY, not gated by the photo's own skip-if-exists check
+    (see its call site), specifically so a stale corpus predating this
+    fixture self-heals on a re-run -- but embed_test_metadata still does
+    real exiv2 I/O on every call otherwise, and re-embedding is belt-and-
+    suspenders safe rather than assumed-idempotent: it re-checks the
+    ACTUAL bytes on disk instead of trusting embed_test_metadata's own
+    idempotency fix never regresses.
+
+    Lazy metareader/picasa_db import: this is the only --picasa-extras
+    step that needs exiv2 (embed_test_metadata raises loudly if it's
+    unavailable -- a broken fixture must fail the generator, not degrade
+    quietly), so the default / --scale / --benchmark profiles never pay
+    for it."""
+    desktop_python = str(Path(__file__).resolve().parent.parent
+                         / "apps" / "desktop-python")
+    if desktop_python not in sys.path:
+        sys.path.insert(0, desktop_python)
+    import metareader  # noqa: PLC0415 (deliberate lazy import, see above)
+    import picasa_db  # noqa: PLC0415
+
+    left, top, right, bottom = picasa_db.parse_rect64(_ALICE_FACE_RECT64)
+    x, y = (left + right) / 2, (top + bottom) / 2
+    w, h = right - left, bottom - top
+    added_rect = (0.85 - 0.05, 0.15 - 0.05, 0.85 + 0.05, 0.15 + 0.05)
+
+    raw = path.read_bytes()
+    existing = metareader.read_file_meta(raw).faces
+    if len(existing) == 2 \
+            and _rects_close(existing[0][0], (left, top, right, bottom)) \
+            and existing[0][1] == FACES_XMP_MATCH_NAME \
+            and _rects_close(existing[1][0], added_rect) \
+            and existing[1][1] == FACES_XMP_ADDED_NAME:
+        return  # already planted -- no need to touch the file again
+
+    data = metareader.embed_test_metadata(
+        raw,
+        faces=[
+            (FACES_XMP_MATCH_NAME, x, y, w, h),               # overlaps Alice's ini rect
+            (FACES_XMP_ADDED_NAME, 0.85, 0.15, 0.10, 0.10),   # far corner, no overlap
+        ],
+    )
+    path.write_bytes(data)
+
+
 # Per-folder plan: (folder name, (y, m, d), photo count, ini lines or None).
 # Ini lines are joined with CRLF; None means "no sidecar in this folder".
 _EXTRAS_FOLDERS: list[tuple[str, tuple[int, int, int], int, list[str] | None]] = [
@@ -428,7 +511,7 @@ _EXTRAS_FOLDERS: list[tuple[str, tuple[int, int, int], int, list[str] | None]] =
             "date=2020-06-15T10:00:00-07:00",
             "[photo00.jpg]",
             "star=yes",
-            f"faces=rect64(3f845bcb59418507),{CONTACT_ALICE}",
+            f"faces=rect64({_ALICE_FACE_RECT64}),{CONTACT_ALICE}",
             f"albums={ALBUM_AGREE}",
             "[photo01.jpg]",
             "caption=Sunset over the bay",
@@ -798,6 +881,8 @@ _EXTRAS_EXPECTED = {
     "db3_video_dims": 2,      # both video clips indexed with matching dims
     "db3_video_filetype": 2,  # both video clips, imagedata filetype 0x08/0x09
     "db3_caption_precedence": 2,  # photo00 gap-fill + photo01 ini conflict
+    # ---- faces-in-XMP (fauxcasa-za8, mwg-rs RegionInfo) --------------------
+    "faces_in_xmp": 2,        # 1 matched-by-geometry + 1 added, see FACES_XMP_*
 }
 
 
@@ -807,7 +892,13 @@ def make_extras_library(root: Path | None = None) -> Path:
     Deterministic and self-contained: photos via make_photo_fast (same
     EXIF scheme as --scale), metadata from the fixed plan above. Existing
     photo files are kept (same skip-if-exists behavior as other profiles);
-    sidecars/manifest are always rewritten so plan edits propagate.
+    sidecars/manifest are always rewritten so plan edits propagate. ONE
+    exception (fauxcasa-za8): the FACES_XMP_REL photo's in-file XMP is
+    always re-checked (_embed_faces_in_xmp), even when the file itself was
+    kept -- a self-heal so a corpus directory generated before this
+    fixture existed still picks it up on a re-run; it short-circuits to a
+    no-op once the regions already match, so re-running against an
+    already-current corpus does not rewrite the file's bytes.
     """
     import json
 
@@ -827,6 +918,10 @@ def make_extras_library(root: Path | None = None) -> Path:
             (d / ".picasa.ini").write_bytes(
                 ("\r\n".join(ini_lines) + "\r\n").encode("utf-8")
             )
+    # fauxcasa-za8: unconditional (not skip-if-exists like the photo writes
+    # above) so a cached corpus directory predating this fixture still
+    # picks up the XMP overlay on a re-run.
+    _embed_faces_in_xmp(library / FACES_XMP_REL)
     for folder, name, hue_idx in _EXTRAS_VIDEOS:
         f = library / folder / name
         if not f.exists():
@@ -860,6 +955,14 @@ def make_extras_library(root: Path | None = None) -> Path:
         "contacts_xml_ids": [CONTACT_ALICE, CONTACT_BOB, CONTACT_EVE],
         "contacts_ini_ids": [CONTACT_ALICE, CONTACT_BOB, CONTACT_CAROL,
                              CONTACT_PAD],
+        # fauxcasa-za8: identifiers for the faces_in_xmp class, so
+        # check-ingest-parity.py never hardcodes a second copy of them.
+        "faces_in_xmp": {
+            "rel": FACES_XMP_REL,
+            "ini_contact_id": CONTACT_ALICE,
+            "match_name": FACES_XMP_MATCH_NAME,
+            "added_name": FACES_XMP_ADDED_NAME,
+        },
     }
     (root / "manifest.json").write_text(
         json.dumps(manifest, indent=1), encoding="utf-8"

@@ -7056,6 +7056,30 @@ def test_metareader_reads_faces_xmp() -> None:
     assert rect2 == pytest.approx((0.625, 0.475, 0.775, 0.725))
 
 
+def test_embed_test_metadata_faces_is_idempotent() -> None:
+    """fauxcasa-za8 regression: embed_test_metadata(faces=...) called TWICE
+    on the same bytes must yield the same faces the second time, not an
+    empty RegionList. Before the fix, xmp.add()'s second Bag left the
+    RegionList ambiguous and exiv2 serialized it as empty on write --
+    reproduced live by scripts/make-synthetic-library.py's generator
+    re-run wiping its own faces-in-XMP fixture. Also proves a THIRD call
+    (and a stale applied_dims from the first call not leaking into a
+    second call that omits it) stay clean."""
+    faces = [("Ada Test", 0.40, 0.35, 0.20, 0.30),
+             (None, 0.70, 0.60, 0.15, 0.25)]
+    once = metareader.embed_test_metadata(
+        _jpeg_bytes(), faces=faces, applied_dims=(64, 48))
+    fm_once = metareader.read_file_meta(once)
+    assert len(fm_once.faces) == 2
+
+    twice = metareader.embed_test_metadata(once, faces=faces)
+    fm_twice = metareader.read_file_meta(twice)
+    assert fm_twice.faces == fm_once.faces
+
+    thrice = metareader.embed_test_metadata(twice, faces=faces)
+    assert metareader.read_file_meta(thrice).faces == fm_once.faces
+
+
 def test_metareader_reads_caption_keywords_faces_tiff() -> None:
     """A TIFF carrier (fauxcasa-cam.5: RAW/TIFF containers) round-trips
     caption, keywords, and a face region through the same exiv2 seam."""

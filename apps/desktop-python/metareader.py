@@ -298,6 +298,10 @@ def _parse_subject(value: str | None) -> tuple[str, ...]:
 _INVERSE_ORIENTATION = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 8, 7: 7, 8: 6}
 
 _MWG_APPLIED_DIMS = "Xmp.mwg-rs.Regions/mwg-rs:AppliedToDimensions"
+# The struct both of the above live under -- embed_test_metadata's erase
+# step (fauxcasa-za8) clears this ONE key to drop the whole mwg-rs Regions
+# subtree (RegionList + AppliedToDimensions) in one eraseFamily call.
+_MWG_REGIONS_STRUCT = "Xmp.mwg-rs.Regions"
 
 
 def _parse_mwg_faces(xmp: dict[str, str], orientation: int = 1,
@@ -611,7 +615,16 @@ def embed_test_metadata(data: bytes, *,
     name=None omits mwg-rs:Name entirely, matching a real unnamed/
     suggested region). The Bag container itself must exist before any
     indexed sub-key can be assigned (XMP Toolkit error 102 "Indexing
-    applied to non-array" otherwise) — built once, on first use.
+    applied to non-array" otherwise) — built once, on first use. IDEMPOTENT
+    (fauxcasa-za8): `data` may already carry a RegionList from a prior
+    embed_test_metadata(faces=...) call on the same bytes (e.g. a
+    generator re-run over a cached fixture) -- xmp.add() APPENDS a second
+    Bag rather than replacing the first, and exiv2 then serializes the
+    now-ambiguous RegionList as empty, silently dropping every face. The
+    whole mwg-rs Regions subtree (RegionList + AppliedToDimensions) is
+    erased first so the result is identical whether this is the first or
+    Nth call with the same faces (see test_embed_test_metadata_faces_is_
+    idempotent in test_tracer.py).
 
     applied_dims -> mwg-rs:AppliedToDimensions (stDim:w/h, unit "pixel"):
     plant it deliberately mismatched from the fixture's real stored pixel
@@ -647,6 +660,17 @@ def embed_test_metadata(data: bytes, *,
             for kw in keywords:
                 xmp[_SUBJECT_KEY] = kw
         if faces:
+            # Idempotency (fauxcasa-za8): drop any Regions subtree already
+            # in `data` before adding a fresh Bag -- see the docstring.
+            # eraseFamily on the STRUCT key removes RegionList and
+            # AppliedToDimensions together in one call; found independently
+            # (not assumed nested) since exiv2's in-memory shape differs
+            # slightly from what a round-tripped-through-bytes packet
+            # re-parses as.
+            for stale_key in (_MWG_REGIONLIST, _MWG_REGIONS_STRUCT):
+                pos = xmp.findKey(exiv2.XmpKey(stale_key))
+                if pos != xmp.end():
+                    xmp.eraseFamily(pos)
             if applied_dims is not None:
                 aw, ah = applied_dims
                 xmp[f"{_MWG_APPLIED_DIMS}/stDim:w"] = str(aw)
