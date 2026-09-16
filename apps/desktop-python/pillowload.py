@@ -243,28 +243,35 @@ def heif_container_transform(data: bytes) -> bool | None:
         if primary is None or ipma is None:
             return None
         s, e = ipma
+        if s + 8 > e:
+            return None
         version = data[s]
         flags = data[s + 3]
         entry_count = struct.unpack_from(">I", data, s + 4)[0]
         p = s + 8
         bound: list[int] | None = None
+        # Every read below is bounded by the ipma box's own end `e`: a
+        # shrunken or truncated ipma must read as None, never as a
+        # verdict built from whatever bytes happen to follow it.
         for _ in range(entry_count):
-            if version < 1:
-                item_id = struct.unpack_from(">H", data, p)[0]
-                p += 2
-            else:
-                item_id = struct.unpack_from(">I", data, p)[0]
-                p += 4
+            id_len = 2 if version < 1 else 4
+            if p + id_len + 1 > e:
+                return None
+            item_id = struct.unpack_from(">H" if id_len == 2 else ">I",
+                                         data, p)[0]
+            p += id_len
             count = data[p]
             p += 1
+            idx_len = 2 if flags & 1 else 1
+            if p + count * idx_len > e:
+                return None
             idxs = []
             for _ in range(count):
-                if flags & 1:
+                if idx_len == 2:
                     idxs.append(struct.unpack_from(">H", data, p)[0] & 0x7FFF)
-                    p += 2
                 else:
                     idxs.append(data[p] & 0x7F)
-                    p += 1
+                p += idx_len
             if item_id == primary:
                 bound = idxs
                 break
