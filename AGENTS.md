@@ -104,6 +104,7 @@ QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_inmeta_datasets.py -q 
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py              # tracer.yml runs it without -q
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_sandbox_e2e.py -q       # tracer.yml, Windows leg only
 QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q
+uv run apps/desktop-python/test_inisidecar.py -q                                 # pure stdlib, no Qt (fauxcasa-lgg.1)
 
 # local-only gate (not a CI job): no beads-jsonl pollution —
 # .beads/issues.jsonl must stay untracked, so this command must FAIL

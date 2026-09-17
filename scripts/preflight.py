@@ -16,6 +16,8 @@ Checks (derived from .github/workflows/tests.yml and tracer.yml):
   - uv run scripts/test_delegation_report.py -q
   - uv run scripts/test_picasa_db.py -q
   - uv run scripts/test_confirm_archive.py -q
+  - uv run apps/desktop-python/test_inisidecar.py -q
+    (pure stdlib, no Qt -- fauxcasa-lgg.1 ini write-layer skeleton)
   - uv run scripts/check-ingest-parity.py
   - uv run scripts/make-heic-exif-only-fixture.py --check
     (fauxcasa-zq9 HEIC orientation fixtures pinned; instant)
@@ -132,6 +134,14 @@ def checks(root: Path, fast: bool) -> list[dict]:
             "command": ["uv", "run", "scripts/test_confirm_archive.py", "-q"],
             "cwd": root,
             "env": None,
+        },
+        {
+            "name": "inisidecar tests",
+            "command": ["uv", "run", "apps/desktop-python/test_inisidecar.py", "-q"],
+            "cwd": root,
+            "env": None,
+            # pure stdlib, no Qt (fauxcasa-lgg.1) -- unlike the
+            # apps/desktop-python suites below, no QT_QPA_PLATFORM needed.
         },
         {
             "name": "ingest-parity gate",
