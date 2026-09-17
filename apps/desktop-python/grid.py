@@ -286,26 +286,46 @@ def prefetch_margin(viewport_w: int, viewport_h: int, tile_px: int,
     rows_per_side = (max_band_tiles - visible) // cols // 2
     return min(int(viewport_h * PREFETCH_SCREENS), rows_per_side * cell)
 
-# Colors are theme.py's named constants (fauxcasa-ez2.4): module-level
-# aliases here so the paint code below (and callers/tests that import
-# these names off `grid`, e.g. grid.STAR_GOLD, grid.GEO_TEAL) don't need
-# to change. See theme.py for the palette and the ACCENT color decision.
-PLACEHOLDER = theme.PLACEHOLDER
-ERROR_TILE = theme.ERROR_TILE
-BACKGROUND = theme.WINDOW
-HEADER_BG = theme.HEADER_BG
-HEADER_FG = theme.HEADER_FG
-HEADER_RULE = theme.HEADER_RULE       # 1px lighter top rule (fauxcasa-ez2.4)
-SELECT = theme.ACCENT
-SELECT_SOFT = theme.ACCENT_SOFT       # translucent gutter fill under selection
-HOVER_OUTLINE = theme.HOVER_OUTLINE
-STAR_GOLD = theme.STAR
-STAR_OUTLINE = theme.STAR_OUTLINE     # 1px dark outline so gold reads on gold/yellow photos
-GEO_TEAL = theme.GEOTAG  # geotag badge (fauxcasa-cam.10)
-PLAY_WHITE = theme.PLAY_WHITE  # video play badge (fauxcasa-v46.2)
-HEADER_PLAY = theme.PLAY   # group header play button (fauxcasa-q6l.16)
-HIDDEN_VEIL = theme.HIDDEN_VEIL  # reveal mode: dim hidden/stash tiles
-TEXT_MUTED = theme.TEXT_MUTED
+# Colors are theme.py's named constants (fauxcasa-ez2.4). Paint code below
+# reads theme.X directly (not a snapshot) so a runtime scheme switch
+# (fauxcasa-6y0, theme.apply_scheme()) repaints correctly on the very next
+# frame. External callers/tests still know these tiles by their own names
+# (e.g. grid.STAR_GOLD, grid.GEO_TEAL, grid.BACKGROUND) — module __getattr__
+# (PEP 562) resolves those live off theme.py's current globals instead of a
+# value captured at import time.
+_THEME_ALIASES = {
+    "PLACEHOLDER": "PLACEHOLDER",
+    "ERROR_TILE": "ERROR_TILE",
+    "BACKGROUND": "WINDOW",
+    "HEADER_BG": "HEADER_BG",
+    "HEADER_FG": "HEADER_FG",
+    "HEADER_RULE": "HEADER_RULE",       # 1px lighter top rule (fauxcasa-ez2.4)
+    "SELECT": "ACCENT",
+    "SELECT_SOFT": "ACCENT_SOFT",       # translucent gutter fill under selection
+    "HOVER_OUTLINE": "HOVER_OUTLINE",
+    "STAR_GOLD": "STAR",
+    "STAR_OUTLINE": "STAR_OUTLINE",     # 1px dark outline so gold reads on gold/yellow photos
+    "GEO_TEAL": "GEOTAG",  # geotag badge (fauxcasa-cam.10)
+    "PLAY_WHITE": "PLAY_WHITE",  # video play badge (fauxcasa-v46.2)
+    "HEADER_PLAY": "PLAY",   # group header play button (fauxcasa-q6l.16)
+    "HIDDEN_VEIL": "HIDDEN_VEIL",  # reveal mode: dim hidden/stash tiles
+    "TEXT_MUTED": "TEXT_MUTED",
+}
+
+
+def __getattr__(name):
+    theme_name = _THEME_ALIASES.get(name)
+    if theme_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(theme, theme_name)
+
+
+def __dir__():
+    # PEP 562's other half: without this, dir(grid) / tab-completion never
+    # lists the alias names since they aren't real module attributes.
+    return sorted(set(globals()) | set(_THEME_ALIASES))
+
+
 # Width (px) of the play-glyph hit area at the right end of every group header
 # (fauxcasa-q6l.16). Chosen to be comfortably clickable while leaving enough
 # label space; constant so hit-test and draw use the same geometry.
@@ -316,10 +336,13 @@ HEADER_PLAY_W = 22
 # at a glance); the CURRENT item gets the stronger 3px border; a current
 # item the user Ctrl-toggled OUT of the set keeps a dashed focus cue so
 # keyboard navigation never goes invisible.
-PEN_SELECTED = QPen(SELECT, 2)
-PEN_CURRENT = QPen(SELECT, 3)
-PEN_FOCUS = QPen(SELECT, 1, Qt.PenStyle.DashLine)
-PEN_HOVER = QPen(HOVER_OUTLINE, 1)
+# ACCENT is identical in both schemes (see theme.py), so these three
+# pens don't need to be rebuilt on a scheme switch — but HOVER_OUTLINE is
+# NOT (dark: white@102, light: black@102), so PEN_HOVER is built fresh at
+# each paint (~1497) instead of being a module constant here.
+PEN_SELECTED = QPen(theme.ACCENT, 2)
+PEN_CURRENT = QPen(theme.ACCENT, 3)
+PEN_FOCUS = QPen(theme.ACCENT, 1, Qt.PenStyle.DashLine)
 # How far the selection halo (soft fill + outline) reaches into the PAD
 # gutter around a tile (fauxcasa-ez2.4): PAD is 8, so 4 leaves each tile's
 # own half of the gutter without ever touching its neighbor's.
@@ -471,7 +494,7 @@ class _JumpButton(QToolButton):
         super().paintEvent(event)  # hover/pressed chrome from the style
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(HEADER_FG, 2)
+        pen = QPen(theme.HEADER_FG, 2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
@@ -494,7 +517,7 @@ class _HeaderRule(QWidget):
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
-        painter.fillRect(self.rect(), HEADER_RULE)
+        painter.fillRect(self.rect(), theme.HEADER_RULE)
         painter.end()
 
 
@@ -1321,7 +1344,7 @@ class GridView(QAbstractScrollArea):
         self.wanted = frozenset(idx for _g, _n, idx in band)
 
         painter = QPainter(vp)
-        painter.fillRect(vp.rect(), BACKGROUND)
+        painter.fillRect(vp.rect(), theme.WINDOW)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         # One Antialiasing hint for the whole frame (fauxcasa-ez2.4 UX
         # audit: badges, the header play glyph, and selection/hover chrome
@@ -1336,7 +1359,7 @@ class GridView(QAbstractScrollArea):
             # No automatic wording (main.py picks copy per view) — just
             # make sure an empty display doesn't paint literally nothing
             # (fauxcasa-ez2.4 UX audit).
-            painter.setPen(TEXT_MUTED)
+            painter.setPen(theme.TEXT_MUTED)
             painter.drawText(vp.rect(), Qt.AlignmentFlag.AlignCenter,
                              self.empty_text)
 
@@ -1359,12 +1382,12 @@ class GridView(QAbstractScrollArea):
                 halo = r.adjusted(-m, -m, m, m)
                 ring = QRegion(halo).subtracted(QRegion(r))
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(SELECT_SOFT)
+                painter.setBrush(theme.ACCENT_SOFT)
                 for ring_rect in ring:  # QRegion iterates its rectangles
                     painter.drawRect(ring_rect)
             t = self.tiles.get(idx)
             if t is None:
-                painter.fillRect(r, PLACEHOLDER)
+                painter.fillRect(r, theme.PLACEHOLDER)
                 blank = True
             elif t[0] is None:
                 self._draw_error_tile(painter, r, self.catalog.photos[idx].name)
@@ -1431,15 +1454,15 @@ class GridView(QAbstractScrollArea):
             # Reveal mode shows hidden=yes / stash files; veil them so they
             # read as not-normally-shown (star + selection stay on top).
             if self.reveal and not photo.visible:
-                painter.fillRect(r, HIDDEN_VEIL)
+                painter.fillRect(r, theme.HIDDEN_VEIL)
             if photo.star:
                 # count >= 1 shows the badge (star is 0-5 now; the exact
                 # count reads out in the status bar / viewer info line).
                 # A 1px dark outline (fauxcasa-ez2.4 UX audit) so the gold
                 # fill still reads as a star over a gold/yellow photo.
                 s = max(7.0, self.tile / 14.0)
-                painter.setPen(QPen(STAR_OUTLINE, 1))
-                painter.setBrush(STAR_GOLD)
+                painter.setPen(QPen(theme.STAR_OUTLINE, 1))
+                painter.setBrush(theme.STAR)
                 painter.drawPolygon(_star_polygon(
                     r.right() - s - 2, r.y() + s + 2, s))
             if photo.geotag is not None:
@@ -1448,7 +1471,7 @@ class GridView(QAbstractScrollArea):
                 # M2 reject badge will claim a third.
                 s = max(7.0, self.tile / 14.0)
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(GEO_TEAL)
+                painter.setBrush(theme.GEOTAG)
                 painter.drawPolygon(_pin_polygon(
                     r.right() - s - 2, r.bottom() - s - 2, s))
             if photo.media == "video":
@@ -1458,7 +1481,7 @@ class GridView(QAbstractScrollArea):
                 # geotag pin bottom-right.
                 s = max(7.0, self.tile / 14.0)
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(PLAY_WHITE)
+                painter.setBrush(theme.PLAY_WHITE)
                 painter.drawPolygon(_play_polygon(
                     r.x() + s + 2, r.bottom() - s - 2, s))
             # Multi-select paint (fauxcasa-q6l.1): the translucent ACCENT
@@ -1467,8 +1490,11 @@ class GridView(QAbstractScrollArea):
             # (dashed focus cue if Ctrl-toggled out of the set); an
             # unselected hovered tile gets a plain hover ring
             # (fauxcasa-ez2.4 UX audit: the old 1px hairline was too faint
-            # to read at a glance, and hover had no feedback at all). Pens
-            # are module constants — no per-tile allocation.
+            # to read at a glance, and hover had no feedback at all).
+            # PEN_SELECTED/CURRENT/FOCUS are module constants (ACCENT is
+            # shared by both schemes) — no per-tile allocation for those;
+            # the hover pen is built here, per paint, since HOVER_OUTLINE
+            # itself differs between schemes (fauxcasa-6y0).
             if is_cur:
                 painter.setPen(PEN_CURRENT if in_sel else PEN_FOCUS)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1478,7 +1504,7 @@ class GridView(QAbstractScrollArea):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(r.adjusted(-1, -1, 1, 1))
             elif idx == self._hover_idx:
-                painter.setPen(PEN_HOVER)
+                painter.setPen(QPen(theme.HOVER_OUTLINE, 1))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(r.adjusted(-1, -1, 0, 0))
 
@@ -1507,8 +1533,8 @@ class GridView(QAbstractScrollArea):
         drop it silently), the item count right-aligned before the play
         glyph, and a 1px HEADER_RULE top rule separating this band from
         whatever scrolled up above it."""
-        painter.fillRect(0, y, width, HEADER_H, HEADER_BG)
-        painter.setPen(HEADER_RULE)
+        painter.fillRect(0, y, width, HEADER_H, theme.HEADER_BG)
+        painter.setPen(theme.HEADER_RULE)
         painter.drawLine(0, y, width, y)
 
         # Play glyph: right-pointing triangle at the right of the header
@@ -1518,7 +1544,7 @@ class GridView(QAbstractScrollArea):
         cy = y + HEADER_H // 2
         play_r = HEADER_H * 0.28
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(HEADER_PLAY)
+        painter.setBrush(theme.PLAY)
         painter.drawPolygon(_play_polygon(cx, cy, play_r))
 
         base_font = painter.font()
@@ -1528,7 +1554,7 @@ class GridView(QAbstractScrollArea):
         count_w = base_fm.horizontalAdvance(count_text) + PAD
         count_x = width - PAD - HEADER_PLAY_W - count_w
         painter.setFont(base_font)
-        painter.setPen(HEADER_FG)
+        painter.setPen(theme.HEADER_FG)
         painter.drawText(QRect(count_x, y, count_w, HEADER_H),
                          Qt.AlignmentFlag.AlignVCenter
                          | Qt.AlignmentFlag.AlignRight, count_text)
@@ -1540,7 +1566,7 @@ class GridView(QAbstractScrollArea):
         title_avail = max(0, count_x - PAD - PAD)
         title_text = _elide(title_fm, g.title, title_avail)
         painter.setFont(title_font)
-        painter.setPen(HEADER_FG)
+        painter.setPen(theme.HEADER_FG)
         painter.drawText(QRect(PAD, y, title_avail, HEADER_H),
                          Qt.AlignmentFlag.AlignVCenter, title_text)
 
@@ -1550,7 +1576,7 @@ class GridView(QAbstractScrollArea):
             desc_text = _elide(base_fm, g.description, desc_w)
             if desc_text:
                 painter.setFont(base_font)
-                painter.setPen(TEXT_MUTED)
+                painter.setPen(theme.TEXT_MUTED)
                 painter.drawText(QRect(desc_x, y, desc_w, HEADER_H),
                                  Qt.AlignmentFlag.AlignVCenter, desc_text)
 
@@ -1559,19 +1585,23 @@ class GridView(QAbstractScrollArea):
         """An undecodable entry (fauxcasa-ez2.4 UX audit: used to be a
         flat maroon square with no other information) — the fill, plus a
         simple broken-image glyph and the elided filename so the tile at
-        least says WHICH photo failed."""
-        painter.fillRect(r, ERROR_TILE)
+        least says WHICH photo failed. The filename reads in theme.TEXT
+        (not TEXT_MUTED, fauxcasa-6y0 Opus review): the light ERROR_TILE
+        vs TEXT_MUTED pairing only cleared 2.94:1, under the 3:1 floor;
+        the glyph outline stays TEXT_MUTED, which the retuned ERROR_TILE
+        clears at 3.57:1."""
+        painter.fillRect(r, theme.ERROR_TILE)
         pad = max(6, r.width() // 6)
         frame = QRect(r.x() + pad, r.y() + pad,
                      max(1, r.width() - 2 * pad),
                      max(1, r.height() - 2 * pad - 14))
         if frame.width() > 4 and frame.height() > 4:
-            painter.setPen(QPen(TEXT_MUTED, 2))
+            painter.setPen(QPen(theme.TEXT_MUTED, 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(frame)
             painter.drawLine(frame.topLeft(), frame.center())
             painter.drawLine(frame.center(), frame.bottomRight())
-        painter.setPen(TEXT_MUTED)
+        painter.setPen(theme.TEXT)
         fm = painter.fontMetrics()
         label = fm.elidedText(name, Qt.TextElideMode.ElideMiddle,
                               max(0, r.width() - 8))

@@ -15,6 +15,7 @@ from tracer_helpers import (
     _click,
     _offscreen_app,
     _press,
+    _search_win,
     _selection_grid,
     make_jpeg,
 )
@@ -137,6 +138,161 @@ def test_theme_dark_palette_sets_expected_roles() -> None:
     disabled = QPalette.ColorGroup.Disabled
     for role in (R.WindowText, R.Text, R.ButtonText):
         assert pal.color(disabled, role) == theme.TEXT_MUTED
+
+
+# ---------- light/dark theme, window level (fauxcasa-6y0) ----------
+
+
+def test_theme_menu_and_persistence(search_library: Path, monkeypatch) -> None:
+    """View > Theme (fauxcasa-6y0): an exclusive System/Light/Dark radio
+    group, "system" checked by default, driving theme.apply_mode plus
+    persistence through _save_theme_mode/_load_theme_mode — monkeypatched
+    here to a plain dict so the test never touches the real per-user
+    config.json. _set_theme_mode/_toggle_theme keep the radio group in
+    sync and apply the QApplication palette; restores "dark" in a
+    finally."""
+    import main
+    import theme
+    from PySide6.QtGui import QPalette
+    from PySide6.QtWidgets import QApplication
+
+    store: dict[str, str] = {}
+    monkeypatch.setattr(main, "_load_theme_mode",
+                        lambda cache_root: store.get("theme", "system"))
+    monkeypatch.setattr(
+        main, "_save_theme_mode",
+        lambda cache_root, mode: store.__setitem__("theme", mode))
+    win = None
+    try:
+        win = _search_win(search_library)
+        assert win.theme_mode == "system"
+        assert win.theme_menu is not None
+        assert len(win.theme_actions) == 3
+        assert [a.data() for a in win.theme_actions] == \
+            ["system", "light", "dark"]
+        assert [a.data() for a in win.theme_actions if a.isChecked()] == \
+            ["system"]
+
+        win.show()  # grab() below needs an actual paint
+        QApplication.instance().processEvents()
+
+        win._set_theme_mode("light")
+        QApplication.instance().processEvents()
+        assert QApplication.instance().palette().color(
+            QPalette.ColorRole.Window).getRgb()[:3] == (240, 240, 240)
+        assert theme.current_scheme() == "light"
+        assert store["theme"] == "light"
+        assert [a.data() for a in win.theme_actions if a.isChecked()] == \
+            ["light"]
+        # Qt resolves a QSS palette(…) function against the QApplication
+        # palette AT setStyleSheet() time and CACHES it (Opus review
+        # finding): the search box's border would stay the OLD scheme's
+        # FIELD_BORDER forever without _refresh_theme's clear-then-
+        # reset-the-same-sheet trick. Probe the actual rendered pixel at
+        # the box's left edge, not just the sheet text, so a regression
+        # that re-breaks the cache (e.g. skipping the clear step) fails
+        # this test even though the sheet STRING never changes.
+        h = win.search.height()
+        border_px = win.search.grab().toImage().pixelColor(0, h // 2)
+        assert border_px.getRgb()[:3] == theme.FIELD_BORDER.getRgb()[:3]
+
+        win._toggle_theme()
+        assert theme.current_scheme() == "dark"
+        assert store["theme"] == "dark"
+        assert [a.data() for a in win.theme_actions if a.isChecked()] == \
+            ["dark"]
+    finally:
+        theme.apply_mode(QApplication.instance(), "dark")
+        if win is not None:
+            win.hide()
+
+
+def test_theme_toggle_shortcut_from_keymap(search_library: Path) -> None:
+    """The View > Theme > Toggle Light/Dark action's real QAction
+    shortcuts come from the keymap (fauxcasa-6y0) — never hard-coded,
+    the same rule app.play/app.info follow."""
+    import keymap
+
+    win = _search_win(search_library)
+    assert win.theme_toggle_menu_action.shortcuts() == \
+        keymap.shortcuts("app.theme_toggle")
+
+
+def test_refresh_theme_preserves_selected_view(search_library: Path,
+                                               tmp_path: Path) -> None:
+    """_refresh_theme()'s _rebuild_sidebar() call must be bracketed with
+    _selected_view()/_reselect_view() like every other rebuild call site
+    (_toggle_reveal, _toggle_folder_view, ...) — Opus review blocker:
+    without the bracket, switching theme (or the OS flipping scheme at
+    sunset via colorSchemeChanged) silently reset the current view back
+    to All photos (fauxcasa-6y0).
+
+    Built with an explicit tmp cache_root because _set_theme_mode below
+    persists the mode to self.cache_root, exactly as _remember_library
+    does (main.py, _change_library) — a MainWindow method writing the
+    user's choice to its own cache root is the established behavior, so
+    the fix is to give the TEST a cache root of its own instead of
+    making persistence conditional. Without it this test merge-wrote the
+    theme key into the developer's real config.json (fauxcasa-6y0
+    review)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+
+    import theme
+
+    try:
+        win = _search_win(search_library, cache_root=tmp_path / "cr")
+        it = QTreeWidgetItemIterator(win.tree)
+        folder_item = None
+        while it.value():
+            data = it.value().data(0, Qt.ItemDataRole.UserRole)
+            if data is not None and data[0] == "folder":
+                folder_item = it.value()
+                break
+            it += 1
+        assert folder_item is not None, "search_library has no folder item"
+        win._sidebar_clicked(folder_item, 0)
+        before = win._selected_view()
+        assert before[0] == "folder"
+
+        win._refresh_theme()
+        assert win._selected_view() == before
+
+        win._set_theme_mode("light")
+        assert win._selected_view() == before
+    finally:
+        theme.apply_mode(QApplication.instance(), "dark")
+
+
+def test_on_os_color_scheme_changed_respects_mode(
+        search_library: Path) -> None:
+    """MainWindow._on_os_color_scheme_changed (fauxcasa-6y0), the
+    QStyleHints.colorSchemeChanged slot: in "system" mode it re-resolves
+    against the real app.styleHints().colorScheme() (offscreen always
+    reports Unknown -> "dark" — see resolve_scheme), so calling it from
+    "light" flips to "dark"; in an explicit "light"/"dark" mode it must
+    be a complete no-op, leaving the scheme untouched. Called directly
+    (a bound-method slot, not a closure) rather than faking a real
+    QStyleHints signal emission."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    import theme
+
+    try:
+        win = _search_win(search_library)
+
+        win.theme_mode = "system"
+        theme.apply_scheme("light")
+        win._on_os_color_scheme_changed(Qt.ColorScheme.Dark)
+        assert theme.current_scheme() == "dark"
+
+        win.theme_mode = "light"
+        theme.apply_scheme("light")
+        win._on_os_color_scheme_changed(Qt.ColorScheme.Dark)
+        assert theme.current_scheme() == "light"  # untouched: not "system"
+    finally:
+        theme.apply_mode(QApplication.instance(), "dark")
 
 
 def test_grid_empty_text_paints_only_when_set(tmp_path: Path) -> None:

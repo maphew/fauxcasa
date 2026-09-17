@@ -30,13 +30,18 @@ nothing partial is left behind) unless --finish-build holds the quit
 until the build lands (raise --timeout for bigger libraries). For
 deterministic warm runs at scale, pre-build with
 scripts/make-thumbcache.py and adopt via --thumbs.
+
+Persistence readers/writers (per-user config, per-library view prefs,
+window geometry, stars) live in librarystate.py — see its docstring.
+Argument parsing, the standalone subcommands and the scripted-run state
+machine (ScriptedRun) live in cli.py; the folder/albums/people sidebar
+lives in sidebar.py (fauxcasa-4tu). main.py re-exports the moved names
+tests and scripts reach as `main.<name>`.
 """
 
 from __future__ import annotations
 
-import argparse
 import calendar
-import html
 import importlib
 import json
 import os
@@ -70,7 +75,6 @@ if sys.argv[1:] == ["--decode-worker"]:
     sys.exit(decodesvc_worker_win.worker_entrypoint())
 
 from PySide6.QtCore import (
-    QByteArray,
     QObject,
     QProcess,
     QSize,
@@ -84,7 +88,6 @@ from PySide6.QtGui import (
     QIcon,
     QKeySequence,
     QPainter,
-    QPalette,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -148,17 +151,17 @@ from filetypes import (  # noqa: E402
     save_excluded_exts,
 )
 from grid import (  # noqa: E402
-    DEFAULT_SORT_MODE,
-    SORT_MODES,
     CompositeThumbCache,
     GridView,
     _date_sort_key,
     folder_key,
 )
+import cli  # noqa: E402
 import icons  # noqa: E402
 from inspector import InspectorPanel  # noqa: E402
 import keymap  # noqa: E402
 import library  # noqa: E402
+import sidebar  # noqa: E402
 import volumes  # noqa: E402
 from thumbcache import (  # noqa: E402
     THUMB_EDGE,
@@ -183,6 +186,48 @@ from starstore import (  # noqa: E402
 )
 from tray import SelectionTray  # noqa: E402
 from viewer import ViewerPage  # noqa: E402
+
+# Re-export block (fauxcasa-4tu): these names used to be DEFINED in this
+# module and moved to librarystate.py; this import is the compatibility
+# surface tests and scripts rely on when they reach for main.<name> or
+# `from main import <name>` — no other call site in this file should
+# import librarystate a second time.
+from librarystate import (  # noqa: E402,F401  (re-export surface for tests and scripts)
+    _config_path,
+    _config_update,
+    _default_window_size,
+    _is_filesystem_root,
+    _library_config_path,
+    _migrate_library_state,
+    _remember_library,
+    _remembered_library,
+    library_state_dir,
+    load_folder_view,
+    load_sort_modes,
+    load_star_min,
+    load_window_geometry,
+    save_folder_view,
+    save_sort_modes,
+    save_star_min,
+    save_window_geometry,
+)
+# Same re-export contract as the librarystate block above, for the names
+# fauxcasa-4tu stage 2 moved to cli.py: main.<name>/`from main import
+# <name>` compatibility for tests and scripts.
+from cli import (  # noqa: E402,F401  (re-export surface for tests and scripts)
+    _parse_image_size_arg,
+    run_search_probe,
+    select_sidebar_view,
+)
+# Same re-export contract again, for the names fauxcasa-4tu stage 3 moved
+# to sidebar.py. ElidingLabel is NOT here: it stays defined in main.py
+# (MainWindow's status-bar labels use it too, not just the sidebar).
+from sidebar import (  # noqa: E402,F401  (re-export surface for tests and scripts)
+    _OFFLINE_DRIVE_NAME_MAX_CHARS,
+    _offline_root_labels,
+    _plain_tooltip,
+    _single_root_offline_message,
+)
 
 import applog  # noqa: E402
 
@@ -209,6 +254,36 @@ try:
     from _buildinfo import BUILD_DATE, GIT_SHA  # type: ignore[import-not-found]
 except ImportError:
     GIT_SHA = BUILD_DATE = ""
+
+
+def _load_theme_mode(cache_root: Path) -> str:
+    """The user's theme MODE ("system"/"light"/"dark") from the same
+    per-user config.json as _remembered_library, default "system"
+    (fauxcasa-6y0). Tolerates a missing/garbage config or an unrecognized
+    value the same way _remembered_library does — theme choice is a
+    convenience, not a gate. Called only from main() (never from
+    MainWindow.__init__, which takes the already-resolved mode as a
+    kwarg instead — a test/tool building a MainWindow with cache_root=
+    None must never read the developer's own real config.json)."""
+    try:
+        data = json.loads(_config_path(cache_root).read_text())
+    except (OSError, ValueError):
+        return "system"
+    if not isinstance(data, dict):
+        return "system"
+    mode = data.get("theme")
+    if mode not in theme.MODES:
+        return "system"
+    return mode
+
+
+def _save_theme_mode(cache_root: Path, mode: str) -> None:
+    """Persist the theme MODE, merging into the existing config.json
+    without disturbing the 'library' key or any other key already
+    there. Best-effort: a write failure must never abort the session."""
+    err = _config_update(cache_root, "theme", mode)
+    if err is not None:
+        log.warning("could not remember theme choice: %s", err)
 
 
 def version_string() -> str:
@@ -386,330 +461,6 @@ def _default_library() -> Path | None:
     return REPO / "cache" / "synthetic-library"
 
 
-def _config_path(cache_root: Path) -> Path:
-    """Per-user config, beside (never inside) the per-library cache dirs —
-    cache_dir_for() names those by a 16-hex digest, so 'config.json' is
-    collision-free."""
-    return cache_root / "config.json"
-
-
-def _remembered_library(cache_root: Path) -> Path | None:
-    """The library chosen on a previous (frozen) run, if it still exists on
-    disk; a vanished one is ignored so the app re-prompts. Tolerates a
-    missing or garbage config file — recall is a convenience, not a gate."""
-    try:
-        data = json.loads(_config_path(cache_root).read_text())
-    except (OSError, ValueError):
-        return None
-    # A valid-but-non-object JSON value ('null', '42', '[]') parses fine but
-    # has no .get — guard it here, else the AttributeError escapes the
-    # (OSError, ValueError) catch and crashes the launch instead of being
-    # treated as 'nothing remembered'.
-    if not isinstance(data, dict):
-        return None
-    lib = data.get("library")
-    if not isinstance(lib, str) or not lib:
-        return None
-    p = Path(lib)
-    if not p.is_dir():
-        return None
-    if _is_filesystem_root(p):
-        log.warning("ignoring remembered filesystem root library: %s", p)
-        return None
-    return p
-
-
-def _is_filesystem_root(path: Path) -> bool:
-    """True for anchors such as '/', 'C:\\', and UNC share roots.
-
-    Opening a whole volume as a photo library makes the first-run picker vanish
-    while startup recursively scans the OS tree before the main window exists.
-    """
-    try:
-        p = path.resolve()
-    except OSError:
-        p = path.absolute()
-    return p.parent == p
-
-
-def _remember_library(cache_root: Path, library: Path) -> None:
-    """Persist the chosen library so the next no-arg (double-click) launch
-    reopens it. Best-effort: a write failure must never abort the launch.
-    Writes via a per-process temp sibling + os.replace so a second frozen
-    instance launching concurrently can never read a half-written (torn)
-    config — it sees either the old file or the whole new one.
-
-    Reads the existing doc first and only overwrites the 'library' key —
-    filetypes.save_excluded_exts persists per-library File Types
-    exclusions in this same config.json (see filetypes.py's
-    preserved-keys contract), and a blind overwrite here would wipe them
-    on every library switch. Fail-soft on a garbage/missing file: keep
-    whatever raw keys survive parsing, same posture as
-    _remembered_library and save_excluded_exts."""
-    cfg = _config_path(cache_root)
-    tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
-    try:
-        data = json.loads(cfg.read_text())
-    except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    data["library"] = str(library)
-    try:
-        cache_root.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data))
-        os.replace(tmp, cfg)
-    except OSError as e:
-        log.warning("could not remember library choice: %s", e)
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-
-
-# Per-folder sort modes (fauxcasa-q6l.11) — DURABLE-HOME DECISION
-# (2026-07-02): a per-folder sort mode is a VIEW preference of a read-only
-# app, so it lives MACHINE-LOCAL in a per-LIBRARY config.json inside that
-# library's own state dir (library_state_dir() names the dir by a digest
-# of the library identity, so the prefs follow the library without
-# touching it, N1 — and, since fauxcasa-6vk finding 2, without following
-# the WALK: a File-Types change must not lose the user's sort choices).
-# N3 says durable state lives in the library, and Picasa's MANUAL sort
-# order is on the rebuild-loss regression list — but
-# v1's date/name/size modes are recomputable views, not user-authored
-# order (manual mode IS user-authored, and is blocked on the missing db3
-# oracle fixture — out of scope here), so losing this file costs one
-# right-click, not data. REVISIT AT M2: when tier-2 library-home state
-# lands (the albums order file), sort modes may move there so a library
-# carries its view prefs between machines.
-def _library_config_path(state_dir: Path) -> Path:
-    """Machine-local per-library view prefs, in the library STATE dir
-    (variant-free — fauxcasa-6vk finding 2; for a default walk that is
-    the same directory catalog.json lives in). The name
-    'config.json' is collision-free there (catalog.json,
-    thumbs.fcache, import-report.json) and mirrors the per-user config.json
-    at the cache ROOT (_config_path) in shape and fail-soft handling."""
-    return state_dir / "config.json"
-
-
-def _read_library_config(state_dir: Path) -> dict:
-    """Read the raw per-library config dict, or {} on any failure.
-    View prefs are a convenience, never a gate."""
-    try:
-        data = json.loads(_library_config_path(state_dir).read_text())
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _write_library_config(state_dir: Path, data: dict) -> None:
-    """Persist the per-library config atomically via temp-sibling + os.replace.
-    Best-effort: a write failure never breaks the session."""
-    cfg = _library_config_path(state_dir)
-    tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
-    try:
-        state_dir.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data))
-        os.replace(tmp, cfg)
-    except OSError as e:
-        log.warning("could not persist library config: %s", e)
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-
-
-def load_sort_modes(state_dir: Path | None) -> dict[str, str]:
-    """The persisted per-folder sort modes (folder rel-path -> mode), or {}.
-    Tolerates a missing/garbage file, a non-object document, and unknown
-    mode values (dropped) — view prefs are a convenience, never a gate.
-    Default-mode entries are dropped too: absent == DEFAULT_SORT_MODE."""
-    if state_dir is None:
-        return {}
-    modes = _read_library_config(state_dir).get("sort_modes")
-    if not isinstance(modes, dict):
-        return {}
-    return {rel: mode for rel, mode in modes.items()
-            if isinstance(rel, str) and mode in SORT_MODES
-            and mode != DEFAULT_SORT_MODE}
-
-
-def save_sort_modes(state_dir: Path | None, modes: dict[str, str]) -> None:
-    """Persist the non-default per-folder sort modes. Best-effort and
-    torn-proof via temp-sibling + os.replace. Merges into the existing config
-    doc so other view prefs (folder_view_flat) survive the write."""
-    if state_dir is None:
-        return  # no state dir (tests, degraded runs): session-only modes
-    keep = {rel: mode for rel, mode in sorted(modes.items())
-            if mode in SORT_MODES and mode != DEFAULT_SORT_MODE}
-    doc = _read_library_config(state_dir)
-    doc["sort_modes"] = keep
-    _write_library_config(state_dir, doc)
-
-
-def load_star_min(state_dir: Path | None) -> int:
-    """The persisted star-threshold predicate (fauxcasa-q6l.20 clause a):
-    0 ("Any", off) through 5. Tolerates missing/garbage config and an
-    out-of-range value — view prefs are a convenience, never a gate.
-    Absent/invalid == 0."""
-    if state_dir is None:
-        return 0
-    v = _read_library_config(state_dir).get("star_min")
-    return v if isinstance(v, int) and not isinstance(v, bool) \
-        and 0 <= v <= 5 else 0
-
-
-def save_star_min(state_dir: Path | None, star_min: int) -> None:
-    """Persist the star-threshold predicate. Best-effort and torn-proof.
-    Merges into the existing config so sort_modes/folder_view_flat
-    survive the write. The default (0/Any) is stored as absent, not 0."""
-    if state_dir is None:
-        return
-    doc = _read_library_config(state_dir)
-    if 0 < star_min <= 5:
-        doc["star_min"] = star_min
-    else:
-        doc.pop("star_min", None)
-    _write_library_config(state_dir, doc)
-
-
-def load_folder_view(state_dir: Path | None) -> bool:
-    """Whether the folder sidebar should use flat (True) or tree (False) mode.
-    Default False (tree). Tolerates missing/garbage config — view prefs are
-    a convenience, never a gate. Absent key == tree (False)."""
-    if state_dir is None:
-        return False
-    v = _read_library_config(state_dir).get("folder_view_flat")
-    return bool(v) if isinstance(v, bool) else False
-
-
-def save_folder_view(state_dir: Path | None, flat: bool) -> None:
-    """Persist the flat/tree folder sidebar choice. Best-effort and
-    torn-proof. Merges into the existing config so sort_modes survives.
-    The default (tree/False) is stored as absent, not False."""
-    if state_dir is None:
-        return
-    doc = _read_library_config(state_dir)
-    if flat:
-        doc["folder_view_flat"] = True
-    else:
-        doc.pop("folder_view_flat", None)
-    _write_library_config(state_dir, doc)
-
-
-def _default_window_size() -> tuple[int, int]:
-    """min(1280, 0.9 * available width) x min(800, 0.9 * available height)
-    (fauxcasa-ez2.6 §6): the v1 baseline 1280x800 fit fine on a normal
-    monitor but spilled off-screen on a small laptop display — this scales
-    down to the actual screen instead. Falls back to the bare 1280x800
-    baseline when no primary screen is reported (rare; some CI/offscreen
-    setups)."""
-    screen = QApplication.primaryScreen()
-    if screen is None:
-        return 1280, 800
-    avail = screen.availableGeometry()
-    return (min(1280, round(avail.width() * 0.9)),
-            min(800, round(avail.height() * 0.9)))
-
-
-def load_window_geometry(state_dir: Path | None) -> QByteArray | None:
-    """The persisted QWidget.saveGeometry() blob (base64 in config.json),
-    decoded back to a QByteArray, or None if absent/garbage. View prefs
-    are a convenience, never a gate — QByteArray.fromBase64 never raises
-    (invalid input just decodes to something restoreGeometry() rejects),
-    but an empty/near-empty result is treated as absent so the caller
-    falls straight to the freshly computed default size."""
-    if state_dir is None:
-        return None
-    b64 = _read_library_config(state_dir).get("window_geometry")
-    if not isinstance(b64, str) or not b64:
-        return None
-    data = QByteArray.fromBase64(b64.encode("ascii"))
-    return data if data.size() > 0 else None
-
-
-def save_window_geometry(state_dir: Path | None, geometry: QByteArray) -> None:
-    """Persist QWidget.saveGeometry() as base64, merged into the existing
-    config doc so sort_modes/folder_view_flat survive the write."""
-    if state_dir is None:
-        return
-    doc = _read_library_config(state_dir)
-    doc["window_geometry"] = bytes(geometry.toBase64()).decode("ascii")
-    _write_library_config(state_dir, doc)
-
-
-def library_state_dir(library_key: str, cache_root: Path) -> Path:
-    """The VARIANT-FREE per-library directory that holds user CHOICES —
-    stars.json and the view-prefs config.json (fauxcasa-6vk finding 2).
-
-    `cache_dir_for(library_key, cache_root, variant)` keys the disposable
-    cache on the WALK (scan filter + excluded extensions) so a different
-    walk gets a different thumbs/catalog pair. That is right for derived
-    data and wrong for user choices: changing File Types or
-    --min-image-size would otherwise hide every star the user has set.
-    Passing no variant returns the same directory the default walk uses,
-    so a plain single-variant library keeps one directory for both.
-    """
-    return cache_dir_for(library_key, cache_root)
-
-
-def _migrate_library_state(cache_dir: Path | None,
-                           state_dir: Path | None) -> None:
-    """Adopt user state left in a VARIANT cache dir into the variant-free
-    state dir (fauxcasa-6vk finding 2), so testers who starred photos
-    while running with a File-Types/scan-size variant keep those stars.
-
-    A MERGE, not a one-shot copy (Codex cross-vendor review): a tester who
-    starred photos on the default walk AND more photos under a variant has
-    state in BOTH places, so "skip if the base file already exists" would
-    silently drop every variant-only choice. Every key the base does not
-    have is adopted; every key it does have WINS, because the base dir is
-    where this build has been writing. Per-photo for stars and per-folder
-    for sort modes — the granularity the user actually chose at.
-
-    Idempotent (a second launch finds nothing left to adopt and writes
-    nothing), copy-never-move (the variant file stays where an older build
-    would still find it), and best-effort: state is a convenience."""
-    if state_dir is None or cache_dir is None or state_dir == cache_dir:
-        return
-    try:
-        variant_stars = load_star_overrides(cache_dir)
-        if variant_stars:
-            stars = load_star_overrides(state_dir)
-            adopted = {k: v for k, v in variant_stars.items()
-                       if k not in stars}
-            if adopted:
-                stars.update(adopted)
-                save_star_overrides(state_dir, stars)
-                log.info("adopted %d star choice(s) from %s",
-                         len(adopted), cache_dir)
-        variant_cfg = _read_library_config(cache_dir)
-        if variant_cfg:
-            doc = _read_library_config(state_dir)
-            merged = dict(doc)
-            changed = False
-            for key, value in variant_cfg.items():
-                if key not in merged:
-                    merged[key] = value           # e.g. folder_view_flat
-                    changed = True
-                elif (key == "sort_modes" and isinstance(value, dict)
-                        and isinstance(merged[key], dict)):
-                    # Per-FOLDER merge: the sort-mode analogue of the
-                    # per-photo star merge above — a folder sorted only
-                    # under the variant must not be lost just because some
-                    # OTHER folder was sorted on the base walk.
-                    extra = {rel: mode for rel, mode in value.items()
-                             if rel not in merged[key]}
-                    if extra:
-                        merged[key] = {**merged[key], **extra}
-                        changed = True
-            if changed:
-                _write_library_config(state_dir, merged)
-                log.info("adopted library view prefs from %s", cache_dir)
-    except OSError as e:
-        log.warning("could not migrate library state: %s", e)
-
-
 def _gui_unavailable() -> bool:
     """Whether a real windowing GUI is reachable — decided from the
     ENVIRONMENT ALONE, before any QApplication is constructed. This matters
@@ -844,7 +595,7 @@ def _prompt_for_library(cache_root: Path) -> Path | None:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
-    app.setPalette(theme.dark_palette())
+    theme.apply_mode(app, _load_theme_mode(cache_root))
     app.setWindowIcon(app_icon())  # the picker dialog is our first window
     # Backstop: an in-process headless platform (e.g. forced offscreen with a
     # DISPLAY present) still can't show a modal — keep this post-construction
@@ -1018,18 +769,10 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Multi-root management CLI actions (fauxcasa-ed5.7.4, bead .d, design §10)
+# --promote / --add-root management CLI actions (fauxcasa-ed5.7.4, bead .d,
+# design §10) — see cli.py's --import-picasa-watched banner for the sibling
+# handler and the shared "not the normal open path" rationale.
 # ---------------------------------------------------------------------------
-#
-# --promote / --add-root / --import-picasa-watched are management
-# operations, not the normal open path: each validates its arguments,
-# performs the on-disk change via library.py, prints a one-line summary,
-# and returns an exit code WITHOUT proceeding to the normal warm/cold-walk
-# open below — opening an explicit multi-root library through the grid/tree
-# is bead .g's scope (the "tree per root" UI); today's open flow only knows
-# how to browse a single Path. Re-running the app afterwards (implicit
-# legacy open for an un-promoted root, or a future explicit-open path once
-# .g lands) picks up the change.
 
 def _cmd_promote(library_arg: str | None, cache_root: Path) -> int:
     """--promote: promote the legacy library named by the positional
@@ -1084,72 +827,6 @@ def _cmd_add_root(library_arg: str | None, cache_root: Path,
     library.save_library(cfg)
     print(f"added root {added.id} ({added.label}) to {home}")
     return 0
-
-
-def _read_watched_list_file(path: Path) -> list[Path]:
-    """One folder path per line; blank lines and '#'-prefixed comments are
-    skipped. Raises OSError if `path` can't be read — the caller turns
-    that into a friendly CLI error."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    return [Path(s) for s in (line.strip() for line in lines)
-            if s and not s.startswith("#")]
-
-
-def _cmd_import_picasa_watched(library_arg: str | None,
-                               listfile: str) -> int:
-    """--import-picasa-watched LISTFILE: create a FRESH library-home at the
-    positional `library` argument from a Picasa watched-folders list.
-    `listfile` is a text file (one path per line, '#' comments), or the
-    literal 'registry' to read Picasa's own HKCU watched-folders list
-    (Windows only; library.picasa_watched_from_registry fails soft with a
-    clear RuntimeError when absent/unsupported, caught here)."""
-    if not library_arg:
-        log.error("--import-picasa-watched requires a library-home path "
-                  "as the positional argument")
-        return 2
-    home = Path(library_arg).expanduser().resolve()
-
-    if listfile == "registry":
-        try:
-            folders = library.picasa_watched_from_registry()
-        except RuntimeError as e:
-            log.error(str(e))
-            return 2
-    else:
-        try:
-            folders = _read_watched_list_file(Path(listfile))
-        except OSError as e:
-            log.error("cannot read %s: %s", listfile, e)
-            return 2
-
-    skipped: list[str] = []
-    cfg = library.import_picasa_watched(folders, home, name=home.name,
-                                        skipped=skipped)
-    for msg in skipped:
-        log.warning("picasa import: skipped %s", msg)
-    if not cfg.roots:
-        log.error("no usable watched folders found — nothing imported")
-        return 2
-    library.save_library(cfg)
-    for r in cfg.roots:
-        library.write_root_marker(r.path.resolve(), r.id)  # fail-soft
-    print(f"imported {len(cfg.roots)} root(s) into {cfg.home}")
-    return 0
-
-
-def _parse_image_size_arg(value: str) -> tuple[int, int]:
-    raw = value.strip().lower()
-    sep = "x" if "x" in raw else ","
-    parts = raw.split(sep, 1)
-    if len(parts) != 2:
-        raise argparse.ArgumentTypeError("expected WIDTHxHEIGHT")
-    try:
-        width, height = (int(parts[0]), int(parts[1]))
-    except ValueError as e:
-        raise argparse.ArgumentTypeError("expected WIDTHxHEIGHT") from e
-    if width <= 0 or height <= 0:
-        raise argparse.ArgumentTypeError("WIDTH and HEIGHT must be positive")
-    return width, height
 
 
 def read_rss_mb() -> tuple[float, float]:
@@ -1314,41 +991,6 @@ def _reconcile_online_roots(
     return total, _offline_root_labels(catalog)
 
 
-def _plain_tooltip(text: str) -> str:
-    """Tooltip text that renders LITERALLY (fauxcasa-6vk finding 7).
-
-    QToolTip has no plain-text mode: it hands the string to a QLabel in
-    AutoText, so Qt::mightBeRichText decides — and every tooltip below
-    carries user-authored catalog text (folder/album descriptions, album
-    names, on-disk paths, import-note details). A description of
-    "<img src=http://…>" would be INTERPRETED: the markup swallowed, a
-    broken-image icon shown, an external URL fetched on hover.
-
-    Escaping alone is not the fix: mightBeRichText only notices "&lt;"
-    BEFORE the first newline, and these tooltips are multi-line, so an
-    escaped description on line 2 would show its raw entities instead.
-    Emit explicit HTML with <br> breaks — unambiguously rich text, so
-    every escaped character renders as itself. A string with neither
-    '<' nor '&' can never trip mightBeRichText, so it passes through
-    untouched (the common case: every path-only tooltip)."""
-    if "<" not in text and "&" not in text:
-        return text
-    return "<html>" + "<br>".join(
-        html.escape(line) for line in text.split("\n")) + "</html>"
-
-
-def _folder_tooltip(path, description: str | None) -> str:
-    """Sidebar folder-item tooltip text (fauxcasa-cam.14): the on-disk path
-    (path on demand, per q6l.10) followed by the folder's .picasa.ini
-    [Picasa] description= on its own line when non-empty. Kept as a pure
-    function so all four sidebar shapes (single/multi-root x tree/flat)
-    share one formatting rule instead of drifting."""
-    tip = str(path)
-    if description:
-        tip += "\n" + description
-    return _plain_tooltip(tip)
-
-
 class ElidingLabel(QLabel):
     """A QLabel whose MINIMUM width does not track its text (fauxcasa-a3m).
 
@@ -1492,75 +1134,6 @@ class ElidingLabel(QLabel):
             self.fontMetrics().elidedText(
                 text, self._elide_mode, rect.width()),
             self.foregroundRole())
-
-
-def _offline_root_labels(catalog: Catalog) -> list[str]:
-    """Sidebar/status-bar badge labels for offline roots (design §12, bead
-    .e). Only meaningful once a library actually HAS more than one root —
-    a single-root library going offline has no sensible in-app badge (the
-    grid/viewer would show nothing at all, and today's main.py never even
-    opens a multi-root library — bead .d/.g), so this returns [] whenever
-    `len(catalog.roots) <= 1` even if `offline_ids` happens to be
-    populated. Kept as a pure function (no Qt types) so the offline-badge
-    LOGIC is unit-testable without a QApplication or pixel-level check —
-    per bead .e's brief, "test the logic (offline set) rather than
-    pixels." Does NOT call refresh_offline_ids() itself: callers
-    (load_catalog on open, _reconcile_online_roots on reconcile) already
-    keep `offline_ids` current, and re-stat-ing on every sidebar rebuild
-    would be surprising I/O in a UI-paint path.
-
-    fauxcasa-hi2 item 4: the owner explicitly RATIFIED this single-root
-    suppression on 2026-09-14 rather than lifting it — it is deliberate,
-    not an oversight a future reviewer should "fix" by deleting the
-    `len(catalog.roots) <= 1` guard. `_reconcile_online_roots` below
-    reuses this same function (instead of building its own label list) so
-    the two callers can never drift back out of sync. The real gap that
-    prompted the review finding — a single-root offline library leaving
-    an unexplained empty grid — is closed separately, by
-    `_single_root_offline_message`'s status-bar text (hi2 item 5)."""
-    if len(catalog.roots) <= 1:
-        return []
-    return [r.label or r.path.name or str(r.path)
-            for r in catalog.offline_roots()]
-
-
-# One sentence needs to stay readable in a status bar at ordinary window
-# widths even when a drive's label/folder name is a long real-world path;
-# see _single_root_offline_message's elision below (same middle-ellipsis
-# choice ElidingLabel makes for path-shaped text — fauxcasa-a3m).
-_OFFLINE_DRIVE_NAME_MAX_CHARS = 40
-
-
-def _single_root_offline_message(catalog: Catalog) -> str | None:
-    """The status-bar sentence for the gap `_offline_root_labels`
-    deliberately leaves open (fauxcasa-hi2 item 5): a single-root library
-    whose one root is offline shows an empty grid with no badge to
-    explain it (item 4 keeps that badge suppressed on purpose — there is
-    nothing in the grid to badge). This is the only in-app explanation
-    such a user gets, so callers should prefer it over the raw
-    `_offline_root_labels` badge text whenever it returns non-None.
-
-    Returns None whenever there is nothing to explain this way: a
-    multi-root library (badges are the right surface there — this
-    function only ever covers the single-root case) or a single root
-    that is not offline.
-
-    Deliberately non-technical wording (matches docs/releases/v0.1.0.md's
-    register, not developer phrasing) — never says "root", "catalog",
-    "reconcile", or "offline_ids"."""
-    if len(catalog.roots) > 1:
-        return None
-    offline = catalog.offline_roots()
-    if not offline:
-        return None
-    r = offline[0]
-    name = r.label or r.path.name or str(r.path)
-    if len(name) > _OFFLINE_DRIVE_NAME_MAX_CHARS:
-        keep = (_OFFLINE_DRIVE_NAME_MAX_CHARS - 1) // 2
-        name = f"{name[:keep]}…{name[-keep:]}"
-    return (f'The drive holding these photos, "{name}", isn\'t '
-            f'connected right now; plug it back in and Fauxcasa will '
-            f'pick up where it left off.')
 
 
 def _scan_library_config(
@@ -1782,6 +1355,19 @@ class _BuildBridge(QObject):
     scan_done = Signal(object)
 
 
+# Toolbar search box QSS (fauxcasa-e2y, palette-role — no literal colors —
+# so it holds under both themes). ONE spelling, used at construction and
+# by _refresh_theme (fauxcasa-6y0): Qt resolves a stylesheet's palette(…)
+# functions against the QApplication palette AT setStyleSheet() TIME and
+# caches the result, so a later app.setPalette() (a runtime theme switch)
+# would otherwise leave this one widget a stale-colored island — clearing
+# the sheet and re-setting the SAME text forces Qt to re-resolve it.
+_SEARCH_BOX_QSS = (
+    "QLineEdit { border: 1px solid palette(mid); border-radius: 3px;"
+    " padding: 2px 4px; background: palette(base); color: palette(text); }"
+    " QLineEdit:focus { border: 1px solid palette(highlight); }")
+
+
 class MainWindow(QMainWindow):
     def __init__(self, catalog: Catalog, thumbs: ThumbCache | None,
                  cache_dir: Path | None, build_dir: Path | None,
@@ -1796,7 +1382,8 @@ class MainWindow(QMainWindow):
                  contacts_path: Path | None = None,
                  cfg: library.LibraryConfig | None = None,
                  contacts_sig: tuple[int, int] | None = None,
-                 state_dir: Path | None = None):
+                 state_dir: Path | None = None,
+                 theme_mode: str = "system"):
         super().__init__()
         self.catalog = catalog
         self.cache_dir = cache_dir
@@ -1854,6 +1441,16 @@ class MainWindow(QMainWindow):
         self.cache_root = cache_root or (
             cache_dir.parent if cache_dir is not None else _default_cache_root()
         )
+        # Theme MODE (fauxcasa-6y0): "system" (default)/"light"/"dark". A
+        # constructor KWARG, not read here via _load_theme_mode(self.
+        # cache_root) — a caller with no cache_root (most tests) would
+        # otherwise fall back to _default_cache_root() and read the
+        # DEVELOPER'S OWN real config.json (Opus review). main() is the
+        # only production caller and already resolved + applied the
+        # scheme (theme.apply_mode) before this window exists; this is
+        # only STORED here, for the View > Theme submenu
+        # (_build_theme_menu) to show its initial checked state.
+        self.theme_mode = theme_mode
         self.adopt = adopt
         self.ready_reported = False
         self.build_failed = False
@@ -1917,6 +1514,10 @@ class MainWindow(QMainWindow):
         self._peek_page: PeekPage | None = None
 
         # --- sidebar: All / Starred / Folders / Albums ---
+        # Sidebar logic (fauxcasa-4tu stage 3): self.tree/_flat_check/
+        # _sidebar_panel stay MainWindow attributes (many non-sidebar call
+        # sites read them too); self._sidebar operates on them.
+        self._sidebar = sidebar.Sidebar(self)
         # Flat/tree toggle (fauxcasa-q6l.10): small checkbox above the tree;
         # load the persisted choice before _build_sidebar reads it.
         self.tree = self._new_sidebar_tree()
@@ -1996,15 +1597,35 @@ class MainWindow(QMainWindow):
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(360)
         self.search.textChanged.connect(self._search_changed)
+        # fauxcasa-e2y: on the dark palette the plain QLineEdit read as
+        # empty toolbar space (owner finding in the rc2 manual pass) — no
+        # PlaceholderText role and no frame contrast from Fusion. Give it
+        # a minimum width, a magnifier glyph, and a border scoped to this
+        # widget only. The palette roles resolve against the APPLICATION
+        # palette at the time the sheet is set (Qt caches them), so a
+        # palette chosen at startup holds, but a runtime theme switch
+        # (fauxcasa-6y0) must re-set this sheet and repaint the glyph.
+        # A declared border also silences Fusion's focus frame, hence the
+        # :focus rule — Ctrl+F on an empty box needs a visible landing.
+        # The 220px minimum reflows the toolbar sooner: below ~820px the
+        # Info button moves into the toolbar's >> extension.
+        self.search.setMinimumWidth(220)
+        self.search_glyph_action = self.search.addAction(
+            icons.make_icon("search", theme.TEXT_MUTED),
+            QLineEdit.ActionPosition.LeadingPosition)
+        _search_chords = " / ".join(
+            s.toString() for s in keymap.shortcuts("app.search"))
+        self.search_glyph_action.setToolTip(f"Search ({_search_chords})")
+        self.search.setStyleSheet(_SEARCH_BOX_QSS)
         bar.addWidget(self.search)
         bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
         bar.addWidget(QLabel("Zoom"))
         # Small/large picture glyphs bracket the slider (ez2.14) — a
         # non-interactive visual cue, like the "Zoom" label beside them.
-        zoom_small = QLabel()
-        zoom_small.setPixmap(
+        self.zoom_small_label = QLabel()
+        self.zoom_small_label.setPixmap(
             icons.make_icon("zoom_small", theme.TEXT_MUTED).pixmap(12, 12))
-        bar.addWidget(zoom_small)
+        bar.addWidget(self.zoom_small_label)
         self.zoom = QSlider(Qt.Orientation.Horizontal)
         self.zoom.setRange(64, 256)
         self.zoom.setValue(160)
@@ -2019,10 +1640,10 @@ class MainWindow(QMainWindow):
         self.zoom.valueChanged.connect(
             lambda _v: self._zoom_timer.start())
         bar.addWidget(self.zoom)
-        zoom_large = QLabel()
-        zoom_large.setPixmap(
+        self.zoom_large_label = QLabel()
+        self.zoom_large_label.setPixmap(
             icons.make_icon("zoom_large", theme.TEXT_MUTED).pixmap(16, 16))
-        bar.addWidget(zoom_large)
+        bar.addWidget(self.zoom_large_label)
         bar.addSeparator()   # real spacing (fauxcasa-ez2.6), not a padded label
         self.reveal_box = QCheckBox("Show hidden")
         self.reveal_box.setToolTip(
@@ -2267,7 +1888,7 @@ class MainWindow(QMainWindow):
         # Set by _on_scan_done when the background walk raised (Codex
         # cross-vendor review finding 2): the synchronous cold path let
         # that exception propagate out of main() and crash the process —
-        # never a fake READY. This flag is how main()'s check_ready tells
+        # never a fake READY. This flag is how cli.ScriptedRun.check_ready tells
         # a failed deferred walk apart from a genuinely empty, successful
         # one (both leave the placeholder catalog in place).
         self._scan_failed = False
@@ -2395,6 +2016,9 @@ class MainWindow(QMainWindow):
         self.star_clear_action.triggered.connect(self._menu_clear_stars)
 
         view_menu.addSeparator()
+        self.theme_menu = self._build_theme_menu(view_menu)
+
+        view_menu.addSeparator()
         view_menu.addAction(self.play_action)   # toolbar's "Play" action
 
         help_menu = self.help_menu = menubar.addMenu("&Help")
@@ -2466,6 +2090,138 @@ class MainWindow(QMainWindow):
             self._apply_view(kind, key)
         self.grid.scroll_to_fraction(frac)   # best-effort scroll restore
         self.grid.setFocus()
+
+    # Menu text for each theme-mode radio action (fauxcasa-6y0).
+    THEME_MENU_LABELS: dict[str, str] = {
+        "system": "&System",
+        "light": "&Light",
+        "dark": "&Dark",
+    }
+
+    def _build_theme_menu(self, view_menu: QMenu) -> QMenu:
+        """The View > Theme submenu (fauxcasa-6y0): an exclusive radio
+        group over theme.MODES, the current self.theme_mode checked,
+        copying _build_star_menu's durable-reference pattern
+        (self.theme_menu, self.theme_actions — tests must never
+        re-discover these through findChildren, the pyside-findchildren-
+        wrapper-heisenbug memory). A fourth entry after a separator
+        toggles light/dark directly; its chord text is derived from the
+        keymap (never hard-coded) so it stays truthful if the binding
+        ever changes."""
+        menu = view_menu.addMenu("&Theme")
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self.theme_actions: list[QAction] = []
+        for mode in theme.MODES:
+            act = menu.addAction(self.THEME_MENU_LABELS[mode])
+            act.setCheckable(True)
+            act.setChecked(mode == self.theme_mode)
+            act.setData(mode)
+            group.addAction(act)
+            act.triggered.connect(
+                lambda _checked=False, mode=mode: self._set_theme_mode(mode))
+            self.theme_actions.append(act)
+        menu.addSeparator()
+        # A real QAction shortcut (unlike star_clear_action's text-only
+        # Shift+Space, which a bare-modifier chord CANNOT be — it would
+        # eat keystrokes while typing in the search box): Ctrl+Shift+D is
+        # a modifier chord, safe as a window-level shortcut, so it is
+        # both DISPLAYED (tab-separated, same textual convention as
+        # star_clear_action) and actually BOUND here. self.addAction
+        # keeps it firing even if the View menu is never opened.
+        _toggle_chords = " / ".join(
+            s.toString() for s in keymap.shortcuts("app.theme_toggle"))
+        self.theme_toggle_menu_action = menu.addAction(
+            f"Toggle Light/Dark\t{_toggle_chords}")
+        self.theme_toggle_menu_action.setShortcuts(
+            keymap.shortcuts("app.theme_toggle"))
+        self.theme_toggle_menu_action.triggered.connect(self._toggle_theme)
+        self.addAction(self.theme_toggle_menu_action)
+        return menu
+
+    def _set_theme_mode(self, mode: str) -> None:
+        """Apply + persist the theme MODE (fauxcasa-6y0): sync the View >
+        Theme radio group itself — same direct/programmatic-call-safe
+        pattern as _set_star_min, so a keyboard toggle or a test driving
+        this directly still leaves the menu agreeing with reality —
+        apply the resolved scheme to the QApplication palette, and
+        refresh every piece of chrome that doesn't read theme.X live."""
+        for act in self.theme_actions:
+            act.setChecked(act.data() == mode)
+        self.theme_mode = mode
+        _save_theme_mode(self.cache_root, mode)
+        app = QApplication.instance()
+        theme.apply_mode(app, mode)
+        self._refresh_theme()
+
+    def _toggle_theme(self) -> None:
+        """Ctrl+Shift+D / View > Theme > Toggle Light/Dark (fauxcasa-6y0):
+        flips between explicit "light" and "dark" from the CURRENT
+        EFFECTIVE scheme (theme.current_scheme()), not the mode — so
+        toggling while on "system" picks the opposite of whatever the OS
+        is showing right now, landing on an explicit override either
+        way, matching the bead's "from an effective light go to dark,
+        from dark go to light" rule."""
+        self._set_theme_mode(
+            "dark" if theme.current_scheme() == "light" else "light")
+
+    def _refresh_theme(self) -> None:
+        """Re-paint every piece of chrome that was built FROM theme.X at
+        construction time rather than read live (fauxcasa-6y0): the
+        toolbar glyphs (icons.py bakes a color into the QIcon's pixmap,
+        so re-setting each one is the only way to repaint them), the
+        search box's palette-role stylesheet (Qt resolves a QSS
+        palette(…) function against the QApplication palette AT
+        setStyleSheet() time and caches it — clearing then re-applying
+        the SAME sheet forces a re-resolve against the new palette), the
+        sidebar (rebuilt wholesale, which repaints its own icons.make_icon
+        calls), and the inspector's QSS-styled labels. Finally repaints
+        every top-level widget so the custom-painted surfaces (grid,
+        viewer, tray — all read theme.X live in their own paintEvent)
+        redraw with the new colors on the very next frame."""
+        self.open_action.setIcon(icons.make_icon("library", theme.TEXT))
+        self.back_action.setIcon(icons.make_icon("back", theme.TEXT))
+        self.play_action.setIcon(icons.make_icon("play", theme.PLAY))
+        self.search_glyph_action.setIcon(
+            icons.make_icon("search", theme.TEXT_MUTED))
+        self.search.setStyleSheet("")
+        self.search.setStyleSheet(_SEARCH_BOX_QSS)
+        self.zoom_small_label.setPixmap(
+            icons.make_icon("zoom_small", theme.TEXT_MUTED).pixmap(12, 12))
+        self.zoom_large_label.setPixmap(
+            icons.make_icon("zoom_large", theme.TEXT_MUTED).pixmap(16, 16))
+        self.info_action.setIcon(icons.make_icon("info", theme.TEXT))
+        # _rebuild_sidebar() rebuilds the tree wholesale (it repaints its
+        # own icons.make_icon calls) and, left alone, drops the current
+        # selection back to All photos — every OTHER call site brackets it
+        # with _selected_view()/_reselect_view() (_toggle_reveal,
+        # _toggle_folder_view, ...) and a theme switch is no exception, or
+        # the OS flipping scheme at sunset (colorSchemeChanged) would
+        # silently reset whatever folder/album/search the user was in.
+        kind, key = self._selected_view()
+        self._rebuild_sidebar()
+        self._reselect_view(kind, key)
+        self.inspector.refresh_style()
+        # GridView is a QAbstractScrollArea: its viewport is a separate
+        # child widget with its own paint surface, so the top-level
+        # update() loop below does not reach it on its own.
+        self.grid.viewport().update()
+        for w in QApplication.topLevelWidgets():
+            w.update()
+
+    def _on_os_color_scheme_changed(self, _scheme) -> None:
+        """QStyleHints.colorSchemeChanged slot (fauxcasa-6y0), connected
+        once in main() after this window exists. A bound method rather
+        than a closure: Qt auto-disconnects a signal from a QObject
+        method when that QObject is deleted (a closure over `win` would
+        keep firing into a half-torn-down window), and a test can call
+        this directly instead of needing to fake styleHints() emitting a
+        real signal. Only follows the OS while the user's theme MODE is
+        "system" — an explicit Light/Dark override must never be
+        silently undone by the OS switching under it."""
+        if self.theme_mode == "system":
+            theme.apply_mode(QApplication.instance(), "system")
+            self._refresh_theme()
 
     def _step_zoom(self, delta: int) -> None:
         """Zoom In/Out menu actions step the SAME slider the toolbar
@@ -2626,7 +2382,7 @@ class MainWindow(QMainWindow):
             # Codex cross-vendor review finding 2: the synchronous cold
             # path let a scan exception propagate out of main() and crash
             # the process (never a fake READY, always a nonzero exit for
-            # scripted runs). _scan_failed is how main()'s check_ready
+            # scripted runs). _scan_failed is how cli.ScriptedRun.check_ready
             # tells this apart from a genuinely empty, successful walk —
             # both leave the placeholder catalog in win.catalog. An
             # interactive run isn't killed outright (the window already
@@ -3251,411 +3007,39 @@ class MainWindow(QMainWindow):
     # ---------- sidebar ----------
 
     def _new_sidebar_tree(self) -> QTreeWidget:
-        """Create and wire a fresh sidebar tree. Factored out so a rebuild can
-        swap in a brand-new widget rather than clear() the live one."""
-        tree = QTreeWidget()
-        tree.setHeaderHidden(True)
-        tree.itemClicked.connect(self._sidebar_clicked)
-        # After the view applies: the tray readout's type/count follow the
-        # sidebar selection (q6l.2). Connection order makes this run second.
-        tree.itemClicked.connect(
-            lambda *_a: self._refresh_tray_readout())
-        # Folder context menu (fauxcasa-q6l.11): per-folder sort modes.
-        # Wired HERE so every swapped-in rebuild tree (the gfz fresh-widget
-        # pattern) carries the menu, not just the first one.
-        tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        tree.customContextMenuRequested.connect(self._sidebar_menu)
-        return tree
+        """Delegates to self._sidebar (fauxcasa-4tu stage 3): kept as a
+        one-line MainWindow method so self._new_sidebar_tree() call sites
+        and Qt signal connections that name it still resolve."""
+        return self._sidebar._new_sidebar_tree()
 
     def _rebuild_sidebar(self) -> None:
-        """Repopulate the sidebar after a reveal toggle or reconcile reload.
-
-        Swaps in a freshly built QTreeWidget and defers the old one's
-        destruction via deleteLater(), instead of self.tree.clear()+repopulate.
-        On the real Windows Qt platform, clear()-ing a QTreeWidget that has a
-        current item set intermittently aborts with a native access violation
-        in the in-place item teardown (fauxcasa-gfz) — reproducible in a single
-        shown window with a running event loop, so it can crash the real app on
-        a Show-hidden toggle or a post-reconcile reload, not just the tests.
-        Building a new tree and letting the event loop free the old one at a
-        safe point sidesteps that teardown path entirely."""
-        old = self.tree
-        new = self._new_sidebar_tree()
-        self.tree = new
-        # Replace the tree inside the sidebar panel (not the splitter) so the
-        # flat/tree toggle above it stays in place (fauxcasa-q6l.10).
-        self._sidebar_panel.layout().replaceWidget(old, new)
-        self._build_sidebar()
-        old.deleteLater()
+        """Delegates to self._sidebar; see its docstring for why a fresh
+        tree is swapped in rather than clear()-ing the live one."""
+        self._sidebar._rebuild_sidebar()
 
     def _build_sidebar(self) -> None:
-        cat = self.catalog
-        reveal = self.grid.reveal
-        t = self.tree
-
-        def fcount(folder) -> int:
-            return folder.total_count if reveal else folder.photo_count
-
-        all_item = QTreeWidgetItem(
-            t, [f"All photos  ({self._shown_count()})"])
-        all_item.setData(0, Qt.ItemDataRole.UserRole, ("all", ""))
-        starred = sum(
-            1 for p in cat.photos if (p.visible or reveal) and p.star)
-        star_item = QTreeWidgetItem(t, [f"Starred  ({starred})"])
-        star_item.setData(0, Qt.ItemDataRole.UserRole, ("starred", ""))
-        star_item.setIcon(0, icons.make_icon("star", theme.STAR))
-        # Recently Updated auto-collection (fauxcasa-q6l.7): mtime recency,
-        # semantics in recent_indices(). Live count like Starred — rebuilt
-        # with the sidebar, plus a cold-build refresh once mtimes exist.
-        recent_item = QTreeWidgetItem(t, [self._recent_label()])
-        recent_item.setData(0, Qt.ItemDataRole.UserRole, ("recent", ""))
-        recent_item.setIcon(0, icons.make_icon("clock", theme.TEXT_MUTED))
-
-        folders_root = QTreeWidgetItem(t, ["Folders"])
-        folders_root.setFlags(
-            folders_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-        folders_root.setIcon(0, icons.make_icon("folder", theme.TEXT))
-        # Right-click affordance for the flat/tree toggle (ez2.14: replaces
-        # the bare checkbox that used to sit above the tree); data marks
-        # this item so _sidebar_menu can tell it apart from a real folder.
-        folders_root.setData(0, Qt.ItemDataRole.UserRole, ("folders_root", ""))
-        # Flat/tree toggle (fauxcasa-q6l.10): both branches below grow a flat
-        # mode alongside their existing tree mode, and both modes now carry
-        # a full on-disk-path tooltip (path on demand) on every folder item.
-        flat = self._flat_check.isChecked()
-        if len(cat.roots) <= 1:
-            # Exact one-root passthrough: keep the historical tree shape,
-            # labels, item data, and offline badge behavior unchanged.
-            for label in _offline_root_labels(cat):
-                badge = QTreeWidgetItem(folders_root, [f"{label} (offline)"])
-                badge.setFlags(badge.flags() & ~Qt.ItemFlag.ItemIsSelectable
-                               & ~Qt.ItemFlag.ItemIsEnabled)
-                bf = badge.font(0)
-                bf.setItalic(True)
-                badge.setFont(0, bf)
-            # cat.roots is populated for every load_catalog()/scan_library()
-            # call (single-root gets the implicit LEGACY_ROOT_ID entry); the
-            # cat.root fallback only matters for a bare test fixture that
-            # never went through either.
-            root_path = cat.roots[0].path if cat.roots else cat.root
-            if flat:
-                # Flat mode: alphabetical by leaf name, tooltip carries the
-                # full on-disk path (path on demand).
-                ordered = sorted(
-                    ((rel, folder) for rel, folder in cat.folders.items()
-                     if fcount(folder) > 0),
-                    key=lambda rf: rf[0].rsplit("/", 1)[-1].lower(),
-                )
-                for rel, folder in ordered:
-                    # rel == "" is the library root itself (photos directly
-                    # in the root folder) — label it by on-disk folder name,
-                    # matching what multiroot flat does for a root leaf.
-                    leaf = rel.split("/")[-1] if rel else root_path.name
-                    item = QTreeWidgetItem(
-                        folders_root, [f"{leaf}  ({fcount(folder)})"])
-                    item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
-                    item.setToolTip(
-                        0, _folder_tooltip(root_path / rel, folder.description))
-                    item.setIcon(0, icons.make_icon("folder", theme.TEXT_MUTED))
-            else:
-                # Tree mode (default): hierarchical, with full-path tooltips.
-                nodes: dict[str, QTreeWidgetItem] = {"": folders_root}
-
-                def node_for(rel: str) -> QTreeWidgetItem:
-                    if rel in nodes:
-                        return nodes[rel]
-                    parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
-                    parent = node_for(parent_rel)
-                    item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
-                    item.setData(0, Qt.ItemDataRole.UserRole, ("folder", rel))
-                    item.setToolTip(0, _plain_tooltip(str(root_path / rel)))
-                    item.setIcon(0, icons.make_icon("folder", theme.TEXT_MUTED))
-                    nodes[rel] = item
-                    return item
-
-                for rel, folder in cat.folders.items():
-                    if fcount(folder) == 0:
-                        continue
-                    item = node_for(rel)
-                    # node_for() only sets a bare-path tooltip (it doesn't
-                    # know the Folder object); recompute here with the
-                    # description appended, whether rel is a real subfolder
-                    # or "" (node_for("") is the preseeded "Folders" header
-                    # standing in for the root folder — keep the path-on-
-                    # demand promise there too).
-                    item.setToolTip(0, _folder_tooltip(
-                        root_path if not rel else root_path / rel,
-                        folder.description))
-                    item.setText(0, f"{folder.title}  ({fcount(folder)})")
-        else:
-            # Genuine multiroot: durable manifest order is display order in
-            # tree mode; flat mode is alphabetical across every root. Child
-            # identities use the catalog's root-qualified convention
-            # (folder_key) so duplicate rels across roots never merge.
-            roots_by_id = {r.id: r for r in cat.roots}
-            if flat:
-                # Flat mode: alphabetical by leaf name across all roots.
-                # Offline roots remain browseable from cached thumbs (not
-                # skipped) — styled with the same italic/dim cue tree mode
-                # gives the offline root header, since a flat list has no
-                # header row to carry that cue instead.
-                def leaf_label(item: tuple[str, object]) -> str:
-                    folder = item[1]
-                    if folder.rel:
-                        return folder.rel.split("/")[-1]
-                    root = roots_by_id[folder.root_id]
-                    return root.label or root.path.name
-
-                ordered = sorted(
-                    ((key, folder) for key, folder in cat.folders.items()
-                     if fcount(folder) > 0
-                     and folder.root_id in roots_by_id),
-                    key=lambda kf: leaf_label(kf).lower(),
-                )
-                for key, folder in ordered:
-                    root = roots_by_id[folder.root_id]
-                    if folder.rel:
-                        leaf = folder.rel.split("/")[-1]
-                        text = f"{leaf}  ({fcount(folder)})"
-                    else:
-                        label = root.label or root.path.name
-                        if folder.root_id in cat.offline_ids:
-                            label += " (offline)"
-                        text = f"{label}  ({fcount(folder)})"
-                    item = QTreeWidgetItem(folders_root, [text])
-                    item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
-                    item.setToolTip(0, _folder_tooltip(
-                        root.path / folder.rel, folder.description))
-                    item.setIcon(0, icons.make_icon("folder", theme.TEXT_MUTED))
-                    if folder.root_id in cat.offline_ids:
-                        font = item.font(0)
-                        font.setItalic(True)
-                        item.setFont(0, font)
-                        item.setForeground(0, t.palette().brush(
-                            QPalette.ColorGroup.Disabled,
-                            QPalette.ColorRole.Text))
-            else:
-                # Tree mode (default): root labels are the top-level folder
-                # nodes; child items carry full-path tooltips too.
-                root_nodes: dict[str, QTreeWidgetItem] = {}
-                nodes2: dict[tuple[str, str], QTreeWidgetItem] = {}
-                for root in cat.roots:
-                    label = root.label or root.path.name or str(root.path)
-                    if root.id in cat.offline_ids:
-                        label += " (offline)"
-                    item = QTreeWidgetItem(folders_root, [label])
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-                    item.setToolTip(0, _plain_tooltip(str(root.path)))
-                    item.setIcon(0, icons.make_icon("folder", theme.TEXT))
-                    if root.id in cat.offline_ids:
-                        font = item.font(0)
-                        font.setItalic(True)
-                        item.setFont(0, font)
-                        item.setForeground(0, t.palette().brush(
-                            QPalette.ColorGroup.Disabled,
-                            QPalette.ColorRole.Text))
-                    root_nodes[root.id] = item
-                    nodes2[(root.id, "")] = item
-
-                def node_for_root(root_id: str, rel: str) -> QTreeWidgetItem:
-                    ident = (root_id, rel)
-                    if ident in nodes2:
-                        return nodes2[ident]
-                    parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
-                    parent = node_for_root(root_id, parent_rel)
-                    item = QTreeWidgetItem(parent, [rel.split("/")[-1]])
-                    key = folder_key(cat, root_id, rel)
-                    item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
-                    item.setToolTip(
-                        0,
-                        _plain_tooltip(str(roots_by_id[root_id].path / rel)))
-                    item.setIcon(0, icons.make_icon("folder", theme.TEXT_MUTED))
-                    nodes2[ident] = item
-                    return item
-
-                for key, folder in cat.folders.items():
-                    if fcount(folder) == 0 or folder.root_id not in root_nodes:
-                        continue
-                    item = node_for_root(folder.root_id, folder.rel)
-                    # node_for_root() only sets a bare-path tooltip (it
-                    # doesn't know the Folder object, and the root header
-                    # nodes created above never see one either); recompute
-                    # here with the description appended, using the owning
-                    # root's manifest path exactly as the bare-path tooltip
-                    # already does.
-                    root = roots_by_id[folder.root_id]
-                    item.setToolTip(0, _folder_tooltip(
-                        root.path if not folder.rel else root.path / folder.rel,
-                        folder.description))
-                    if folder.rel:
-                        item.setText(0, f"{folder.title}  ({fcount(folder)})")
-                    else:
-                        label = (next(r for r in cat.roots
-                                      if r.id == folder.root_id).label
-                                 or next(r for r in cat.roots
-                                         if r.id == folder.root_id).path.name)
-                        if folder.root_id in cat.offline_ids:
-                            label += " (offline)"
-                        item.setText(0, f"{label}  ({fcount(folder)})")
-                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsSelectable)
-                        item.setData(0, Qt.ItemDataRole.UserRole, ("folder", key))
-                for item in root_nodes.values():
-                    item.setExpanded(True)
-        folders_root.setExpanded(True)
-
-        if cat.albums:
-            albums_root = QTreeWidgetItem(t, ["Albums"])
-            albums_root.setFlags(
-                albums_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-            albums_root.setIcon(0, icons.make_icon("album", theme.TEXT))
-            for uid, album in cat.albums.items():
-                # §3: a placeholder (albums= uid with no definition) is
-                # never dropped — shown dimmed/italic with a "?" suffix so
-                # the gap is visible, not silent (import report has the
-                # entry). A .pal-sourced album reads like a real one; its
-                # provenance lives in the tooltip.
-                suffix = " ?" if album.placeholder else ""
-                item = QTreeWidgetItem(
-                    albums_root,
-                    [f"{album.name}{suffix}  ({len(album.members)})"])
-                item.setData(0, Qt.ItemDataRole.UserRole, ("album", uid))
-                item.setIcon(0, icons.make_icon("album", theme.TEXT_MUTED))
-                if album.placeholder:
-                    f = item.font(0)
-                    f.setItalic(True)
-                    item.setFont(0, f)
-                    item.setForeground(0, t.palette().brush(
-                        QPalette.ColorGroup.Disabled,
-                        QPalette.ColorRole.Text))
-                    item.setToolTip(
-                        0, "Referenced by albums= lines but defined nowhere "
-                           "— placeholder (see import notes)")
-                elif album.pal_sourced:
-                    item.setToolTip(
-                        0, "Album definition from a Picasa2Albums .pal file")
-                else:
-                    # Regular album: show date and/or description if present.
-                    tip_parts = []
-                    if album.date:
-                        tip_parts.append(album.date)
-                    if album.description:
-                        tip_parts.append(album.description)
-                    if tip_parts:
-                        item.setToolTip(
-                            0, _plain_tooltip("\n".join(tip_parts)))
-            albums_root.setExpanded(True)
-
-        # People (read-only v1 slice, fauxcasa-cam.3): named people with
-        # photo counts, clicking filters the grid like an album, plus an
-        # explicit "Unnamed faces" affordance for photos carrying
-        # suggested/unresolved face regions (N7: the gap is never silent).
-        # Counts are live: rebuilt with the sidebar on reveal/reconcile.
-        people, unnamed, name_cids = self._people_counts()
-        if people or unnamed:
-            # db3-rescued people are source-flagged (fauxcasa-cam.7): the
-            # name exists only because the §4 rescue importer read it from
-            # a machine-local db3 person album — provenance in the tooltip,
-            # like a .pal-sourced album's. Rekeyed honestly by contact id,
-            # not display name (fauxcasa-7aj.2): two DIFFERENT contacts can
-            # share a display name (one ini-named, one db3-rescued), so a
-            # name is flagged only when EVERY contact id that resolves to
-            # it is db3-rescued — a name also known via a non-db3 contact
-            # id must not be tarred with the rescue flag.
-            db3_names = {name for name, cids in name_cids.items()
-                         if cids and cids <= cat.db3_contacts}
-            people_root = QTreeWidgetItem(t, ["People"])
-            people_root.setFlags(
-                people_root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-            people_root.setIcon(0, icons.make_icon("person", theme.TEXT))
-            for person in sorted(people, key=str.lower):
-                item = QTreeWidgetItem(
-                    people_root, [f"{person}  ({people[person]})"])
-                item.setData(0, Qt.ItemDataRole.UserRole, ("person", person))
-                item.setIcon(0, icons.make_icon("person", theme.TEXT_MUTED))
-                if person in db3_names:
-                    item.setToolTip(
-                        0, "Name rescued from the Picasa db3 database — "
-                           "no .picasa.ini or contacts.xml names this "
-                           "person (see import notes)")
-            if unnamed:
-                item = QTreeWidgetItem(
-                    people_root, [f"Unnamed faces  ({unnamed})"])
-                item.setData(0, Qt.ItemDataRole.UserRole, ("unnamed", ""))
-            people_root.setExpanded(True)
+        """Delegates to self._sidebar."""
+        self._sidebar._build_sidebar()
 
     def _recent_indices(self) -> list[int]:
         """The Recently Updated set for the current reveal state (semantics
-        + one-line mtime decision live on recent_indices above)."""
+        + one-line mtime decision live on recent_indices above). Stays on
+        MainWindow (fauxcasa-4tu stage 3): _apply_view (not sidebar-only)
+        calls it too, alongside sidebar._recent_label."""
         return recent_indices(self.catalog, self.grid.reveal)
 
-    def _recent_label(self) -> str:
-        """The sidebar text for Recently Updated. Honesty hint (the PR #41
-        rider, fauxcasa-cam.12): while an adopt-mode backfill has not yet
-        filled real mtimes, an empty collection says WHY it is empty
-        instead of a bare 0 — the count appears once the backfill lands
-        (or immediately, if some already-backfilled photos qualify)."""
-        n = len(self._recent_indices())
-        if n == 0 and self.catalog.backfill_state != BACKFILL_COMPLETE:
-            return "Recently Updated  (indexing metadata…)"
-        return f"Recently Updated  ({n})"
-
     def _refresh_recent_count(self) -> None:
-        """A COLD build fills Photo.mtime in-place only after the sidebar was
-        first built (its count then read 0) — update just that item's label.
-        setText on a live item is safe; only clear()+repopulate of a tree
-        with a current item is the fauxcasa-gfz crash path."""
-        it = QTreeWidgetItemIterator(self.tree)
-        while it.value():
-            if it.value().data(0, Qt.ItemDataRole.UserRole) == ("recent", ""):
-                it.value().setText(0, self._recent_label())
-                return
-            it += 1
+        """Delegates to self._sidebar."""
+        self._sidebar._refresh_recent_count()
 
     def _people_counts(self) -> tuple[dict[str, int], int, dict[str, set]]:
-        """Per-person photo tallies for the current reveal state: {name:
-        photo count} over named faces, plus how many photos carry at least
-        one unnamed (suggested/unresolved) face. Photo counts, not face
-        counts — a photo with the same person tagged twice counts once.
-        Also returns {name: {contact ids that resolved to it}} — the
-        db3-rescued sidebar flag (fauxcasa-7aj.2) needs this to rekey by
-        contact id rather than display name, since two DIFFERENT contacts
-        can share a display name."""
-        reveal = self.grid.reveal
-        people: dict[str, int] = {}
-        name_cids: dict[str, set] = {}
-        unnamed = 0
-        for p in self.catalog.photos:
-            if not (p.visible or reveal) or not p.faces:
-                continue
-            names = {n for _rect, _cid, n in p.faces if n}
-            for n in names:
-                people[n] = people.get(n, 0) + 1
-            for _rect, cid, n in p.faces:
-                if n:
-                    name_cids.setdefault(n, set()).add(cid)
-            if any(n is None for _rect, _cid, n in p.faces):
-                unnamed += 1
-        return people, unnamed, name_cids
+        """Delegates to self._sidebar."""
+        return self._sidebar._people_counts()
 
     def _sidebar_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
-        data = item.data(0, Qt.ItemDataRole.UserRole)
-        if data is None:
-            return
-        if data[0] == "folders_root":
-            # Header row (ez2.14: now carries data so the right-click menu
-            # can find it) — unselectable, and a click on it must not reset
-            # the active view to All photos the way a bare "unknown kind"
-            # would via _apply_view's else branch.
-            return
-        # Track the active view so a Show-hidden toggle can preserve it
-        # (fauxcasa-x1l). On a real click Qt has already made this the
-        # current item; set it explicitly so a programmatic call agrees.
-        self.tree.setCurrentItem(item)
-        self.search.blockSignals(True)
-        self.search.clear()
-        self.search.blockSignals(False)
-        self._apply_view(*data)
-        self.grid.setFocus()
+        """Delegates to self._sidebar; kept as a one-line MainWindow method
+        so Qt signal connections that name self._sidebar_clicked resolve."""
+        self._sidebar._sidebar_clicked(item, _col)
 
     def _scope_indices(self, idxs: list[int]) -> list[int]:
         """The single star-threshold choke point (fauxcasa-q6l.20 clause a,
@@ -3761,79 +3145,20 @@ class MainWindow(QMainWindow):
     # ---------- per-folder sort modes (fauxcasa-q6l.11) ----------
 
     def _sidebar_menu(self, point) -> None:
-        """Right-click on the sidebar: FOLDER items get the sort-mode menu
-        (spec §5 per-folder sort; the manual mode is blocked on the db3
-        oracle fixture and absent). The Folders root gets the flat/tree
-        toggle (ez2.14: moved off the bare checkbox that used to sit above
-        the tree; the View menu's "Flat Folders" action is the other,
-        kept in sync via the shared _flat_check state). Every other item
-        kind — albums keep membership order, auto-collections keep catalog
-        order — has no menu, which is the folder-scoped contract made
-        visible."""
-        item = self.tree.itemAt(point)
-        if item is None:
-            return
-        data = item.data(0, Qt.ItemDataRole.UserRole)
-        if not data:
-            return
-        if data[0] == "folders_root":
-            menu = self._folders_root_menu()
-            menu.exec(self.tree.viewport().mapToGlobal(point))
-            return
-        if data[0] != "folder":
-            return
-        menu = self._folder_sort_menu(data[1])
-        menu.exec(self.tree.viewport().mapToGlobal(point))
+        """Delegates to self._sidebar."""
+        self._sidebar._sidebar_menu(point)
 
     def _folders_root_menu(self) -> QMenu:
-        """Build (without exec'ing — mirrors _folder_sort_menu's seam) the
-        Folders-root context menu: one checkable Flat Folders action, kept
-        in sync with the View menu's identical action via the shared
-        self._flat_check state (both toggling it fires _toggle_folder_view
-        exactly once each way)."""
-        menu = QMenu(self.tree)
-        act = menu.addAction("Flat Folders")
-        act.setCheckable(True)
-        act.setChecked(self._flat_check.isChecked())
-        act.toggled.connect(self._flat_check.setChecked)
-        return menu
+        """Delegates to self._sidebar."""
+        return self._sidebar._folders_root_menu()
 
     def _folder_sort_menu(self, rel: str) -> QMenu:
-        """Build (without exec'ing — the seam tests drive) the context menu
-        for one folder: a checkable, mutually exclusive action per sort
-        mode, the folder's current mode checked."""
-        menu = QMenu(self.tree)
-        menu.addSection("Sort by")
-        group = QActionGroup(menu)
-        current = self.grid.sort_modes.get(rel, DEFAULT_SORT_MODE)
-        for mode in SORT_MODES:
-            act = menu.addAction(mode.capitalize())
-            act.setCheckable(True)
-            act.setChecked(mode == current)
-            act.setData(mode)
-            group.addAction(act)
-            act.triggered.connect(
-                lambda _checked=False, m=mode: self._set_folder_sort(rel, m))
-        return menu
+        """Delegates to self._sidebar."""
+        return self._sidebar._folder_sort_menu(rel)
 
     def _set_folder_sort(self, rel: str, mode: str) -> None:
-        """Apply + persist one folder's sort mode. The mode reshapes the
-        folder-grouped default view only, so 'apply immediately' means:
-        when that view is showing (no search, All-photos/folder selection),
-        rebuild it and bring the re-sorted folder into view; an active
-        search/album/starred view keeps its own order by design and picks
-        the mode up on the next return to the folder view."""
-        if mode == DEFAULT_SORT_MODE:
-            self.grid.sort_modes.pop(rel, None)
-        else:
-            self.grid.sort_modes[rel] = mode
-        save_sort_modes(self.state_dir, self.grid.sort_modes)
-        if self.search.text().strip():
-            return
-        kind, key = self._selected_view()
-        if kind in ("all", "folder"):
-            self._apply_view(kind, key)
-            self.grid.scroll_to_folder(rel)
+        """Delegates to self._sidebar."""
+        self._sidebar._set_folder_sort(rel, mode)
 
     # ---------- search ----------
 
@@ -4569,79 +3894,6 @@ class MainWindow(QMainWindow):
             self._peek_page.dismiss()
 
 
-def run_search_probe(win: MainWindow, spec: str) -> list[dict]:
-    """§7 search-latency probe (fauxcasa-ed5.4): drive each comma-separated
-    query through the live search box exactly as its final keystroke would
-    (setText -> textChanged -> _search_changed, synchronously) and print one
-    machine-readable {"event": "search", "query", "ms", "hits"} line per
-    query for the CI/dev harness. `ms` is _search_changed end to end (see
-    its docstring comment for what that covers). The box is cleared between
-    queries — a repeated identical query would otherwise not re-fire
-    textChanged — and left empty afterwards. Blank segments are skipped, so
-    a trailing comma is harmless."""
-    events: list[dict] = []
-    for q in (t.strip() for t in spec.split(",")):
-        if not q:
-            continue
-        win.search.setText("")
-        win.search.setText(q)
-        ev = {"event": "search", "query": q,
-              "ms": round(win.last_search_ms, 3),
-              "hits": win.last_search_hits}
-        print(json.dumps(ev), flush=True)
-        events.append(ev)
-    win.search.setText("")
-    return events
-
-
-def select_sidebar_view(win: MainWindow, spec: str) -> bool:
-    """Select a sidebar view exactly as a click on its tree item would
-    (scripted-run screenshot flag --view). SPEC is 'all', 'starred',
-    'recent', 'unnamed', 'album:<name-or-uid>', 'person:<name>', or
-    'folder:<rel-path>' — the part before ':' (or the whole string, for
-    the colon-less kinds) is matched against a tree item's (kind, key)
-    UserRole payload set up in _rebuild_sidebar/_build_sidebar. An album
-    matches by UID OR by its resolved display name (win.catalog.albums
-    [uid].name), since a human would rather type "Best Of" than a hex
-    token; person/folder match the key exactly (case-sensitive). Drives
-    win._sidebar_clicked(item, 0) so the tree highlights too, exactly
-    like a real click — not just win._apply_view, which leaves the tree
-    selection stale. Returns False for an unknown kind or a spec with no
-    matching item; the caller (check_ready) decides how to fail a
-    scripted run on that."""
-    kind, _, key = spec.partition(":")
-    if kind not in ("all", "starred", "recent", "unnamed",
-                    "album", "person", "folder"):
-        return False
-    matches = []
-    it = QTreeWidgetItemIterator(win.tree)
-    while it.value():
-        item = it.value()
-        it += 1
-        data = item.data(0, Qt.ItemDataRole.UserRole)
-        if data is None or data[0] != kind:
-            continue
-        item_key = data[1]
-        if kind == "album":
-            album = win.catalog.albums.get(item_key)
-            if item_key != key and not (album is not None
-                                        and album.name == key):
-                continue
-        elif item_key != key:
-            continue
-        matches.append(item)
-    if len(matches) != 1:
-        # Picasa permits two albums with one display name, and a name
-        # could equal another album's uid: refuse to guess which the
-        # caller meant rather than screenshot the wrong one.
-        if matches:
-            log.error("--view %r is ambiguous: %d sidebar items match",
-                      spec, len(matches))
-        return False
-    win._sidebar_clicked(matches[0], 0)
-    return True
-
-
 BUNDLE_RUNTIME_MODULES = (
     "PySide6.QtWidgets",
     # QtMultimedia ships from PySide6-Addons for QAudioSink ONLY (video
@@ -4700,7 +3952,7 @@ def main() -> int:
     # where its two writable artifacts live. The module docstring above
     # stays the developer's map (bead ids, repo-relative commands) and is
     # deliberately not reused here (rel-0.1 identity, fauxcasa-ez2.3).
-    ap = argparse.ArgumentParser(
+    ap = cli.build_parser(
         prog=APP_SLUG,
         description=(
             f"{APP_NAME} {__version__} — browse your photo library: folders, "
@@ -4709,130 +3961,7 @@ def main() -> int:
             "modified. The only things written are a rebuildable catalog + "
             "thumbnail cache and a log file, both under the cache directory "
             "(--cache-root shows/overrides where that is)."),
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--version", action="version", version=version_string(),
-                    help="print the version and exit")
-    ap.add_argument("library", nargs="?", default=None,
-                    help="library root to browse (read-only). Default: the "
-                         "bundled synthetic library in a source checkout; in "
-                         "a frozen build, the library you last opened, or one "
-                         "you pick on first run")
-    ap.add_argument("--thumbs", type=Path, default=None,
-                    help="adopt an existing .fcache instead of building "
-                         "one (e.g. cache/benchmark-thumbs.fcache)")
-    ap.add_argument("--cache-root", type=Path, default=None,
-                    help="where the app keeps its own disposable caches "
-                         "(default: <repo>/cache/fauxcasa-cache in a checkout, "
-                         "a per-user cache dir when run as a frozen bundle)")
-    ap.add_argument("--rebuild", action="store_true",
-                    help="ignore any existing tracer cache and rebuild")
-    ap.add_argument("--promote", action="store_true",
-                    help="promote the legacy library given as the "
-                         "positional argument to a multi-root-capable "
-                         "library-home in place (design §10: mint "
-                         "identity, rename cache dir, header-upgrade "
-                         "catalog.json — no re-walk/re-hash), print the "
-                         "resulting home, and exit")
-    ap.add_argument("--add-root", type=Path, default=None, metavar="PATH",
-                    help="add PATH as a new watched root to the "
-                         "already-promoted library-home given as the "
-                         "positional argument, then exit")
-    ap.add_argument("--import-picasa-watched", type=str, default=None,
-                    metavar="LISTFILE",
-                    help="create a fresh library-home at the positional "
-                         "argument from a Picasa watched-folders list: "
-                         "LISTFILE is a text file (one path per line, "
-                         "'#' comments), or the literal 'registry' to "
-                         "read Picasa's own watched-folders list from the "
-                         "Windows registry, then exit")
-    ap.add_argument("--contacts", type=Path, default=None,
-                    help="Picasa contacts.xml for face names (read-only; "
-                         "default: the machine-local copy under "
-                         "%%LocalAppData%%\\Google\\Picasa2 when present)")
-    ap.add_argument("--pal-dir", type=Path, default=None,
-                    help="Picasa2Albums directory of .pal album files "
-                         "(read-only; merged per spec §4 — ini wins "
-                         "membership, .pal fills gaps; default: the "
-                         "machine-local Picasa2Albums under "
-                         "%%LocalAppData%%\\Google\\Picasa2 when present)")
-    ap.add_argument("--db3", type=Path, default=None,
-                    help="Picasa db3 directory for the §4 rescue import "
-                         "(read-only; person-album names gap-fill contacts "
-                         "the ini/contacts.xml never named; default: the "
-                         "machine-local db3 under "
-                         "%%LocalAppData%%\\Google\\Picasa2 when present — "
-                         "use this flag for PicasaStarter relocations)")
-    ap.add_argument("--min-image-size", type=_parse_image_size_arg,
-                    metavar="WIDTHxHEIGHT",
-                    help="ignore images smaller than WIDTHxHEIGHT during "
-                         "catalog scan (for icons and thumbnails)")
-    ap.add_argument("--max-image-size", type=_parse_image_size_arg,
-                    metavar="WIDTHxHEIGHT",
-                    help="ignore images larger than WIDTHxHEIGHT during "
-                         "catalog scan (for huge source or GIS images)")
-    ap.add_argument("--zoom", type=int, default=160)
-    ap.add_argument("--screenshot", type=Path, default=None,
-                    help="save a PNG once the viewport is fully decoded, "
-                         "then quit (pairs with QT_QPA_PLATFORM=offscreen)")
-    ap.add_argument("--scroll-to", type=float, default=None, metavar="FRAC",
-                    help="after ready, jump to this scroll fraction (0-1)")
-    ap.add_argument("--open", type=int, default=None, metavar="N",
-                    help="after ready, open the viewer on the Nth photo "
-                         "of the current view (screenshot testing)")
-    ap.add_argument("--view", type=str, default=None, metavar="SPEC",
-                    help="after ready, select a sidebar view exactly as a "
-                         "click would: 'all', 'starred', 'recent', "
-                         "'unnamed', 'album:<name-or-uid>', "
-                         "'person:<name>', or 'folder:<rel-path>' "
-                         "(screenshot testing)")
-    ap.add_argument("--search", type=str, default=None, metavar="QUERY",
-                    help="after ready (and --view, if given), type QUERY "
-                         "into the search box (screenshot testing; "
-                         "distinct from --search-probe, which is a "
-                         "latency probe that quits)")
-    ap.add_argument("--select", type=int, default=None, metavar="N",
-                    help="after ready/--view/--search, make the Nth photo "
-                         "of the current view the grid's current/selected "
-                         "item (clamped like --open; screenshot testing)")
-    ap.add_argument("--info", action="store_true",
-                    help="after ready, open the metadata inspector panel "
-                         "(screenshot testing)")
-    ap.add_argument("--play", action="store_true",
-                    help="after ready, start the slideshow over the "
-                         "current view; --screenshot then captures the "
-                         "slideshow surface instead of the main window "
-                         "(screenshot testing)")
-    ap.add_argument("--faces", action="store_true",
-                    help="after --open N: show the viewer's face boxes "
-                         "(the F key) before the screenshot; exits 1 if the "
-                         "viewer is not on a face-tagged photo (screenshot "
-                         "testing)")
-    ap.add_argument("--window-size", type=_parse_image_size_arg,
-                    metavar="WIDTHxHEIGHT",
-                    help="resize the window to exactly WIDTHxHEIGHT "
-                         "before showing it, for a screenshot size that "
-                         "doesn't depend on the machine's screen")
-    ap.add_argument("--quit-after-ready", action="store_true",
-                    help="exit right after the READY line (perf probe)")
-    ap.add_argument("--search-probe", type=str, default=None, metavar="TERMS",
-                    help="after READY, run each comma-separated query "
-                         "through the search box, print a machine-readable "
-                         '{"event":"search",...} line per query, then quit '
-                         "(§7 latency probe; offscreen-safe; a query may "
-                         "contain spaces and -negations)")
-    ap.add_argument("--finish-build", action="store_true",
-                    help="scripted runs: wait for an in-flight cache "
-                         "build before quitting (warm-run scripting)")
-    ap.add_argument("--timeout", type=float, default=30.0,
-                    help="scripted runs (--screenshot/--quit-after-ready) "
-                         "abort with exit 1 after this many seconds")
-    ap.add_argument("--bundle-self-check", action="store_true",
-                    help=argparse.SUPPRESS)
-    ap.add_argument("--require-sandbox", action="store_true",
-                    help="fail loud (nonzero exit) instead of degrading "
-                         "to in-process decoding if the Windows decode "
-                         "sandbox cannot start (fauxcasa-ez2.9); maps to "
-                         "FAUXCASA_DECODE_SANDBOX=require")
+        version_text=version_string())
     args = ap.parse_args()
     if args.require_sandbox:
         os.environ["FAUXCASA_DECODE_SANDBOX"] = "require"
@@ -4882,8 +4011,8 @@ def main() -> int:
     if args.add_root is not None:
         return _cmd_add_root(args.library, args.cache_root, args.add_root)
     if args.import_picasa_watched is not None:
-        return _cmd_import_picasa_watched(args.library,
-                                          args.import_picasa_watched)
+        return cli._cmd_import_picasa_watched(args.library,
+                                              args.import_picasa_watched)
 
     root = _resolve_library(args.library, args.cache_root)
     if root is None:
@@ -5132,7 +4261,13 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
-    app.setPalette(theme.dark_palette())
+    # Resolved ONCE here (the per-user config.json read) and threaded
+    # through to MainWindow as a kwarg (fauxcasa-6y0 Opus review):
+    # MainWindow.__init__ itself must never call _load_theme_mode, or a
+    # caller with no cache_root (most tests) would read the developer's
+    # own real config.json via _default_cache_root().
+    theme_mode = _load_theme_mode(args.cache_root)
+    theme.apply_mode(app, theme_mode)
     # App-wide default: every top-level (message boxes, the File Types
     # dialog, ...) inherits it; MainWindow/slideshow/peek also set it
     # explicitly so a window built outside main() (tests) carries it too.
@@ -5170,7 +4305,8 @@ def main() -> int:
                      excluded_exts=excluded_exts,
                      thumbs_path=args.thumbs, db3_dir=db3_dir,
                      contacts_path=contacts_path, cfg=cfg,
-                     contacts_sig=contacts_sig, state_dir=state_dir)
+                     contacts_sig=contacts_sig, state_dir=state_dir,
+                     theme_mode=theme_mode)
     if args.zoom != 160:
         win.grid.set_zoom(args.zoom)  # direct: skip the slider debounce
         win.zoom.setValue(args.zoom)
@@ -5181,27 +4317,11 @@ def main() -> int:
     win.show()
     win.grid.setFocus()  # only really lands once the window is mapped
 
-    # P3 finding: a MID-SESSION degrade (decodefacade.DecodeService.
-    # decode() flips state -> "degraded" on a per-file spawn/OSError/
-    # queue.Empty failure, well after the READY-time snapshot below) must
-    # still update the status-bar label -- N7 "never silent" applies for
-    # the whole session, not just at startup. check_ready's scripted
-    # `poll` timer is stopped once an interactive run's instrumentation is
-    # done, so this uses its OWN long-lived timer instead.
-    def _sync_decode_sandbox_label() -> None:
-        if decode_svc.state == "degraded" and not win.decode_sandbox_label.isVisible():
-            log.error("decode sandbox degraded: %s", decode_svc.reason)
-            win.decode_sandbox_label.setText(
-                f"Decoding is not sandboxed on this machine: "
-                f"{decode_svc.reason}  ")
-            win.decode_sandbox_label.setToolTip(decode_svc.reason)
-            win.decode_sandbox_label.setVisible(True)
-
-    decode_sandbox_poll = QTimer(win)
-    decode_sandbox_poll.setInterval(1000)
-    decode_sandbox_poll.timeout.connect(_sync_decode_sandbox_label)
-    decode_sandbox_poll.start()
-
+    # Follow a LIVE OS light/dark flip (fauxcasa-6y0): win._on_os_color_
+    # scheme_changed is a no-op unless the user's theme MODE is "system".
+    # Subscribed once, here, after the window exists (_refresh_theme
+    # touches window chrome that isn't built yet earlier).
+    app.styleHints().colorSchemeChanged.connect(win._on_os_color_scheme_changed)
     if cold_scan_needed:
         # Non-blocking first run (fauxcasa-q6l.13): the window is already
         # painted (empty) — start the deferred walk now, off the startup
@@ -5210,313 +4330,20 @@ def main() -> int:
         # the build it chains into) land.
         win._start_cold_scan(cache_dir)
 
-    # READY instrumentation (§7 cold start): poll until every visible
-    # tile is decoded, then report cold start + RSS on stdout.
-    state = {"scrolled": False, "shot": False, "opened": False,
-             "probed": False, "scan_failure_handled": False,
-             "viewed": False, "searched": False, "selected": False,
-             "info_set": False, "played": False, "faced": False}
-    # A scripted probe (any of the three) implies quit — same set the hard
-    # timeout below arms on; reused by check_ready's scan-failure gate
-    # (fauxcasa-q6l.13, Codex cross-vendor review finding 2).
-    scripted_run = (args.screenshot is not None or args.quit_after_ready
-                    or args.search_probe is not None)
-
-    def may_quit() -> bool:
-        if not args.finish_build:
-            return True
-        if win.index_busy():
-            return False
-        if win.build_failed:
-            # --finish-build promised a cache; a failed build must not
-            # masquerade as a green run.
-            log.error("cache build failed under --finish-build")
-            app.exit(1)
-            return False
-        return True
-
-    def check_ready() -> None:
-        if win._scan_failed:
-            # Codex cross-vendor review finding 2: never let a failed
-            # deferred walk report a fake READY against the still-empty
-            # placeholder catalog — _on_scan_done already surfaced the
-            # failure via the activity row/status bar/log. A scripted
-            # probe gets an immediate nonzero exit here (mirrors the crash
-            # an unhandled scan exception caused on the old synchronous
-            # path, just without waiting out the full --timeout); a plain
-            # interactive run simply stays open with the window it already
-            # has — not killed outright, since unlike the old path the
-            # window exists and is otherwise usable.
-            if scripted_run and not state["scan_failure_handled"]:
-                state["scan_failure_handled"] = True
-                log.error("cold scan failed — exiting nonzero, no READY")
-                app.exit(1)
-            return
-        # fauxcasa-q6l.13: while the deferred cold scan is still in flight
-        # the grid is genuinely empty (0 items), so all_visible_decoded()
-        # would trivially read True and fire READY against the EMPTY
-        # placeholder catalog — never once the real one lands. Hold READY
-        # until the walk lands (this does NOT block the event loop; the
-        # walk runs on its own thread and the window is already painted
-        # and responsive), same as the pre-existing "wait for visible
-        # tiles to decode" gate this joins for the async BUILD that
-        # follows.
-        # The "visible tiles decoded" gate is about the GRID page. Once a
-        # scripted --open has switched to the viewer, the grid is hidden and
-        # never paints, so it never requests decodes; if the cold build
-        # lands AFTER the viewer opened (READY can fire before "indexed"),
-        # set_thumbs() makes every visible tile undecoded again and this
-        # gate would hold the poll forever (a bare TIMEOUT, seen ~1 in 5
-        # runs locally and on CI's native-smoke leg). Apply it only while
-        # the grid page is current.
-        grid_current = win.pages.currentWidget() is not win.viewer
-        if win._cold_scan_pending or (
-                grid_current and not win.grid.all_visible_decoded()):
-            return
-        if not win.ready_reported:
-            win.ready_reported = True
-            cold_ms = (time.perf_counter() - T0) * 1000.0
-            rss, hwm = read_rss_mb()
-            # §7 catalog-size row (fauxcasa-ed5.3): the persisted
-            # catalog.json's on-disk bytes, normalized per photo. 0 = not
-            # yet persisted (a cold build writes it when the index lands).
-            # fauxcasa-ed5.5 re-baselined the budget to <=100 B/photo fully
-            # indexed (spec §10 item 20) and met it honestly: catalog.json
-            # is now zstd level 3 over folder-grouped compact JSON (see
-            # catalog.save_catalog and docs/research/catalog-size-analysis.md)
-            # — st_size already reflects that compression, so this field
-            # continues to measure the file honestly, just a smaller one.
-            try:
-                cat_bytes = cat_path.stat().st_size
-            except OSError:
-                cat_bytes = 0
-            print("READY", flush=True)
-            # fauxcasa-ez2.9 Stage 1, item 6: one line right after READY,
-            # every run (CI's --require-sandbox smoke asserts state ==
-            # "sandboxed" on this exact key). Logged via applog too, and
-            # "degraded" additionally gets a persistent status-bar note
-            # (N7: never silent) -- "in-process" (non-Windows, or
-            # FAUXCASA_DECODE_SANDBOX=0) is a softer log-only note.
-            print(json.dumps({"event": "decode-sandbox",
-                              "state": decode_svc.state,
-                              "reason": decode_svc.reason}), flush=True)
-            if decode_svc.state == "degraded":
-                _sync_decode_sandbox_label()
-            elif decode_svc.state == "in-process":
-                log.info("decode sandbox: in-process (%s)", decode_svc.reason)
-            else:
-                log.info("decode sandbox: sandboxed")
-            # fauxcasa-q6l.13: win.catalog, not the outer `catalog` closed
-            # over above — on the non-blocking cold-scan path that outer
-            # binding is the EMPTY placeholder forever, while win.catalog
-            # is swapped in place by reload_data once the deferred walk
-            # lands (_on_scan_done). Reading win.catalog means READY
-            # reports whatever is actually live at the moment first paint
-            # settled — 0 on a still-scanning NAS-scale library (honest:
-            # the walk isn't done yet), the real counts when the walk
-            # already landed by then (small/warm-adjacent libraries).
-            # "version" (+ "git_sha" only on a stamped build) rides the
-            # existing keys so a perf/CI record says WHICH build produced
-            # the numbers (rel-0.1 identity). Consumers read keys by name
-            # (scripts/perf-canary.py), so an added key is additive.
-            print(json.dumps({
-                "event": "ready",
-                "version": __version__,
-                **({"git_sha": GIT_SHA} if GIT_SHA else {}),
-                "cold_start_ms": round(cold_ms),
-                "prep_ms": round(prep_ms),
-                "warm": warm,
-                "photos": len(win.catalog.photos),
-                "visible_photos": win.catalog.visible_count,
-                "folders": len(win.catalog.folders),
-                "albums": len(win.catalog.albums),
-                "catalog_bytes": cat_bytes,
-                "catalog_bytes_per_photo": round(
-                    cat_bytes / max(1, len(win.catalog.photos)), 1),
-                "vm_rss_mb": round(rss, 1),
-                "vm_hwm_mb": round(hwm, 1),
-            }), flush=True)
-            if args.quit_after_ready and args.screenshot is None \
-                    and args.scroll_to is None and args.open is None \
-                    and args.search_probe is None and args.view is None \
-                    and args.search is None and args.select is None \
-                    and not args.info and not args.play \
-                    and not args.faces and may_quit():
-                app.quit()
-                return
-        if args.search_probe is not None and not state["probed"]:
-            # §7 search probe (fauxcasa-ed5.4): run once, right after READY,
-            # then fall through to the normal scripted-quit path below —
-            # --search-probe implies quit (see the bottom of check_ready).
-            state["probed"] = True
-            run_search_probe(win, args.search_probe)
-        # Scripted-run screenshot flags: view -> search -> select -> info ->
-        # scroll_to -> open -> faces -> play -> (loading waits) -> screenshot. Each
-        # step sets its state flag and returns once so the viewport gets a
-        # poll cycle to decode (same pattern scroll_to always used).
-        if args.view is not None and not state["viewed"]:
-            state["viewed"] = True
-            if not select_sidebar_view(win, args.view):
-                log.error("--view: no sidebar item matches %r", args.view)
-                print(json.dumps({"event": "view", "ok": False,
-                                  "spec": args.view}), flush=True)
-                app.exit(1)
-                return
-            kind, _, key = args.view.partition(":")
-            print(json.dumps({
-                "event": "view", "ok": True, "kind": kind, "key": key,
-                "shown": len(win.grid.display),
-            }), flush=True)
-            return  # let the new view's viewport decode
-        if args.search is not None and not state["searched"]:
-            state["searched"] = True
-            win.search.setText(args.search)
-            print(json.dumps({
-                "event": "view", "ok": True, "kind": "search",
-                "key": args.search, "shown": len(win.grid.display),
-            }), flush=True)
-            return
-        if args.select is not None and not state["selected"]:
-            state["selected"] = True
-            display = win.grid.display
-            if display:
-                pos = max(0, min(len(display) - 1, args.select))
-                win.grid._select(display[pos])
-                win.grid._ensure_visible(display[pos])
-            print(json.dumps({
-                "event": "view", "ok": True, "kind": "select",
-                "key": str(args.select), "shown": len(display),
-            }), flush=True)
-            return
-        if args.info and not state["info_set"]:
-            state["info_set"] = True
-            win.info_action.setChecked(True)  # opens the inspector
-            return
-        if args.scroll_to is not None and not state["scrolled"]:
-            state["scrolled"] = True
-            win.grid.scroll_to_fraction(args.scroll_to)
-            return  # wait for the new viewport to decode
-        if args.open is not None and not state["opened"]:
-            state["opened"] = True
-            display = win.grid.display
-            if display:
-                pos = max(0, min(len(display) - 1, args.open))
-                win._open_viewer(display[pos], display, pos)
-            return
-        if args.faces and not state["faced"]:
-            # Face boxes come from the catalog, not the decoded original,
-            # so this need not wait for the viewer's load; toggle_faces is
-            # a no-op unless the viewer is current on a face-tagged photo.
-            state["faced"] = True
-            win.viewer.toggle_faces()
-            if not win.viewer.faces_visible:
-                # Same contract as a --view miss: a screenshot promised to
-                # show face boxes must not quietly come out without them.
-                log.error("--faces: the viewer is not on a face-tagged photo "
-                          "(pair it with --open N on one that is)")
-                print(json.dumps({"event": "view", "ok": False,
-                                  "kind": "faces", "key": ""}), flush=True)
-                app.exit(1)
-                return
-            print(json.dumps({"event": "view", "ok": True, "kind": "faces",
-                              "key": "", "shown": 1}), flush=True)
-            return
-        if args.play and not state["played"]:
-            state["played"] = True
-            win._start_slideshow()  # no-op (no _slideshow surface) if empty
-            return
-        if state["opened"] and win.viewer.loading:
-            # Let the original finish loading before the shot — but never
-            # wait forever: a wedged decode used to turn a scripted
-            # --open/--screenshot run into a bare TIMEOUT with no diagnosis.
-            # Bounded wait, then shoot whatever is painted and say why.
-            state["open_wait"] = state.get("open_wait", 0) + 1
-            if state["open_wait"] * poll.interval() < OPEN_WAIT_MS:
-                return
-            dec = getattr(win.viewer, "_decoder", None)
-            log.error(
-                "viewer original still loading after %d ms (decoder alive=%s,"
-                " queued jobs=%d) — taking the screenshot anyway",
-                OPEN_WAIT_MS, bool(dec is not None and dec.is_alive()),
-                win.viewer._jobs.qsize())
-            win.viewer.loading = False
-        if state["played"] and win._slideshow is not None \
-                and win._slideshow.loading:
-            # Same bounded-wait pattern as the viewer original above, for
-            # the slideshow's own first-slide decode.
-            state["play_wait"] = state.get("play_wait", 0) + 1
-            if state["play_wait"] * poll.interval() < OPEN_WAIT_MS:
-                return
-            dec = getattr(win._slideshow, "_decoder", None)
-            log.error(
-                "slideshow original still loading after %d ms (decoder "
-                "alive=%s, queued jobs=%d) — taking the screenshot anyway",
-                OPEN_WAIT_MS, bool(dec is not None and dec.is_alive()),
-                win._slideshow._jobs.qsize())
-            win._slideshow.loading = False
-        if not may_quit():
-            return  # --finish-build: hold the quit for the cache build
-        if args.screenshot is not None and not state["shot"]:
-            state["shot"] = True
-            # --play's surface is its own top-level window (slideshow.py
-            # module docstring) — grab THAT, not the main window it sits
-            # on top of, once it is actually up.
-            shot_target = win
-            if state["played"] and win._slideshow is not None \
-                    and win._slideshow.isVisible():
-                shot_target = win._slideshow
-            if shot_target.grab().save(str(args.screenshot)):
-                log.info("screenshot: %s", args.screenshot)
-            else:
-                log.error("FAILED to save screenshot to %s", args.screenshot)
-                app.exit(1)
-                return
-            app.quit()
-        elif args.quit_after_ready or args.search_probe is not None:
-            app.quit()
-        else:
-            poll.stop()  # interactive run: instrumentation is done
-
-    # Parented to the window it polls (fauxcasa-q6l.15): check_ready
-    # dereferences win.grid, and the timeout connection forms a Python
-    # reference cycle (poll -> check_ready -> poll) that kept the orphan
-    # timer alive past main()'s return — an in-process caller (the test
-    # suite) that later deleted the window got a stale fire into a deleted
-    # GridView (rediscovered independently three times before the fix).
-    poll = QTimer(win)
-    poll.setObjectName("ready-poll")
-    poll.setInterval(50)
-    poll.timeout.connect(check_ready)
-    poll.start()
-    # Hard stop for scripted runs: a stuck decode must fail loudly, not
-    # hang CI or masquerade as success.
-    #
-    # Parented and stopped below for the same reason as the poll timer
-    # above (fauxcasa-9pr, the case q6l.15 missed): a bare
-    # QTimer.singleShot belongs to no object and nothing cancels it, so a
-    # run that finishes INSIDE its own deadline leaves the deadline armed
-    # in the shared QApplication. Whichever later in-process run happened
-    # to be in app.exec() when it fired was killed with exit 1 and a log
-    # line quoting the dead run's timeout and state — an ubuntu-only
-    # tracer failure on main, and a latent flake everywhere else.
-    hard_stop = None
-    if scripted_run:
-        def on_timeout() -> None:
-            log.error("TIMEOUT after %ss — ready=%s state=%s",
-                      args.timeout, win.ready_reported, state)
-            app.exit(1)
-
-        hard_stop = QTimer(win)
-        hard_stop.setObjectName("scripted-hard-stop")
-        hard_stop.setSingleShot(True)
-        hard_stop.timeout.connect(on_timeout)
-        hard_stop.start(int(args.timeout * 1000))
+    # The check_ready() scripted-run state machine (fauxcasa-4tu stage 2,
+    # commit 3): cli.ScriptedRun owns the ready-poll/decode-sandbox-poll/
+    # hard-stop QTimers and the READY-instrumentation state that used to be
+    # a closure over main()'s own locals. start()/stop() bracket app.exec()
+    # so every timer this run owns is parented to `win` and explicitly
+    # stopped before shutdown (fauxcasa-q6l.15, fauxcasa-9pr).
+    scripted = cli.ScriptedRun(
+        win, app, args, decode_svc=decode_svc, t0=T0, prep_ms=prep_ms,
+        cat_path=cat_path, warm=warm, version=__version__, git_sha=GIT_SHA,
+        open_wait_ms=OPEN_WAIT_MS, read_rss_mb=read_rss_mb)
+    scripted.start()
 
     code = app.exec()
-    poll.stop()  # belt to the parenting suspenders: never fire post-exec
-    decode_sandbox_poll.stop()  # same belt-and-suspenders for the sandbox label poller
-    if hard_stop is not None:
-        hard_stop.stop()
+    scripted.stop()  # belt to the parenting suspenders: never fire post-exec
     win.shutdown()  # reap any in-flight cache build cleanly
     rss, hwm = read_rss_mb()
     print(json.dumps({"event": "exit", "vm_rss_mb": round(rss, 1),

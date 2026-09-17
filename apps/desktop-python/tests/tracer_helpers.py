@@ -336,7 +336,14 @@ def _two_folder_library(root):
     make_jpeg(root / "folder_b" / "img3.jpg")
 
 
-def _search_win(library_root: Path):
+def _search_win(library_root: Path, cache_root: Path | None = None):
+    """A MainWindow over `library_root` for UI tests. Pass `cache_root`
+    (a tmp_path) whenever the test drives something that PERSISTS —
+    MainWindow writes user choices to self.cache_root, which with no
+    cache_root/cache_dir falls back to main._default_cache_root(), i.e.
+    the developer's own real <repo>/cache/fauxcasa-cache/config.json
+    (fauxcasa-6y0 review; same hazard _load_theme_mode's docstring warns
+    about on the read side)."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -345,7 +352,7 @@ def _search_win(library_root: Path):
     app = QApplication.instance() or QApplication([])
     assert app is not None
     return MainWindow(scan_library(library_root), None,
-                      cache_dir=None, build_dir=None)
+                      cache_dir=None, build_dir=None, cache_root=cache_root)
 
 
 def _hits(win) -> set:

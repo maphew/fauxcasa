@@ -879,6 +879,35 @@ def test_remember_library_preserves_filetypes_exclusions(tmp_path: Path) -> None
     assert filetypes.load_excluded_exts(cache_root, lib) == excluded
 
 
+def test_save_theme_mode_preserves_other_config_keys(tmp_path: Path) -> None:
+    """main._save_theme_mode (fauxcasa-6y0), like _remember_library, must
+    merge into config.json rather than overwrite it — both now share the
+    extracted _config_update helper. Seed the file with a 'library' key
+    and an arbitrary other key (standing in for filetypes.
+    save_excluded_exts's own entry) written directly, call the real
+    _save_theme_mode, and confirm every pre-existing key survives and
+    'theme' lands."""
+    import json
+
+    import main
+
+    cache_root = tmp_path / "cr"
+    cache_root.mkdir()
+    cfg = main._config_path(cache_root)
+    cfg.write_text(json.dumps({
+        "library": str(tmp_path / "lib"),
+        "excluded_exts": [".bmp", ".gif"],
+    }))
+
+    main._save_theme_mode(cache_root, "light")
+
+    data = json.loads(cfg.read_text())
+    assert data["library"] == str(tmp_path / "lib")
+    assert data["excluded_exts"] == [".bmp", ".gif"]
+    assert data["theme"] == "light"
+    assert main._load_theme_mode(cache_root) == "light"
+
+
 def test_remember_library_oserror_is_soft(tmp_path: Path, capsys) -> None:
     """_remember_library (fauxcasa-7e5) is best-effort: an unwritable cache
     root — here its parent is a regular file, so mkdir raises NotADirectoryError

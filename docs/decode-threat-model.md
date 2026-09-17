@@ -14,6 +14,14 @@ design's own recommendation. Originally an agent draft written
 alongside the stack-decision report
 (`docs/research/stack-balloons.md`); overturnable by argument like
 every decision, but the burden now sits with the challenger.
+**Amended 2026-09-16 (fauxcasa-3d4, ratified via
+`docs/architecture-review-2026-09.md` §5.1):** this revisits the
+2026-08-11 ratified decision, and the owner ratified the revisit. The
+Decision below is unchanged; it is still the requirement. What changes
+is that the gap between it and the shipped code is now recorded in the
+open: the section "What ships today" records the gap, and "Scope
+freeze" records that the gap stays open by decision until release 0.4
+has shipped.
 
 ## Why this document exists
 
@@ -115,6 +123,9 @@ In plain words first:
    M1.** No exceptions for "simple" formats — JPEG parsers have the
    richest exploit history of all. The broker process opens files and
    passes fds/buffers; workers cannot open anything themselves.
+
+   *This requirement stands, but does not describe what ships today; see
+   "What ships today" below for the current gap.*
 2. **The UI/index process decodes only app-written cache artifacts**
    (thumbnails, preview tiles). This keeps the N4 hot path fast and
    outside the sandbox boundary by provenance, not by exception.
@@ -127,6 +138,10 @@ In plain words first:
    in-process schedule valve (`docs/design/decode-service.md` §3),
    so v46.3 ships as the sandboxed frame-streaming seam and no
    residual-risk exception is recorded here.
+
+   *That last sentence no longer holds: video playback ships today as
+   an unsandboxed `subprocess.Popen` worker, a recorded exception; see
+   "What ships today" below.*
 4. Memory-safe decoder implementations are welcome *inside* the sandbox
    (defense in depth), never as a substitute for it.
 
@@ -136,16 +151,38 @@ worker pool; none of them changes the cost materially. This means the
 threat model does not constrain the §10 item 12 stack choice — and the
 stack choice cannot weaken the isolation requirement.
 
-## In-process decoders (documented exception)
+## What ships today (documented exceptions, 2026-09-16)
 
-Three format fallbacks decode in-process today, on all platforms,
-outside the sandboxed worker pool the Decision above prescribes as the
-floor from M1: **PSD** (fauxcasa-v46.4), **16-bit TIFF** (fauxcasa-v46.7)
-and **HEIC/HEIF** (fauxcasa-y5b). All three share one shape: the pinned
-PySide6 build ships no Qt plugin for them (PSD, HEIC/HEIF) or Qt's own
-plugin corrupts the pixels (16-bit TIFF grayscale silently clips to
-white on Linux), so `pillowload.py` decodes the same bytes with Pillow
-instead — for HEIC/HEIF, Pillow itself has no built-in HEIF reader, so
+The Decision above is the requirement. What actually ships is
+narrower, verified against `apps/desktop-python/thumbcache.py`
+`_index_one`, `viewer.py` `load_original_oriented`, `decodefacade.py`
+`ensure_started`, `catalog.py` `_image_size` and `videostream.py`:
+
+| Content | Where it runs | Code seam |
+|---|---|---|
+| Plain stills (Windows): JPEG, PNG, GIF, BMP, 8-bit TIFF, WebP, TGA | AppContainer worker pool, sandboxed, on by default | `decodefacade.DecodeService.decode()`, route `"still"`; `decodesvc_win.py` |
+| Plain stills (Linux, macOS): same formats | In-process | `decodefacade.ensure_started` sets in-process unconditionally; no sandbox transport exists in the tree |
+| RAW | In-process | `rawload.py` (LibRaw); pre-routed ahead of the sandbox check in `thumbcache._index_one` and `viewer.load_original_oriented` |
+| PSD | In-process | `pillowload.py` (Pillow); same pre-route |
+| 16-bit TIFF | In-process | `pillowload.py` (Pillow); same pre-route |
+| HEIC/HEIF | In-process | `pillowload.py` (Pillow, plus pi-heif/libde265); same pre-route |
+| Video poster frame | In-process | `videoload.py` (PyAV/FFmpeg); same pre-route |
+| Video playback | Separate unsandboxed worker process (plain `subprocess.Popen`, no AppContainer) | `videostream.py` |
+| Scan-time metadata/header read | In-process | `metareader.py` (exiv2 seam); `catalog._image_size` calls `QImageReader` directly |
+
+`DecodeService.index()` is always in-process too, but it has no
+production call site yet, so it is not counted as a shipped gap.
+
+These gaps sit outside the sandboxed worker pool the Decision above
+prescribes as the floor from M1. They fall into a few groups.
+
+Of these, **PSD** (fauxcasa-v46.4), **16-bit TIFF** (fauxcasa-v46.7)
+and **HEIC/HEIF** (fauxcasa-y5b) share one shape, distinct from RAW,
+video and the header read below: the pinned PySide6 build ships no Qt
+plugin for them (PSD, HEIC/HEIF) or Qt's own plugin corrupts the
+pixels (16-bit TIFF grayscale silently clips to white on Linux), so
+`pillowload.py` decodes the same bytes with Pillow instead — for
+HEIC/HEIF, Pillow itself has no built-in HEIF reader, so
 `pillowload.py` additionally registers **pi-heif**'s opener (PyPI
 `pi-heif`, wrapping libheif 1.23.0 + the libde265 HEVC decoder,
 LGPLv3 — see `docs/research/heic-decode-decision.md` for the licensing
@@ -162,19 +199,96 @@ contains, with the same ambient authority as the rest of the UI/index
 process. PSD and 16-bit TIFF carry the analogous risk for Pillow's own
 PSD/TIFF codecs, already accepted before this bead.
 
+**RAW** decodes in-process through `rawload.py` (LibRaw), pre-routed
+ahead of the sandbox check the same way as PSD, TIFF and HEIC/HEIF, but
+it is not a fallback from a missing Qt plugin, it is the only path:
+RAW was never inside the sandboxed worker pool. LibRaw parses the
+widest, least-standardized format family Fauxcasa bundles (vendor RAW
+containers), against attacker-controlled bytes, with the full
+authority of the UI/index process.
+
+**Video decodes in two places, neither sandboxed.** The poster frame
+(`videoload.py`, PyAV/FFmpeg) runs in-process on the same pre-route as
+RAW. Playback (`videostream.py`) is a separate worker process, spawned
+with a plain `subprocess.Popen`, not an AppContainer. Its fd-only
+design is a partial mitigation: the worker receives an already-open
+read-only descriptor and never sees a path, so it cannot open
+arbitrary files even without OS-enforced ambient-authority stripping,
+but the OS still grants that worker process the same authority as any
+other process the user runs, and PyAV/FFmpeg itself is decoding
+attacker-controlled bytes inside it. The AppContainer launcher for this
+worker is outstanding fauxcasa-i92 work. This contradicts Decision item
+3's "no residual-risk exception is recorded here": that sentence no
+longer describes what ships, and the exception is recorded here
+instead.
+
+**The scan-time metadata/header read** also runs in-process, on every
+platform: `metareader.py`'s exiv2 seam extracts capture date, GPS, XMP
+rating and EXIF orientation from attacker-controlled bytes before a
+photo is ever opened for viewing, and `catalog._image_size` calls
+`QImageReader` directly for a quick dimension probe. Both are metadata
+parsers, the same class of attack surface the Decision names alongside
+pixel decoders (see "Trust boundaries" above), and neither runs inside
+the sandbox today. Moving this read is fauxcasa-i92.4.
+
+**Linux and macOS have no sandbox transport at all.**
+`decodefacade.ensure_started` sets the transport to in-process
+unconditionally on both platforms; no Linux or macOS AppContainer- or
+seccomp-equivalent code exists anywhere in the tree, only the design
+prose in `docs/design/decode-service.md`. Every format in the coverage
+table above, including the plain stills that get the sandbox on
+Windows, decodes in-process on Linux and macOS. The owner runs Linux
+daily.
+
 Tracked for migration into the sandboxed worker pool under
 **fauxcasa-i92** (the decode-isolation epic this document belongs to),
-not resolved here: moving these three fallbacks behind the broker/worker
-boundary closes the gap without changing `pillowload.py`'s bytes-in/
-pixels-out interface, which was deliberately kept sandbox-service-shaped
-for exactly this future move (see `pillowload.py`'s module docstring).
+not resolved here: moving the PSD/TIFF/HEIC fallbacks behind the
+broker/worker boundary would close that part of the gap without
+changing `pillowload.py`'s bytes-in/pixels-out interface, which was
+deliberately kept sandbox-service-shaped for exactly this future move
+(see `pillowload.py`'s module docstring). That migration, and the
+matching moves for RAW, video and the header read, are frozen; see
+"Scope freeze" below.
+
+## Scope freeze (2026-09-16, until release 0.4 has shipped)
+
+No expansion of the sandbox's scope until release 0.4 ("Fix it", the
+edit room, per `docs/architecture-review-2026-09.md` §9) has shipped.
+Concretely, none of the following until then: the Linux (or macOS)
+sandbox transport; moving RAW, PSD, HEIC/HEIF or video into the
+sandboxed worker pool; moving scan-time metadata parsing into the
+sandbox (fauxcasa-i92.4); the AppContainer launcher for the video
+playback worker; the hostile-corpus and fuzz gates (fauxcasa-i92.5);
+any wasm adoption.
+
+What exists stays. It keeps running, stays tested, and stays on by
+default; this freeze blocks new sandbox work, not the sandbox itself.
+
+The one exception: a user-reported incident lifts the freeze. This
+follows the arch review's rule against measurement or hardening
+campaigns without a trigger (`docs/architecture-review-2026-09.md`
+§10 rule 4), which lists three triggers — a user report, a failed CI
+gate, or new reference hardware — that govern such campaigns in
+general; for this freeze specifically, only the user-reported incident
+lifts it, and curiosity does not.
+
+See `docs/architecture-review-2026-09.md` §5.1 for the cost/benefit
+argument behind this freeze and §8.4 for the freeze list it belongs
+to. Revisit trigger beyond the incident exception: when the app starts
+accepting files from outside the library (device import, M4), because
+that is when untrusted bytes actually start arriving from new sources
+and the whole posture should be revisited, not just this freeze's end
+date.
 
 ## Verification (becomes CI gates)
 
 - **M1 gate (with decode isolation landing):** a test worker, handed a
   hostile-format probe corpus, demonstrably cannot (a) open a file
   outside its handed-in fd, (b) reach the network, (c) write anywhere
-  but its output shm — asserted per platform.
+  but its output shm — asserted per platform. As shipped, this gate is
+  met for "plain stills on Windows" only; the per-platform, full-matrix
+  assertion this item originally implied is pending the scope freeze
+  above lifting.
 - **Crash robustness (ties to N5 kill-fuzzer):** kill -9 a worker
   mid-decode → job retried/flagged, app state intact, no UI stall.
 - **Fuzz smoke:** the decoder corpus (vendor RAW samples, truncated/
@@ -285,3 +399,10 @@ read only after the worker has exited. `FAUXCASA_DECODE_SANDBOX=require`
   invalidated if the worker's AppContainer is ever granted a loopback
   exemption or any network capability, at which point socket creation
   itself would need to be blocked.
+- **The unsandboxed in-process decoders (RAW, PSD, 16-bit TIFF,
+  HEIC/HEIF, the video poster frame, the scan-time metadata/header
+  read, and everything on Linux/macOS) and the plain `subprocess.Popen`
+  video-playback worker are owned residual risk for the freeze period**
+  ("What ships today" and "Scope freeze" above), not oversights: the
+  owner accepted them explicitly on 2026-09-16 rather than expand the
+  sandbox's scope before release 0.4 ships.

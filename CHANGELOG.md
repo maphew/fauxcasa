@@ -14,6 +14,25 @@ this section dated 2026-09-13 or earlier; see `docs/releases/v0.1.0.md`
 for the full user-facing notes. Entries dated after 2026-09-13 (below)
 landed since rc2 and are not yet in any tagged release.
 
+### Fixed (2026-09-16)
+
+- The toolbar search box now announces itself: a visible border, a
+  magnifier glyph with the Ctrl+F / `/` hint on hover, a highlight ring
+  when focused, and readable placeholder text on the dark palette. The
+  owner's rc2 manual pass could not find search at all (fauxcasa-e2y).
+  Side effect: the box keeps at least 220px, so on windows narrower than
+  about 820px the Info button moves into the toolbar's overflow menu.
+
+### Added (2026-09-16)
+
+- Fauxcasa now follows the OS's light/dark setting by default, and offers
+  a quick switch: **View > Theme** (System / Light / Dark, plus a Toggle
+  Light/Dark entry) or Ctrl+Shift+D. Switching repaints the whole app
+  immediately — grid, viewer, tray, toolbar icons, sidebar and the
+  metadata inspector — with no restart needed; the choice is remembered
+  per machine. "System" is the default and follows a live OS scheme
+  change while it's selected (fauxcasa-6y0).
+
 ### Added (2026-09-15)
 
 - Starred Photos is now date-grouped (month buckets, newest first, with

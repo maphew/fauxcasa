@@ -85,13 +85,36 @@ from thumbcache import THUMB_EDGE, ThumbCache
 
 log = logging.getLogger("fauxcasa")
 
-# Colors are theme.py's named constants (fauxcasa-ez2.4). BACKGROUND takes
+# Colors are theme.py's named constants (fauxcasa-ez2.4). Paint code below
+# reads theme.X directly (not a snapshot) so a runtime scheme switch
+# (fauxcasa-6y0, theme.apply_scheme()) repaints correctly on the very next
+# frame — same live-lookup fix as grid.py's module __getattr__ (see there
+# for why a plain `NAME = theme.X` alias goes stale). BACKGROUND takes
 # theme.VIEWER_BG — deliberately darker than the grid's theme.WINDOW, a
 # photo-viewing surface with no sibling chrome to compete with.
-BACKGROUND = theme.VIEWER_BG
-CAPTION_BG = theme.CAPTION_BG
-CAPTION_FG = theme.CAPTION_FG
-TEXT_MUTED = theme.TEXT_MUTED
+_THEME_ALIASES = {
+    "BACKGROUND": "VIEWER_BG",
+    "CAPTION_BG": "CAPTION_BG",
+    "CAPTION_FG": "CAPTION_FG",
+    "TEXT_MUTED": "TEXT_MUTED",
+    "TRANSPORT_FG": "TRANSPORT_FG",       # glyphs + played seek bar
+    "TRANSPORT_TRACK": "TRANSPORT_TRACK",  # unplayed seek-bar remainder
+}
+
+
+def __getattr__(name):
+    theme_name = _THEME_ALIASES.get(name)
+    if theme_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(theme, theme_name)
+
+
+def __dir__():
+    # PEP 562's other half: without this, dir(viewer) / tab-completion
+    # never lists the alias names since they aren't real module attributes.
+    return sorted(set(globals()) | set(_THEME_ALIASES))
+
+
 # Bottom caption/info bar height (fauxcasa-ez2.4 UX audit: the viewer used
 # to fit the photo into the FULL widget height, so the semi-transparent
 # bar could cover the bottom of the image — see _caption_h/paintEvent).
@@ -99,25 +122,36 @@ CAPTION_H = 30
 # A press that travels less than this (logical px, Manhattan) before its
 # release is a CLICK (zoom toggle); at or past it, a DRAG (pan at 1:1).
 CLICK_SLOP = 6
-# Face-overlay chrome (fauxcasa-cam.4): subtle, non-blocking outlines.
+# Face-overlay chrome (fauxcasa-cam.4): subtle, non-blocking outlines. The
+# BOX is drawn over the photo itself (not chrome), so — like PLAY_WHITE —
+# a plain white stays right in both schemes; not routed through theme.py.
+# Its name chip is a different case: that sits on theme.CAPTION_BG, so the
+# label takes theme.CAPTION_FG (see _paint_faces).
 FACE_PEN = QColor(255, 255, 255, 215)
 FACE_RADIUS = 6  # rounded-rect corner, logical px (chrome, so zoom-invariant)
 # Video transport chrome (fauxcasa-v46.3): painted-in-widget, like every
 # other viewer overlay — no child widget tree, keyboard keeps working.
 TRANSPORT_H = 34            # transport strip height, above the CAPTION_H info bar
-TRANSPORT_FG = theme.PLAY_WHITE   # glyphs + seek progress
-TRANSPORT_TRACK = QColor(255, 255, 255, 60)  # unplayed seek-bar track
-AFFORDANCE_BG = QColor(0, 0, 0, 140)   # centered play badge disc
+# The seek track and the transport glyphs live in theme.py
+# (TRANSPORT_TRACK / TRANSPORT_FG, aliased above): they are painted on
+# the CAPTION_BG strip — chrome — so they follow the scheme, unlike the
+# centered affordance below, which sits directly on the photo.
+AFFORDANCE_BG = QColor(0, 0, 0, 140)   # centered play badge disc: over the photo, not chrome
 SEEK_STEP_US = 5_000_000    # Ctrl+Left / Ctrl+Right skip (±5 s)
 
 # Hover-revealed prev/next chevrons (fauxcasa-ez2.14): shown while the
 # cursor sits within this many logical px of either edge, hidden
 # otherwise — theme.TEXT_MUTED at 40% alpha, matching HOVER_OUTLINE's
 # "hover-only chrome" alpha convention (theme.py) rather than a fresh
-# literal.
+# literal. A function, not a module constant: TEXT_MUTED itself differs
+# between schemes (unlike ACCENT, which is shared — fauxcasa-6y0), so
+# this must be read at paint time to follow a live scheme switch.
 CHEVRON_MARGIN = 80
-CHEVRON_FG = QColor(theme.TEXT_MUTED.red(), theme.TEXT_MUTED.green(),
-                    theme.TEXT_MUTED.blue(), 102)
+
+
+def _chevron_fg() -> QColor:
+    return QColor(theme.TEXT_MUTED.red(), theme.TEXT_MUTED.green(),
+                  theme.TEXT_MUTED.blue(), 102)
 
 
 def _play_triangle(cx: float, cy: float, r: float) -> QPolygonF:
@@ -1484,9 +1518,13 @@ class ViewerPage(QWidget):
                 ly = rect.top() - th - 8
             chip = QRectF(rect.left(), ly, tw + 12, th + 4)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(CAPTION_BG)
+            painter.setBrush(theme.CAPTION_BG)
             painter.drawRoundedRect(chip, 4, 4)
-            painter.setPen(TRANSPORT_FG)
+            # The chip is themed chrome (CAPTION_BG), so its label takes
+            # the matching CAPTION_FG rather than PLAY_WHITE — the latter
+            # is for glyphs drawn straight onto the photo, and over a
+            # light chip it was near-invisible (fauxcasa-6y0 review).
+            painter.setPen(theme.CAPTION_FG)
             painter.drawText(chip, Qt.AlignmentFlag.AlignCenter, label)
 
     def _step(self, delta: int) -> None:
@@ -1739,33 +1777,36 @@ class ViewerPage(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(AFFORDANCE_BG)
             painter.drawEllipse(QPointF(cx, cy), 34.0, 34.0)
-            painter.setBrush(TRANSPORT_FG)
+            painter.setBrush(theme.PLAY_WHITE)
             # +3 px: optically center the triangle inside the disc.
             painter.drawPolygon(_play_triangle(cx + 3, cy, 16))
         strip = self._transport_rect()
-        painter.fillRect(strip, CAPTION_BG)
+        painter.fillRect(strip, theme.CAPTION_BG)
         gy = strip.center().y()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(TRANSPORT_FG)
+        # Everything from here down is painted ON the CAPTION_BG strip,
+        # so it takes the scheme-variant transport colors, not PLAY_WHITE
+        # (which stays right only over the photo — fauxcasa-6y0 review).
+        painter.setBrush(theme.TRANSPORT_FG)
         if playing:                               # pause: two bars
-            painter.fillRect(QRect(14, gy - 7, 4, 14), TRANSPORT_FG)
-            painter.fillRect(QRect(22, gy - 7, 4, 14), TRANSPORT_FG)
+            painter.fillRect(QRect(14, gy - 7, 4, 14), theme.TRANSPORT_FG)
+            painter.fillRect(QRect(22, gy - 7, 4, 14), theme.TRANSPORT_FG)
         else:                                     # play triangle
             painter.drawPolygon(_play_triangle(20, gy, 8))
         dur = pb.info.duration_us if pb is not None \
             else (self._video_duration_us or 0)
         posn = pb.position_us if pb is not None else 0
-        painter.setPen(CAPTION_FG)
+        painter.setPen(theme.CAPTION_FG)
         painter.drawText(QRect(36, strip.y(), 110, strip.height()),
                          Qt.AlignmentFlag.AlignVCenter,
                          f"{_format_us(posn)} / {_format_us(dur)}")
         bar = self._transport_seek_rect()
-        painter.fillRect(bar, TRANSPORT_TRACK)
+        painter.fillRect(bar, theme.TRANSPORT_TRACK)
         if dur > 0:
             frac = max(0.0, min(1.0, posn / dur))
             painter.fillRect(QRect(bar.x(), bar.y(),
                                    round(bar.width() * frac), bar.height()),
-                             TRANSPORT_FG)
+                             theme.TRANSPORT_FG)
 
     def _caption_visible(self) -> bool:
         """Whether the bottom caption/info bar is drawn THIS frame — always
@@ -1783,7 +1824,7 @@ class ViewerPage(QWidget):
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
-        painter.fillRect(self.rect(), BACKGROUND)
+        painter.fillRect(self.rect(), theme.VIEWER_BG)
         w, h = self.width(), self.height()
         idx = self.current_index()
         if idx < 0:
@@ -1807,7 +1848,7 @@ class ViewerPage(QWidget):
             painter.drawImage(self._shown_rect(w, box_h, shown), shown)
             self._paint_faces(painter)   # no-op unless toggled on + faces
         else:
-            painter.setPen(TEXT_MUTED)
+            painter.setPen(theme.TEXT_MUTED)
             msg = "loading…" if self.loading else "could not decode this file"
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, msg)
 
@@ -1817,8 +1858,8 @@ class ViewerPage(QWidget):
 
         if cap_visible:
             bar = self._info_text(self.catalog.photos[idx])
-            painter.fillRect(0, h - CAPTION_H, w, CAPTION_H, CAPTION_BG)
-            painter.setPen(CAPTION_FG)
+            painter.fillRect(0, h - CAPTION_H, w, CAPTION_H, theme.CAPTION_BG)
+            painter.setPen(theme.CAPTION_FG)
             painter.drawText(10, h - CAPTION_H, w - 20, CAPTION_H,
                              Qt.AlignmentFlag.AlignVCenter, bar)
         self._paint_chevrons(painter, w, h)
@@ -1826,12 +1867,13 @@ class ViewerPage(QWidget):
 
     def _paint_chevrons(self, painter: QPainter, w: int, h: int) -> None:
         """Hover-revealed prev/next chevrons (ez2.14): painted only while
-        _hover_prev/_hover_next is set (mouseMoveEvent), in CHEVRON_FG —
-        theme.TEXT_MUTED at 40% alpha."""
+        _hover_prev/_hover_next is set (mouseMoveEvent), in _chevron_fg()
+        — theme.TEXT_MUTED at 40% alpha, read live so it follows a scheme
+        switch."""
         if not (self._hover_prev or self._hover_next):
             return
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(CHEVRON_FG)
+        painter.setBrush(_chevron_fg())
         cy = h / 2
         r = 22.0
         if self._hover_prev:

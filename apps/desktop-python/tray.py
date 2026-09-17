@@ -53,12 +53,29 @@ THUMB = 44    # held-thumb box edge
 PAD = 6
 # Colors are theme.py's named constants (fauxcasa-ez2.4) — a raised panel
 # below the grid, so BACKGROUND takes theme.SURFACE rather than its own
-# near-duplicate gray.
-BACKGROUND = theme.SURFACE
-PLACEHOLDER = theme.PLACEHOLDER    # cache not built yet
-ERROR_TILE = theme.ERROR_TILE      # cached error entry / unreadable blob
-HINT_FG = theme.HINT_FG
-MORE_FG = theme.HEADER_FG
+# near-duplicate gray. Paint code below reads theme.X directly (not a
+# snapshot) so a runtime scheme switch (fauxcasa-6y0) repaints correctly
+# on the very next frame — same live-lookup fix as grid.py/viewer.py.
+_THEME_ALIASES = {
+    "BACKGROUND": "SURFACE",
+    "PLACEHOLDER": "PLACEHOLDER",    # cache not built yet
+    "ERROR_TILE": "ERROR_TILE",      # cached error entry / unreadable blob
+    "HINT_FG": "HINT_FG",
+    "MORE_FG": "HEADER_FG",
+}
+
+
+def __getattr__(name):
+    theme_name = _THEME_ALIASES.get(name)
+    if theme_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(theme, theme_name)
+
+
+def __dir__():
+    # PEP 562's other half: without this, dir(tray) / tab-completion never
+    # lists the alias names since they aren't real module attributes.
+    return sorted(set(globals()) | set(_THEME_ALIASES))
 
 
 class SelectionTray(QWidget):
@@ -288,10 +305,10 @@ class _ThumbsBar(QWidget):
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
-        painter.fillRect(self.rect(), BACKGROUND)
+        painter.fillRect(self.rect(), theme.SURFACE)
         tray = self._tray
         if not tray.held:
-            painter.setPen(HINT_FG)
+            painter.setPen(theme.HINT_FG)
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignVCenter,
                              "  Hold (Ctrl+H) keeps selected photos here "
                              "across folders")
@@ -312,10 +329,10 @@ class _ThumbsBar(QWidget):
             else:
                 # No cache yet -> placeholder; a cached error -> error tile
                 painter.fillRect(
-                    r, PLACEHOLDER if tray.thumbs is None else ERROR_TILE)
+                    r, theme.PLACEHOLDER if tray.thumbs is None else theme.ERROR_TILE)
         if more:
             r = QRect(PAD + shown * self._cell(), y, THUMB, THUMB)
-            painter.setPen(MORE_FG)
+            painter.setPen(theme.HEADER_FG)
             painter.drawText(r, Qt.AlignmentFlag.AlignCenter, f"+{more}")
         painter.end()
 
