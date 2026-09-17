@@ -875,7 +875,7 @@ under the §4 precedence (pinned by M1 exit), instant grid, folders/albums/stars
 faces displayed, search, selection tray, slideshow, stills + RAW rendering,
 video indexing/playback, decode isolation for plain stills on Windows (the
 shipped scope of the §5 threat-model requirement; RAW, PSD, 16-bit TIFF,
-HEIC, video and Linux stay in-process, per "What ships today" in
+HEIC, video and Linux/macOS stay in-process, per "What ships today" in
 `docs/decode-threat-model.md`, and the scope is frozen until 0.4). *Gate:* N4 budgets green on the 100k synthetic library;
 `picasa_db.py survey` cross-check shows zero ingest loss on synthetic
 corpora; owner confirms the same on the family archive.
