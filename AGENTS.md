@@ -282,8 +282,9 @@ docstrings describe a since-superseded stage:
   (v1 single-resolution, v2 multi-resolution) that catalog photos bind to
   by content hash plus library-relative path; it is the layer that decodes
   originals during indexing.
-- **`grid.py`**, **`viewer.py`**, and the folder-tree/albums sidebar (built
-  directly in `main.py`, there is no separate sidebar module) render the
+- **`grid.py`**, **`viewer.py`**, and **`sidebar.py`** (the folder-tree/
+  albums/people sidebar; `MainWindow` in `main.py` keeps the tree widget
+  and one-line delegators) render the
   catalog plus thumbcache: the grid reads only the cache pair, never
   originals, while the viewer decodes originals on demand through the
   decode seam below. `inspector.py`'s `InspectorPanel` is the read-only
@@ -313,6 +314,18 @@ docstrings describe a since-superseded stage:
 - **`applog.py`** is the diagnostics channel (rotating log file, plus a
   console when one exists) that survives a windowed PyInstaller build
   where `sys.stdout`/`stderr` are `None`.
+- **`librarystate.py`** is the single home for everything persisted on
+  the user's behalf (fauxcasa-4tu): the machine-local half (last library,
+  per-library sort modes, star threshold, folder view, window geometry,
+  all under the cache root) and the in-library tier-2 half, which today
+  only re-exports `starstore.py` and is where the sidecar-first write
+  layer (fauxcasa-lgg) lands. **`cli.py`** holds argument parsing, the
+  standalone subcommands (`--import-picasa-watched`) and `ScriptedRun`,
+  the state machine behind the scripted-run flags (`--screenshot`,
+  `--quit-after-ready`, `--view`, ...). `main.py` re-exports the moved
+  names, so tests keep patching and importing through `main`; note that a
+  patch on `main.<name>` does not reach code inside the new modules that
+  calls the same name through its own globals.
 
 ## Conventions & Patterns
 
