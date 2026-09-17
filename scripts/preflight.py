@@ -25,6 +25,8 @@ Checks (derived from .github/workflows/tests.yml and tracer.yml):
     (dataset-gated: self-skips cleanly when cache/test-datasets/ isn't
     fetched, so always safe here)
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_tracer.py -q   (skipped with --fast)
+    (thin wrapper, fauxcasa-l09: one pytest process per
+    apps/desktop-python/tests/test_*.py; command itself is unchanged)
   - QT_QPA_PLATFORM=offscreen uv run apps/desktop-python/test_decodesvc_win.py -q
     (skipped with --fast; on Windows this spawns real AppContainer sandbox
     workers -- the i92.3 escape gates; elsewhere only the trusted-side
