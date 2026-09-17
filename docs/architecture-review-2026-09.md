@@ -968,10 +968,16 @@ bd list --type=epic --status=all
 bd list --status=closed --limit 300
 bd list --status=open --limit 300
 
-# Once labels exist (section 10, rule 3): beads closed in the last 30 days,
-# all and touch-labelled; the ratio is the second Total over the first
-bd list --status=closed --closed-after "$(date -d '30 days ago' +%F)" --limit 300 | grep '^Total:'
-bd list --status=closed --closed-after "$(date -d '30 days ago' +%F)" --label touch --limit 300 | grep '^Total:'
+# The 30-day label ratio (section 10, rule 3; labels filed by fauxcasa-g11).
+# Prints one line: how many beads closed in the last 30 days and the share
+# per label. Target: touch at least 50%, process at most 10%. "unlabelled"
+# means a filing error, or a bead closed before 2026-09-16 when labels began.
+since=$(date -d '30 days ago' +%F); bd list --status=closed --closed-after "$since" --limit 300 --json | python -c "
+import sys, json, collections
+d = json.load(sys.stdin); n = len(d) or 1
+kinds = ('touch', 'trust', 'plumbing', 'process')
+c = collections.Counter(next((l for l in (i.get('labels') or []) if l in kinds), 'unlabelled') for i in d)
+print(len(d), 'beads closed since', '$since:', ', '.join(f'{k} {v} ({100 * v // n}%)' for k, v in c.most_common()))"
 
 # Release state
 gh release list --limit 10
