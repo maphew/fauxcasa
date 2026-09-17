@@ -58,9 +58,12 @@ promotion epic when promotion starts.
    unchanged. Bundle smoke stays green through the move.~~ **Dropped
    2026-09-16** (fauxcasa-l09, arch review section 7.4): tied to item 2's
    rename, dropped for the same reason.
-7. **Test suite split by module.** Tests live in `apps/desktop-python/tests/`
-   split by module under test with a shared `conftest.py`, run one pytest
-   process per file; done 2026-09-16 (fauxcasa-l09).
+7. ~~**Test suite split by module.** Tests live in
+   `apps/desktop-python/tests/` split by module under test with a shared
+   `conftest.py`, run one pytest process per file.~~ **Done outside the
+   gate 2026-09-16** (fauxcasa-l09, arch review section 7.4): completed as
+   ordinary work, not because it was a promotion criterion — see "What
+   promotion does NOT require" below, which still holds.
 8. **Beads bookkeeping.** A promotion epic exists; per-file/-surface renames
    and the checklist above are its children; the tracer README's shortcut
    list is reconciled against open beads so nothing labeled "shortcut" is
@@ -79,9 +82,9 @@ promotion epic when promotion starts.
 ## Sequencing note
 
 Criteria 2–8 are a few days of mechanical work with CI as the net. The only
-scheduling constraint worth stating: do the rename (2) and README flip (5)
-in the same PR, so no commit range exists where the code lives in a product
-home while calling itself an experiment, or vice versa.
+scheduling constraint worth stating: do the rename (2, dropped — see item 2)
+and README flip (5) in the same PR, so no commit range exists where the code
+lives in a product home while calling itself an experiment, or vice versa.
 
 ## Amendment — 2026-09-13
 
@@ -121,5 +124,5 @@ versa. For 0.1, item 5 lands **without** item 2: the README flip here is a
 release-notes truth requirement (0.1.0 ships and must not describe itself
 as "not yet the application"), not a code-home statement — the code still
 lives in `apps/desktop-python/`, and the README says so. The rule is waived
-for this one case; it resumes governing the eventual 0.2 rename + any
-further README changes tied to it.
+for this one case; it resumes governing the eventual 0.2 rename (dropped,
+see item 2) + any further README changes tied to it.
