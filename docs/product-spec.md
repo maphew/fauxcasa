@@ -873,8 +873,10 @@ original, detected and displayed read-only; pinned: delegated, 2026-07-03,
 fauxcasa-o66, §10 item 18 — the un-bake/restore machinery itself is M3's)
 under the §4 precedence (pinned by M1 exit), instant grid, folders/albums/stars/captions/
 faces displayed, search, selection tray, slideshow, stills + RAW rendering,
-video indexing/playback, decode isolation per the §5 threat-model
-requirement. *Gate:* N4 budgets green on the 100k synthetic library;
+video indexing/playback, decode isolation for plain stills on Windows (the
+shipped scope of the §5 threat-model requirement; RAW, PSD, 16-bit TIFF,
+HEIC, video and Linux/macOS stay in-process, per "What ships today" in
+`docs/decode-threat-model.md`, and the scope is frozen until 0.4). *Gate:* N4 budgets green on the 100k synthetic library;
 `picasa_db.py survey` cross-check shows zero ingest loss on synthetic
 corpora; owner confirms the same on the family archive.
 
@@ -914,8 +916,9 @@ weekly Picasa-opens-the-library differential checks green, owner signs off.
 printing, gallery export interleave as they fit.
 
 **Gate coverage:** N1→M2 · N2→M3 · N3→M2 · N4→M1 (read-only rows; write/watch
-rows at M2/M4) · N5→M2 (+M4 NAS) · N6→M4 · N7→M2. Formats + decode
-isolation→M1. Backup, cohabitation, NAS profile, P1 make-permanent machinery,
+rows at M2/M4) · N5→M2 (+M4 NAS) · N6→M4 · N7→M2. Formats→M1 · decode
+isolation→M1 as plain stills on Windows only (the rest of the §5 matrix waits
+for the post-0.4 scope thaw in `docs/decode-threat-model.md`). Backup, cohabitation, NAS profile, P1 make-permanent machinery,
 movie renderer, first-class Windows CI→M4.
 
 ---
