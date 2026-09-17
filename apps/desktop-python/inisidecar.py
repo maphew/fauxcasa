@@ -112,11 +112,39 @@ class IniEdit:
             raise IniWriteError(
                 "value",
                 "key is empty, contains '=' or a line break, or starts with '['")
+        # Surrounding whitespace is REFUSED, not silently stripped:
+        # `classify_line` stores every existing pair's key stripped, while
+        # `_set` compares the edit's key as given, so a padded key
+        # (" star ") matches no existing line -- pass 2 would insert a
+        # SECOND `" star =v"` pair, and a first-wins reader
+        # (`picasa_db.IniSection.get`, Windows GetPrivateProfileString)
+        # would keep resolving `star` to the OLD value. That shadowed
+        # duplicate is exactly the reader disagreement design §2's
+        # "edited everywhere" rule exists to prevent, and step 4 would
+        # catch it only late, as a misleading `kind="verify"`. A
+        # whitespace-only key (" ") is worse: it is truthy, so the
+        # emptiness check above passes it, and the inserted `" =v"` line
+        # re-parses with key "" and can never match anything.
+        if self.key != self.key.strip():
+            raise IniWriteError(
+                "value", "key has leading or trailing whitespace")
         if (not self.section or "]" in self.section
                 or "\r" in self.section or "\n" in self.section):
             raise IniWriteError(
                 "value",
                 "section is empty or contains ']' or a line break")
+        # The same shadowing argument one level up: `_set` compares the
+        # edit's section against each header Line's own `name`, so a
+        # padded edit section ("a.jpg ") matches no existing `[a.jpg]`
+        # header and appends a duplicate SECTION instead of editing the
+        # existing run. (The mirror case -- a FILE whose header is spelled
+        # `[ a.jpg ]`, whose `name` keeps that padding and so never
+        # matches a clean edit section -- is deliberately NOT handled
+        # here: changing which existing lines a write rewrites is a design
+        # §2 call for lgg.4, not one validation may make on its own.)
+        if self.section != self.section.strip():
+            raise IniWriteError(
+                "value", "section has leading or trailing whitespace")
 
 
 @dataclass(frozen=True)
@@ -316,9 +344,22 @@ class IniDocument:
         `read_picasa_ini` splits only on "\\n", so a lone CR is NOT a line
         break to the reader either) both need fixing, not just "" --
         checking `eol == ""` alone missed the lone-CR case and glued the
-        next line's `key=value` directly onto the previous value."""
+        next line's `key=value` directly onto the previous value.
+
+        ADD-ONLY, never replace. A bare-CR run keeps its own byte(s) and
+        gains only the missing "\\n" ("\\r" -> "\\r\\n"); it is NOT
+        swapped for `self.eol`, which would DESTROY the original 0x0D in
+        an LF-majority document (`b"[a]\\nk=v\\r"` would emit
+        `b"[a]\\nk=v\\n..."`), and design §4 step 4 allows the trailing
+        EOL only as an ADDED byte -- a REPLACED one becomes a
+        `kind="verify"` refusal once lgg.4 lands `_check_payload`. Only
+        the genuinely EOL-less case ("") has no original bytes to keep,
+        so only it uses `self.eol`. In a CRLF-majority document the two
+        rules coincide ("\\r" -> "\\r\\n" either way), which is why the
+        CRLF-only lone-CR test never caught this."""
         if self.lines and not self.lines[-1].eol.endswith("\n"):
-            self.lines[-1].eol = self.eol
+            last = self.lines[-1]
+            last.eol = (last.eol + "\n") if last.eol else self.eol
             self.appended_eol = True
 
     def _set(self, section: str, key: str, value: str) -> bool:
@@ -528,7 +569,7 @@ def _atomic_replace(path: Path, payload: bytes) -> tuple[int, int]:
     to back the tier-2 native sidecar writer, design §6).
 
     - Write `payload` to `<path.name>.<pid>.tmp` in `path`'s own
-      directory (the `_write_library_config` idiom, `main.py:450`),
+      directory (the `_remember_library` idiom, `main.py:450`),
       then `flush()` and `os.fsync()` the temp file's descriptor before
       closing it -- the §7 row's "durable means fsync'd", which every
       existing writer in the tree (`starstore.py`, `library.py`,

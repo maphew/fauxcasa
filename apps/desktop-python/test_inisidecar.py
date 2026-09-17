@@ -196,16 +196,38 @@ def test_apply_set_duplicate_sections_and_keys_rewrites_all():
     assert doc.to_bytes() == b"[a.jpg]\r\nk=9\r\n[a.jpg]\r\nk=9\r\nk=9\r\n"
 
 
-def test_apply_set_duplicate_sections_key_missing_in_one_run_inserts_there():
-    # A run that already has the key gets it REWRITTEN; a run that
-    # lacks it gets it INSERTED -- every run of the name ends up
-    # carrying key=value, not just the last one (Opus review finding 4).
+def test_apply_set_duplicate_sections_key_missing_in_every_run_inserts_in_each():
+    # NEITHER run carries the key, so both take the insert path (pass 2)
+    # -- every run of the name ends up carrying key=value, not just the
+    # last one (Opus review finding 4). The mixed rewrite-in-one-run +
+    # insert-in-the-other case is the next test.
     raw = b"[a.jpg]\r\nx=1\r\n[a.jpg]\r\ny=2\r\n"
     doc = ini.IniDocument.from_bytes(raw)
     changed = doc.apply([ini.IniEdit("a.jpg", "star", "yes")])
     assert changed == [("a.jpg", "star")]
     assert doc.to_bytes() == (
         b"[a.jpg]\r\nx=1\r\nstar=yes\r\n[a.jpg]\r\ny=2\r\nstar=yes\r\n")
+
+
+def test_apply_set_duplicate_sections_rewrites_one_run_and_inserts_in_other():
+    # Both mechanisms in ONE apply() call: run 1 already has `star` and
+    # gets it REWRITTEN (pass 1, in place), run 2 lacks it and gets it
+    # INSERTED (pass 2) -- the pass-1/pass-2 interaction behind the
+    # insertion rule, which the all-insert fixture above never reaches.
+    raw = b"[a.jpg]\r\nstar=yes\r\n[a.jpg]\r\ny=2\r\n"
+    doc = ini.IniDocument.from_bytes(raw)
+    changed = doc.apply([ini.IniEdit("a.jpg", "star", "no")])
+    assert changed == [("a.jpg", "star")]
+    assert doc.to_bytes() == (
+        b"[a.jpg]\r\nstar=no\r\n[a.jpg]\r\ny=2\r\nstar=no\r\n")
+    # Asserted separately, so a regression that turned the rewrite into a
+    # second insertion (or vice versa) cannot hide behind the byte
+    # comparison: exactly one line was added, and both runs now resolve
+    # `star` to the new value for a first-wins reader as well as a
+    # last-wins one.
+    assert len(doc.lines) == len(ini.IniDocument.from_bytes(raw).lines) + 1
+    assert [ln.value for ln in doc.lines
+            if ln.kind == "pair" and ln.key == "star"] == ["no", "no"]
 
 
 def test_apply_set_no_op_when_value_already_matches():
@@ -254,6 +276,27 @@ def test_apply_set_new_key_and_new_section_after_lone_cr_at_eof():
     doc2.apply([ini.IniEdit("b.jpg", "star", "yes")])
     out2 = doc2.to_bytes()
     assert out2 == b"[a.jpg]\r\nstar=yes\r\n[b.jpg]\r\nstar=yes\r\n"
+
+
+def test_apply_after_lone_cr_at_eof_in_an_lf_file_keeps_the_cr_byte():
+    # LF-majority twin of the CRLF case above, the one the old
+    # `_ensure_trailing_eol` got wrong: with `doc.eol == "\n"`, assigning
+    # the majority EOL to a last line whose own eol is a bare "\r"
+    # REPLACED the file's final 0x0D instead of adding to it. Adding the
+    # missing "\n" keeps every original byte, which is what design §4
+    # step 4 allows (the trailing EOL is an ADDED byte, never a swapped
+    # one).
+    raw = b"[a]\nk=v\r"
+    doc = ini.IniDocument.from_bytes(raw)
+    assert doc.eol == "\n"  # majority is LF, and the lone CR is not one
+    assert doc.to_bytes() == raw  # sanity: unmodified round-trip first
+    doc.apply([ini.IniEdit("a", "caption", "hi")])
+    out = doc.to_bytes()
+    assert doc.appended_eol is True
+    assert out == b"[a]\nk=v\r\ncaption=hi\n"
+    # The strongest form of the invariant: the original bytes survive
+    # untouched and in order, with the write only appending after them.
+    assert out.startswith(raw)
 
 
 def test_apply_lone_cr_at_eof_reparses_cleanly_via_the_reader(tmp_path):
@@ -329,6 +372,10 @@ _INVALID_EDITS = [
     pytest.param(ini.IniEdit("a", "k\r", "v"), id="key-cr"),
     pytest.param(ini.IniEdit("a", "k\n", "v"), id="key-lf"),
     pytest.param(ini.IniEdit("a", "[k", "v"), id="key-leading-bracket"),
+    pytest.param(ini.IniEdit("a", " star ", "v"), id="key-padded"),
+    pytest.param(ini.IniEdit("a", "star\t", "v"), id="key-trailing-tab"),
+    pytest.param(ini.IniEdit("a", " ", "v"), id="key-whitespace-only"),
+    pytest.param(ini.IniEdit(" a ", "k", "v"), id="section-padded"),
     pytest.param(ini.IniEdit("", "k", "v"), id="section-empty"),
     pytest.param(ini.IniEdit("a]", "k", "v"), id="section-bracket"),
     pytest.param(ini.IniEdit("a\r", "k", "v"), id="section-cr"),
@@ -347,6 +394,25 @@ def test_ini_edit_validate_accepts_well_formed_edits():
     ini.IniEdit("a.jpg", "star", "yes").validate()
     ini.IniEdit("a.jpg", "caption", None).validate()  # remove is fine
     ini.IniEdit("a.jpg", "filters", "K=V,OTHER=1").validate()  # "=" in value ok
+    # Inner whitespace is data, not padding -- only the edges are refused.
+    ini.IniEdit("a b.jpg", "my key", "v").validate()
+
+
+def test_apply_refuses_padded_key_instead_of_inserting_a_shadowed_duplicate():
+    # A padded key can never match the stripped key `classify_line`
+    # stores for an existing `star=old` line, so accepting it would
+    # insert a SECOND pair and leave a first-wins reader
+    # (GetPrivateProfileString, picasa_db.IniSection.get) resolving
+    # `star` to the OLD value -- an edit that silently never lands, and
+    # that step 4 could only report late as a misleading kind="verify".
+    # It is refused up front, and apply() validates BEFORE mutating, so
+    # the document is left byte-identical.
+    raw = b"[a.jpg]\r\nstar=old\r\n"
+    doc = ini.IniDocument.from_bytes(raw)
+    with pytest.raises(ini.IniWriteError) as excinfo:
+        doc.apply([ini.IniEdit("a.jpg", " star ", "new")])
+    assert excinfo.value.kind == "value"
+    assert doc.to_bytes() == raw
 
 
 # --------------------------------------------------------------------------
@@ -386,6 +452,21 @@ def test_write_edits_happy_path_returns_matching_sig_and_bytes(tmp_path):
     assert result.bytes_written == len(on_disk)
 
 
+# Root ignores the 0o444 mode bits `_make_readonly` sets on POSIX:
+# `os.access(path, os.W_OK)` returns True for uid 0 and the write
+# succeeds, so step 2's refusal cannot be provoked this way and
+# pytest.raises would report DID NOT RAISE. Harmless while the xfail
+# below masks everything, but containers run test suites as root often
+# enough that the guard belongs here now, not in lgg.4. Windows has no
+# geteuid and needs no guard (the READONLY attribute binds administrators
+# too).
+_SKIP_IF_ROOT = pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: -1)() == 0,
+    reason="root bypasses the mode bits os.access(W_OK) checks",
+)
+
+
+@_SKIP_IF_ROOT
 @pytest.mark.xfail(strict=True, raises=NotImplementedError)
 def test_write_edits_refuses_on_readonly(tmp_path):
     path = tmp_path / ".picasa.ini"
@@ -435,6 +516,15 @@ def test_write_edits_cleans_up_temp_file_on_failure(tmp_path, monkeypatch):
     path.write_bytes(b"[a.jpg]\r\nstar=yes\r\n")
 
     def _boom(raced_path):
+        # Assert the temp file EXISTS before failing. `_before_swap` is
+        # documented to fire after step 5 has written the temp
+        # (inisidecar.py's `_before_swap` docstring), and without this
+        # assertion an implementation that called the seam too early
+        # would satisfy the empty-glob check below vacuously: "temp
+        # created and then cleaned up" would be indistinguishable from
+        # "temp never created at all".
+        assert list(tmp_path.glob(".picasa.ini.*.tmp")), (
+            "_before_swap fired before step 5 created the temp file")
         raise OSError("synthetic failure injected by the test")
 
     # Fails AFTER step 5 creates the temp file but BEFORE the swap (step

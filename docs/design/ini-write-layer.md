@@ -88,8 +88,13 @@ Decisions:
 - **EOL style** is the file's majority style; a new file uses `\r\n`
   because Picasa does (`docs/research/picasa-ini-format.md:11`, every
   oracle fixture). A file whose last line has no EOL gets one added when
-  we append after it; this is the one byte we change outside our own
-  lines, and the verification step allows exactly it.
+  we append after it; these are the only bytes we change outside our own
+  lines, and the verification step allows exactly them. *Added*, never
+  substituted: a last line ending in a bare `\r` (not a line break to the
+  reader, which splits only on `\n`) keeps that `\r` and gains the missing
+  `\n`, even in an LF-majority file whose majority style would otherwise
+  overwrite it. Only a last line with no EOL at all has nothing to keep,
+  and it gets the majority style.
 - **Duplicate sections and duplicate keys** (real, from crashed Picasa
   writes; format doc "Robustness") are edited *everywhere*: `set` rewrites
   every `key=` pair in every section of that name, `remove` deletes every
@@ -114,7 +119,12 @@ Decisions:
 - **Values are literal**: no quoting, no escaping, `=` allowed in values.
   A value containing `\r` or `\n`, a key containing `=` or starting with
   `[`, or a section name containing `]` is refused before any file is
-  touched (`IniWriteError(kind="value")`).
+  touched (`IniWriteError(kind="value")`). So is a key or section name
+  with leading or trailing whitespace: the reader stores keys stripped,
+  so a padded key would match no existing pair and the write would
+  insert a second, shadowed line a first-wins reader never sees -- the
+  very disagreement the duplicate rule above exists to remove.
+  Whitespace inside a name is data and is kept.
 - **Empty sections are fine to leave behind**: `remove` of the last key in
   a `[photo.jpg]` section leaves the header; Picasa leaves stale sections
   routinely (format doc "Stale sections are normal") and the reader
@@ -134,14 +144,24 @@ is the writer's too, and the writer records which branch it took:
 
 Two edge rules:
 
-- A new value that `cp1252` cannot encode in a legacy file **upgrades the
-  file to UTF-8**: the whole file is transcoded and an `[encoding]` section
-  with `utf8=1` is added as the first lines. This is the one case where
-  every line changes. It is reported in the result (`upgraded_encoding=True`)
-  so the caller can log it, and it is refused (`kind="encoding"`) when the
-  legacy file had undecodable bytes (the `surrogateescape` fallback inside
-  the cp1252 branch), because those bytes have no UTF-8 meaning to
-  transcode. **⚖ argue**: the alternative is to write the value
+- A new value that `cp1252` cannot encode in a **cleanly decoded `cp1252`**
+  file **upgrades the file to UTF-8**: the whole file is transcoded and an
+  `[encoding]` section with `utf8=1` is added as the first lines. This is
+  the one case where every line changes. It is reported in the result
+  (`upgraded_encoding=True`) so the caller can log it. The governing rule
+  is narrower than "cp1252 cannot encode it", and the table row above
+  states it: **never emit ambiguous bytes into a file whose encoding is
+  unknown.** So a `legacy-surrogateescape` document -- one where even
+  cp1252 rejected a byte, so the file's true encoding is *not* known to be
+  cp1252, and no `utf8=1` marker says otherwise -- refuses **any
+  non-ASCII value** (`kind="encoding"`), including a cp1252-encodable one
+  like `café`: writing it would drop unmarked UTF-8 bytes in beside
+  bytes of an unknown legacy encoding, and upgrading the document instead
+  would mean transcoding the undecodable byte(s) under an assumption we
+  cannot make. ASCII values stay fine in every branch (cp1252 and UTF-8
+  agree there), and a `utf-8`/`utf-8-marked` document never needs an
+  upgrade at all. This is the contract `_upgrade_encoding` implements.
+  **⚖ argue**: the alternative is to write the value
   `cp1252`-lossy (replace characters); Picasa would show `?` where the
   user typed an emoji, and the verification step would fail its own
   round-trip. Refusing is honest; upgrading is what Picasa 3 itself does to
@@ -190,14 +210,19 @@ Steps, in order, each with its failure kind:
 4. **Decode, classify, apply** (sections 2 and 3), then **check the
    payload in memory before any file is touched**: every line not in the
    edit set is byte-identical to the original (the only allowed extra
-   byte is the trailing EOL of section 2); `read_picasa_ini` over the
+   byte is the trailing EOL of section 2 -- with one carve-out: a section
+   3 encoding upgrade re-encodes every line and inserts the
+   `[encoding]`/`utf8=1` header, so the invariant then covers only the
+   lines neither `apply()` nor `_upgrade_encoding` meant to touch, and a
+   checker built from the narrow sentence alone would refuse every
+   cp1252-to-UTF-8 upgrade as `kind="verify"`); `read_picasa_ini` over the
    payload bytes shows every edit landed in every run of its section (or
    absent, for removals) and the anomaly count did not grow. A failure
    here is `kind="verify"` and costs nothing, which is the point: a
    placement or encoding bug becomes a refusal, never a corrupt file. If
    the payload equals the original bytes, return success now (no-op).
 5. **Write the temp file** `<name>.<pid>.tmp` in the same directory
-   (the `_write_library_config` idiom, `main.py:450`), `flush`, then
+   (the `_remember_library` idiom, `main.py:450`), `flush`, then
    `os.fsync` on the file. The §7 row says durable means fsync'd; every
    existing writer in the tree skips this (none of `starstore.py:83`,
    `library.py:436`, `catalog.py:2044` fsync), which is fine for caches and
@@ -315,10 +340,29 @@ marks are their own appended lines, `{"seq": 17, "applied": true}`, never
 an edit of an earlier line. On start, `librarystate` replays every entry
 without an applied mark, in `seq` order, through the same writer with
 `expected_sig=None` (section 4 step 3), so an entry that already landed
-is a free no-op and one that did not is applied per key; a `readonly`
-or `io` refusal leaves the entry pending and marks the
-folder's health (section 8), so the journal is also the retry queue the
-review asks for. When every entry is applied and the file exceeds 256 KiB,
+is a free no-op and one that did not is applied per key.
+
+**Which refusals leave the entry pending.** Every refusal kind except
+`value` leaves the entry pending -- no applied mark -- and sets the
+folder's health mark (section 8), so the journal is also the retry queue
+the review asks for:
+
+| Kind | Entry | Retried |
+|---|---|---|
+| `readonly`, `io` | pending | next live action on the folder, and every startup replay |
+| `drift` | pending | once, immediately, by section 5's folder-local recovery |
+| `encoding` | pending | startup replay only (the user may convert the file) |
+| `verify` | pending | startup replay only; the mark stays visible meanwhile |
+| `value` | **terminal** | never |
+
+`value` is the one terminal kind: a malformed edit cannot be made to
+succeed by any change to the file, so it gets its own appended
+`{"seq": 17, "failed": "value"}` mark and drops out of the queue --
+otherwise every replay forever would re-refuse it. When section 5's
+single `drift` retry also refuses, the entry simply stays pending with
+its mark: not retried again in this session, and never dropped; the next
+startup replay picks it up. Nothing else removes a pending entry. When
+every entry is applied or terminally failed and the file exceeds 256 KiB,
 it is rotated by writing an empty journal with the atomic swap. The
 journal file joins the release-notes inventory ("What Fauxcasa writes on
 your computer").
@@ -350,14 +394,25 @@ Three layers, each mechanical to run:
 
 1. **Unit, `test_inisidecar.py`** (ships with the skeleton, most tests
    `xfail(strict=True)` until lgg.4 lands the bodies): byte round-trip on
-   every oracle fixture ini (`fixtures/oracle/*/after/library/**/.picasa.ini`)
-   with zero edits produces identical bytes; each edit kind on CRLF and LF
+   every oracle fixture ini -- all three `INI_NAMES` spellings under
+   *both* library trees,
+   `fixtures/oracle/*/{before,after}/library/**/{.picasa.ini,Picasa.ini,picasa.ini}`,
+   since the legacy spellings and the pre-action tree are exactly where
+   the odd bytes live -- with zero edits produces identical bytes; each
+   edit kind on CRLF and LF
    files; duplicate sections and keys; BOM; `utf8=1` with a stray high
    byte; cp1252 legacy; the encoding upgrade; the missing-trailing-EOL
-   case; refusal on read-only (chmod on POSIX, attribute on Windows);
-   refusal on drift (touch the file between read and write via a hook);
-   verify failure when a hook corrupts the temp; temp-file cleanup on every
-   failure; Windows attribute preservation; new-file creation with and
+   case; refusal on read-only (chmod on POSIX -- skipped as root,
+   whom the mode bits do not bind -- attribute on Windows);
+   refusal on drift (touch the file between read and write via the
+   `_before_swap` hook); verify failure when `_atomic_replace` is
+   monkeypatched to land *different* bytes on disk than the ones the
+   writer computed, so the post-swap read-back has to catch the
+   corruption by re-reading the file rather than the test merely proving
+   a checker raises when told to; temp-file cleanup on every failure
+   (asserting the temp existed before the injected failure, so the check
+   cannot pass vacuously); Windows attribute preservation; new-file
+   creation with and
    without the encoding section; value and key validation.
 2. **Golden fixtures**: for each write feature, a `fixtures/oracle/NNN-*`
    entry captured from real Picasa is the *expected* ini for the same
