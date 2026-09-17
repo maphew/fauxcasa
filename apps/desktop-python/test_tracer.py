@@ -5192,7 +5192,14 @@ def search_library(tmp_path: Path) -> Path:
     return root
 
 
-def _search_win(library_root: Path):
+def _search_win(library_root: Path, cache_root: Path | None = None):
+    """A MainWindow over `library_root` for UI tests. Pass `cache_root`
+    (a tmp_path) whenever the test drives something that PERSISTS —
+    MainWindow writes user choices to self.cache_root, which with no
+    cache_root/cache_dir falls back to main._default_cache_root(), i.e.
+    the developer's own real <repo>/cache/fauxcasa-cache/config.json
+    (fauxcasa-6y0 review; same hazard _load_theme_mode's docstring warns
+    about on the read side)."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -5201,7 +5208,7 @@ def _search_win(library_root: Path):
     app = QApplication.instance() or QApplication([])
     assert app is not None
     return MainWindow(scan_library(library_root), None,
-                      cache_dir=None, build_dir=None)
+                      cache_dir=None, build_dir=None, cache_root=cache_root)
 
 
 def _hits(win) -> set:
@@ -19226,6 +19233,95 @@ def test_grid_aliases_follow_scheme() -> None:
         theme.apply_scheme("dark")
 
 
+def _wcag_contrast(fg, bg) -> float:
+    """WCAG 2.x contrast ratio between two OPAQUE (r, g, b) triples."""
+    def lum(c):
+        chan = []
+        for v in c:
+            v /= 255.0
+            chan.append(v / 12.92 if v <= 0.03928
+                        else ((v + 0.055) / 1.055) ** 2.4)
+        return 0.2126 * chan[0] + 0.7152 * chan[1] + 0.0722 * chan[2]
+    l1, l2 = sorted((lum(fg), lum(bg)), reverse=True)
+    return (l1 + 0.05) / (l2 + 0.05)
+
+
+def _over(top, bottom) -> tuple[int, int, int]:
+    """Source-over composite of a QColor onto an opaque (r, g, b)."""
+    a = top.alpha() / 255.0
+    return tuple(round(a * t + (1 - a) * b)
+                 for t, b in zip(top.getRgb()[:3], bottom))
+
+
+def test_transport_colors_follow_scheme() -> None:
+    """The video transport strip is CHROME — it fills with
+    theme.CAPTION_BG — so its play/pause glyph, seek progress and
+    unplayed track take the scheme-variant theme.TRANSPORT_FG/
+    TRANSPORT_TRACK, not the photo-facing PLAY_WHITE (fauxcasa-6y0
+    review: near-white glyphs and a white@60 track vanished on the light
+    white@180 strip). viewer's module aliases follow theme live, and both
+    light values clear a 3:1 floor against that strip composited over
+    BOTH extremes of photo content — a white photo and a black one."""
+    _offscreen_app()
+    import theme
+    import viewer
+
+    try:
+        assert viewer.TRANSPORT_FG.getRgb() == theme.PLAY_WHITE.getRgb()
+        assert viewer.TRANSPORT_TRACK.getRgb() == (255, 255, 255, 60)
+
+        theme.apply_scheme("light")
+        assert viewer.TRANSPORT_FG.getRgb() == theme.TRANSPORT_FG.getRgb()
+        assert (viewer.TRANSPORT_TRACK.getRgb()
+                == theme.TRANSPORT_TRACK.getRgb())
+        # No longer the photo-facing near-white the review flagged.
+        assert theme.TRANSPORT_FG.getRgb() != theme.PLAY_WHITE.getRgb()
+        for photo in ((255, 255, 255), (0, 0, 0)):
+            strip = _over(theme.CAPTION_BG, photo)
+            assert _wcag_contrast(
+                _over(theme.TRANSPORT_FG, strip), strip) >= 3.0, photo
+            assert _wcag_contrast(
+                _over(theme.TRANSPORT_TRACK, strip), strip) >= 3.0, photo
+        # The face-name chip rides the same CAPTION_BG, so its label is
+        # CAPTION_FG now (viewer._paint_faces) — also a 3:1 floor.
+        for photo in ((255, 255, 255), (0, 0, 0)):
+            strip = _over(theme.CAPTION_BG, photo)
+            assert _wcag_contrast(
+                _over(theme.CAPTION_FG, strip), strip) >= 3.0, photo
+    finally:
+        theme.apply_scheme("dark")
+
+
+def test_theme_check_tables_guards_globals_parity() -> None:
+    """theme._check_tables() enforces BOTH halves of the invariant
+    (fauxcasa-6y0 review): the two scheme tables share every key, and
+    every such key already exists as a module global. The second half is
+    what globals().update() cannot give itself — dict.update ADDS unknown
+    keys, so a key present in both tables but missing from the
+    module-globals block would otherwise raise AttributeError until the
+    first apply_scheme() quietly created it. A plain `raise`, not an
+    `assert`, so `python -O` keeps the guard."""
+    _offscreen_app()
+    from PySide6.QtGui import QColor
+
+    import theme
+
+    theme._check_tables()  # the real tables pass
+
+    probe = QColor(1, 2, 3)
+    theme._DARK["ZZ_PROBE"] = probe
+    try:
+        with pytest.raises(RuntimeError, match="share every key"):
+            theme._check_tables()
+        theme._LIGHT["ZZ_PROBE"] = probe
+        with pytest.raises(RuntimeError, match="module-global"):
+            theme._check_tables()
+    finally:
+        theme._DARK.pop("ZZ_PROBE", None)
+        theme._LIGHT.pop("ZZ_PROBE", None)
+    theme._check_tables()
+
+
 def test_resolve_scheme_matrix() -> None:
     """resolve_scheme's mode x os-scheme table (fauxcasa-6y0): "light"/
     "dark" are explicit overrides and ignore the OS scheme entirely;
@@ -19320,20 +19416,30 @@ def test_theme_toggle_shortcut_from_keymap(search_library: Path) -> None:
         keymap.shortcuts("app.theme_toggle")
 
 
-def test_refresh_theme_preserves_selected_view(search_library: Path) -> None:
+def test_refresh_theme_preserves_selected_view(search_library: Path,
+                                               tmp_path: Path) -> None:
     """_refresh_theme()'s _rebuild_sidebar() call must be bracketed with
     _selected_view()/_reselect_view() like every other rebuild call site
     (_toggle_reveal, _toggle_folder_view, ...) — Opus review blocker:
     without the bracket, switching theme (or the OS flipping scheme at
     sunset via colorSchemeChanged) silently reset the current view back
-    to All photos (fauxcasa-6y0)."""
+    to All photos (fauxcasa-6y0).
+
+    Built with an explicit tmp cache_root because _set_theme_mode below
+    persists the mode to self.cache_root, exactly as _remember_library
+    does (main.py, _change_library) — a MainWindow method writing the
+    user's choice to its own cache root is the established behavior, so
+    the fix is to give the TEST a cache root of its own instead of
+    making persistence conditional. Without it this test merge-wrote the
+    theme key into the developer's real config.json (fauxcasa-6y0
+    review)."""
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
 
     import theme
 
     try:
-        win = _search_win(search_library)
+        win = _search_win(search_library, cache_root=tmp_path / "cr")
         it = QTreeWidgetItemIterator(win.tree)
         folder_item = None
         while it.value():

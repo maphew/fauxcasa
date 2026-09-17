@@ -73,6 +73,13 @@ _DARK: dict[str, QColor] = {
     "HOVER_OUTLINE": QColor(255, 255, 255, 102),  # 40% white — hover-only chrome
     "PLAY": QColor(80, 200, 80),          # actionable play glyph (group-header button)
     "PLAY_WHITE": QColor(235, 235, 235),  # passive "this is a video" badge/transport glyph
+    # Video transport strip (viewer.py _paint_video_chrome): these are
+    # drawn on the CAPTION_BG strip, i.e. on chrome, not over the photo
+    # — so unlike PLAY_WHITE they must follow the scheme
+    # (fauxcasa-6y0 review). FG is the play/pause glyph and the played
+    # part of the seek bar; TRACK is the unplayed remainder.
+    "TRANSPORT_FG": QColor(235, 235, 235),
+    "TRANSPORT_TRACK": QColor(255, 255, 255, 60),
     "STAR": QColor(255, 200, 40),
     "STAR_OUTLINE": QColor(40, 30, 0, 200),   # 1px dark outline so gold reads on gold/yellow photos
     "GEOTAG": QColor(64, 205, 175),
@@ -112,6 +119,17 @@ _LIGHT: dict[str, QColor] = {
     # 4.2-4.4:1 (Opus review, fauxcasa-6y0).
     "PLAY": QColor(30, 120, 50),
     "PLAY_WHITE": _DARK["PLAY_WHITE"],  # drawn over photos, not chrome
+    # Transport chrome on the light CAPTION_BG strip (white @ 180 over
+    # the photo): the dark scheme's near-white glyphs/progress and
+    # white@60 track vanished there (fauxcasa-6y0 review). Measured
+    # against that strip over BOTH extremes of photo content — a white
+    # photo (strip composites to 255) and a black one (strip
+    # composites to 180): TRANSPORT_FG clears 8.4:1 (black photo) to
+    # 17.4:1 (white photo), and TRANSPORT_TRACK — black @ 120, so the
+    # strip still shows through as a track rather than a solid bar —
+    # clears 3.07:1 and 3.63:1 respectively.
+    "TRANSPORT_FG": QColor(28, 28, 28),
+    "TRANSPORT_TRACK": QColor(0, 0, 0, 120),
     "STAR": _DARK["STAR"],
     "STAR_OUTLINE": _DARK["STAR_OUTLINE"],
     "GEOTAG": _DARK["GEOTAG"],
@@ -133,11 +151,19 @@ _LIGHT: dict[str, QColor] = {
     "HIGHLIGHT_TEXT": QColor(28, 28, 28),
 }
 
-# Both tables MUST name exactly the same keys — apply_scheme()'s
-# globals().update() only ever repoints an EXISTING module attribute
-# (never adds one), and build_palette()'s src[key] lookups below assume
-# every key it asks for exists in whichever table was picked.
-assert set(_LIGHT) == set(_DARK), "theme scheme tables must share every key"
+# INVARIANT: the two tables and the module-globals block below all name
+# exactly the same keys. apply_scheme() repoints the constants with
+# globals().update(), which — being dict.update — would happily ADD a
+# name that only the tables know about; the module attribute would then
+# raise AttributeError until the first apply_scheme() silently
+# materialized it (fauxcasa-6y0 review). So the guard is not the update
+# call: it is the explicit `NAME = _DARK["NAME"]` block below, which
+# gives every key a module attribute at import time, plus _check_tables()
+# just below that block, which enforces table<->table AND
+# table<->globals parity. build_palette()'s src[key] lookups likewise
+# assume every key it asks for exists in whichever table was picked.
+# Checked with an explicit raise rather than `assert`, so `python -O`
+# cannot strip the guard.
 
 SCHEMES = ("dark", "light")
 
@@ -168,6 +194,10 @@ HOVER_OUTLINE = _DARK["HOVER_OUTLINE"]  # hover-only chrome; dark default is
 # ---- semantic ---------------------------------------------------------
 PLAY = _DARK["PLAY"]          # actionable play glyph (group-header button)
 PLAY_WHITE = _DARK["PLAY_WHITE"]  # passive "this is a video" badge/transport glyph
+# Video transport strip chrome (viewer.py): scheme-variant, unlike
+# PLAY_WHITE — see the _DARK/_LIGHT entries for the measured contrasts.
+TRANSPORT_FG = _DARK["TRANSPORT_FG"]        # glyph + played seek bar
+TRANSPORT_TRACK = _DARK["TRANSPORT_TRACK"]  # unplayed seek-bar remainder
 STAR = _DARK["STAR"]
 STAR_OUTLINE = _DARK["STAR_OUTLINE"]   # 1px dark outline so gold reads on gold/yellow photos
 GEOTAG = _DARK["GEOTAG"]
@@ -186,6 +216,30 @@ HINT_FG = _DARK["HINT_FG"]
 # direction) from WINDOW — lighter in dark mode, darker in light mode.
 FIELD_BORDER = _DARK["FIELD_BORDER"]
 HIGHLIGHT_TEXT = _DARK["HIGHLIGHT_TEXT"]  # QPalette.HighlightedText, on ACCENT
+
+
+def _check_tables() -> None:
+    """Enforce the parity invariant stated above _DARK/_LIGHT: the two
+    scheme tables name the same keys, AND every one of those keys
+    already exists as a module global. The second half is the one
+    globals().update() cannot provide for itself — dict.update ADDS
+    unknown keys, so without this check a key added to both tables but
+    forgotten in the block above would leave theme.NEWKEY raising
+    AttributeError until the first apply_scheme() call quietly created
+    it (fauxcasa-6y0 review). Raises rather than asserts so `python -O`
+    keeps the guard."""
+    if set(_LIGHT) != set(_DARK):
+        raise RuntimeError(
+            "theme scheme tables must share every key; differ: "
+            f"{sorted(set(_LIGHT) ^ set(_DARK))}")
+    missing = sorted(k for k in _DARK if k not in globals())
+    if missing:
+        raise RuntimeError(
+            "every theme scheme key needs a module-global default above: "
+            f"{missing}")
+
+
+_check_tables()
 
 
 def current_scheme() -> str:

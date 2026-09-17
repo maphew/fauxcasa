@@ -97,7 +97,8 @@ _THEME_ALIASES = {
     "CAPTION_BG": "CAPTION_BG",
     "CAPTION_FG": "CAPTION_FG",
     "TEXT_MUTED": "TEXT_MUTED",
-    "TRANSPORT_FG": "PLAY_WHITE",   # glyphs + seek progress
+    "TRANSPORT_FG": "TRANSPORT_FG",       # glyphs + played seek bar
+    "TRANSPORT_TRACK": "TRANSPORT_TRACK",  # unplayed seek-bar remainder
 }
 
 
@@ -121,15 +122,20 @@ CAPTION_H = 30
 # A press that travels less than this (logical px, Manhattan) before its
 # release is a CLICK (zoom toggle); at or past it, a DRAG (pan at 1:1).
 CLICK_SLOP = 6
-# Face-overlay chrome (fauxcasa-cam.4): subtle, non-blocking outlines. Drawn
-# over the photo itself (not chrome), so — like PLAY_WHITE — a plain white
-# stays right in both schemes; not routed through theme.py.
+# Face-overlay chrome (fauxcasa-cam.4): subtle, non-blocking outlines. The
+# BOX is drawn over the photo itself (not chrome), so — like PLAY_WHITE —
+# a plain white stays right in both schemes; not routed through theme.py.
+# Its name chip is a different case: that sits on theme.CAPTION_BG, so the
+# label takes theme.CAPTION_FG (see _paint_faces).
 FACE_PEN = QColor(255, 255, 255, 215)
 FACE_RADIUS = 6  # rounded-rect corner, logical px (chrome, so zoom-invariant)
 # Video transport chrome (fauxcasa-v46.3): painted-in-widget, like every
 # other viewer overlay — no child widget tree, keyboard keeps working.
 TRANSPORT_H = 34            # transport strip height, above the CAPTION_H info bar
-TRANSPORT_TRACK = QColor(255, 255, 255, 60)  # unplayed seek-bar track: over the photo, not chrome
+# The seek track and the transport glyphs live in theme.py
+# (TRANSPORT_TRACK / TRANSPORT_FG, aliased above): they are painted on
+# the CAPTION_BG strip — chrome — so they follow the scheme, unlike the
+# centered affordance below, which sits directly on the photo.
 AFFORDANCE_BG = QColor(0, 0, 0, 140)   # centered play badge disc: over the photo, not chrome
 SEEK_STEP_US = 5_000_000    # Ctrl+Left / Ctrl+Right skip (±5 s)
 
@@ -1514,7 +1520,11 @@ class ViewerPage(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(theme.CAPTION_BG)
             painter.drawRoundedRect(chip, 4, 4)
-            painter.setPen(theme.PLAY_WHITE)
+            # The chip is themed chrome (CAPTION_BG), so its label takes
+            # the matching CAPTION_FG rather than PLAY_WHITE — the latter
+            # is for glyphs drawn straight onto the photo, and over a
+            # light chip it was near-invisible (fauxcasa-6y0 review).
+            painter.setPen(theme.CAPTION_FG)
             painter.drawText(chip, Qt.AlignmentFlag.AlignCenter, label)
 
     def _step(self, delta: int) -> None:
@@ -1774,10 +1784,13 @@ class ViewerPage(QWidget):
         painter.fillRect(strip, theme.CAPTION_BG)
         gy = strip.center().y()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(theme.PLAY_WHITE)
+        # Everything from here down is painted ON the CAPTION_BG strip,
+        # so it takes the scheme-variant transport colors, not PLAY_WHITE
+        # (which stays right only over the photo — fauxcasa-6y0 review).
+        painter.setBrush(theme.TRANSPORT_FG)
         if playing:                               # pause: two bars
-            painter.fillRect(QRect(14, gy - 7, 4, 14), theme.PLAY_WHITE)
-            painter.fillRect(QRect(22, gy - 7, 4, 14), theme.PLAY_WHITE)
+            painter.fillRect(QRect(14, gy - 7, 4, 14), theme.TRANSPORT_FG)
+            painter.fillRect(QRect(22, gy - 7, 4, 14), theme.TRANSPORT_FG)
         else:                                     # play triangle
             painter.drawPolygon(_play_triangle(20, gy, 8))
         dur = pb.info.duration_us if pb is not None \
@@ -1788,12 +1801,12 @@ class ViewerPage(QWidget):
                          Qt.AlignmentFlag.AlignVCenter,
                          f"{_format_us(posn)} / {_format_us(dur)}")
         bar = self._transport_seek_rect()
-        painter.fillRect(bar, TRANSPORT_TRACK)
+        painter.fillRect(bar, theme.TRANSPORT_TRACK)
         if dur > 0:
             frac = max(0.0, min(1.0, posn / dur))
             painter.fillRect(QRect(bar.x(), bar.y(),
                                    round(bar.width() * frac), bar.height()),
-                             theme.PLAY_WHITE)
+                             theme.TRANSPORT_FG)
 
     def _caption_visible(self) -> bool:
         """Whether the bottom caption/info bar is drawn THIS frame — always
