@@ -92,20 +92,17 @@ def _remembered_library(cache_root: Path) -> Path | None:
     return p
 
 
-def _remember_library(cache_root: Path, library: Path) -> None:
-    """Persist the chosen library so the next no-arg (double-click) launch
-    reopens it. Best-effort: a write failure must never abort the launch.
-    Writes via a per-process temp sibling + os.replace so a second frozen
-    instance launching concurrently can never read a half-written (torn)
-    config — it sees either the old file or the whole new one.
-
-    Reads the existing doc first and only overwrites the 'library' key —
-    filetypes.save_excluded_exts persists per-library File Types
-    exclusions in this same config.json (see filetypes.py's
-    preserved-keys contract), and a blind overwrite here would wipe them
-    on every library switch. Fail-soft on a garbage/missing file: keep
-    whatever raw keys survive parsing, same posture as
-    _remembered_library and save_excluded_exts."""
+def _config_update(cache_root: Path, key: str, value) -> OSError | None:
+    """Shared atomic merge-one-key-into-config.json idiom (fauxcasa-6y0,
+    extracted from _remember_library): read the existing doc first (a
+    missing/garbage file fails soft to {}) and set only KEY — a blind
+    overwrite would wipe whatever else lives in this same per-user
+    config.json (e.g. filetypes.save_excluded_exts's own keys, this
+    module's other key). Writes via a per-process temp sibling +
+    os.replace so a second frozen instance launching concurrently can
+    never read a half-written (torn) config — it sees either the old
+    file or the whole new one. Returns the OSError on a write failure
+    (never raised — callers decide how to log it) or None on success."""
     cfg = _config_path(cache_root)
     tmp = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
     try:
@@ -114,17 +111,26 @@ def _remember_library(cache_root: Path, library: Path) -> None:
         data = {}
     if not isinstance(data, dict):
         data = {}
-    data["library"] = str(library)
+    data[key] = value
     try:
         cache_root.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(data))
         os.replace(tmp, cfg)
     except OSError as e:
-        log.warning("could not remember library choice: %s", e)
         try:
             tmp.unlink()
         except OSError:
             pass
+        return e
+    return None
+
+
+def _remember_library(cache_root: Path, library: Path) -> None:
+    """Persist the chosen library so the next no-arg (double-click) launch
+    reopens it. Best-effort: a write failure must never abort the launch."""
+    err = _config_update(cache_root, "library", str(library))
+    if err is not None:
+        log.warning("could not remember library choice: %s", err)
 
 
 # Per-folder sort modes (fauxcasa-q6l.11) — DURABLE-HOME DECISION

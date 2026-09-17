@@ -31,7 +31,17 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPainter
 
 import keymap
-from viewer import CAPTION_BG, CAPTION_FG, CAPTION_H, ViewerPage, load_original
+import theme
+from viewer import CAPTION_H, ViewerPage, load_original
+
+# CAPTION_BG/CAPTION_FG are deliberately NOT imported by name here
+# (fauxcasa-6y0, Opus review): `from viewer import CAPTION_BG` would bind
+# whatever theme.CAPTION_BG resolved to at THIS FILE's import time and
+# freeze it there — viewer.py's own module __getattr__ makes `viewer.
+# CAPTION_BG` track a live scheme switch, but a `from`-import elsewhere
+# copies the value once. Read theme.CAPTION_BG/theme.CAPTION_FG directly
+# at paint time (~line 249) instead. CAPTION_H is a real constant (not a
+# color), so importing it by name is fine.
 
 # Dwell per slide. 4 s follows the one delay default the Picasa corpus
 # records — Movie Maker's "Slide Duration: 4.0s" (picasa-video-notes §1.6).
@@ -246,8 +256,8 @@ class SlideshowPage(ViewerPage):
         if not (self.paused or self._hint_visible):
             return
         painter = QPainter(self)
-        painter.fillRect(0, 0, self.width(), CAPTION_H, CAPTION_BG)
-        painter.setPen(CAPTION_FG)
+        painter.fillRect(0, 0, self.width(), CAPTION_H, theme.CAPTION_BG)
+        painter.setPen(theme.CAPTION_FG)
         painter.drawText(0, 0, self.width(), CAPTION_H,
                          Qt.AlignmentFlag.AlignCenter,
                          PAUSED_TEXT if self.paused else HINT_TEXT)

@@ -161,6 +161,15 @@ DEFAULT_SCHEME: dict[str, Binding] = {
              "actions (grid.invert's Ctrl+I above all) — same key_only-"
              "layering convention as grid.star_toggle's Space vs "
              "Shift+Space."),
+    "app.theme_toggle": Binding(
+        ("Ctrl+Shift+D",),
+        note="Toggle light/dark (fauxcasa-6y0) — a modifier chord, so a "
+             "window-level QAction shortcut is safe while typing in the "
+             "search box (same reasoning as app.play's F11/Ctrl+4). "
+             "Ctrl+D is grid.deselect and Ctrl+Shift+R is the M3 "
+             "counter-clockwise rotate reservation above, so this picks "
+             "the next free Ctrl+Shift chord rather than colliding with "
+             "either."),
 
     # ---- grid (library) ----
     "grid.select_all": Binding(
@@ -310,6 +319,7 @@ ACTION_LABELS: dict[str, str] = {
     "app.play": "Start slideshow of the current view",
     "app.search": "Jump to search",
     "app.info": "Toggle info panel",
+    "app.theme_toggle": "Toggle light/dark theme",
     "grid.select_all": "Select all",
     "grid.hold": "Hold selection in tray",
     "grid.star_toggle": "Add / remove star",

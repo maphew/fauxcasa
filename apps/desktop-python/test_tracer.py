@@ -4023,6 +4023,35 @@ def test_remember_library_preserves_filetypes_exclusions(tmp_path: Path) -> None
     assert filetypes.load_excluded_exts(cache_root, lib) == excluded
 
 
+def test_save_theme_mode_preserves_other_config_keys(tmp_path: Path) -> None:
+    """main._save_theme_mode (fauxcasa-6y0), like _remember_library, must
+    merge into config.json rather than overwrite it — both now share the
+    extracted _config_update helper. Seed the file with a 'library' key
+    and an arbitrary other key (standing in for filetypes.
+    save_excluded_exts's own entry) written directly, call the real
+    _save_theme_mode, and confirm every pre-existing key survives and
+    'theme' lands."""
+    import json
+
+    import main
+
+    cache_root = tmp_path / "cr"
+    cache_root.mkdir()
+    cfg = main._config_path(cache_root)
+    cfg.write_text(json.dumps({
+        "library": str(tmp_path / "lib"),
+        "excluded_exts": [".bmp", ".gif"],
+    }))
+
+    main._save_theme_mode(cache_root, "light")
+
+    data = json.loads(cfg.read_text())
+    assert data["library"] == str(tmp_path / "lib")
+    assert data["excluded_exts"] == [".bmp", ".gif"]
+    assert data["theme"] == "light"
+    assert main._load_theme_mode(cache_root) == "light"
+
+
 def test_remember_library_oserror_is_soft(tmp_path: Path, capsys) -> None:
     """_remember_library (fauxcasa-7e5) is best-effort: an unwritable cache
     root — here its parent is a regular file, so mkdir raises NotADirectoryError
@@ -5163,7 +5192,14 @@ def search_library(tmp_path: Path) -> Path:
     return root
 
 
-def _search_win(library_root: Path):
+def _search_win(library_root: Path, cache_root: Path | None = None):
+    """A MainWindow over `library_root` for UI tests. Pass `cache_root`
+    (a tmp_path) whenever the test drives something that PERSISTS —
+    MainWindow writes user choices to self.cache_root, which with no
+    cache_root/cache_dir falls back to main._default_cache_root(), i.e.
+    the developer's own real <repo>/cache/fauxcasa-cache/config.json
+    (fauxcasa-6y0 review; same hazard _load_theme_mode's docstring warns
+    about on the read side)."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -5172,7 +5208,7 @@ def _search_win(library_root: Path):
     app = QApplication.instance() or QApplication([])
     assert app is not None
     return MainWindow(scan_library(library_root), None,
-                      cache_dir=None, build_dir=None)
+                      cache_dir=None, build_dir=None, cache_root=cache_root)
 
 
 def _hits(win) -> set:
@@ -19148,6 +19184,313 @@ def test_theme_dark_palette_sets_expected_roles() -> None:
     disabled = QPalette.ColorGroup.Disabled
     for role in (R.WindowText, R.Text, R.ButtonText):
         assert pal.color(disabled, role) == theme.TEXT_MUTED
+
+
+def test_light_palette_roles() -> None:
+    """apply_scheme("light") repoints every theme.X module global at the
+    light table (fauxcasa-6y0); build_palette() reads those live, so a
+    palette built right after picks up light colors, and one built after
+    switching back to "dark" returns to today's values. Restores "dark"
+    in a finally so later tests see today's colors regardless of
+    ordering/failure."""
+    _offscreen_app()
+    import theme
+    from PySide6.QtGui import QPalette
+
+    try:
+        theme.apply_scheme("light")
+        pal = theme.build_palette()
+        R = QPalette.ColorRole
+        assert pal.color(R.Window).getRgb()[:3] == (240, 240, 240)
+        assert theme.WINDOW.getRgb()[:3] == (240, 240, 240)
+        assert theme.TEXT.getRgb()[:3] == (28, 28, 28)
+        assert theme.TEXT.lightness() < theme.WINDOW.lightness()
+
+        theme.apply_scheme("dark")
+        pal2 = theme.build_palette()
+        assert pal2.color(R.Window).getRgb()[:3] == (24, 24, 24)
+        assert theme.WINDOW.getRgb()[:3] == (24, 24, 24)
+        assert theme.TEXT.getRgb()[:3] == (220, 220, 220)
+    finally:
+        theme.apply_scheme("dark")
+
+
+def test_grid_aliases_follow_scheme() -> None:
+    """grid.BACKGROUND (module __getattr__, fauxcasa-6y0) tracks
+    theme.WINDOW live under both schemes — the fix that replaced the old
+    import-time snapshot (and the same fix applied to tray.py/viewer.py,
+    which had the identical bug)."""
+    _offscreen_app()
+    import theme
+    import grid
+
+    try:
+        assert grid.BACKGROUND.getRgb() == theme.WINDOW.getRgb()
+        theme.apply_scheme("light")
+        assert grid.BACKGROUND.getRgb() == theme.WINDOW.getRgb()
+        assert grid.BACKGROUND.getRgb()[:3] == (240, 240, 240)
+    finally:
+        theme.apply_scheme("dark")
+
+
+def _wcag_contrast(fg, bg) -> float:
+    """WCAG 2.x contrast ratio between two OPAQUE (r, g, b) triples."""
+    def lum(c):
+        chan = []
+        for v in c:
+            v /= 255.0
+            chan.append(v / 12.92 if v <= 0.03928
+                        else ((v + 0.055) / 1.055) ** 2.4)
+        return 0.2126 * chan[0] + 0.7152 * chan[1] + 0.0722 * chan[2]
+    l1, l2 = sorted((lum(fg), lum(bg)), reverse=True)
+    return (l1 + 0.05) / (l2 + 0.05)
+
+
+def _over(top, bottom) -> tuple[int, int, int]:
+    """Source-over composite of a QColor onto an opaque (r, g, b)."""
+    a = top.alpha() / 255.0
+    return tuple(round(a * t + (1 - a) * b)
+                 for t, b in zip(top.getRgb()[:3], bottom))
+
+
+def test_transport_colors_follow_scheme() -> None:
+    """The video transport strip is CHROME — it fills with
+    theme.CAPTION_BG — so its play/pause glyph, seek progress and
+    unplayed track take the scheme-variant theme.TRANSPORT_FG/
+    TRANSPORT_TRACK, not the photo-facing PLAY_WHITE (fauxcasa-6y0
+    review: near-white glyphs and a white@60 track vanished on the light
+    white@180 strip). viewer's module aliases follow theme live, and both
+    light values clear a 3:1 floor against that strip composited over
+    BOTH extremes of photo content — a white photo and a black one."""
+    _offscreen_app()
+    import theme
+    import viewer
+
+    try:
+        assert viewer.TRANSPORT_FG.getRgb() == theme.PLAY_WHITE.getRgb()
+        assert viewer.TRANSPORT_TRACK.getRgb() == (255, 255, 255, 60)
+
+        theme.apply_scheme("light")
+        assert viewer.TRANSPORT_FG.getRgb() == theme.TRANSPORT_FG.getRgb()
+        assert (viewer.TRANSPORT_TRACK.getRgb()
+                == theme.TRANSPORT_TRACK.getRgb())
+        # No longer the photo-facing near-white the review flagged.
+        assert theme.TRANSPORT_FG.getRgb() != theme.PLAY_WHITE.getRgb()
+        for photo in ((255, 255, 255), (0, 0, 0)):
+            strip = _over(theme.CAPTION_BG, photo)
+            assert _wcag_contrast(
+                _over(theme.TRANSPORT_FG, strip), strip) >= 3.0, photo
+            assert _wcag_contrast(
+                _over(theme.TRANSPORT_TRACK, strip), strip) >= 3.0, photo
+        # The face-name chip rides the same CAPTION_BG, so its label is
+        # CAPTION_FG now (viewer._paint_faces) — also a 3:1 floor.
+        for photo in ((255, 255, 255), (0, 0, 0)):
+            strip = _over(theme.CAPTION_BG, photo)
+            assert _wcag_contrast(
+                _over(theme.CAPTION_FG, strip), strip) >= 3.0, photo
+    finally:
+        theme.apply_scheme("dark")
+
+
+def test_theme_check_tables_guards_globals_parity() -> None:
+    """theme._check_tables() enforces BOTH halves of the invariant
+    (fauxcasa-6y0 review): the two scheme tables share every key, and
+    every such key already exists as a module global. The second half is
+    what globals().update() cannot give itself — dict.update ADDS unknown
+    keys, so a key present in both tables but missing from the
+    module-globals block would otherwise raise AttributeError until the
+    first apply_scheme() quietly created it. A plain `raise`, not an
+    `assert`, so `python -O` keeps the guard."""
+    _offscreen_app()
+    from PySide6.QtGui import QColor
+
+    import theme
+
+    theme._check_tables()  # the real tables pass
+
+    probe = QColor(1, 2, 3)
+    theme._DARK["ZZ_PROBE"] = probe
+    try:
+        with pytest.raises(RuntimeError, match="share every key"):
+            theme._check_tables()
+        theme._LIGHT["ZZ_PROBE"] = probe
+        with pytest.raises(RuntimeError, match="module-global"):
+            theme._check_tables()
+    finally:
+        theme._DARK.pop("ZZ_PROBE", None)
+        theme._LIGHT.pop("ZZ_PROBE", None)
+    theme._check_tables()
+
+
+def test_resolve_scheme_matrix() -> None:
+    """resolve_scheme's mode x os-scheme table (fauxcasa-6y0): "light"/
+    "dark" are explicit overrides and ignore the OS scheme entirely;
+    "system" maps Qt.ColorScheme.Light -> "light", Dark -> "dark", and
+    Unknown -> "dark" (today's look, so offscreen tests — which never
+    report a real OS scheme — are unchanged)."""
+    from PySide6.QtCore import Qt
+
+    import theme
+
+    for os_scheme in (Qt.ColorScheme.Light, Qt.ColorScheme.Dark,
+                      Qt.ColorScheme.Unknown):
+        assert theme.resolve_scheme("light", os_scheme) == "light"
+        assert theme.resolve_scheme("dark", os_scheme) == "dark"
+    assert theme.resolve_scheme("system", Qt.ColorScheme.Light) == "light"
+    assert theme.resolve_scheme("system", Qt.ColorScheme.Dark) == "dark"
+    assert theme.resolve_scheme("system", Qt.ColorScheme.Unknown) == "dark"
+
+
+def test_theme_menu_and_persistence(search_library: Path, monkeypatch) -> None:
+    """View > Theme (fauxcasa-6y0): an exclusive System/Light/Dark radio
+    group, "system" checked by default, driving theme.apply_mode plus
+    persistence through _save_theme_mode/_load_theme_mode — monkeypatched
+    here to a plain dict so the test never touches the real per-user
+    config.json. _set_theme_mode/_toggle_theme keep the radio group in
+    sync and apply the QApplication palette; restores "dark" in a
+    finally."""
+    import main
+    import theme
+    from PySide6.QtGui import QPalette
+    from PySide6.QtWidgets import QApplication
+
+    store: dict[str, str] = {}
+    monkeypatch.setattr(main, "_load_theme_mode",
+                        lambda cache_root: store.get("theme", "system"))
+    monkeypatch.setattr(
+        main, "_save_theme_mode",
+        lambda cache_root, mode: store.__setitem__("theme", mode))
+    win = None
+    try:
+        win = _search_win(search_library)
+        assert win.theme_mode == "system"
+        assert win.theme_menu is not None
+        assert len(win.theme_actions) == 3
+        assert [a.data() for a in win.theme_actions] == \
+            ["system", "light", "dark"]
+        assert [a.data() for a in win.theme_actions if a.isChecked()] == \
+            ["system"]
+
+        win.show()  # grab() below needs an actual paint
+        QApplication.instance().processEvents()
+
+        win._set_theme_mode("light")
+        QApplication.instance().processEvents()
+        assert QApplication.instance().palette().color(
+            QPalette.ColorRole.Window).getRgb()[:3] == (240, 240, 240)
+        assert theme.current_scheme() == "light"
+        assert store["theme"] == "light"
+        assert [a.data() for a in win.theme_actions if a.isChecked()] == \
+            ["light"]
+        # Qt resolves a QSS palette(…) function against the QApplication
+        # palette AT setStyleSheet() time and CACHES it (Opus review
+        # finding): the search box's border would stay the OLD scheme's
+        # FIELD_BORDER forever without _refresh_theme's clear-then-
+        # reset-the-same-sheet trick. Probe the actual rendered pixel at
+        # the box's left edge, not just the sheet text, so a regression
+        # that re-breaks the cache (e.g. skipping the clear step) fails
+        # this test even though the sheet STRING never changes.
+        h = win.search.height()
+        border_px = win.search.grab().toImage().pixelColor(0, h // 2)
+        assert border_px.getRgb()[:3] == theme.FIELD_BORDER.getRgb()[:3]
+
+        win._toggle_theme()
+        assert theme.current_scheme() == "dark"
+        assert store["theme"] == "dark"
+        assert [a.data() for a in win.theme_actions if a.isChecked()] == \
+            ["dark"]
+    finally:
+        theme.apply_mode(QApplication.instance(), "dark")
+        if win is not None:
+            win.hide()
+
+
+def test_theme_toggle_shortcut_from_keymap(search_library: Path) -> None:
+    """The View > Theme > Toggle Light/Dark action's real QAction
+    shortcuts come from the keymap (fauxcasa-6y0) — never hard-coded,
+    the same rule app.play/app.info follow."""
+    import keymap
+
+    win = _search_win(search_library)
+    assert win.theme_toggle_menu_action.shortcuts() == \
+        keymap.shortcuts("app.theme_toggle")
+
+
+def test_refresh_theme_preserves_selected_view(search_library: Path,
+                                               tmp_path: Path) -> None:
+    """_refresh_theme()'s _rebuild_sidebar() call must be bracketed with
+    _selected_view()/_reselect_view() like every other rebuild call site
+    (_toggle_reveal, _toggle_folder_view, ...) — Opus review blocker:
+    without the bracket, switching theme (or the OS flipping scheme at
+    sunset via colorSchemeChanged) silently reset the current view back
+    to All photos (fauxcasa-6y0).
+
+    Built with an explicit tmp cache_root because _set_theme_mode below
+    persists the mode to self.cache_root, exactly as _remember_library
+    does (main.py, _change_library) — a MainWindow method writing the
+    user's choice to its own cache root is the established behavior, so
+    the fix is to give the TEST a cache root of its own instead of
+    making persistence conditional. Without it this test merge-wrote the
+    theme key into the developer's real config.json (fauxcasa-6y0
+    review)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItemIterator
+
+    import theme
+
+    try:
+        win = _search_win(search_library, cache_root=tmp_path / "cr")
+        it = QTreeWidgetItemIterator(win.tree)
+        folder_item = None
+        while it.value():
+            data = it.value().data(0, Qt.ItemDataRole.UserRole)
+            if data is not None and data[0] == "folder":
+                folder_item = it.value()
+                break
+            it += 1
+        assert folder_item is not None, "search_library has no folder item"
+        win._sidebar_clicked(folder_item, 0)
+        before = win._selected_view()
+        assert before[0] == "folder"
+
+        win._refresh_theme()
+        assert win._selected_view() == before
+
+        win._set_theme_mode("light")
+        assert win._selected_view() == before
+    finally:
+        theme.apply_mode(QApplication.instance(), "dark")
+
+
+def test_on_os_color_scheme_changed_respects_mode(
+        search_library: Path) -> None:
+    """MainWindow._on_os_color_scheme_changed (fauxcasa-6y0), the
+    QStyleHints.colorSchemeChanged slot: in "system" mode it re-resolves
+    against the real app.styleHints().colorScheme() (offscreen always
+    reports Unknown -> "dark" — see resolve_scheme), so calling it from
+    "light" flips to "dark"; in an explicit "light"/"dark" mode it must
+    be a complete no-op, leaving the scheme untouched. Called directly
+    (a bound-method slot, not a closure) rather than faking a real
+    QStyleHints signal emission."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    import theme
+
+    try:
+        win = _search_win(search_library)
+
+        win.theme_mode = "system"
+        theme.apply_scheme("light")
+        win._on_os_color_scheme_changed(Qt.ColorScheme.Dark)
+        assert theme.current_scheme() == "dark"
+
+        win.theme_mode = "light"
+        theme.apply_scheme("light")
+        win._on_os_color_scheme_changed(Qt.ColorScheme.Dark)
+        assert theme.current_scheme() == "light"  # untouched: not "system"
+    finally:
+        theme.apply_mode(QApplication.instance(), "dark")
 
 
 def test_grid_empty_text_paints_only_when_set(tmp_path: Path) -> None:
