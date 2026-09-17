@@ -2407,6 +2407,9 @@ def test_blocking_failures_drop_stageable_worker_dir(monkeypatch):
     monkeypatch.setattr(dw, "preflight_worker_grants",
                          lambda: [(source_worker_dir, "SetNamedSecurityInfoW(...) err=5")])
     monkeypatch.setattr(dw, "get_cached_profile_sid", lambda name: "fake-sid")
+    # Pinned, not ambient: the drop is only legal when staging is
+    # actually possible (see the LOCALAPPDATA test below).
+    monkeypatch.setattr(dw, "cache_root_is_localappdata", lambda: True)
 
     staging_calls = []
 
@@ -2418,6 +2421,34 @@ def test_blocking_failures_drop_stageable_worker_dir(monkeypatch):
 
     assert dw.blocking_worker_grant_failures() == []
     assert staging_calls == [str(dw.worker_staging_root())]
+
+
+@_WINDOWS_ONLY
+def test_blocking_failures_keep_worker_dir_when_localappdata_unset(monkeypatch):
+    """fauxcasa-ayh review finding 9: stage_worker_script() refuses
+    (OSError) when the cache root did not resolve from LOCALAPPDATA, and
+    spawn() then falls back to the REFUSED source path -- so on such a
+    box the worker-dir failure is blocking no matter how grantable the
+    TEMP/home fallback staging dir happens to be, and the probe must not
+    issue a recursive grant spawn() itself would never issue."""
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    source_worker_dir = str(Path(dw.__file__).resolve().parent)
+    monkeypatch.setattr(dw, "preflight_worker_grants",
+                         lambda: [(source_worker_dir, "SetNamedSecurityInfoW(...) err=5")])
+    monkeypatch.setattr(dw, "get_cached_profile_sid", lambda name: "fake-sid")
+    monkeypatch.setattr(dw, "cache_root_is_localappdata", lambda: False)
+
+    called = []
+    monkeypatch.setattr(
+        dw, "grant_read_execute_once",
+        lambda path, sid, inherit=dw.SUB_CONTAINERS_AND_OBJECTS_INHERIT:
+        called.append(path) or None)  # the fallback dir WOULD grant
+
+    assert dw.blocking_worker_grant_failures() == [
+        (source_worker_dir, "SetNamedSecurityInfoW(...) err=5")]
+    assert called == [], (
+        "with LOCALAPPDATA unset the staging root must not even be probed -- "
+        "spawn() never grants a staging root it refuses to stage into")
 
 
 @_WINDOWS_ONLY

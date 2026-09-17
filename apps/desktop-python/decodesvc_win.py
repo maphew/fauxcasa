@@ -1907,6 +1907,16 @@ if sys.platform == "win32":
         ungrantable, staging cannot save the worker either, and the
         worker-dir failure is real and must stay reported.
 
+        The probe mirrors spawn()'s preconditions IN ORDER (review
+        finding 9): stage_worker_script() refuses (OSError) when the
+        cache root did not resolve from LOCALAPPDATA, and spawn() then
+        falls back to the refused source path -- so with LOCALAPPDATA
+        unset the drop is never justified, however grantable the
+        TEMP/home fallback directory happens to be. Checking that FIRST
+        also keeps this proxy from issuing a recursive grant spawn()
+        itself would never issue (spawn never grants a staging root it
+        refuses to stage into).
+
         When frozen, nothing is dropped: sys._MEIPASS is not a separate
         "worker script dir" that spawn() can substitute a staged copy
         for -- it IS the payload directory being granted, so a failure
@@ -1919,6 +1929,12 @@ if sys.platform == "win32":
         except OSError:
             return failures
         if not any(p == source_worker_dir for p, _ in failures):
+            return failures
+        if not cache_root_is_localappdata():
+            # Staging is unavailable at all (stage_worker_script raises,
+            # spawn falls back to the source path) -- the worker-dir
+            # failure is real, and probing the TEMP/home fallback root
+            # would answer a question spawn never asks.
             return failures
         sid = get_cached_profile_sid(PROFILE_NAME)
         staging_err = grant_read_execute_once(

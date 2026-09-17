@@ -83,7 +83,10 @@ def _real_sandbox_env(base: dict[str, str], check_name: str) -> dict[str, str]:
 
     Called once per real-sandbox check (three times total today), but
     the note is printed at most ONCE per preflight run -- it is the same
-    fact each time, not one worth repeating per check (review finding 5)."""
+    fact each time, not one worth repeating per check (review finding 5),
+    and it goes to STDERR: checks() runs before main()'s --json dump, so
+    a stdout notice would prepend a non-JSON line to the documented
+    machine-readable contract and break json.loads(stdout)."""
     global _sandbox_env_note_printed
     env = dict(base)
     if sys.platform == "win32" and "UV_CACHE_DIR" not in os.environ:
@@ -97,7 +100,8 @@ def _real_sandbox_env(base: dict[str, str], check_name: str) -> dict[str, str]:
                     f"checks ({check_name} and others) to {env['UV_CACHE_DIR']!r} so "
                     "they're deterministic (fauxcasa-ayh); if your uv cache is "
                     "configured elsewhere via uv.toml, the first run here re-downloads "
-                    "wheels -- set UV_CACHE_DIR explicitly to keep yours")
+                    "wheels -- set UV_CACHE_DIR explicitly to keep yours",
+                    file=sys.stderr)
     return env
 
 
