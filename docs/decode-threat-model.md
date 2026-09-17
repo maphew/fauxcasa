@@ -167,7 +167,7 @@ narrower, verified against `apps/desktop-python/thumbcache.py`
 | 16-bit TIFF | In-process | `pillowload.py` (Pillow); same pre-route |
 | HEIC/HEIF | In-process | `pillowload.py` (Pillow, plus pi-heif/libde265); same pre-route |
 | Video poster frame | In-process | `videoload.py` (PyAV/FFmpeg); same pre-route |
-| Video playback | In-process, plain `subprocess.Popen` worker | `videostream.py` |
+| Video playback | Separate unsandboxed worker process (plain `subprocess.Popen`, no AppContainer) | `videostream.py` |
 | Scan-time metadata/header read | In-process | `metareader.py` (exiv2 seam); `catalog._image_size` calls `QImageReader` directly |
 
 `DecodeService.index()` is always in-process too, but it has no
@@ -267,8 +267,10 @@ default; this freeze blocks new sandbox work, not the sandbox itself.
 The one exception: a user-reported incident lifts the freeze. This
 follows the arch review's rule against measurement or hardening
 campaigns without a trigger (`docs/architecture-review-2026-09.md`
-§10 rule 4): a user report, a failed CI gate, or new reference
-hardware count as triggers; curiosity does not.
+§10 rule 4), which lists three triggers — a user report, a failed CI
+gate, or new reference hardware — that govern such campaigns in
+general; for this freeze specifically, only the user-reported incident
+lifts it, and curiosity does not.
 
 See `docs/architecture-review-2026-09.md` §5.1 for the cost/benefit
 argument behind this freeze and §8.4 for the freeze list it belongs
