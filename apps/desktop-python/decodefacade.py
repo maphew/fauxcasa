@@ -249,6 +249,15 @@ class DecodeService:
     def __init__(self) -> None:
         self.state = STATE_IN_PROCESS
         self.reason = ""
+        # fauxcasa-ayh: non-fatal, user-actionable warnings surfaced
+        # BEFORE the first decode (e.g. a worker PYTHONPATH the
+        # AppContainer grant could not reach) -- distinct from
+        # `self.reason`, which only carries the STATE_DEGRADED cause.
+        # Empty in the common case (grant succeeded, or no sandbox).
+        # This is an INSPECTION hook only (read by tests today, a future
+        # status UI later) -- the user-facing channel today is the
+        # log.warning() line next to each append below.
+        self.warnings: list[str] = []
         self._in_process = InProcessTransport()
         self._sandbox: WinSandboxTransport | None = None
         self._lock = threading.Lock()
@@ -291,6 +300,49 @@ class DecodeService:
             except Exception:
                 INDEX_WORKERS = 4
             sandbox = WinSandboxTransport(n_batch=INDEX_WORKERS)
+            # fauxcasa-ayh: check grantability of the worker's PYTHONPATH
+            # (and the other spawn() grant targets) BEFORE the first spawn
+            # attempt, so a ReFS/Dev Drive uv cache that refuses the
+            # per-SID grant is reported here -- once, with the actionable
+            # fix -- instead of only surfacing later as a pre-hello
+            # ModuleNotFoundError: PySide6 worker death. Best-effort: the
+            # grant itself is best-effort in spawn() too (an ALL
+            # APPLICATION PACKAGES-granted volume, e.g. Program Files,
+            # still lets the spawn below succeed even when this reports
+            # nothing to fix), and an unexpected exception HERE must not
+            # itself degrade the service -- start() below is the real
+            # readability proof either way.
+            try:
+                import decodesvc_win as dw
+                # fauxcasa-ayh review finding 2: blocking_worker_grant_
+                # failures() (not the raw preflight_worker_grants()) is
+                # the one call site both here and _assert_sandbox_
+                # grantable() in test_decodefacade.py share -- it alone
+                # knows the worker-script-dir-vs-staging-root nuance (see
+                # its docstring), so the "is this actually blocking" rule
+                # lives in exactly one place.
+                failures = dw.blocking_worker_grant_failures()
+            except Exception as preflight_exc:
+                log.warning(
+                    "decode sandbox: preflight grant check raised %s: %s (continuing to spawn)",
+                    type(preflight_exc).__name__, preflight_exc)
+            else:
+                if failures:
+                    detail = "; ".join(f"{p!r}: {err}" for p, err in failures)
+                    self.warnings.append(
+                        "decode sandbox: read+execute grant failed before first decode on "
+                        f"{detail}; {dw.UNGRANTABLE_PYTHONPATH_HINT}")
+                    # fauxcasa-ayh review finding 4: grant_read_execute_
+                    # once() already logged the same per-path detail as
+                    # its own WARNING at grant time (decodesvc_win.py,
+                    # once per (sid, path) per process) -- repeating the
+                    # full path:error listing here too would be a
+                    # near-duplicate log line. Point back at that instead
+                    # of restating it; the full detail (for a future
+                    # status UI, or a test) lives in self.warnings above.
+                    log.warning(
+                        "decode sandbox: read+execute grant failed before first decode "
+                        "(grant details logged above); %s", dw.UNGRANTABLE_PYTHONPATH_HINT)
             try:
                 sandbox.start()
             except Exception as e:
