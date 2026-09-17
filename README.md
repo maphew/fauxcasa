@@ -18,8 +18,8 @@ try on your own photos and easy to remove again.
 
 ## Try it
 
-1. Download the current version from the
-   [releases page](https://github.com/maphew/fauxcasa/releases/latest).
+1. Download the current version, `0.1.0-rc2`, from its
+   [release page](https://github.com/maphew/fauxcasa/releases/tag/v0.1.0-rc2).
    Windows 10 or 11: the file ending in `windows-x64.zip`. Linux: the file
    ending in `linux-x64.tar.gz`. (The "x64" means a 64-bit computer,
    which is almost every PC made in the last decade.)
