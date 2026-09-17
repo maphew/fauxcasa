@@ -175,18 +175,17 @@ def _parse_image_size_arg(value: str) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Multi-root management CLI actions (fauxcasa-ed5.7.4, bead .d, design §10)
+# --import-picasa-watched (fauxcasa-ed5.7.4, bead .d, design §10)
 # ---------------------------------------------------------------------------
 #
-# --promote / --add-root / --import-picasa-watched are management
-# operations, not the normal open path: each validates its arguments,
-# performs the on-disk change via library.py, prints a one-line summary,
-# and returns an exit code WITHOUT proceeding to the normal warm/cold-walk
-# open below — opening an explicit multi-root library through the grid/tree
-# is bead .g's scope (the "tree per root" UI); today's open flow only knows
-# how to browse a single Path. Re-running the app afterwards (implicit
-# legacy open for an un-promoted root, or a future explicit-open path once
-# .g lands) picks up the change.
+# Like --promote/--add-root (main.py), this is a management operation, not
+# the normal open path: it validates its arguments, performs the on-disk
+# change via library.py, prints a one-line summary, and returns an exit code
+# WITHOUT proceeding to the normal warm/cold-walk open — opening an explicit
+# multi-root library through the grid/tree is bead .g's scope (the "tree per
+# root" UI); today's open flow only knows how to browse a single Path.
+# Re-running the app afterwards (implicit legacy open for an un-promoted
+# root, or a future explicit-open path once .g lands) picks up the change.
 
 def _read_watched_list_file(path: Path) -> list[Path]:
     """One folder path per line; blank lines and '#'-prefixed comments are

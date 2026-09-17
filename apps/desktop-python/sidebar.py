@@ -182,7 +182,7 @@ class Sidebar:
         """Repopulate the sidebar after a reveal toggle or reconcile reload.
 
         Swaps in a freshly built QTreeWidget and defers the old one's
-        destruction via deleteLater(), instead of self.tree.clear()+repopulate.
+        destruction via deleteLater(), instead of win.tree.clear()+repopulate.
         On the real Windows Qt platform, clear()-ing a QTreeWidget that has a
         current item set intermittently aborts with a native access violation
         in the in-place item teardown (fauxcasa-gfz) — reproducible in a single
@@ -601,7 +601,7 @@ class Sidebar:
         """Build (without exec'ing — mirrors _folder_sort_menu's seam) the
         Folders-root context menu: one checkable Flat Folders action, kept
         in sync with the View menu's identical action via the shared
-        self._flat_check state (both toggling it fires _toggle_folder_view
+        win._flat_check state (both toggling it fires _toggle_folder_view
         exactly once each way)."""
         win = self.win
         menu = QMenu(win.tree)

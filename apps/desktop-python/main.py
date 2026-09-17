@@ -737,6 +737,12 @@ def _resolve_library(arg: str | None, cache_root: Path) -> Path | None:
     return root
 
 
+# ---------------------------------------------------------------------------
+# --promote / --add-root management CLI actions (fauxcasa-ed5.7.4, bead .d,
+# design §10) — see cli.py's --import-picasa-watched banner for the sibling
+# handler and the shared "not the normal open path" rationale.
+# ---------------------------------------------------------------------------
+
 def _cmd_promote(library_arg: str | None, cache_root: Path) -> int:
     """--promote: promote the legacy library named by the positional
     `library` argument in place (design §10). Reuses _resolve_library for
